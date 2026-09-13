@@ -31,7 +31,7 @@ map:
   - addon_config:rw
 
 options:
-  influx_host: "a0d7b954-influxdb"
+  influx_host: "f6484555-influxdb-vistalba"
   influx_port: 8086
   influx_username: ""
   influx_password: ""
