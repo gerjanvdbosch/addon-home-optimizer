@@ -126,6 +126,6 @@ class Worker:
             case JobType.VALIDATE:
                 container.identification.validate(job.config)
             case JobType.OPTIMIZE:
-                container.optimization.run()
+                container.optimization.run(job.config)
             case _:
                 raise NotImplementedError(f"Unknown job type={job.type}")

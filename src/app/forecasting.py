@@ -78,6 +78,7 @@ class Forecasting:
 
         results, study = forecaster.tune(
             df,
+            steps=config.steps,
             n_trials=config.trails,
             study_storage=self.study_storage,
         )

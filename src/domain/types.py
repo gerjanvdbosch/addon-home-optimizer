@@ -229,7 +229,7 @@ class FitConfig(BaseModel):
 
 class PredictConfig(BaseModel):
     target: ForecasterType | None = Field(default=None)
-    steps: int = Field(default=48)
+    steps: int = Field(default=192)
 
 
 class BacktestConfig(BaseModel):
@@ -250,10 +250,14 @@ class CalibrateConfig(BaseModel):
 class ValidateConfig(BaseModel):
     target: IdentificationType | None = Field(default=None)
     days: int = Field(default=90)
-    steps: int = Field(default=8)
 
 
-class OptimizeConfig(BaseModel): ...
+class OptimizeConfig(BaseModel):
+    # MPC horizon in 15-minute steps (same convention as PredictConfig.steps) -
+    # fixed here so the optimizer always plans over this many steps, rather
+    # than incidentally following however many points the last solar
+    # prediction happened to produce.
+    steps: int = Field(default=192)
 
 
 P = TypeVar("P")
@@ -481,10 +485,10 @@ class MPCConfig:
     # dominated by proving optimality across many binaries, not by finding a
     # good solution, so halving the variable count for the *look-ahead-only*
     # portion of the horizon (re-solved at full precision before it is ever
-    # acted on) is a real, low-risk speedup. 18h keeps at least the next
+    # acted on) is a real, low-risk speedup. 24h keeps at least the next
     # daily target deadline at full precision regardless of what time of day
     # this solves, given this installation's targets recur roughly daily.
-    fine_horizon_hours: float = 18.0
+    fine_horizon_hours: float = 24.0
     coarse_step_hours: float = 1.0
 
 

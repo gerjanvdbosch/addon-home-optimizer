@@ -26,6 +26,27 @@ RETRAIN_INTERVAL_HOURS = 6
 MAX_TRAIN_WINDOW_DAYS = 30
 MAX_LEAD_TIME_HOURS = 3.0
 
+# Solcast/Open-Meteo data (and this forecaster's own dataset()) is natively
+# 30-minute resolution, while every caller of predict() (PredictConfig,
+# OptimizeConfig, the other forecasters' 15-minute asfreq) works in
+# 15-minute (0.25h) steps. `steps` on this class's own predict()/
+# predict_arguments() follows that shared 15-minute convention; it is
+# translated to native rows internally so callers never need to know this
+# forecaster's underlying resolution differs.
+NATIVE_STEP_MINUTES = 30
+PREDICT_STEP_MINUTES = 15
+
+
+def _native_steps(steps: int) -> int:
+    """How many native 30-minute rows are needed so that resampling their
+    predictions down to 15-minute resolution covers at least `steps`
+    15-minute points (each native row yields NATIVE_STEP_MINUTES /
+    PREDICT_STEP_MINUTES target points once interpolated)."""
+
+    ratio = NATIVE_STEP_MINUTES // PREDICT_STEP_MINUTES
+
+    return -(-(max(steps, 1) - 1) // ratio) + 1
+
 
 class SolarForecaster(SklearnForecaster):
     @property
@@ -117,7 +138,7 @@ class SolarForecaster(SklearnForecaster):
             .sort_values(["target_time", "time"])
             .drop_duplicates("target_time", keep="last")
             .sort_values("target_time")
-            .iloc[:steps]
+            .iloc[: _native_steps(steps)]
         )
 
         return future[self.exog_columns]
@@ -256,7 +277,15 @@ class SolarForecaster(SklearnForecaster):
         if result.empty:
             return result
 
-        return result.resample("15min").interpolate(method="time").clip(lower=0.0)
+        # super().predict() resolved `steps` to native 30-minute rows (see
+        # predict_arguments); downsample those to the caller's own
+        # 15-minute steps and trim to exactly the requested count.
+        return (
+            result.resample("15min")
+            .interpolate(method="time")
+            .clip(lower=0.0)
+            .iloc[:steps]
+        )
 
     def predict_result(self, prediction: np.ndarray, df: pd.DataFrame) -> pd.Series:
         p50 = df["p50"].to_numpy()

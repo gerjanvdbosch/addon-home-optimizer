@@ -2,7 +2,7 @@ import logging
 from pathlib import Path
 
 from app.state import StateManager
-from domain.types import MPCConfig, MPCInput
+from domain.types import MPCConfig, MPCInput, OptimizeConfig
 from features.boiler import BoilerThermalIdentifier
 from features.cop import HeatPumpCOPIdentifier
 from features.optimizer import MPCOptimizer
@@ -22,14 +22,31 @@ class Optimization:
         self.config_repository = config_repository
         self.models_path = models_path
 
-    def run(self) -> None:
+    def run(self, optimize_config: OptimizeConfig) -> None:
         state = self.state_manager.load()
         config = self.config_repository.load()
 
         mpc_config = MPCConfig()
 
-        solar_forecast = [p.value for p in state.predictions.solar]
-        forecast_times = [p.time for p in state.predictions.solar]
+        # Fixed to optimize_config.steps so the MPC horizon is an explicit
+        # choice, not whatever length the last solar prediction happened to
+        # produce (which itself may have used a different PredictConfig.steps).
+        # Falls back to however many steps are actually available (a shorter
+        # horizon is still a valid, physically meaningful plan) rather than
+        # inventing missing forecast data.
+        steps = min(optimize_config.steps, len(state.predictions.solar))
+
+        if steps < optimize_config.steps:
+            logger.warning(
+                "Solar prediction covers only %d of the requested %d optimize "
+                "steps; planning over %d steps instead.",
+                len(state.predictions.solar),
+                optimize_config.steps,
+                steps,
+            )
+
+        solar_forecast = [p.value for p in state.predictions.solar[:steps]]
+        forecast_times = [p.time for p in state.predictions.solar[:steps]]
 
         # The stored state.schedule.heat_pump.boiler.target_temperature is
         # resolved against *today's* timestamps (see StateManager.update()) - not

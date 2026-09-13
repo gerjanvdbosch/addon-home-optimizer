@@ -272,7 +272,7 @@ actions:
       payload: |
         {{ {
           "target": "solar",
-          "steps": 96
+          "steps": 192
         } | to_json }}
 ```
 
@@ -351,7 +351,6 @@ actions:
         {{ {
           "target": "boiler"
           "days": 90,
-          "steps": 8
         } | to_json }}
 ```
 
@@ -368,7 +367,9 @@ actions:
     data:
       endpoint: optimize
       payload: |
-        {{ {} | to_json }}
+        {{ {
+          "steps": 192
+        } | to_json }}
 ```
 
 ## Development
