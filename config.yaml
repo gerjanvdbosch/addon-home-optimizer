@@ -1,0 +1,48 @@
+---
+name: "Home Optimizer"
+description: >-
+  Smart heat pump control based on thermal behavior, solar, and energy prices.
+version: "dev"
+slug: "home_optimizer"
+url: "https://github.com/gerjanvandenbosch/addon-home-optimizer"
+init: false
+
+panel_title: Optimizer
+panel_icon: mdi:home-lightning-bolt-outline
+
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+
+homeassistant_api: true
+ingress: true
+ingress_port: 8099
+
+ports:
+  8099/tcp: 8099
+
+ports_description:
+  8099/tcp: "Home Optimizer"
+
+map:
+  - addon_config:rw
+
+options:
+  influx_host: "a0d7b954-influxdb"
+  influx_port: 8086
+  influx_username: ""
+  influx_password: ""
+  influx_database: "home_assistant"
+  log_level: "INFO"
+
+schema:
+  influx_host: str
+  influx_port: int
+  influx_username: str
+  influx_password: password
+  influx_database: str
+  log_level: list(DEBUG|INFO|WARNING|ERROR|CRITICAL)
+

@@ -1,0 +1,40 @@
+name: Python lint
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python and enable pip cache
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.14'
+          cache: 'pip'
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install project with dev dependencies
+        run: python -m pip install -e .[dev]
+
+      - name: Pyflakes (syntax check)
+        run: pyflakes src tests
+
+      - name: Ruff (lint)
+        run: ruff check src tests
+
+      - name: Black (format check)
+        run: black --check src tests
+
+      - name: Pyright (type check)
+        run: pyright
+
+      - name: Pytest
+        run: python -m pytest

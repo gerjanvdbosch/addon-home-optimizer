@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Home Optimizer</title>
+    <link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+<h1>Home Optimizer</h1>
+{% if backtest_chart %}
+<div class="chart-container">
+    {{ backtest_chart | safe }}
+</div>
+{% else %}
+<div class="chart-container">
+    {{ dashboard_chart | safe }}
+</div>
+{% endif %}
+</body>
+</html>
