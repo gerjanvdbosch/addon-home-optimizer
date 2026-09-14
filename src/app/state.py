@@ -22,11 +22,15 @@ class StateManager:
         state_repository: StateRepository,
         config_repository: ConfigRepository,
         models_path: Path,
+        latitude: float,
+        longitude: float,
     ):
         self.loader = loader
         self.state_repository = state_repository
         self.config_repository = config_repository
         self.models_path = models_path
+        self.latitude = latitude
+        self.longitude = longitude
 
     def load(self) -> State:
         return self.state_repository.load()
@@ -71,13 +75,18 @@ class StateManager:
         if not forecast.p50:
             return
 
-        identifier = SolarBiasIdentifier()
+        identifier = SolarBiasIdentifier(self.latitude, self.longitude)
         identifier.load(self.models_path)
 
         if identifier.model is None:
             return
 
-        p50 = predict_solar(identifier.model, self._future_series(forecast.p50, now))
+        p50 = predict_solar(
+            identifier.model,
+            self._future_series(forecast.p50, now),
+            self.latitude,
+            self.longitude,
+        )
         state.predictions.solar = self._series_points(p50)
 
         if forecast.p10 and forecast.p90:

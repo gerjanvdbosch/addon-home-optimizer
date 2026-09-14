@@ -67,6 +67,10 @@ class Settings(BaseModel):
         default="INFO",
         description="Logging level",
     )
+    # Required, no default: a wrong location silently misplaces every reading's
+    # solar elevation band (see features.solar), so a missing one must fail.
+    latitude: float = Field(description="Installation latitude (degrees)")
+    longitude: float = Field(description="Installation longitude (degrees)")
 
 
 class InfluxSensor(BaseModel):

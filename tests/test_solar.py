@@ -6,7 +6,6 @@ import pytest
 
 from features.solar import (
     ELEVATION_BINS,
-    LATITUDE_DEG,
     MAX_TRAIN_WINDOW_DAYS,
     MIN_OUTAGE_STEPS,
     MIN_QUANTILE_N,
@@ -26,28 +25,30 @@ from features.solar import (
     predict_solar_band,
 )
 
+LATITUDE = 52.0
+LONGITUDE = 5.0
+
 
 def test_solar_elevation_matches_expected_value_at_solstice_noon():
     """Sanity check against pvlib: at summer solstice, solar-noon elevation
     should be close to 90 - latitude + solar declination (~23.44 deg) -
     confirms the coordinates and pvlib wiring are correct, not just that
-    the function runs. Solar noon at LONGITUDE_DEG (not necessarily
-    12:00 UTC - see the module comment on LATITUDE_DEG/LONGITUDE_DEG) is
+    the function runs. Solar noon at LONGITUDE (11:40 UTC, not 12:00) is
     used here so this isn't sensitive to that same longitude correction.
     """
 
     solar_noon = pd.Series([datetime(2026, 6, 21, 11, 40, tzinfo=UTC)])
 
-    elevation = _solar_elevation(solar_noon)
+    elevation = _solar_elevation(solar_noon, LATITUDE, LONGITUDE)
 
-    expected_max = 90.0 - LATITUDE_DEG + 23.44
+    expected_max = 90.0 - LATITUDE + 23.44
     assert elevation.iloc[0] == pytest.approx(expected_max, abs=1.0)
 
 
 def test_solar_elevation_is_clipped_to_zero_below_the_horizon():
     night = pd.Series([datetime(2026, 6, 21, 0, 0, tzinfo=UTC)])
 
-    elevation = _solar_elevation(night)
+    elevation = _solar_elevation(night, LATITUDE, LONGITUDE)
 
     assert elevation.iloc[0] == pytest.approx(0.0)
 
@@ -68,7 +69,7 @@ def test_solar_elevation_preserves_row_alignment_with_duplicate_timestamps():
         index=[5, 7, 9],
     )
 
-    elevation = _solar_elevation(target_time)
+    elevation = _solar_elevation(target_time, LATITUDE, LONGITUDE)
 
     assert list(elevation.index) == [5, 7, 9]
     assert elevation.loc[5] == pytest.approx(elevation.loc[9])
@@ -240,7 +241,7 @@ def test_prepare_raises_a_clear_error_for_an_empty_range():
     empty = pd.DataFrame(columns=["time", "target_time", "P_solar", "p50"])
 
     with pytest.raises(ValueError, match="No data available"):
-        _prepare(empty)
+        _prepare(empty, LATITUDE, LONGITUDE)
 
 
 def _synthetic_walk_forward_df(n_issue_times: int = 20, max_lead_steps: int = 10):
@@ -312,7 +313,7 @@ def test_calibrate_fits_and_stores_the_elevation_bias_model():
     it on self.model so save() can persist it.
     """
 
-    # Summer-solstice noon at LATITUDE_DEG=52 puts the sun well above the
+    # Summer-solstice noon at LATITUDE=52 puts the sun well above the
     # horizon - any elevation band with real training rows is fine here,
     # the exact band split is already covered by
     # test_elevation_bias_model_recovers_a_known_ratio_per_band.
@@ -331,13 +332,13 @@ def test_calibrate_fits_and_stores_the_elevation_bias_model():
         }
     )
 
-    identifier = SolarBiasIdentifier()
+    identifier = SolarBiasIdentifier(LATITUDE, LONGITUDE)
     model = identifier.calibrate(df)
 
     assert identifier.model is model
     assert not model.table.empty
 
-    prepared = _prepare(df.copy())
+    prepared = _prepare(df.copy(), LATITUDE, LONGITUDE)
     predicted = model.predict(prepared[["solar_elevation"]])
     assert predicted == pytest.approx(0.8, abs=0.02)
 
@@ -362,7 +363,7 @@ def test_calibrate_trains_on_the_same_window_validate_evaluates():
         }
     )
 
-    model = SolarBiasIdentifier().calibrate(df)
+    model = SolarBiasIdentifier(LATITUDE, LONGITUDE).calibrate(df)
 
     assert model.table.to_numpy() == pytest.approx([0.8])
 
@@ -458,7 +459,7 @@ def test_validate_raises_when_fewer_than_two_windows_are_trustworthy():
     methodology (see the +7.1%/-9.8% single-window swing this replaced).
     """
 
-    identifier = SolarBiasIdentifier()
+    identifier = SolarBiasIdentifier(LATITUDE, LONGITUDE)
     df = _synthetic_solar_df()
 
     def fake_validate_window(self, window_df):
@@ -503,7 +504,7 @@ def test_validate_pools_windows_weighted_by_sample_size():
     def fake_validate_window(self, window_df):
         return next(canned)
 
-    identifier = SolarBiasIdentifier()
+    identifier = SolarBiasIdentifier(LATITUDE, LONGITUDE)
     df = _synthetic_solar_df()
 
     SolarBiasIdentifier._validate_window = fake_validate_window
@@ -567,7 +568,7 @@ def test_predict_solar_applies_multiplicative_scale_and_clips_negatives():
         index=pd.DatetimeIndex([now, now + timedelta(minutes=30)]),
     )
 
-    result = predict_solar(_HalfScaleModel(), p50)
+    result = predict_solar(_HalfScaleModel(), p50, LATITUDE, LONGITUDE)
 
     assert not result.empty
     assert (result >= 0.0).all()
@@ -587,7 +588,7 @@ def test_predict_solar_resamples_onto_the_shared_15_minute_grid():
         index=pd.DatetimeIndex([base + timedelta(minutes=30 * i) for i in range(3)]),
     )
 
-    result = predict_solar(_UnitScaleModel(), p50)
+    result = predict_solar(_UnitScaleModel(), p50, LATITUDE, LONGITUDE)
 
     assert not result.isna().any()
     diffs = np.diff(result.index.values)
@@ -647,7 +648,7 @@ def test_predict_solar_covers_the_last_native_period():
         index=pd.DatetimeIndex([base, base + timedelta(minutes=30)]),
     )
 
-    result = predict_solar(_UnitScaleModel(), p50)
+    result = predict_solar(_UnitScaleModel(), p50, LATITUDE, LONGITUDE)
 
     assert result.index[-1] == base + timedelta(minutes=45)
     assert result.iloc[-1] == pytest.approx(200.0)
@@ -661,6 +662,6 @@ def test_predict_solar_returns_empty_series_for_empty_input():
 
     empty = pd.Series(dtype=float, index=pd.DatetimeIndex([]))
 
-    result = predict_solar(_UnitScaleModel(), empty)
+    result = predict_solar(_UnitScaleModel(), empty, LATITUDE, LONGITUDE)
 
     assert result.empty

@@ -20,16 +20,6 @@ MIN_SOLAR_IRRADIANCE = 100.0
 RETRAIN_INTERVAL_HOURS = 6
 MAX_TRAIN_WINDOW_DAYS = 30
 
-# Netherlands-ish coordinates, used only to compute solar_elevation via
-# pvlib's solar-position algorithm (NREL SPA) - adjust to this
-# installation's actual coordinates for the most accurate elevation-band
-# assignment (see ELEVATION_BINS): the further off these are, the more a
-# row can land in the wrong band, especially near sunrise/sunset where
-# elevation changes fastest with time - exactly the low-elevation band the
-# bias correction cares about most.
-LATITUDE_DEG = 52.0
-LONGITUDE_DEG = 5.0
-
 # Solar-elevation bands (degrees), low sun/high air mass through
 # near-zenith - confirmed by scripts/analyze_solar_bias.py to be where a
 # real, stable bias between actual PV production and Solcast's forecast
@@ -157,9 +147,11 @@ def _mask_outages(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _solar_elevation(target_time: pd.Series) -> pd.Series:
+def _solar_elevation(
+    target_time: pd.Series, latitude: float, longitude: float
+) -> pd.Series:
     """Pure astronomical geometry - depends only on target_time and this
-    installation's coordinates (LATITUDE_DEG/LONGITUDE_DEG), no forecast/
+    installation's coordinates (see load_settings()), no forecast/
     measurement data needed. Delegates to pvlib's NREL SPA implementation
     (accurate to a small fraction of a degree, including the longitude and
     equation-of-time corrections a simpler hand-rolled formula would miss)
@@ -172,7 +164,7 @@ def _solar_elevation(target_time: pd.Series) -> pd.Series:
     """
 
     position = solarposition.get_solarposition(
-        pd.DatetimeIndex(target_time), latitude=LATITUDE_DEG, longitude=LONGITUDE_DEG
+        pd.DatetimeIndex(target_time), latitude=latitude, longitude=longitude
     )
 
     elevation = np.clip(position["apparent_elevation"].to_numpy(), 0.0, None)
@@ -180,7 +172,7 @@ def _solar_elevation(target_time: pd.Series) -> pd.Series:
     return pd.Series(elevation, index=target_time.index)
 
 
-def _prepare(df: pd.DataFrame) -> pd.DataFrame:
+def _prepare(df: pd.DataFrame, latitude: float, longitude: float) -> pd.DataFrame:
     """Shared by SolarBiasIdentifier's calibrate()/validate() - masks
     outages and derives the two columns the bias correction needs:
     lead_time_hours (a training-row filter) and solar_elevation (the
@@ -199,7 +191,7 @@ def _prepare(df: pd.DataFrame) -> pd.DataFrame:
     df["lead_time_hours"] = (
         df["target_time"] - df["time"]
     ).dt.total_seconds() / 3600.0
-    df["solar_elevation"] = _solar_elevation(df["target_time"])
+    df["solar_elevation"] = _solar_elevation(df["target_time"], latitude, longitude)
 
     return df.sort_values(["time", "target_time"])
 
@@ -463,7 +455,9 @@ class _ElevationBiasModel:
         return self._band(X).map(self.table).astype(float).fillna(1.0).to_numpy()
 
 
-def predict_solar(model: _ElevationBiasModel, p50: pd.Series) -> pd.Series:
+def predict_solar(
+    model: _ElevationBiasModel, p50: pd.Series, latitude: float, longitude: float
+) -> pd.Series:
     """Applies the calibrated elevation-band bias correction (see
     _ElevationBiasModel) to the live, forward-looking Solcast p50 curve
     (state.forecast.solcast.p50, indexed by target time) and resamples the
@@ -477,7 +471,7 @@ def predict_solar(model: _ElevationBiasModel, p50: pd.Series) -> pd.Series:
         return p50
 
     p50 = p50.sort_index()
-    elevation = _solar_elevation(pd.Series(p50.index))
+    elevation = _solar_elevation(pd.Series(p50.index), latitude, longitude)
     scale = np.nan_to_num(
         model.predict(pd.DataFrame({"solar_elevation": elevation.to_numpy()})),
         nan=1.0,
@@ -549,6 +543,14 @@ class SolarBiasIdentifier(SystemIdentifier[_ElevationBiasModel]):
     forecast (state.predictions.solar, built by StateManager.update()).
     """
 
+    def __init__(self, latitude: float, longitude: float) -> None:
+        super().__init__()
+        # The installation's own coordinates (see load_settings()): calibration
+        # and live prediction must use the same ones, or the elevation bands no
+        # longer line up.
+        self.latitude = latitude
+        self.longitude = longitude
+
     @property
     def name(self) -> str:
         return "solar"
@@ -565,7 +567,7 @@ class SolarBiasIdentifier(SystemIdentifier[_ElevationBiasModel]):
         return _dataset_definition(config)
 
     def calibrate(self, df: pd.DataFrame) -> _ElevationBiasModel:
-        df = _prepare(df)
+        df = _prepare(df, self.latitude, self.longitude)
         # Same training window as every walk-forward fold in validate(), so
         # the model going live is the one that was actually validated.
         train_start = df["time"].max() - pd.Timedelta(days=MAX_TRAIN_WINDOW_DAYS)
@@ -605,7 +607,9 @@ class SolarBiasIdentifier(SystemIdentifier[_ElevationBiasModel]):
         window to have data; shorter windows are simply skipped.
         """
 
-        prepared = _prepare(df).dropna(subset=[TARGET_COLUMN, "p50"])
+        prepared = _prepare(df, self.latitude, self.longitude).dropna(
+            subset=[TARGET_COLUMN, "p50"]
+        )
         latest = prepared["time"].max()
 
         window_results = []

@@ -22,6 +22,7 @@ from features.dataset import (
 )
 from features.solar import SolarBiasIdentifier
 from features.tap import TapForecaster
+from infrastructure.home_assistant import HomeAssistant
 from infrastructure.influx import InfluxDatabase, InfluxSensorResolver
 from infrastructure.repositories import (
     BacktestRepository,
@@ -78,6 +79,8 @@ def create_container() -> Container:
         state_repository=state_repository,
         config_repository=config_repository,
         models_path=models_path,
+        latitude=settings.latitude,
+        longitude=settings.longitude,
     )
 
     forecasting = Forecasting(
@@ -104,7 +107,9 @@ def create_container() -> Container:
             HeatPumpCOPIdentifier(
                 mode=BoilerThermalIdentifier.DHW_ACTIVE_STATE, key="dhw"
             ),
-            SolarBiasIdentifier(),
+            SolarBiasIdentifier(
+                latitude=settings.latitude, longitude=settings.longitude
+            ),
         ],
     )
 
@@ -130,9 +135,13 @@ def load_settings() -> Settings:
     options = Path("/data/options.json")
 
     if options.exists():
+        latitude, longitude = HomeAssistant(os.environ["SUPERVISOR_TOKEN"]).location()
+
         return Settings(
             **json.loads(options.read_text()),
             data_path=Path("/data"),
+            latitude=latitude,
+            longitude=longitude,
         )
 
     load_dotenv()
@@ -144,7 +153,21 @@ def load_settings() -> Settings:
         influx_password=os.getenv("INFLUX_PASSWORD", ""),
         influx_database=os.getenv("INFLUX_DATABASE", "home_assistant"),
         log_level=os.getenv("LOG_LEVEL", "DEBUG"),
+        latitude=_required_float_env("LATITUDE"),
+        longitude=_required_float_env("LONGITUDE"),
     )
+
+
+def _required_float_env(name: str) -> float:
+    value = os.getenv(name)
+
+    if value is None:
+        raise ValueError(
+            f"{name} must be set (e.g. in .env): the installation's location "
+            "is required for the solar position."
+        )
+
+    return float(value)
 
 
 def configure_logger(level: str) -> None:

@@ -225,10 +225,10 @@ actions:
 ### Update API
 
 The `/api/update` endpoint is called from a Home Assistant automation using a
-`rest_command`. It updates the current optimizer state, including the live
-solar forecast (state.predictions.solar): the current Solcast p50 curve
-corrected by whatever elevation-band bias table was last calibrated (see the
-Calibrate API) - there is no separate fit/predict step for solar.
+`rest_command`. It updates the current optimizer state, including the live solar
+forecast (state.predictions.solar): the current Solcast p50 curve corrected by whatever
+elevation-band bias table was last calibrated (see the Calibrate API) - there is no
+separate fit/predict step for solar.
 
 Example automation action:
 
@@ -244,8 +244,8 @@ actions:
 ### Fit API
 
 The `/api/fit` endpoint is called from a Home Assistant automation using a
-`rest_command`. Solar is not a valid `target` here - its forecast is
-calibrated via the Calibrate API instead (see below).
+`rest_command`. Solar is not a valid `target` here - its forecast is calibrated via the
+Calibrate API instead (see below).
 
 Example automation action:
 
@@ -264,8 +264,8 @@ actions:
 ### Predict API
 
 The `/api/predict` endpoint is called from a Home Assistant automation using a
-`rest_command`. Solar is not a valid `target` here - its forecast is built
-automatically as part of the Update API instead (see above).
+`rest_command`. Solar is not a valid `target` here - its forecast is built automatically
+as part of the Update API instead (see above).
 
 Example automation action:
 
@@ -284,9 +284,8 @@ actions:
 ### Backtest API
 
 The `/api/backtest` endpoint is called from a Home Assistant automation using a
-`rest_command`. Solar is not a valid `target` here - use the Validate API
-instead (see below), which pools several backtest windows into one reliable
-result.
+`rest_command`. Solar is not a valid `target` here - use the Validate API instead (see
+below), which pools several backtest windows into one reliable result.
 
 Example automation action:
 
@@ -306,8 +305,8 @@ actions:
 ### Tune API
 
 The `/api/tune` endpoint is called from a Home Assistant automation using a
-`rest_command`. Solar is not a valid `target` here - its elevation-band bias
-table has no hyperparameters to tune.
+`rest_command`. Solar is not a valid `target` here - its elevation-band bias table has
+no hyperparameters to tune.
 
 Example automation action:
 
@@ -327,10 +326,9 @@ actions:
 ### Calibrate API
 
 The `/api/calibrate` endpoint is called from a Home Assistant automation using a
-`rest_command`. This is also how the solar forecast's elevation-band bias
-correction is (re)calibrated - schedule this periodically (e.g. every few
-hours) with `target: "solar"` for the correction the Update API applies to
-stay current.
+`rest_command`. This is also how the solar forecast's elevation-band bias correction is
+(re)calibrated - schedule this periodically (e.g. every few hours) with
+`target: "solar"` for the correction the Update API applies to stay current.
 
 Example automation action:
 
@@ -349,13 +347,12 @@ actions:
 ### Validate API
 
 The `/api/validate` endpoint is called from a Home Assistant automation using a
-`rest_command`. For `target: "solar"`, this pools several fixed, weekly-spaced
-backtest windows (weighted by sample size, plus a significance check across
-them) rather than trusting any single window - a single window's improvement
-% has been observed to swing between clean windows a month apart, so this is
-the only way to get a trustworthy read on whether the correction still helps.
-Pass `end` to anchor the pooled windows to a fixed instant instead of "now",
-so repeated validations are comparable.
+`rest_command`. For `target: "solar"`, this pools several fixed, weekly-spaced backtest
+windows (weighted by sample size, plus a significance check across them) rather than
+trusting any single window - a single window's improvement % has been observed to swing
+between clean windows a month apart, so this is the only way to get a trustworthy read
+on whether the correction still helps. Pass `end` to anchor the pooled windows to a
+fixed instant instead of "now", so repeated validations are comparable.
 
 Example automation action:
 
