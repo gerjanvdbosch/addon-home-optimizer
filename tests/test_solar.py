@@ -636,6 +636,23 @@ def test_uncalibrated_model_keeps_the_raw_solcast_band():
     assert high[times[0]] == pytest.approx(2000.0)
 
 
+def test_predict_solar_covers_the_last_native_period():
+    """Solcast values are period averages starting at their timestamp - the
+    last 30-minute value must also fill its period's final 15-minute step, so
+    a day whose last value is at 23:30 still has a 23:45 prediction."""
+
+    base = datetime(2026, 6, 21, 23, 0, tzinfo=UTC)
+    p50 = pd.Series(
+        [400.0, 200.0],
+        index=pd.DatetimeIndex([base, base + timedelta(minutes=30)]),
+    )
+
+    result = predict_solar(_UnitScaleModel(), p50)
+
+    assert result.index[-1] == base + timedelta(minutes=45)
+    assert result.iloc[-1] == pytest.approx(200.0)
+
+
 def test_predict_solar_returns_empty_series_for_empty_input():
     """No live Solcast forecast yet (fresh install, forecast fetch not run)
     must return an empty series, not raise - StateManager treats an empty

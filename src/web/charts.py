@@ -1,11 +1,11 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from domain.time import to_local_series, to_local_time
-from domain.types import BacktestResult, State
+from domain.time import local_day_start, to_local_series, to_local_time
+from domain.types import BacktestResult, MPCConfig, SeriesPoint, State
 
 
 def add_series(
@@ -52,10 +52,26 @@ def dashboard_chart(state: State) -> str:
         row_heights=[0.5, 0.25, 0.25],
     )
 
+    # Exactly today and tomorrow in local time. Points outside are dropped, not
+    # just scrolled out of view: plotly's y autorange would otherwise still
+    # scale to them (e.g. a baseload prediction running past tomorrow).
+    now = datetime.now(timezone.utc)
+    window_start = local_day_start(now)
+    window_end = local_day_start(now, days=2)
+
+    def in_window(points: list) -> list:
+        return [p for p in points if window_start <= p.time < window_end]
+
+    def series(name: str, points: list, **kwargs) -> None:
+        add_series(fig, name, in_window(points), **kwargs)
+
+    solcast_p10 = in_window(state.forecast.solcast.p10)
+    solcast_p90 = in_window(state.forecast.solcast.p90)
+
     fig.add_trace(
         go.Scatter(
-            x=[to_local_time(p.time) for p in state.forecast.solcast.p10],
-            y=[p.value for p in state.forecast.solcast.p10],
+            x=[to_local_time(p.time) for p in solcast_p10],
+            y=[p.value for p in solcast_p10],
             mode="lines",
             line=dict(width=0),
             showlegend=False,
@@ -68,8 +84,8 @@ def dashboard_chart(state: State) -> str:
 
     fig.add_trace(
         go.Scatter(
-            x=[to_local_time(p.time) for p in state.forecast.solcast.p90],
-            y=[p.value for p in state.forecast.solcast.p90],
+            x=[to_local_time(p.time) for p in solcast_p90],
+            y=[p.value for p in solcast_p90],
             mode="lines",
             line=dict(width=0),
             fill="tonexty",
@@ -82,8 +98,7 @@ def dashboard_chart(state: State) -> str:
         col=1,
     )
 
-    add_series(
-        fig,
+    series(
         "Solcast",
         state.forecast.solcast.p50,
         line=dict(
@@ -96,8 +111,7 @@ def dashboard_chart(state: State) -> str:
         col=1,
     )
 
-    add_series(
-        fig,
+    series(
         "Solar",
         state.measurements.solar,
         line=dict(width=1.5, color="#FFA15A", shape="spline"),
@@ -108,8 +122,7 @@ def dashboard_chart(state: State) -> str:
         col=1,
     )
 
-    add_series(
-        fig,
+    series(
         "Solar",
         state.predictions.solar,
         line=dict(width=1.5, color="#FFA15A", shape="spline"),
@@ -126,8 +139,7 @@ def dashboard_chart(state: State) -> str:
         ("Solar p10", state.predictions.solar_p10),
         ("Solar p90", state.predictions.solar_p90),
     ):
-        add_series(
-            fig,
+        series(
             name,
             points,
             line=dict(width=1, color="rgba(255, 161, 90, 0.7)", dash="dash"),
@@ -138,8 +150,7 @@ def dashboard_chart(state: State) -> str:
             col=1,
         )
 
-    add_series(
-        fig,
+    series(
         "Baseload",
         state.measurements.baseload,
         unit="W",
@@ -149,8 +160,7 @@ def dashboard_chart(state: State) -> str:
         legendgroup="baseload",
     )
 
-    add_series(
-        fig,
+    series(
         "Baseload",
         state.predictions.baseload,
         line=dict(width=1, color="rgba(239, 85, 59, 0.5)", shape="spline"),
@@ -161,8 +171,7 @@ def dashboard_chart(state: State) -> str:
         col=1,
     )
 
-    add_series(
-        fig,
+    series(
         "Heat pump",
         state.measurements.heat_pump.power,
         unit="W",
@@ -173,8 +182,7 @@ def dashboard_chart(state: State) -> str:
         showlegend=False,
     )
 
-    add_series(
-        fig,
+    series(
         "Heat pump",
         state.schedule.heat_pump.power,
         unit="W",
@@ -184,8 +192,7 @@ def dashboard_chart(state: State) -> str:
         legendgroup="heat_pump",
     )
 
-    add_series(
-        fig,
+    series(
         "Climate target",
         state.schedule.climate.target_temperature,
         row=2,
@@ -195,8 +202,7 @@ def dashboard_chart(state: State) -> str:
         decimal=1,
     )
 
-    add_series(
-        fig,
+    series(
         "Climate temp",
         state.measurements.climate.temperature,
         row=2,
@@ -217,8 +223,7 @@ def dashboard_chart(state: State) -> str:
     #     decimal=1,
     # )
 
-    add_series(
-        fig,
+    series(
         "Outside",
         state.forecast.open_meteo.temperature,
         row=2,
@@ -229,8 +234,7 @@ def dashboard_chart(state: State) -> str:
         decimal=1,
     )
 
-    add_series(
-        fig,
+    series(
         "Boiler temperature",
         state.schedule.heat_pump.boiler.temperatures,
         row=3,
@@ -241,8 +245,7 @@ def dashboard_chart(state: State) -> str:
         decimal=2,
     )
 
-    add_series(
-        fig,
+    series(
         "Boiler target",
         state.schedule.heat_pump.boiler.target_temperature,
         row=3,
@@ -252,27 +255,23 @@ def dashboard_chart(state: State) -> str:
         decimal=1,
     )
 
-    add_series(
-        fig,
-        "Boiler bottom",
-        state.measurements.heat_pump.boiler.bottom_temperature,
-        row=3,
-        col=1,
-        line=dict(width=1, color="#636EFA", shape="spline"),
-        legendgroup="boiler_bottom",
-        showlegend=False,
-        unit="°C",
-        decimal=1,
-    )
+    # The same single-node tank average the optimizer plans with, so the measured
+    # line continues straight into the planned "Boiler temperature" line.
+    boiler = state.measurements.heat_pump.boiler
+    bottom_by_time = {p.time: p.value for p in boiler.bottom_temperature}
+    measured_average = [
+        SeriesPoint(time=p.time, value=(p.value + bottom_by_time[p.time]) / 2.0)
+        for p in boiler.top_temperature
+        if p.time in bottom_by_time
+    ]
 
-    add_series(
-        fig,
-        "Boiler top",
-        state.measurements.heat_pump.boiler.top_temperature,
+    series(
+        "Boiler temperature",
+        measured_average,
         row=3,
         col=1,
         line=dict(width=2, color="#19D3F3", shape="spline"),
-        legendgroup="boiler_top",
+        legendgroup="boiler_temperature",
         showlegend=False,
         unit="°C",
         decimal=1,
@@ -345,6 +344,13 @@ def dashboard_chart(state: State) -> str:
             font=dict(size=12),
         ),
         hovermode="x unified",
+    )
+
+    # Points mark the start of their step, so tomorrow's last one is at 23:45:
+    # ending the axis there makes it equal to the data's own extent, so plotly's
+    # double-click autosize lands on exactly the same view.
+    fig.update_xaxes(
+        range=[window_start, window_end - timedelta(hours=MPCConfig().step_hours)]
     )
 
     fig.add_vline(

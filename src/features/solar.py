@@ -196,7 +196,9 @@ def _prepare(df: pd.DataFrame) -> pd.DataFrame:
 
     df = _mask_outages(df)
 
-    df["lead_time_hours"] = (df["target_time"] - df["time"]).dt.total_seconds() / 3600.0
+    df["lead_time_hours"] = (
+        df["target_time"] - df["time"]
+    ).dt.total_seconds() / 3600.0
     df["solar_elevation"] = _solar_elevation(df["target_time"])
 
     return df.sort_values(["time", "target_time"])
@@ -212,7 +214,9 @@ def _arguments(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
 
     df = df.dropna(subset=[TARGET_COLUMN, "p50", *EXOG_COLUMNS]).copy()
 
-    df = df[(df["p50"] >= MIN_SOLAR_IRRADIANCE) & (df["lead_time_hours"] >= 0.5)].copy()
+    df = df[
+        (df["p50"] >= MIN_SOLAR_IRRADIANCE) & (df["lead_time_hours"] >= 0.5)
+    ].copy()
 
     y_target = df[TARGET_COLUMN] / df["p50"]
 
@@ -373,6 +377,34 @@ def _generate_walk_forward_folds(
         yield update_time, train_df, test_df, need_retrain
 
 
+def _dataset_definition(config: Config) -> DatasetDefinition:
+    return (
+        DatasetBuilder()
+        .timeseries(
+            "P_solar",
+            config.solar,
+            interval="30m",
+            aggregation="mean",
+            fill=0,
+        )
+        .attribute_timeseries(
+            "solcast",
+            config.forecast.solcast,
+            attributes=["p10", "p50", "p90"],
+            interval="30m",
+            aggregation="last",
+        )
+        .join(
+            left="solcast",
+            right="P_solar",
+            left_on=("target_time",),
+            right_on=("time",),
+            how="left",
+        )
+        .build()
+    )
+
+
 class _ElevationBiasModel:
     """The correction predict_solar() applies: a fixed lookup table of the
     p50-weighted median Actual/Solcast ratio per solar-elevation band (see
@@ -489,12 +521,26 @@ def _scaled_quantile(
 
 
 def _on_predict_grid(series: pd.Series) -> pd.Series:
-    return (
+    step = pd.Timedelta(minutes=PREDICT_STEP_MINUTES)
+    grid = (
         series.clip(lower=0.0)
         .resample(f"{PREDICT_STEP_MINUTES}min")
         .interpolate(method="time")
-        .clip(lower=0.0)
     )
+
+    # Solcast times are period starts (see the README's template sensor), so the
+    # last native value covers its whole period and is held over that period's
+    # remaining grid steps - otherwise 30-minute data ending at 23:30 would
+    # leave the day's final 23:45 step without a prediction.
+    if len(series) > 1:
+        native_step = series.index.to_series().diff().median()
+        tail = pd.date_range(
+            grid.index[-1] + step, series.index[-1] + native_step - step, freq=step
+        )
+        if len(tail):
+            grid = pd.concat([grid, pd.Series(grid.iloc[-1], index=tail)])
+
+    return grid.clip(lower=0.0)
 
 
 class SolarBiasIdentifier(SystemIdentifier[_ElevationBiasModel]):
@@ -516,31 +562,7 @@ class SolarBiasIdentifier(SystemIdentifier[_ElevationBiasModel]):
         return "W"
 
     def dataset(self, config: Config) -> DatasetDefinition:
-        return (
-            DatasetBuilder()
-            .timeseries(
-                "P_solar",
-                config.solar,
-                interval="30m",
-                aggregation="mean",
-                fill=0,
-            )
-            .attribute_timeseries(
-                "solcast",
-                config.forecast.solcast,
-                attributes=["p10", "p50", "p90"],
-                interval="30m",
-                aggregation="last",
-            )
-            .join(
-                left="solcast",
-                right="P_solar",
-                left_on=("target_time",),
-                right_on=("time",),
-                how="left",
-            )
-            .build()
-        )
+        return _dataset_definition(config)
 
     def calibrate(self, df: pd.DataFrame) -> _ElevationBiasModel:
         df = _prepare(df)
@@ -648,7 +670,8 @@ class SolarBiasIdentifier(SystemIdentifier[_ElevationBiasModel]):
             ", ".join(f"{v:+.1f}%" for v in per_window_improvement),
         )
         logger.info(
-            "One-sample t-test (H0: mean per-window improvement = 0): t=%.2f, p=%.3f%s",
+            "One-sample t-test (H0: mean per-window improvement = 0): "
+            "t=%.2f, p=%.3f%s",
             ttest.statistic,
             ttest.pvalue,
             " (not significant at p<0.05 - few windows, low power)"

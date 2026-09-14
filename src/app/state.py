@@ -4,7 +4,7 @@ from typing import Sequence
 
 import pandas as pd
 
-from domain.time import to_local_time
+from domain.time import local_day_start, to_local_time
 from domain.types import (
     Config,
     SeriesPoint,
@@ -34,20 +34,21 @@ class StateManager:
     def update(self) -> None:
         now = datetime.now(timezone.utc)
 
-        start = now.replace(
-            hour=0,
-            minute=0,
-            second=0,
-            microsecond=0,
-        )
+        # Local midnight, not UTC midnight: the dashboard shows the local day,
+        # and UTC midnight would drop its first hours east of Greenwich.
+        start = local_day_start(now).astimezone(timezone.utc)
 
         config = self.config_repository.load()
 
+        # Loaded from the previous local midnight and trimmed afterwards: sensors
+        # filled with their previous value need a reading from before midnight,
+        # or the day's first interval stays empty (seen as a 00:15 start).
         df = self.loader.load(
             self._dataset(config),
-            start,
+            local_day_start(now, days=-1).astimezone(timezone.utc),
             now,
         )
+        df = df[df["time"] >= start]
 
         state = self._map(df, self.load(), config=config)
 
