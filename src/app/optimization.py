@@ -48,6 +48,19 @@ class Optimization:
         solar_forecast = [p.value for p in state.predictions.solar[:steps]]
         forecast_times = [p.time for p in state.predictions.solar[:steps]]
 
+        # The expected-cost scenarios need the band at exactly the p50
+        # prediction's own times; if it doesn't fully cover them (not
+        # calibrated yet, no Solcast p10/p90), plan on p50 alone rather than
+        # inventing the missing values.
+        p10_by_time = {p.time: p.value for p in state.predictions.solar_p10}
+        p90_by_time = {p.time: p.value for p in state.predictions.solar_p90}
+
+        if all(t in p10_by_time and t in p90_by_time for t in forecast_times):
+            solar_p10 = tuple(p10_by_time[t] for t in forecast_times)
+            solar_p90 = tuple(p90_by_time[t] for t in forecast_times)
+        else:
+            solar_p10, solar_p90 = (), ()
+
         # The stored state.schedule.heat_pump.boiler.target_temperature is
         # resolved against *today's* timestamps (see StateManager.update()) - not
         # the future forecast horizon the MPC actually needs. Resolve the raw
@@ -120,6 +133,8 @@ class Optimization:
             target_temperature_top=target_temps,
             tap_forecast_w=tap_forecast,
             outdoor_temperature_forecast=outdoor_temperature_forecast,
+            solar_p10_w=solar_p10,
+            solar_p90_w=solar_p90,
         )
 
         optimizer = MPCOptimizer(

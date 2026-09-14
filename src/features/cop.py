@@ -195,7 +195,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         df = df.copy()
 
         # dataset() anchors the join on the 5-minute heat-pump readings (not
-        # the other way around, unlike SolarForecaster - that forecaster needs
+        # the other way around, unlike SolarBiasIdentifier - that identifier needs
         # the full forecast-snapshot history to learn how forecasts evolve
         # with lead time; COP only needs the best-known outdoor temperature at
         # each reading). The outdoor-temperature attribute only reports hourly
@@ -711,7 +711,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         # attribute_series() (a single latest-snapshot lookup, ignores the
         # requested time range) cannot supply this historically -
         # attribute_timeseries() fetches the full history of forecast
-        # snapshots instead (same mechanism SolarForecaster already relies on
+        # snapshots instead (same mechanism SolarBiasIdentifier already relies on
         # for this exact sensor).
         #
         # Anchored on T_supply (a water temperature sensor - see below for why
@@ -720,7 +720,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         # attribute's own hourly target times keeps only 1 in 12 of the
         # 5-minute readings (whichever happens to fall exactly on the hour),
         # and a real DHW cycle rarely lines up with the hour mark, so real DHW
-        # rows were silently discarded. Unlike SolarForecaster (which
+        # rows were silently discarded. Unlike SolarBiasIdentifier (which
         # genuinely needs the full forecast-snapshot history to learn how
         # forecasts evolve with lead time), COP only needs the best-known
         # outdoor temperature at each reading - see prepare(), which

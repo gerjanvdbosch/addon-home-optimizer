@@ -12,9 +12,9 @@ from pydantic import BaseModel, Field, model_validator
 
 HeatPumpMode = Literal["heat", "cool"]
 
-ForecasterType = Literal["solar", "baseload", "tap"]
+ForecasterType = Literal["baseload", "tap"]
 
-IdentificationType = Literal["boiler", "cop_dhw"]
+IdentificationType = Literal["boiler", "cop_dhw", "solar"]
 
 
 class JobType(str, Enum):
@@ -250,6 +250,13 @@ class CalibrateConfig(BaseModel):
 class ValidateConfig(BaseModel):
     target: IdentificationType | None = Field(default=None)
     days: int = Field(default=90)
+    # Anchors the `days`-long window to this instant instead of "now" - so
+    # repeated validations (e.g. checking a model change, or the solar bias
+    # identifier's own multi-window pooling) evaluate the exact same
+    # historical period rather than one that drifts forward every time the
+    # job runs, which otherwise makes two runs' numbers incomparable
+    # regardless of what actually changed between them.
+    end: datetime | None = Field(default=None)
 
 
 class OptimizeConfig(BaseModel):
@@ -339,6 +346,10 @@ class Forecast(BaseModel):
 
 class Predictions(BaseModel):
     solar: list[SeriesPoint[float]] = Field(default_factory=list)
+    # Calibrated p10/p90 band around `solar` (see features.solar.predict_solar_band),
+    # used as the MPC's pessimistic/optimistic solar scenarios.
+    solar_p10: list[SeriesPoint[float]] = Field(default_factory=list)
+    solar_p90: list[SeriesPoint[float]] = Field(default_factory=list)
     baseload: list[SeriesPoint[float]] = Field(default_factory=list)
     tap: list[SeriesPoint[float]] = Field(default_factory=list)
     boiler: list[SeriesPoint[float]] = Field(default_factory=list)
@@ -523,6 +534,13 @@ class MPCInput:
     # assumption for costing (see MPCOptimizer._electrical_power_w) rather
     # than inventing a temperature.
     outdoor_temperature_forecast: tuple[float, ...] = ()
+    # Calibrated p10/p90 solar forecasts (W) aligned to the horizon, around
+    # solar_forecast_w as p50 - grid import is then costed as an expectation
+    # over these three scenarios (see optimizer.SOLAR_SCENARIO_WEIGHTS)
+    # instead of assuming p50 comes true. Both empty means "no band
+    # available": plan on solar_forecast_w alone.
+    solar_p10_w: tuple[float, ...] = ()
+    solar_p90_w: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)

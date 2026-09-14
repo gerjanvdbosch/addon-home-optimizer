@@ -5,7 +5,6 @@ from typing import Any
 
 from domain.types import (
     BacktestConfig,
-    Config,
     FitConfig,
     ForecasterType,
     PredictConfig,

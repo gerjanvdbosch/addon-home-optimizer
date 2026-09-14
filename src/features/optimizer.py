@@ -19,6 +19,14 @@ from features.cop import HeatPumpCOPIdentifier
 
 logger = logging.getLogger(__name__)
 
+# Swanson's rule: the standard three-point weights for a distribution's
+# expectation from its P10/P50/P90 (exact for a symmetric distribution, close
+# for moderately skewed ones). Grid import is costed as this expectation over
+# solar outcomes: import cost is convex in solar (max(0, P_el - solar)), so
+# costing at P50 alone systematically understates the expected cost of
+# relying on uncertain sun.
+SOLAR_SCENARIO_WEIGHTS = (0.3, 0.4, 0.3)
+
 
 @dataclass
 class _StepPlan:
@@ -135,6 +143,15 @@ class MPCOptimizer:
                 f"{len(data.outdoor_temperature_forecast)}."
             )
 
+        if len(data.solar_p10_w) != len(data.solar_p90_w) or (
+            data.solar_p10_w and len(data.solar_p10_w) != horizon
+        ):
+            raise ValueError(
+                "solar_p10_w and solar_p90_w must both be empty or both have "
+                f"the same length as solar_forecast_w ({horizon}), got "
+                f"{len(data.solar_p10_w)} and {len(data.solar_p90_w)}."
+            )
+
         if self.config.step_hours <= 0:
             raise ValueError("step_hours must be greater than zero.")
 
@@ -200,7 +217,19 @@ class MPCOptimizer:
         def mean(values: list[float]) -> float:
             return sum(values) / len(values)
 
-        solar_w = self._aggregate(data.solar_forecast_w, plan, mean)
+        scenarios = (
+            zip(
+                SOLAR_SCENARIO_WEIGHTS,
+                (data.solar_p10_w, data.solar_forecast_w, data.solar_p90_w),
+                strict=True,
+            )
+            if data.solar_p10_w
+            else [(1.0, data.solar_forecast_w)]
+        )
+        solar_scenarios = [
+            (weight, self._aggregate(values, plan, mean))
+            for weight, values in scenarios
+        ]
         tap_w = self._aggregate(
             data.tap_forecast_w or (0.0,) * horizon, plan, mean
         )
@@ -318,14 +347,18 @@ class MPCOptimizer:
                 + b_d[0, 2] * float(tap_w[k])
             )
 
-        # active_power_w[k] represents boiler_on[k] * max(0, electrical_power_w[k]
-        # - solar[k]) - the grid draw actually costed at step k. electrical
-        # power is linear in T[k] (see _power_line_coefficients), so this
-        # would ordinarily need a McCormick linearization to multiply by the
-        # binary boiler_on[k]; folding the max(0, ...) and the on/off gating
-        # into one big-M lower bound (below) avoids a second, separate
-        # linearization for that product.
-        model.active_power_w = pyo.Var(model.K, domain=pyo.NonNegativeReals)
+        # active_power_w[k, s] represents boiler_on[k] * max(0,
+        # electrical_power_w[k] - solar_s[k]) - the grid draw at step k if
+        # solar scenario s comes true. One schedule is shared by all scenarios
+        # (the plan cannot know which one will happen; replanning every step
+        # corrects course once it does), and only the cost differs between
+        # them. electrical power is linear in T[k] (see
+        # _power_line_coefficients), so this would ordinarily need a McCormick
+        # linearization to multiply by the binary boiler_on[k]; folding the
+        # max(0, ...) and the on/off gating into one big-M lower bound (below)
+        # avoids a second, separate linearization for that product.
+        model.S = pyo.RangeSet(0, len(solar_scenarios) - 1)
+        model.active_power_w = pyo.Var(model.K, model.S, domain=pyo.NonNegativeReals)
 
         model.active_power_constraint = pyo.ConstraintList()
 
@@ -333,24 +366,27 @@ class MPCOptimizer:
             T_outdoor = outdoor_c[k] if outdoor_c else None
             alpha, beta = self._power_line_coefficients(T_outdoor, overall_target_max)
 
-            solar_available_w = max(0.0, float(solar_w[k]))
-
             # Safe upper bound on (alpha + beta*T - solar) for T within its
             # own declared bounds and solar >= 0 - large enough that the
             # constraint is always non-binding once relaxed by
-            # (1 - boiler_on[k]), so active_power_w[k] is free to fall to 0
+            # (1 - boiler_on[k]), so active_power_w[k, s] is free to fall to 0
             # (via the objective's minimization) whenever boiler_on[k] = 0.
             t_lower, t_upper = model.T[k].bounds
             big_m = max(alpha + beta * t_lower, alpha + beta * t_upper) + 1.0
 
-            model.active_power_constraint.add(
-                model.active_power_w[k]
-                >= (alpha + beta * model.T[k] - solar_available_w)
-                - big_m * (1 - model.boiler_on[k])
-            )
+            for s, (_, solar_w) in enumerate(solar_scenarios):
+                solar_available_w = max(0.0, float(solar_w[k]))
+
+                model.active_power_constraint.add(
+                    model.active_power_w[k, s]
+                    >= (alpha + beta * model.T[k] - solar_available_w)
+                    - big_m * (1 - model.boiler_on[k])
+                )
 
         model.objective = pyo.Objective(
-            expr=self._build_objective(model, plan),
+            expr=self._build_objective(
+                model, plan, [weight for weight, _ in solar_scenarios]
+            ),
             sense=pyo.minimize,
         )
 
@@ -469,11 +505,16 @@ class MPCOptimizer:
         self,
         model: pyo.ConcreteModel,
         plan: _StepPlan,
+        scenario_weights: list[float],
     ):
         objective = 0.0
 
         for k in model.K:
-            grid_energy_kwh = model.active_power_w[k] * plan.dt_hours[k] / 1000.0
+            expected_grid_power_w = sum(
+                weight * model.active_power_w[k, s]
+                for s, weight in enumerate(scenario_weights)
+            )
+            grid_energy_kwh = expected_grid_power_w * plan.dt_hours[k] / 1000.0
 
             objective += self.config.price_eur_per_kwh * grid_energy_kwh
 

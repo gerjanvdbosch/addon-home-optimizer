@@ -1,4 +1,5 @@
 from datetime import datetime, time, timezone
+from pathlib import Path
 from typing import Sequence
 
 import pandas as pd
@@ -10,6 +11,7 @@ from domain.types import (
     State,
 )
 from features.dataset import DatasetBuilder, DatasetDefinition, DatasetLoader
+from features.solar import SolarBiasIdentifier, predict_solar, predict_solar_band
 from infrastructure.repositories import ConfigRepository, StateRepository
 
 
@@ -19,10 +21,12 @@ class StateManager:
         loader: DatasetLoader,
         state_repository: StateRepository,
         config_repository: ConfigRepository,
+        models_path: Path,
     ):
         self.loader = loader
         self.state_repository = state_repository
         self.config_repository = config_repository
+        self.models_path = models_path
 
     def load(self) -> State:
         return self.state_repository.load()
@@ -47,7 +51,62 @@ class StateManager:
 
         state = self._map(df, self.load(), config=config)
 
+        self._predict_solar(state, now)
+
         self.state_repository.save(state)
+
+    def _predict_solar(self, state: State, now: datetime) -> None:
+        """Builds state.predictions.solar and its calibrated p10/p90 band from
+        the live Solcast forecast curves and whatever SolarBiasIdentifier last
+        calibrated, so the MPC optimizer and the dashboard chart always see a
+        forecast as current as the state refresh itself. Leaves existing
+        predictions untouched when there's no Solcast curve or no calibrated
+        model yet, rather than clobbering a stale-but-real prediction with an
+        empty one.
+        """
+
+        forecast = state.forecast.solcast
+
+        if not forecast.p50:
+            return
+
+        identifier = SolarBiasIdentifier()
+        identifier.load(self.models_path)
+
+        if identifier.model is None:
+            return
+
+        p50 = predict_solar(identifier.model, self._future_series(forecast.p50, now))
+        state.predictions.solar = self._series_points(p50)
+
+        if forecast.p10 and forecast.p90:
+            p10, p90 = predict_solar_band(
+                identifier.model,
+                self._future_series(forecast.p10, now),
+                self._future_series(forecast.p90, now),
+                now,
+            )
+            state.predictions.solar_p10 = self._series_points(p10)
+            state.predictions.solar_p90 = self._series_points(p90)
+        else:
+            state.predictions.solar_p10 = []
+            state.predictions.solar_p90 = []
+
+    @staticmethod
+    def _future_series(points: list[SeriesPoint], now: datetime) -> pd.Series:
+        series = pd.Series(
+            [point.value for point in points],
+            index=pd.DatetimeIndex([point.time for point in points]),
+        )
+
+        return series[series.index > now]
+
+    @staticmethod
+    def _series_points(series: pd.Series) -> list[SeriesPoint]:
+        return [
+            SeriesPoint(time=pd.Timestamp(t).to_pydatetime(), value=float(v))
+            for t, v in series.items()
+        ]
 
     def update_prediction(self, name: str, series: pd.Series) -> None:
         state = self.load()

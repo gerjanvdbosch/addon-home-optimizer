@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from domain.types import BacktestConfig, CalibrateConfig
+from domain.types import CalibrateConfig, ValidateConfig
 from features.dataset import DatasetLoader
 from features.identifier import SystemIdentifier
 from infrastructure.repositories import BacktestRepository, ConfigRepository
@@ -39,15 +39,22 @@ class Identification:
 
             identifier.save(self.path)
 
-    def validate(self, config: BacktestConfig) -> None:
-        identifier, df = self._prepare(config.target, config.days)
+    def validate(self, config: ValidateConfig) -> None:
+        identifier, df = self._prepare(config.target, config.days, end=config.end)
 
-        identifier.validate(df)
+        result = identifier.validate(df)
+
+        logger.info(
+            "Validate finished (%s): %s",
+            identifier.name,
+            " ".join(f"{key}={value:.4g}" for key, value in result.items()),
+        )
 
     def _prepare(
         self,
         identifier: str | SystemIdentifier,
         days: int,
+        end: datetime | None = None,
     ) -> tuple[SystemIdentifier, Any]:
         if isinstance(identifier, str):
             identifier = self._get_identifier(identifier)
@@ -56,7 +63,7 @@ class Identification:
 
         config = self.config_repository.load()
 
-        end = datetime.now(timezone.utc)
+        end = end or datetime.now(timezone.utc)
         start = end - timedelta(days=days)
 
         dataset = identifier.dataset(config)

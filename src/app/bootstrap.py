@@ -20,7 +20,7 @@ from features.dataset import (
     DatasetLoader,
     TimeSeriesLoader,
 )
-from features.solar import SolarForecaster
+from features.solar import SolarBiasIdentifier
 from features.tap import TapForecaster
 from infrastructure.influx import InfluxDatabase, InfluxSensorResolver
 from infrastructure.repositories import (
@@ -71,13 +71,14 @@ def create_container() -> Container:
         JsonStorage(settings.data_path / "backtest.json"),
     )
 
+    models_path = settings.data_path / "models"
+
     state_manager = StateManager(
         loader=dataset_loader,
         state_repository=state_repository,
         config_repository=config_repository,
+        models_path=models_path,
     )
-
-    models_path = settings.data_path / "models"
 
     forecasting = Forecasting(
         loader=dataset_loader,
@@ -87,7 +88,6 @@ def create_container() -> Container:
         path=models_path,
         study_storage=f"sqlite:///{models_path / 'optuna.db'}",
         forecasters=[
-            SolarForecaster(),
             BaseloadForecaster(),
             TapForecaster(models_path=models_path),
         ],
@@ -104,6 +104,7 @@ def create_container() -> Container:
             HeatPumpCOPIdentifier(
                 mode=BoilerThermalIdentifier.DHW_ACTIVE_STATE, key="dhw"
             ),
+            SolarBiasIdentifier(),
         ],
     )
 

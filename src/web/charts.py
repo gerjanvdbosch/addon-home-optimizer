@@ -119,6 +119,25 @@ def dashboard_chart(state: State) -> str:
         col=1,
     )
 
+    # Calibrated band the optimizer plans with, drawn as edges rather than a
+    # second fill: beyond the calibrated lead times it coincides with the raw
+    # Solcast band above, where a second fill would just double its shade.
+    for name, points in (
+        ("Solar p10", state.predictions.solar_p10),
+        ("Solar p90", state.predictions.solar_p90),
+    ):
+        add_series(
+            fig,
+            name,
+            points,
+            line=dict(width=1, color="rgba(255, 161, 90, 0.7)", dash="dash"),
+            legendgroup="solar",
+            showlegend=False,
+            unit="W",
+            row=1,
+            col=1,
+        )
+
     add_series(
         fig,
         "Baseload",

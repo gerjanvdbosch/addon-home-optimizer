@@ -239,6 +239,73 @@ def test_minimum_runtime_is_respected():
             k += 1
 
 
+def test_identical_solar_band_matches_planning_on_p50_alone():
+    """With p10 = p50 = p90 the expected-cost objective must reduce exactly to
+    the single-scenario one (the weights sum to 1) - the band only changes the
+    plan when it actually carries uncertainty.
+    """
+
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[18] = 45.0
+    optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig())
+
+    on_p50 = optimizer.solve(_make_input(target_temperature_top=tuple(target)))
+    with_band = optimizer.solve(
+        _make_input(
+            target_temperature_top=tuple(target),
+            solar_p10_w=tuple(SOLAR_FORECAST_W),
+            solar_p90_w=tuple(SOLAR_FORECAST_W),
+        )
+    )
+
+    assert with_band.schedule == on_p50.schedule
+    assert with_band.objective_value == pytest.approx(on_p50.objective_value)
+
+
+def test_uncertain_solar_window_loses_to_a_certain_one_with_less_p50():
+    """The reason for costing grid import as an expectation: a window whose
+    p50 covers the heat pump but whose p10 does not is, on average, more
+    expensive than a window with a bit less but certain sun. Planning on p50
+    alone picks the uncertain window; the scenario objective must pick the
+    certain one.
+    """
+
+    horizon = 24
+    certain = range(4, 9)
+    uncertain = range(12, 17)
+
+    p10, p50, p90 = ([0.0] * horizon for _ in range(3))
+    for k in certain:
+        p10[k] = p50[k] = p90[k] = 2500.0  # 500 W short of the 3 kW heat pump
+    for k in uncertain:
+        p10[k], p50[k], p90[k] = 0.0, 3500.0, 7000.0
+
+    target = [10.0] * horizon
+    target[20] = 45.0
+
+    optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig())
+    common = dict(solar_forecast_w=p50, target_temperature_top=tuple(target))
+
+    on_p50 = optimizer.solve(_make_input(**common))
+    with_band = optimizer.solve(
+        _make_input(**common, solar_p10_w=tuple(p10), solar_p90_w=tuple(p90))
+    )
+
+    assert {k for k, on in enumerate(on_p50.schedule) if on} <= set(uncertain)
+    assert {k for k, on in enumerate(with_band.schedule) if on} <= set(certain)
+    assert with_band.temperatures[20] >= 45.0 - 1e-6
+
+
+def test_validate_input_rejects_a_solar_band_of_the_wrong_length():
+    optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig())
+
+    with pytest.raises(ValueError):
+        optimizer.solve(_make_input(solar_p10_w=(0.0, 0.0), solar_p90_w=(0.0, 0.0)))
+
+    with pytest.raises(ValueError):
+        optimizer.solve(_make_input(solar_p10_w=tuple(SOLAR_FORECAST_W)))
+
+
 def test_validate_input_rejects_mismatched_target_length():
     data = _make_input(target_temperature_top=(10.0, 10.0))  # wrong length
 
