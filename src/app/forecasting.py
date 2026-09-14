@@ -65,7 +65,10 @@ class Forecasting:
             if config.target and forecaster.name != config.target:
                 continue
 
-            forecaster, df = self._prepare(forecaster, 7)
+            # 8 days: baseload looks back a week plus one step (673 steps), and 7
+            # days gives exactly that many, so a single missing reading would
+            # break the prediction.
+            forecaster, df = self._prepare(forecaster, 8)
 
             result = forecaster.predict(df=df, steps=config.steps)
 

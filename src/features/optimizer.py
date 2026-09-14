@@ -14,7 +14,12 @@ from domain.types import (
     MPCInput,
     MPCResult,
 )
-from features.boiler import discretize_zoh, lumped_state_space
+from features.boiler import (
+    CP_WATER_J_PER_KG_K,
+    RHO_WATER_KG_PER_L,
+    discretize_zoh,
+    lumped_state_space,
+)
 from features.cop import HeatPumpCOPIdentifier
 
 logger = logging.getLogger(__name__)
@@ -328,9 +333,15 @@ class MPCOptimizer:
 
         model.active_power_constraint = pyo.ConstraintList()
 
+        power_lines = [
+            self._power_line_coefficients(
+                outdoor_c[k] if outdoor_c else None, overall_target_max
+            )
+            for k in range(num_steps)
+        ]
+
         for k in range(num_steps):
-            T_outdoor = outdoor_c[k] if outdoor_c else None
-            alpha, beta = self._power_line_coefficients(T_outdoor, overall_target_max)
+            alpha, beta = power_lines[k]
 
             # Safe upper bound on (alpha + beta*T - solar) for T within its
             # own declared bounds and solar >= 0 - large enough that the
@@ -349,10 +360,58 @@ class MPCOptimizer:
                     - big_m * (1 - model.boiler_on[k])
                 )
 
+        # Heat still in the tank when the horizon ends is not lost: it covers
+        # demand after the horizon that would otherwise need heating then.
+        # Without a value for it, heat stored from (partly free) solar ahead of
+        # a later deadline counts as pure waste against just-in-time grid
+        # heating - confirmed on real data, where a solar-peak run needing one
+        # extra 15-min step (overshooting the deadline by ~5 K) tied in cost
+        # with a run just before the deadline, so the plan flipped between them.
+        #
+        # Valued at the cheapest grid heat this horizon could buy: the model's
+        # own electrical power per watt of heat input, at the lowest tank
+        # temperature heating could start from (power rises with T; passive loss
+        # cannot cool the tank below its surroundings). Valuing it any higher
+        # would make buying grid heat just to store it look profitable; at this
+        # value only heat that is cheaper than grid heat (solar) gains, and
+        # standby losses until the horizon end still count against it.
+        t_floor_c = min(initial_temperature, float(data.ambient_temperature))
+        cheapest_grid_w_per_w_heat = (
+            min(alpha + beta * t_floor_c for alpha, beta in power_lines)
+            / self.thermal_model.q_in_nominal_w
+        )
+        tank_capacity_kwh_per_k = (
+            RHO_WATER_KG_PER_L
+            * self.thermal_model.volume_l
+            * CP_WATER_J_PER_KG_K
+            / 3.6e6
+        )
+        stored_heat_value_eur_per_k = (
+            self.config.price_eur_per_kwh
+            * tank_capacity_kwh_per_k
+            * cheapest_grid_w_per_w_heat
+        )
+
+        # Credited only up to the tank temperature the heat pump itself can
+        # reach (its supply limit minus the supply-to-tank margin, see
+        # _power_line_coefficients); above that the booster element takes over,
+        # which this model does not plan with.
+        model.stored_temperature = pyo.Var(
+            bounds=(
+                None,
+                HeatPumpCOPIdentifier.POWER_FIT_T_HIGH_C
+                - self._supply_margin_c(overall_target_max),
+            )
+        )
+        model.stored_temperature_constraint = pyo.Constraint(
+            expr=model.stored_temperature <= model.T[num_steps - 1]
+        )
+
         model.objective = pyo.Objective(
             expr=self._build_objective(
                 model, plan, [weight for weight, _ in solar_scenarios]
-            ),
+            )
+            - stored_heat_value_eur_per_k * model.stored_temperature,
             sense=pyo.minimize,
         )
 
@@ -428,10 +487,7 @@ class MPCOptimizer:
         if self.cop_model is None or T_outdoor is None:
             return self.config.boiler_electrical_power_w, 0.0
 
-        margin = max(
-            self.cop_model.reference_supply_temperature_c - overall_target_max,
-            0.0,
-        )
+        margin = self._supply_margin_c(overall_target_max)
 
         power_low, power_high = map(
             float,
@@ -456,6 +512,17 @@ class MPCOptimizer:
         alpha = power_low - beta * t_k_low
 
         return alpha, beta
+
+    def _supply_margin_c(self, overall_target_max: float) -> float:
+        """How much hotter the heat pump's supply runs than the tank it charges
+        (see _power_line_coefficients); 0 without a calibrated COP model."""
+
+        if self.cop_model is None:
+            return 0.0
+
+        return max(
+            self.cop_model.reference_supply_temperature_c - overall_target_max, 0.0
+        )
 
     def _build_objective(
         self,

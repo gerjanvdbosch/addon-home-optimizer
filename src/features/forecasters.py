@@ -58,9 +58,32 @@ class Forecaster(Protocol):
     def load(self, path: Path, study_storage: str | None = None) -> None: ...
 
 
+def _best_params(name: str, storage: str) -> dict[str, Any]:
+    """Best hyperparameters from this forecaster's Optuna study (see tune()), or
+    {} while it has not been tuned."""
+
+    if not Path(storage.removeprefix("sqlite:///")).exists():
+        return {}
+
+    study = create_study(
+        study_name=name,
+        direction="minimize",
+        storage=storage,
+        load_if_exists=True,
+    )
+
+    if not study.trials or study.best_trial is None:
+        return {}
+
+    logging.info("Load best params %s", study.best_params)
+
+    return study.best_params
+
+
 class SkforecastForecaster(Forecaster):
     def __init__(self):
         self.forecaster = self.create()
+        self.best_params: dict[str, Any] = {}
 
     @abstractmethod
     def create(self, **overrides: Any) -> ForecasterBase: ...
@@ -88,6 +111,15 @@ class SkforecastForecaster(Forecaster):
         df = self.prepare(df)
 
         y, exog = self.arguments(df)
+
+        # Rebuilt from code rather than refitting the loaded model, so a change to
+        # the model itself (e.g. its loss) takes effect; tuned estimator settings
+        # are reapplied on top.
+        self.forecaster = self.create()
+        estimator_params = self.forecaster.estimator.get_params()
+        self.forecaster.estimator.set_params(
+            **{k: v for k, v in self.best_params.items() if k in estimator_params}
+        )
 
         self.forecaster.fit(y=y, exog=exog)
 
@@ -139,6 +171,9 @@ class SkforecastForecaster(Forecaster):
         df = self.prepare(df)
 
         y, exog = self.arguments(df)
+
+        # Searched from the model as defined in code, not the loaded one (see fit()).
+        self.forecaster = self.create()
 
         result, study = bayesian_search_forecaster(
             n_jobs=1,
@@ -222,6 +257,9 @@ class SkforecastForecaster(Forecaster):
         )
 
     def load(self, path: Path, study_storage: str | None = None) -> None:
+        if study_storage is not None:
+            self.best_params = _best_params(self.name, study_storage)
+
         file_name = path / f"{self.name}.joblib"
 
         if not file_name.exists():
@@ -286,26 +324,6 @@ class SklearnForecaster(Forecaster):
     ) -> tuple[pd.DataFrame, Study]:
         raise NotImplementedError()
 
-    def _load_best_params(self, storage: str) -> bool:
-        if not Path(storage.removeprefix("sqlite:///")).exists():
-            return False
-
-        study = create_study(
-            study_name=self.name,
-            direction="minimize",
-            storage=storage,
-            load_if_exists=True,
-        )
-
-        if not study.trials or study.best_trial is None:
-            return False
-
-        self.best_params = study.best_params
-
-        logging.info("Load best params %s", study.best_params)
-
-        return True
-
     def save(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
 
@@ -320,4 +338,4 @@ class SklearnForecaster(Forecaster):
         self.forecaster = load(file_name)
 
         if study_storage is not None:
-            self._load_best_params(storage=study_storage)
+            self.best_params = _best_params(self.name, study_storage)

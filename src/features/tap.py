@@ -94,17 +94,16 @@ class TapForecaster(SkforecastForecaster):
                     random_state=42,
                 ),
             ),
-            # No weekly lags (unlike BaseloadForecaster): Forecasting.predict()
-            # only ever supplies 7 days of context (app/forecasting.py), and this
-            # forecaster's own prepare() drops a few rows on top of that (the
-            # first row has no dt_seconds, BoilerThermalIdentifier.prepare()
-            # filters oversized gaps, excess_loss_w() drops the last row) - so a
-            # lag near 7*96=672 is not reliably available. Physically, tap draws
-            # are driven by daily human activity rhythm, already covered by the
-            # daily lags below plus the hour/day_of_week/weekend calendar
-            # features; a residual same-time-last-week effect on top of that
-            # (real for whole-household baseload, e.g. work-from-home patterns)
-            # is not a justified assumption for tap draws specifically.
+            # No weekly lags (unlike BaseloadForecaster): tap draws are driven by
+            # daily human activity rhythm, already covered by the daily lags below
+            # plus the hour/day_of_week/weekend calendar features; a residual
+            # same-time-last-week effect on top of that (real for whole-household
+            # baseload, e.g. work-from-home patterns) is not a justified
+            # assumption for tap draws specifically. This forecaster's prepare()
+            # also drops a few rows from the history Forecasting.predict()
+            # supplies (the first row has no dt_seconds, oversized gaps are
+            # filtered, excess_loss_w() drops the last row), so short lags keep it
+            # robust to that.
             lags=overrides.pop("lags", [1, 2, 3, 4, 95, 96, 97]),
             calendar_features=overrides.pop(
                 "calendar_features",

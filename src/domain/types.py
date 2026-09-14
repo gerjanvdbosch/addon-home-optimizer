@@ -239,7 +239,9 @@ class PredictConfig(BaseModel):
 class BacktestConfig(BaseModel):
     target: ForecasterType
     days: int = Field(default=90)
-    steps: int = Field(default=24)
+    # Same horizon as PredictConfig.steps, so backtest and tune measure the
+    # forecast the optimizer actually receives, not a shorter, easier one.
+    steps: int = Field(default=192)
 
 
 class TuneConfig(BacktestConfig):

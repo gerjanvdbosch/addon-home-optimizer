@@ -113,12 +113,18 @@ def test_tap_forecast_adds_an_additional_heat_sink_to_the_temperature_trajectory
     """
 
     low_target = (10.0,) * len(SOLAR_FORECAST_W)
+    # No sun: free solar would otherwise be worth storing (see the stored-heat
+    # value in MPCOptimizer._build_model), adding heating decisions.
+    no_sun = [0.0] * len(SOLAR_FORECAST_W)
     optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig())
 
-    baseline = optimizer.solve(_make_input(target_temperature_top=low_target))
+    baseline = optimizer.solve(
+        _make_input(solar_forecast_w=no_sun, target_temperature_top=low_target)
+    )
 
     with_draws = optimizer.solve(
         _make_input(
+            solar_forecast_w=no_sun,
             target_temperature_top=low_target,
             # Small enough that the resulting drop stays well above the 10 degC
             # floor (starting ~29 degC) - isolates the tap term's effect on the
@@ -296,8 +302,14 @@ def test_uncertain_solar_window_loses_to_a_certain_one_with_less_p50():
         _make_input(**common, solar_p10_w=tuple(p10), solar_p90_w=tuple(p90))
     )
 
-    assert {k for k, on in enumerate(on_p50.schedule) if on} <= set(uncertain)
-    assert {k for k, on in enumerate(with_band.schedule) if on} <= set(certain)
+    # Both windows' sun is worth storing (see the stored-heat value in
+    # MPCOptimizer._build_model), so compare where each plan puts its heating
+    # rather than expecting one window to be skipped entirely.
+    def steps_in(result, window):
+        return sum(result.schedule[k] for k in window)
+
+    assert steps_in(on_p50, uncertain) > steps_in(on_p50, certain)
+    assert steps_in(with_band, certain) > steps_in(with_band, uncertain)
     assert with_band.temperatures[20] >= 45.0 - 1e-6
 
 
@@ -322,10 +334,12 @@ def test_validate_input_rejects_mismatched_target_length():
 
 def test_no_heating_scheduled_when_target_already_below_current():
     """If the whole horizon's requirement is already satisfied by the current
-    temperature, the optimizer must not spend money heating anyway.
+    temperature, the optimizer must not spend grid money heating anyway - the
+    end-of-horizon value of stored heat never exceeds what grid heat costs.
     """
 
     data = _make_input(
+        solar_forecast_w=[0.0] * len(SOLAR_FORECAST_W),
         current_temp_top=50.0,
         current_temp_bottom=50.0,
         target_temperature_top=(10.0,) * len(SOLAR_FORECAST_W),
@@ -335,7 +349,36 @@ def test_no_heating_scheduled_when_target_already_below_current():
     result = optimizer.solve(data)
 
     assert all(v == 0 for v in result.schedule)
-    assert result.objective_value == pytest.approx(0.0, abs=1e-9)
+
+
+def test_grid_heat_is_never_bought_just_to_store_it_even_from_a_cold_tank():
+    """The stored-heat value is priced at the cheapest grid heat reachable, so
+    with a temperature-dependent power line and a tank colder than its
+    surroundings, heating on grid alone must still not pay off."""
+
+    data = _make_input(
+        solar_forecast_w=[0.0] * len(SOLAR_FORECAST_W),
+        current_temp_top=15.0,
+        current_temp_bottom=15.0,
+        outdoor_temperature_forecast=(20.0,) * len(SOLAR_FORECAST_W),
+    )
+
+    result = MPCOptimizer(THERMAL_MODEL, MPCConfig(), COP_MODEL).solve(data)
+
+    assert all(v == 0 for v in result.schedule)
+
+
+def test_solar_surplus_is_stored_as_heat_without_any_target():
+    """Heat left in the tank at the horizon end has value (it covers later
+    demand), so free solar is stored even when no target asks for it."""
+
+    optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig())
+    result = optimizer.solve(_make_input())
+
+    on_steps = [k for k, v in enumerate(result.schedule) if v == 1]
+
+    assert on_steps
+    assert all(SOLAR_FORECAST_W[k] > 0 for k in on_steps)
 
 
 def test_electrical_power_matches_the_line_the_objective_was_built_from():
