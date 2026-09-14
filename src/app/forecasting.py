@@ -39,9 +39,24 @@ class Forecasting:
             if config.target and forecaster.name != config.target:
                 continue
 
-            forecaster, df = self._prepare(forecaster, config.days)
+            try:
+                forecaster, df = self._prepare(forecaster, config.days)
+                forecaster.fit(df)
+            except ValueError as error:
+                if "feature names should match" not in str(error):
+                    raise
 
-            forecaster.fit(df)
+                logging.warning(
+                    "Saved %s model does not match the current features, deleting "
+                    "it and fitting a new one: %s",
+                    forecaster.name,
+                    error,
+                )
+                (self.path / f"{forecaster.name}.joblib").unlink(missing_ok=True)
+                forecaster.forecaster = forecaster.create()
+
+                forecaster, df = self._prepare(forecaster, config.days)
+                forecaster.fit(df)
 
             forecaster.save(self.path)
 

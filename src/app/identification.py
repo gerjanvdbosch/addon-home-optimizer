@@ -33,9 +33,24 @@ class Identification:
             if config.target and identifier.name != config.target:
                 continue
 
-            identifier, df = self._prepare(identifier, config.days)
+            try:
+                identifier, df = self._prepare(identifier, config.days)
+                identifier.calibrate(df)
+            except ValueError as error:
+                if "feature names should match" not in str(error):
+                    raise
 
-            identifier.calibrate(df)
+                logger.warning(
+                    "Saved %s model does not match the current features, deleting "
+                    "it and calibrating a new one: %s",
+                    identifier.name,
+                    error,
+                )
+                (self.path / f"{identifier.name}.joblib").unlink(missing_ok=True)
+                identifier.model = None
+
+                identifier, df = self._prepare(identifier, config.days)
+                identifier.calibrate(df)
 
             identifier.save(self.path)
 
