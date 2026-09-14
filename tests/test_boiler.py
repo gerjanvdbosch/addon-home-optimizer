@@ -11,6 +11,7 @@ from features.boiler import (
     _rollout,
     _state_space,
     discretize_zoh,
+    lumped_state_space,
 )
 from features.tap import TapForecaster
 
@@ -1473,3 +1474,82 @@ def test_calibration_skips_tap_cleaning_without_a_saved_tap_model(tmp_path, capl
     assert not any(
         "tap-demand forecaster" in record.message for record in caplog.records
     )
+
+
+def _single_node_runs(start_delay_s: float) -> tuple[BoilerThermalModel, pd.DataFrame]:
+    """Four 45-minute heating runs whose tank average follows the single-node
+    planning model (constant q_in_nominal_w while on) exactly, except that the
+    tank only starts warming `start_delay_s` into each run."""
+
+    model = BoilerThermalModel(
+        volume_l=TRUE_VOLUME_L,
+        ua_top_w_per_k=TRUE_UA_TOP_W_PER_K,
+        ua_bottom_w_per_k=TRUE_UA_BOTTOM_W_PER_K,
+        ua_mix_idle_w_per_k=TRUE_UA_MIX_IDLE_W_PER_K,
+        ua_mix_active_w_per_k=TRUE_UA_MIX_ACTIVE_W_PER_K,
+        q_in_nominal_w=TRUE_Q_IN_NOMINAL_W,
+    )
+    a, b = lumped_state_space(
+        model.volume_l, model.ua_top_w_per_k + model.ua_bottom_w_per_k
+    )
+    a_d, b_d = discretize_zoh(a, b, DT_SECONDS)
+
+    idle_before, run_length, idle_after = 20, 9, 31
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    rows = []
+
+    for _ in range(4):
+        T = 30.0
+        for i in range(idle_before + run_length + idle_after):
+            on = idle_before <= i < idle_before + run_length
+            rows.append(
+                {
+                    "time": start + timedelta(seconds=len(rows) * DT_SECONDS),
+                    "T_top": T,
+                    "T_bottom": T,
+                    "T_ambient": T_AMBIENT_C,
+                    "boiler_on": on,
+                }
+            )
+            seconds_into_run = (i - idle_before) * DT_SECONDS
+            heating_fraction = (
+                min(max(seconds_into_run + DT_SECONDS - start_delay_s, 0.0), DT_SECONDS)
+                / DT_SECONDS
+                if on
+                else 0.0
+            )
+            T = (
+                a_d[0, 0] * T
+                + b_d[0, 0] * T_AMBIENT_C
+                + b_d[0, 1] * model.q_in_nominal_w * heating_fraction
+            )
+
+    return model, pd.DataFrame(rows)
+
+
+def test_planner_run_errors_are_zero_when_the_tank_follows_the_planning_model():
+    model, df = _single_node_runs(start_delay_s=0.0)
+
+    identifier = BoilerThermalIdentifier()
+    identifier.model = model
+    first_step_errors, run_end_errors = identifier._planner_run_errors(df)
+
+    assert first_step_errors.size == 4
+    assert run_end_errors.size == 4
+    assert first_step_errors == pytest.approx(0.0, abs=1e-9)
+    assert run_end_errors == pytest.approx(0.0, abs=1e-9)
+
+
+def test_planner_run_errors_show_a_tank_that_warms_later_than_planned():
+    """Real runs warm the tank only ~15 minutes in, while the planning model
+    heats from the first minute - planned minus measured must then come out
+    positive, after the first step and at the end of the run alike."""
+
+    model, df = _single_node_runs(start_delay_s=900.0)
+
+    identifier = BoilerThermalIdentifier()
+    identifier.model = model
+    first_step_errors, run_end_errors = identifier._planner_run_errors(df)
+
+    assert (first_step_errors > 1.0).all()
+    assert (run_end_errors > 1.0).all()

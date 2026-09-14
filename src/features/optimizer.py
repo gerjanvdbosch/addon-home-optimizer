@@ -14,7 +14,7 @@ from domain.types import (
     MPCInput,
     MPCResult,
 )
-from features.boiler import CP_WATER_J_PER_KG_K, RHO_WATER_KG_PER_L, discretize_zoh
+from features.boiler import discretize_zoh, lumped_state_space
 from features.cop import HeatPumpCOPIdentifier
 
 logger = logging.getLogger(__name__)
@@ -45,40 +45,6 @@ class _StepPlan:
     @property
     def num_steps(self) -> int:
         return len(self.dt_hours)
-
-
-def _lumped_state_space(
-    volume_l: float,
-    ua_total_w_per_k: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Continuous state-space for a single lumped tank node: dT/dt = A T + B u,
-    u = [T_ambient, Q_in_effective, Q_tap_forecast].
-
-    Used only for MPC planning, not for the calibrated identification/validation
-    model (see features/boiler.py, which keeps top and bottom separate). Mixing
-    during active heating was found to saturate at the sampling-resolution
-    ceiling there (UA_mix_active pinned at its bound), meaning the tank is
-    practically fully mixed within one MPC step - so a single node using the
-    well-identified UA_top+UA_bottom sum and q_in_nominal_w is a defensible
-    simplification. It also keeps these dynamics linear in the binary boiler_on
-    decision: the full two-node model would need a disjunctive/big-M
-    reformulation to let UA_mix switch with boiler_on, for precision in the
-    individual UA_top/UA_bottom split that isn't there anyway.
-
-    Q_tap_forecast is an additional heat-sink term (cold mains water entering,
-    warm water drawn out) - the third B column carries a negative coefficient
-    since, unlike Q_in, it removes energy from the tank: C dT/dt = Q_in -
-    UA*(T-T_ambient) - Q_tap.
-    """
-
-    c_total = RHO_WATER_KG_PER_L * volume_l * CP_WATER_J_PER_KG_K
-
-    a = np.array([[-ua_total_w_per_k / c_total]])
-    b = np.array(
-        [[ua_total_w_per_k / c_total, 1.0 / c_total, -1.0 / c_total]]
-    )
-
-    return a, b
 
 
 class MPCOptimizer:
@@ -322,7 +288,7 @@ class MPCOptimizer:
         # coefficient, depends on boiler_on), so (A_d, B_d) depends only on
         # each step's own duration - cached per distinct duration (fine vs.
         # coarse - see _build_step_plan) rather than recomputed per step.
-        a, b = _lumped_state_space(
+        a, b = lumped_state_space(
             self.thermal_model.volume_l,
             self.thermal_model.ua_top_w_per_k + self.thermal_model.ua_bottom_w_per_k,
         )
@@ -420,9 +386,9 @@ class MPCOptimizer:
         actually costs with are the ones shown.
 
         Q_th at each reference point comes from the calibrated
-        q_th_at_power_fit_low_w/high_w (real, calorimetric thermal output
-        measured near that supply temperature - see
-        HeatPumpCOPIdentifier.calibrate()), not BoilerThermalModel's fixed
+        q_th_at_power_fit_low_w/high_w (a line fitted to real calorimetric
+        thermal output so it reproduces measured electrical power - see
+        HeatPumpCOPIdentifier._fit_q_th_line()), not BoilerThermalModel's fixed
         q_in_nominal_w: real data confirmed Q_th is not constant across a
         compressor run (it rises from a low start, peaks mid-cycle, then
         falls as the compressor modulates down approaching setpoint), and
@@ -444,9 +410,9 @@ class MPCOptimizer:
         supply run than the target it's aiming for" gap already implied by
         that calibrated value, floored at 0 so supply is never modelled as
         colder than the tank it is heating. POWER_FIT_T_LOW_C/HIGH_C are
-        real T_supply values (q_th_at_power_fit_low_w/high_w were measured
-        at rows whose *real* T_supply was near them - see
-        HeatPumpCOPIdentifier.calibrate()), so COP is evaluated directly at
+        real T_supply values (q_th_at_power_fit_low_w/high_w are that fitted
+        line evaluated at those *real* T_supply values - see
+        HeatPumpCOPIdentifier._fit_q_th_line()), so COP is evaluated directly at
         those values, with no margin added there - the margin only enters
         when re-expressing the resulting (T_supply -> power) line in T[k]
         terms below (T_supply = T[k] + margin, so T[k] = T_supply - margin
@@ -467,21 +433,11 @@ class MPCOptimizer:
             0.0,
         )
 
-        def power_at_real_supply(T_supply: float, q_th_w: float) -> float:
-            cop = self.cop_model.cop(T_outdoor, T_supply)
-            cop = min(
-                max(cop, HeatPumpCOPIdentifier.MIN_COP), HeatPumpCOPIdentifier.MAX_COP
-            )
-
-            return q_th_w / cop
-
-        power_low = power_at_real_supply(
-            HeatPumpCOPIdentifier.POWER_FIT_T_LOW_C,
-            self.cop_model.q_th_at_power_fit_low_w,
-        )
-        power_high = power_at_real_supply(
-            HeatPumpCOPIdentifier.POWER_FIT_T_HIGH_C,
-            self.cop_model.q_th_at_power_fit_high_w,
+        power_low, power_high = map(
+            float,
+            HeatPumpCOPIdentifier.planned_power_at_reference_points(
+                self.cop_model, T_outdoor
+            ),
         )
 
         fit_range_c = (
@@ -545,7 +501,7 @@ class MPCOptimizer:
         # coarse for the far, look-ahead-only portion of the horizon (see
         # _build_step_plan); the physics used to report the resulting
         # trajectory stays exactly as fine-grained as the input.
-        a, b = _lumped_state_space(
+        a, b = lumped_state_space(
             self.thermal_model.volume_l,
             self.thermal_model.ua_top_w_per_k + self.thermal_model.ua_bottom_w_per_k,
         )

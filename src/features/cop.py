@@ -123,22 +123,31 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
     # tank-temperature approximation through (see
     # MPCOptimizer._power_line_coefficients) - the normal active-heating
     # operating range for a DHW cycle on this installation. Q_th (real,
-    # calorimetric thermal output - see prepare()'s diagnostic) is measured
-    # near each reference point rather than assumed constant: real data
-    # confirmed Q_th is NOT constant across a cycle (it rises from a low
-    # start, peaks mid-cycle, then falls as the compressor modulates down
-    # approaching setpoint) - using a single fixed q_in_nominal_w (the
-    # boiler's own separately calibrated, temperature-independent nominal
-    # thermal output, validated for the tank's temperature *trajectory*, a
-    # different purpose) understated real electrical draw by up to ~40%
-    # through the middle of a cycle.
+    # calorimetric thermal output - see prepare()'s diagnostic) at each
+    # reference point comes from a line fitted to real data rather than
+    # assumed constant (see _fit_q_th_line()): real data confirmed Q_th is NOT
+    # constant across a cycle - using a single fixed q_in_nominal_w (the
+    # boiler's own separately calibrated nominal thermal output, validated
+    # for the tank's temperature *trajectory*, a different purpose)
+    # understated real electrical draw by up to ~40% through the middle of a
+    # cycle.
     POWER_FIT_T_LOW_C = 30.0
     POWER_FIT_T_HIGH_C = 60.0
-    # +/- degrees around each reference point averaged over for a real,
-    # not-too-noisy Q_th estimate - narrow enough to stay local to the
-    # reference point, wide enough for a reasonable sample size given this
-    # mode's own data density.
-    POWER_FIT_WINDOW_C = 5.0
+    # Rows below this supply temperature are left out of that Q_th fit: the
+    # compressor is still ramping up there (real data: ~600 W electrical and
+    # ~2.8 kW thermal at 20-30 degC supply, against ~6.5 kW thermal once
+    # running), a start-up transient the planning line is never evaluated in -
+    # MPCOptimizer maps tank temperature plus the reference margin to supply
+    # temperature, in practice 45 degC and up. Estimating Q_th at the reference
+    # points as local medians instead (+/-5 degC windows at 30 and 60 degC) was
+    # dragged down by exactly those start-up rows and by the modulating-down
+    # tail, and planned DHW power ~20% below real in every one of 20 runs.
+    POWER_FIT_MIN_SUPPLY_C = 35.0
+    # validate() treats readings further apart than this as separate compressor
+    # runs: prepare() keeps only active readings at the dataset's 5-minute
+    # interval, so more than two missing readings in a row means the
+    # compressor stopped in between.
+    RUN_GAP = pd.Timedelta(minutes=15)
 
     def __init__(self, mode: str, key: str) -> None:
         super().__init__()
@@ -482,13 +491,16 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         # approach parameter.
         reference_supply_temperature_c = float(df["T_supply"].quantile(0.95))
 
-        # See the class docstring on POWER_FIT_T_LOW_C/HIGH_C and the
-        # prepare() diagnostic: real Q_th at these two reference points,
-        # not the boiler's fixed q_in_nominal_w, is what MPCOptimizer needs
-        # for an accurate electrical-power estimate.
-        q_th_at_power_fit_low_w = self._median_near(df, "Q_th", self.POWER_FIT_T_LOW_C)
-        q_th_at_power_fit_high_w = self._median_near(
-            df, "Q_th", self.POWER_FIT_T_HIGH_C
+        # See the class docstring on POWER_FIT_T_LOW_C/HIGH_C and
+        # POWER_FIT_MIN_SUPPLY_C. Fitted on the training split only, like the
+        # COP parameters, so validate() scores it on data it never saw.
+        q_th_at_power_fit_low_w, q_th_at_power_fit_high_w = self._fit_q_th_line(
+            train_df,
+            HeatPumpCOPModel(
+                eta_carnot=eta_carnot,
+                delta_t_cond=self.FIXED_DELTA_T_COND,
+                delta_t_evap=delta_t_evap,
+            ),
         )
 
         logger.info(
@@ -513,44 +525,86 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
 
         return self.model
 
-    def _median_near(
-        self, df: pd.DataFrame, column: str, T_supply_center: float
-    ) -> float:
-        """Median of `column` (see prepare()) for rows within
-        POWER_FIT_WINDOW_C of T_supply_center - a local, real-data answer to
-        "what does this heat pump actually do around this supply
-        temperature", used for q_th_at_power_fit_low_w/high_w (in place of
-        the boiler's fixed q_in_nominal_w - see POWER_FIT_T_LOW_C/HIGH_C's
-        class docstring). Median, not mean, for the same reason
-        reference_supply_temperature_c uses a percentile rather than the
-        max - real data showed a std comparable to a third of the mean in
-        some bins (real transients, and - until HeatPumpConfig.booster has
-        enough history - residual booster-heater contamination), more
-        outlier-sensitivity than this estimate needs. Falls back to this
-        mode's overall median for `column` if no data falls in the window
-        (e.g. a short calibration history) - still real, measured data,
-        just less localized, rather than an invented number.
+    @classmethod
+    def clamped_cop(cls, model: HeatPumpCOPModel, T_outdoor, T_supply):
+        """model.cop() clamped to the [MIN_COP, MAX_COP] sanity range, so an
+        outdoor/supply combination outside anything the model was fitted on
+        cannot turn into an absurd power estimate. Scalars or arrays."""
+
+        return np.clip(model.cop(T_outdoor, T_supply), cls.MIN_COP, cls.MAX_COP)
+
+    @classmethod
+    def planned_power_at_reference_points(cls, model: HeatPumpCOPModel, T_outdoor):
+        """Electrical power (W) at POWER_FIT_T_LOW_C and POWER_FIT_T_HIGH_C
+        supply temperature - the two points MPCOptimizer's linear planning
+        power line passes through (see MPCOptimizer._power_line_coefficients).
+        Shared with validate() so it scores exactly the line planning costs
+        with. Scalars or arrays."""
+
+        return (
+            model.q_th_at_power_fit_low_w
+            / cls.clamped_cop(model, T_outdoor, cls.POWER_FIT_T_LOW_C),
+            model.q_th_at_power_fit_high_w
+            / cls.clamped_cop(model, T_outdoor, cls.POWER_FIT_T_HIGH_C),
+        )
+
+    def _fit_q_th_line(
+        self, df: pd.DataFrame, cop_model: HeatPumpCOPModel
+    ) -> tuple[float, float]:
+        """Q_th at POWER_FIT_T_LOW_C/HIGH_C from a line
+        Q_th = q_0 + q_slope * T_supply, chosen so that Q_th / COP reproduces
+        measured P_el as closely as possible - electrical power is what
+        planning costs, so that is the error to minimize, not the Q_th error
+        itself. Linear in (q_0, q_slope), so an ordinary least-squares solve.
+        Uses only rows at or above POWER_FIT_MIN_SUPPLY_C (see its class
+        docstring). Falls back to a flat Q_th when supply temperature barely
+        varies (the slope is then not identifiable), and to all rows, with a
+        warning, when fewer than two lie in the operating range.
         """
 
-        window = self.POWER_FIT_WINDOW_C
-        nearby = df.loc[
-            (df["T_supply"] >= T_supply_center - window)
-            & (df["T_supply"] < T_supply_center + window),
-            column,
-        ]
+        rows = df[df["T_supply"] >= self.POWER_FIT_MIN_SUPPLY_C]
 
-        if nearby.empty:
+        if len(rows) < 2:
             logger.warning(
-                "Heat pump COP calibration (%s): no data within %.1f degC of "
-                "%.1f degC - falling back to this mode's overall median %s.",
+                "Heat pump COP calibration (%s): fewer than 2 readings at or "
+                "above %.1f degC supply - fitting Q_th on all readings instead.",
                 self.mode,
-                window,
-                T_supply_center,
-                column,
+                self.POWER_FIT_MIN_SUPPLY_C,
             )
-            return float(df[column].median())
+            rows = df
 
-        return float(nearby.median())
+        T_supply = rows["T_supply"].to_numpy(dtype=float)
+        P_el = rows["P_el"].to_numpy(dtype=float)
+        inverse_cop = 1.0 / self.clamped_cop(
+            cop_model, rows["T_outdoor"].to_numpy(dtype=float), T_supply
+        )
+
+        design = np.column_stack([inverse_cop, T_supply * inverse_cop])
+        (q_0, q_slope), _, rank, _ = np.linalg.lstsq(design, P_el, rcond=None)
+
+        if rank < 2:
+            q_0 = float(np.dot(inverse_cop, P_el) / np.dot(inverse_cop, inverse_cop))
+            q_slope = 0.0
+
+        return (
+            float(q_0 + q_slope * self.POWER_FIT_T_LOW_C),
+            float(q_0 + q_slope * self.POWER_FIT_T_HIGH_C),
+        )
+
+    def _planned_power_w(self, df: pd.DataFrame) -> np.ndarray:
+        """The electrical power MPCOptimizer plans with at each row's real
+        supply and outdoor temperature. Its line is expressed in tank
+        temperature there, but shifting by the constant reference margin
+        leaves it this same straight line in supply-temperature terms."""
+
+        power_low, power_high = self.planned_power_at_reference_points(
+            self.model, df["T_outdoor"].to_numpy(dtype=float)
+        )
+        fraction = (df["T_supply"].to_numpy(dtype=float) - self.POWER_FIT_T_LOW_C) / (
+            self.POWER_FIT_T_HIGH_C - self.POWER_FIT_T_LOW_C
+        )
+
+        return power_low + (power_high - power_low) * fraction
 
     def validate(self, df: pd.DataFrame) -> dict[str, float]:
         df = self.prepare(df)
@@ -683,10 +737,67 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
                         parameter_values[name],
                     )
 
+        # An accurate COP fit does not guarantee accurate planning: the
+        # optimizer costs with a straight power line through two Q_th
+        # reference values (see _fit_q_th_line()), so that line is scored here
+        # against measured power, in the supply range planning evaluates it in.
+        planned_power_w = self._planned_power_w(test_df)
+        measured_power_w = test_df["P_el"].to_numpy(dtype=float)
+        in_planning_range = T_supply >= self.POWER_FIT_MIN_SUPPLY_C
+
+        if in_planning_range.any():
+            error_w = (planned_power_w - measured_power_w)[in_planning_range]
+            power_bias_w = float(np.mean(error_w))
+            power_mae_w = float(np.mean(np.abs(error_w)))
+
+            runs = (test_df["time"].diff() > self.RUN_GAP).cumsum().to_numpy()
+            power = pd.DataFrame(
+                {
+                    "run": runs,
+                    "T_supply": T_supply,
+                    "planned": planned_power_w,
+                    "measured": measured_power_w,
+                }
+            )
+            peaks = power.groupby("run")[["planned", "measured"]].max()
+            run_peak_ratio = float((peaks["planned"] / peaks["measured"]).median())
+
+            supply_bins = np.arange(
+                self.POWER_FIT_MIN_SUPPLY_C, self.POWER_FIT_T_HIGH_C + 5.0, 5.0
+            )
+            by_supply = power.groupby(
+                pd.cut(power["T_supply"], bins=supply_bins, right=False),
+                observed=True,
+            )[["planned", "measured"]].median()
+
+            logger.info(
+                "Heat pump COP validation (%s): planned vs measured power at "
+                ">= %.0f degC supply: bias=%+.0f W, MAE=%.0f W, median run "
+                "peak planned/measured=%.3f (%d runs); median per supply bin:\n%s",
+                self.mode,
+                self.POWER_FIT_MIN_SUPPLY_C,
+                power_bias_w,
+                power_mae_w,
+                run_peak_ratio,
+                len(peaks),
+                by_supply.round(0).to_string(),
+            )
+        else:
+            power_bias_w = power_mae_w = run_peak_ratio = float("nan")
+            logger.warning(
+                "Heat pump COP validation (%s): no test readings at or above "
+                "%.0f degC supply - planned power not scored.",
+                self.mode,
+                self.POWER_FIT_MIN_SUPPLY_C,
+            )
+
         result = {
             "r2": r2,
             "mae": mae,
             "rmse": rmse,
+            "power_bias_w": power_bias_w,
+            "power_mae_w": power_mae_w,
+            "run_peak_ratio": run_peak_ratio,
             "implausible_delta_t": float(implausible_delta_t),
             "weakly_identified_parameters": float(weakly_identified),
         }

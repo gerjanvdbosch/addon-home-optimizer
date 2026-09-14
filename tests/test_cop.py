@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 from domain.types import HeatPumpCOPModel
+from features.boiler import CP_WATER_J_PER_KG_K, RHO_WATER_KG_PER_L
 from features.cop import HeatPumpCOPIdentifier
 
 TRUE_ETA_CARNOT = 0.45
@@ -82,53 +83,70 @@ def test_calibrate_recovers_known_parameters_and_ignores_other_modes():
     # percentile must be that same value, not (say) HEATING_STATE's T_supply
     # leaking in from the mode filter being broken.
     assert model.reference_supply_temperature_c == pytest.approx(50.0)
-    # Constant T_supply=50.0 falls outside both reference windows (30+/-5,
-    # 60+/-5) - both fields must fall back to this mode's overall median
-    # Q_th, not the (broken, always-0.0) default.
+    # Constant T_supply=50.0 leaves the Q_th slope unidentifiable - both
+    # reference values must fall back to one flat, positive Q_th, not the
+    # (broken, always-0.0) default.
     assert model.q_th_at_power_fit_low_w == pytest.approx(
         model.q_th_at_power_fit_high_w
     )
     assert model.q_th_at_power_fit_low_w > 0.0
 
 
-def test_median_near_uses_local_window_not_global_median():
-    df = pd.DataFrame(
-        {
-            "T_supply": [28.0, 29.0, 32.0, 58.0, 59.0, 62.0],
-            # An outlier in each window - if this were a mean, it would pull
-            # the result well away from the other two, ordinary readings.
-            "Q_th": [3000.0, 3200.0, 9000.0, 6000.0, 6400.0, 100.0],
-        }
+TRUE_COP_MODEL = HeatPumpCOPModel(
+    eta_carnot=TRUE_ETA_CARNOT,
+    delta_t_cond=TRUE_DELTA_T_COND,
+    delta_t_evap=TRUE_DELTA_T_EVAP,
+)
+
+
+def _power_rows(T_supply, q_th_w, T_outdoor: float = 10.0) -> pd.DataFrame:
+    """Readings whose electrical power is exactly q_th_w / COP at each supply
+    temperature - the relationship _fit_q_th_line() inverts."""
+
+    T_supply = np.asarray(T_supply, dtype=float)
+    q_th_w = np.broadcast_to(np.asarray(q_th_w, dtype=float), T_supply.shape)
+    cop = HeatPumpCOPIdentifier.clamped_cop(TRUE_COP_MODEL, T_outdoor, T_supply)
+
+    return pd.DataFrame(
+        {"T_supply": T_supply, "T_outdoor": T_outdoor, "P_el": q_th_w / cop}
     )
 
+
+def test_q_th_line_fit_recovers_a_known_linear_thermal_output():
+    T_supply = np.linspace(35.0, 60.0, 50)
+    df = _power_rows(T_supply, 7000.0 - 20.0 * (T_supply - 35.0))
+
     identifier = HeatPumpCOPIdentifier(mode=SWW_STATE, key="dhw")
+    low, high = identifier._fit_q_th_line(df, TRUE_COP_MODEL)
 
-    # POWER_FIT_WINDOW_C=5 degC - only the first three rows fall within 5
-    # degC of 30, only the last three within 5 degC of 60.
-    low = identifier._median_near(df, "Q_th", 30.0)
-    high = identifier._median_near(df, "Q_th", 60.0)
+    assert low == pytest.approx(7100.0)
+    assert high == pytest.approx(6500.0)
 
-    assert low == pytest.approx(3200.0)
+
+def test_q_th_line_fit_ignores_compressor_start_up_readings():
+    """Regression test for the real finding behind POWER_FIT_MIN_SUPPLY_C:
+    low start-up readings (compressor still ramping up) dragged the planned
+    Q_th down and planned DHW power ~20% below real."""
+
+    running = _power_rows(np.linspace(35.0, 60.0, 50), 6500.0)
+    start_up = _power_rows(np.linspace(20.0, 34.0, 30), 2000.0)
+    df = pd.concat([start_up, running], ignore_index=True)
+
+    identifier = HeatPumpCOPIdentifier(mode=SWW_STATE, key="dhw")
+    low, high = identifier._fit_q_th_line(df, TRUE_COP_MODEL)
+
+    assert low == pytest.approx(6500.0)
+    assert high == pytest.approx(6500.0)
+
+
+def test_q_th_line_fit_is_flat_when_supply_temperature_does_not_vary():
+    df = _power_rows(np.full(20, 50.0), 6000.0)
+
+    identifier = HeatPumpCOPIdentifier(mode=SWW_STATE, key="dhw")
+    low, high = identifier._fit_q_th_line(df, TRUE_COP_MODEL)
+
+    assert low == pytest.approx(6000.0)
     assert high == pytest.approx(6000.0)
-    # A mean would have been pulled noticeably higher/lower by the outlier.
-    assert low != pytest.approx((3000.0 + 3200.0 + 9000.0) / 3)
-    assert high != pytest.approx((6000.0 + 6400.0 + 100.0) / 3)
-
-
-def test_median_near_falls_back_to_overall_median_when_window_is_empty():
-    df = pd.DataFrame(
-        {
-            "T_supply": [45.0, 46.0, 47.0],
-            "Q_th": [5000.0, 5200.0, 20000.0],
-        }
-    )
-
-    identifier = HeatPumpCOPIdentifier(mode=SWW_STATE, key="dhw")
-
-    # Nothing in this data falls within 5 degC of 30.
-    result = identifier._median_near(df, "Q_th", 30.0)
-
-    assert result == pytest.approx(5200.0)
 
 
 def test_prepare_excludes_rows_where_the_booster_heater_is_active():
@@ -256,6 +274,61 @@ def test_validate_reports_low_error_on_matching_synthetic_data():
 
     assert metrics["r2"] > 0.9
     assert metrics["mae"] < 0.3
+
+
+def test_validate_scores_the_planning_power_line_against_measured_power():
+    """validate() must report how far the power line the optimizer plans with
+    is from measured electrical power - the mismatch a COP-only validation
+    could not show. Data here follows the model exactly (constant thermal
+    output), so planned power must land within a few percent of measured,
+    per reading and at each run's peak."""
+
+    rng = np.random.default_rng(13)
+    readings_per_run = 20
+    runs = N // readings_per_run
+    q_th_w = 6500.0
+
+    T_supply = np.tile(np.linspace(35.0, 58.0, readings_per_run), runs)
+    T_outdoor = np.repeat(rng.uniform(5.0, 15.0, size=runs), readings_per_run)
+    water_w_per_k = (RHO_WATER_KG_PER_L / 60.0) * CP_WATER_J_PER_KG_K * FLOW_LPM
+    delta_t_water = q_th_w / water_w_per_k
+    cop = HeatPumpCOPIdentifier._predict_cop(
+        np.array([TRUE_ETA_CARNOT, TRUE_DELTA_T_EVAP]),
+        T_outdoor,
+        T_supply,
+        TRUE_DELTA_T_COND,
+    )
+
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    time = pd.to_datetime(
+        [
+            start + timedelta(hours=2 * run, minutes=5 * reading)
+            for run in range(runs)
+            for reading in range(readings_per_run)
+        ],
+        utc=True,
+    )
+
+    df = pd.DataFrame(
+        {
+            "time": time,
+            "T_outdoor": T_outdoor,
+            "T_supply": T_supply,
+            "T_return": T_supply - delta_t_water,
+            "flow_lpm": FLOW_LPM,
+            "P_el": q_th_w / cop + rng.normal(0.0, 10.0, size=N),
+            "state": SWW_STATE,
+        }
+    )
+
+    identifier = HeatPumpCOPIdentifier(mode=SWW_STATE, key="dhw")
+    identifier.calibrate(df)
+    result = identifier.validate(df)
+
+    mean_power_w = float((q_th_w / cop).mean())
+    assert abs(result["power_bias_w"]) < 0.05 * mean_power_w
+    assert result["power_mae_w"] < 0.05 * mean_power_w
+    assert result["run_peak_ratio"] == pytest.approx(1.0, abs=0.05)
 
 
 def test_validate_flags_delta_t_pinned_at_bound(caplog):

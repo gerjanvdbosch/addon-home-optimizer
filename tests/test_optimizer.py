@@ -2,9 +2,14 @@ import numpy as np
 import pytest
 
 from domain.types import BoilerThermalModel, HeatPumpCOPModel, MPCConfig, MPCInput
-from features.boiler import CP_WATER_J_PER_KG_K, RHO_WATER_KG_PER_L, discretize_zoh
+from features.boiler import (
+    CP_WATER_J_PER_KG_K,
+    RHO_WATER_KG_PER_L,
+    discretize_zoh,
+    lumped_state_space,
+)
 from features.cop import HeatPumpCOPIdentifier
-from features.optimizer import MPCOptimizer, _lumped_state_space
+from features.optimizer import MPCOptimizer
 
 THERMAL_MODEL = BoilerThermalModel(
     volume_l=200.0,
@@ -193,7 +198,7 @@ def test_thermal_dynamics_matches_manual_discretization():
 
     solved_T = [pyo.value(model.T[k]) for k in range(len(pattern))]
 
-    a, b = _lumped_state_space(
+    a, b = lumped_state_space(
         THERMAL_MODEL.volume_l,
         THERMAL_MODEL.ua_top_w_per_k + THERMAL_MODEL.ua_bottom_w_per_k,
     )
@@ -505,7 +510,7 @@ def test_lumped_state_space_matches_full_tank_capacity():
     c_expected = RHO_WATER_KG_PER_L * THERMAL_MODEL.volume_l * CP_WATER_J_PER_KG_K
     ua_total = THERMAL_MODEL.ua_top_w_per_k + THERMAL_MODEL.ua_bottom_w_per_k
 
-    a, b = _lumped_state_space(THERMAL_MODEL.volume_l, ua_total)
+    a, b = lumped_state_space(THERMAL_MODEL.volume_l, ua_total)
 
     assert a.shape == (1, 1)
     assert b.shape == (1, 3)

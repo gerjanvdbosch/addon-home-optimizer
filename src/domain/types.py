@@ -444,8 +444,9 @@ class HeatPumpCOPModel:
     # (default 0.0 is harmless there, e.g. for a trial fit's parameter
     # vector - see HeatPumpCOPIdentifier._predict_cop).
     reference_supply_temperature_c: float = 0.0
-    # Real, calorimetric thermal output (W) observed near
-    # HeatPumpCOPIdentifier.POWER_FIT_T_LOW_C/HIGH_C (see calibrate()) - used
+    # Thermal output (W) at HeatPumpCOPIdentifier.POWER_FIT_T_LOW_C/HIGH_C from
+    # a line fitted to real calorimetric data so that it reproduces measured
+    # electrical power (see HeatPumpCOPIdentifier._fit_q_th_line()) - used
     # by MPCOptimizer instead of BoilerThermalModel's fixed q_in_nominal_w
     # when estimating electrical power: real data confirmed Q_th is not
     # constant across a compressor run (it rises from a low start, peaks

@@ -11,7 +11,7 @@ from sklearn.metrics import (
     r2_score,
 )
 
-from domain.types import BoilerThermalModel, Config
+from domain.types import BoilerThermalModel, Config, MPCConfig
 from features.dataset import DatasetBuilder, DatasetDefinition
 from features.identifier import SystemIdentifier
 
@@ -80,6 +80,49 @@ def discretize_zoh(
     exponent = expm(augmented * dt_seconds)
 
     return exponent[:n, :n], exponent[:n, n:]
+
+
+# A start dead time was tried for this planning model and rejected: no heat into
+# the tank for a run's first 15 minutes, since real runs show the supply water
+# 7-11 degC colder than the tank for ~10 minutes (the loop between heat pump and
+# boiler cools down between runs, so heat first flows out of the tank). Scored
+# per real run with BoilerThermalIdentifier._planner_run_errors() (72 runs over
+# 90 days), it cut the error after the first 15-minute step from ~7.0 K to
+# ~2.3 K - but with a heat input the heat pump actually delivers (4.8-6.2 kW)
+# every run ended 4-6 K too cold, and matching run ends needed ~7.6 kW, more
+# than measured calorimetric output: a fit factor compensating for the sensor
+# nearest the coil running ahead of the rest of the tank, not physical heat
+# input. Capturing both the start dip and the run total needs more than the
+# two-sensor average of a stratified tank.
+def lumped_state_space(
+    volume_l: float,
+    ua_total_w_per_k: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Continuous state-space for a single lumped tank node: dT/dt = A T + B u,
+    u = [T_ambient, Q_in_effective, Q_tap_forecast].
+
+    Used only for MPC planning (and validating that planning model), not for
+    the calibrated two-node identification model. Mixing during active heating
+    was found to saturate at the sampling-resolution ceiling (UA_mix_active
+    pinned at its bound), meaning the tank is practically fully mixed within
+    one MPC step - so a single node using the well-identified UA_top+UA_bottom
+    sum is a defensible simplification. It also keeps these dynamics linear in
+    the binary boiler_on decision: the full two-node model would need a
+    disjunctive/big-M reformulation to let UA_mix switch with boiler_on, for
+    precision in the individual UA_top/UA_bottom split that isn't there anyway.
+
+    Q_tap_forecast is an additional heat-sink term (cold mains water entering,
+    warm water drawn out) - the third B column carries a negative coefficient
+    since, unlike Q_in, it removes energy from the tank: C dT/dt = Q_in -
+    UA*(T-T_ambient) - Q_tap.
+    """
+
+    c_total = RHO_WATER_KG_PER_L * volume_l * CP_WATER_J_PER_KG_K
+
+    a = np.array([[-ua_total_w_per_k / c_total]])
+    b = np.array([[ua_total_w_per_k / c_total, 1.0 / c_total, -1.0 / c_total]])
+
+    return a, b
 
 
 def _model_from_parameters(
@@ -1291,6 +1334,81 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             )
             return clean_transition
 
+    # validate() compares the planning model with the tank this long after a run
+    # ends: heating mixes the tank within a sample (UA_mix_active sits at its
+    # sampling-resolution ceiling), so by then the two-sensor average is a fair
+    # stand-in for its mean temperature - unlike mid-run, when the sensor
+    # nearest the coil runs ahead of the rest of the tank.
+    PLANNER_CHECK_SETTLE_S = 900.0
+
+    def _planner_run_errors(self, df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+        """Replays MPCOptimizer's single-node planning model (lumped_state_space
+        with a constant q_in_nominal_w while on) over every real heating run in
+        `df` it can follow without a data gap or a following run interfering,
+        starting from the measured tank average at the run's start with the
+        run's real on/off timing. Returns planned minus measured tank average
+        (K) after one MPC step (MPCConfig.step_hours - the step the optimizer
+        actually executes) and PLANNER_CHECK_SETTLE_S after the run ends - the
+        checks that matter for planning, which the two-node rollout in
+        validate() does not make.
+        """
+
+        model = self.model
+        a, b = lumped_state_space(
+            model.volume_l, model.ua_top_w_per_k + model.ua_bottom_w_per_k
+        )
+        seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
+        T_average = ((df["T_top"] + df["T_bottom"]) / 2.0).to_numpy(dtype=float)
+        T_ambient = df["T_ambient"].to_numpy(dtype=float)
+        on = df["boiler_on"].to_numpy(dtype=bool)
+        max_gap_seconds = self.MAX_DT_SECONDS_MULTIPLE * float(
+            np.median(np.diff(seconds))
+        )
+        discretized: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+        first_step_seconds = MPCConfig().step_hours * 3600.0
+        first_step_errors: list[float] = []
+        run_end_errors: list[float] = []
+
+        for start in np.flatnonzero(on & ~np.r_[True, on[:-1]]):
+            end = start
+            while end + 1 < len(on) and on[end + 1]:
+                end += 1
+
+            if end + 1 >= len(on):
+                continue
+
+            first_check = int(
+                np.searchsorted(seconds, seconds[start] + first_step_seconds)
+            )
+            settled = int(
+                np.searchsorted(seconds, seconds[end + 1] + self.PLANNER_CHECK_SETTLE_S)
+            )
+
+            if (
+                settled >= len(seconds)
+                or on[end + 1 : settled + 1].any()
+                or np.any(np.diff(seconds[start : settled + 1]) > max_gap_seconds)
+            ):
+                continue
+
+            T = T_average[start]
+
+            for i in range(start, settled):
+                dt = float(seconds[i + 1] - seconds[i])
+                if dt not in discretized:
+                    discretized[dt] = discretize_zoh(a, b, dt)
+                a_d, b_d = discretized[dt]
+
+                q_in = model.q_in_nominal_w if on[i] else 0.0
+                T = a_d[0, 0] * T + b_d[0, 0] * T_ambient[i] + b_d[0, 1] * q_in
+
+                if i + 1 == first_check:
+                    first_step_errors.append(T - T_average[i + 1])
+
+            run_end_errors.append(T - T_average[settled])
+
+        return np.array(first_step_errors), np.array(run_end_errors)
+
     def validate(
         self, df: pd.DataFrame, horizon_hours: float = 2.0
     ) -> dict[str, float]:
@@ -1529,10 +1647,42 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
                         parameter_values[name],
                     )
 
+        # The two-node rollout above uses measured heat input where available;
+        # MPCOptimizer plans with the single-node model and q_in_nominal_w
+        # instead, so that model is scored separately, per real heating run.
+        first_step_errors, run_end_errors = self._planner_run_errors(test_df)
+
+        def _median_and_mae(errors: np.ndarray) -> tuple[float, float]:
+            if errors.size == 0:
+                return float("nan"), float("nan")
+            return float(np.median(errors)), float(np.mean(np.abs(errors)))
+
+        first_step_bias_k, first_step_mae_k = _median_and_mae(first_step_errors)
+        run_end_bias_k, run_end_mae_k = _median_and_mae(run_end_errors)
+
+        logger.info(
+            "Boiler thermal validation, planning model (single node, q_in_nominal_w="
+            "%.0f W) over %d heating runs: after the first %.0f min median "
+            "error=%+.2f K, MAE=%.2f K | %.0f min after the run median "
+            "error=%+.2f K, MAE=%.2f K (planned minus measured).",
+            self.model.q_in_nominal_w,
+            run_end_errors.size,
+            MPCConfig().step_hours * 60.0,
+            first_step_bias_k,
+            first_step_mae_k,
+            self.PLANNER_CHECK_SETTLE_S / 60.0,
+            run_end_bias_k,
+            run_end_mae_k,
+        )
+
         result = {
             "r2": r2,
             "mae": mae,
             "rmse": rmse,
+            "planner_first_step_bias_k": first_step_bias_k,
+            "planner_first_step_mae_k": first_step_mae_k,
+            "planner_run_end_bias_k": run_end_bias_k,
+            "planner_run_end_mae_k": run_end_mae_k,
             "r2_idle": idle_metrics["r2"],
             "mae_idle": idle_metrics["mae"],
             "rmse_idle": idle_metrics["rmse"],
