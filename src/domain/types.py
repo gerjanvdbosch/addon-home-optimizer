@@ -559,6 +559,9 @@ class MPCInput:
     # this first, so only solar beyond it is available to the heat pump. Empty
     # means no forecast - all solar counts as available.
     baseload_forecast_w: tuple[float, ...] = ()
+    # How long the run in progress has been heating (hours), 0 when not heating -
+    # it keeps heating until its minimum runtime has passed (see MPCOptimizer).
+    heating_elapsed_hours: float = 0.0
 
 
 @dataclass(frozen=True)

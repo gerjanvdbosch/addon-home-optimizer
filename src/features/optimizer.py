@@ -1,4 +1,5 @@
 import logging
+import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -122,6 +123,9 @@ class MPCOptimizer:
                 f"the same length as solar_forecast_w ({horizon}), got "
                 f"{len(data.solar_p10_w)} and {len(data.solar_p90_w)}."
             )
+
+        if data.heating_elapsed_hours < 0:
+            raise ValueError("heating_elapsed_hours cannot be negative.")
 
         if data.baseload_forecast_w and len(data.baseload_forecast_w) != horizon:
             raise ValueError(
@@ -327,6 +331,28 @@ class MPCOptimizer:
                 model.minimum_runtime.add(
                     heating(model, k) >= model.boiler_start[start]
                 )
+
+        # A run already heating keeps heating until its minimum runtime has
+        # passed. Otherwise the next replan, minutes after the start, can plan it
+        # off at step 0 while the heat pump finishes the run anyway - the plan,
+        # and anything acting on it, would flip for nothing. Skipped where the
+        # model cannot represent that run: a tank above the heat pump's limit
+        # with no booster to plan with.
+        remaining_steps = math.ceil(
+            (min_runtime * self.config.step_hours - data.heating_elapsed_hours)
+            / self.config.step_hours
+            - 1e-9
+        )
+        unrepresentable = (
+            heat_pump_max_c is not None
+            and booster_heat_w is None
+            and initial_temperature >= heat_pump_max_c
+        )
+        model.running_run = pyo.ConstraintList()
+
+        if data.boiler_on_current and not unrepresentable:
+            for k in range(min(max(remaining_steps, 0), num_steps)):
+                model.running_run.add(heating(model, k) >= 1)
 
         # Exact zero-order-hold dynamics for the lumped tank node. Unlike the
         # two-node calibration model, this simplified model has no on/off

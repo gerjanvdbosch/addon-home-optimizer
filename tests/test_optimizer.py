@@ -357,6 +357,32 @@ def test_validate_input_rejects_a_baseload_forecast_of_the_wrong_length():
         MPCOptimizer(THERMAL_MODEL, MPCConfig()).solve(data)
 
 
+def _running_run_input(elapsed_hours: float) -> MPCInput:
+    """A run in progress that is not needed (target already met, no sun), so
+    stopping it would be cheapest."""
+
+    return _make_input(
+        solar_forecast_w=[0.0] * len(SOLAR_FORECAST_W),
+        current_temp_top=40.0,
+        current_temp_bottom=40.0,
+        boiler_on_current=True,
+        heating_elapsed_hours=elapsed_hours,
+    )
+
+
+def test_a_run_just_started_keeps_heating_until_its_minimum_runtime():
+    config = MPCConfig()
+    result = MPCOptimizer(THERMAL_MODEL, config).solve(_running_run_input(0.1))
+
+    assert result.schedule[: config.boiler_min_runtime_steps] == (1, 1)
+
+
+def test_a_run_past_its_minimum_runtime_may_stop():
+    result = MPCOptimizer(THERMAL_MODEL, MPCConfig()).solve(_running_run_input(1.0))
+
+    assert result.schedule[0] == 0
+
+
 def test_validate_input_rejects_mismatched_target_length():
     data = _make_input(target_temperature_top=(10.0, 10.0))  # wrong length
 
