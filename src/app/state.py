@@ -1,4 +1,4 @@
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
 
@@ -11,7 +11,13 @@ from domain.types import (
     State,
 )
 from features.dataset import DatasetBuilder, DatasetDefinition, DatasetLoader
-from features.solar import SolarBiasIdentifier, predict_solar, predict_solar_band
+from features.solar import (
+    PREDICT_STEP_MINUTES,
+    SolarBiasIdentifier,
+    nowcast_solar,
+    predict_solar,
+    predict_solar_band,
+)
 from infrastructure.repositories import ConfigRepository, StateRepository
 
 
@@ -81,13 +87,29 @@ class StateManager:
         if identifier.model is None:
             return
 
+        step = timedelta(minutes=PREDICT_STEP_MINUTES)
+        nowcast = self._current_quarter_nowcast(state.measurements.solar, now)
+
+        def from_now(series: pd.Series) -> pd.Series:
+            # Only quarter hours that haven't ended. The running one - the step
+            # the optimizer acts on - takes the measurement-based estimate where
+            # there is one, in all three solar scenarios alike: its spread over
+            # the next few minutes is not calibrated.
+            series = series[series.index > now - step]
+
+            if nowcast is not None and nowcast[0] in series.index:
+                series = series.copy()
+                series[nowcast[0]] = nowcast[1]
+
+            return series
+
         p50 = predict_solar(
             identifier.model,
             self._future_series(forecast.p50, now),
             self.latitude,
             self.longitude,
         )
-        state.predictions.solar = self._series_points(p50)
+        state.predictions.solar = self._series_points(from_now(p50))
 
         if forecast.p10 and forecast.p90:
             p10, p90 = predict_solar_band(
@@ -96,8 +118,8 @@ class StateManager:
                 self._future_series(forecast.p90, now),
                 now,
             )
-            state.predictions.solar_p10 = self._series_points(p10)
-            state.predictions.solar_p90 = self._series_points(p90)
+            state.predictions.solar_p10 = self._series_points(from_now(p10))
+            state.predictions.solar_p90 = self._series_points(from_now(p90))
         else:
             state.predictions.solar_p10 = []
             state.predictions.solar_p90 = []
@@ -109,7 +131,43 @@ class StateManager:
             index=pd.DatetimeIndex([point.time for point in points]),
         )
 
-        return series[series.index > now]
+        # From the period running at `now`: Solcast times are period starts, so
+        # that period's value is the forecast for right now - starting after
+        # `now` instead left the optimizer's plan beginning up to 30 minutes
+        # ahead.
+        running = series.index[series.index <= now]
+
+        return series[series.index >= running.max()] if len(running) else series
+
+    def _current_quarter_nowcast(
+        self, measured: list[SeriesPoint], now: datetime
+    ) -> tuple[pd.Timestamp, float] | None:
+        """(start of the quarter hour running at `now`, PV output expected over
+        it) from the latest measured quarter-hour mean (see nowcast_solar), or
+        None without a measurement from this or the previous quarter hour - e.g.
+        the PV sensor stops reporting at night."""
+
+        if not measured:
+            return None
+
+        step = timedelta(minutes=PREDICT_STEP_MINUTES)
+        quarter = pd.Timestamp(now).floor(f"{PREDICT_STEP_MINUTES}min")
+        latest_start = pd.Timestamp(measured[-1].time)
+
+        if not quarter - step <= latest_start <= quarter:
+            return None
+
+        # A running quarter hour's mean covers its start up to now.
+        latest_end = min(latest_start + step, pd.Timestamp(now))
+        value = nowcast_solar(
+            measured[-1].value,
+            latest_start + (latest_end - latest_start) / 2,
+            quarter + step / 2,
+            self.latitude,
+            self.longitude,
+        )
+
+        return None if value is None else (quarter, value)
 
     @staticmethod
     def _series_points(series: pd.Series) -> list[SeriesPoint]:

@@ -21,6 +21,7 @@ from features.solar import (
     _prepare,
     _quantile_scale_arrays,
     _solar_elevation,
+    nowcast_solar,
     predict_solar,
     predict_solar_band,
 )
@@ -665,3 +666,28 @@ def test_predict_solar_returns_empty_series_for_empty_input():
     result = predict_solar(_UnitScaleModel(), empty, LATITUDE, LONGITUDE)
 
     assert result.empty
+
+
+def test_nowcast_carries_measured_output_along_the_sun_elevation():
+    measured_at = datetime(2026, 6, 21, 6, 0, tzinfo=UTC)
+    target = measured_at + timedelta(minutes=15)
+    elevation = _solar_elevation(
+        pd.Series([measured_at, target]), LATITUDE, LONGITUDE
+    ).to_numpy()
+
+    result = nowcast_solar(1000.0, measured_at, target, LATITUDE, LONGITUDE)
+
+    expected = (
+        1000.0 * np.sin(np.radians(elevation[1])) / np.sin(np.radians(elevation[0]))
+    )
+    assert result == pytest.approx(expected)
+    assert result > 1000.0  # the morning sun is still rising
+
+
+def test_nowcast_is_undefined_with_the_sun_below_the_horizon():
+    night = datetime(2026, 6, 21, 0, 0, tzinfo=UTC)
+
+    assert (
+        nowcast_solar(0.0, night, night + timedelta(minutes=15), LATITUDE, LONGITUDE)
+        is None
+    )
