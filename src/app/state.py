@@ -1,3 +1,4 @@
+import math
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
@@ -139,13 +140,14 @@ class StateManager:
 
         return series[series.index >= running.max()] if len(running) else series
 
-    def _current_quarter_nowcast(
-        self, measured: list[SeriesPoint], now: datetime
-    ) -> tuple[pd.Timestamp, float] | None:
-        """(start of the quarter hour running at `now`, PV output expected over
-        it) from the latest measured quarter-hour mean (see nowcast_solar), or
-        None without a measurement from this or the previous quarter hour - e.g.
-        the PV sensor stops reporting at night."""
+    @staticmethod
+    def _latest_measurement(
+        measured: list[SeriesPoint], now: datetime
+    ) -> tuple[pd.Timestamp, float, pd.Timestamp] | None:
+        """(start of the quarter hour running at `now`, the latest measured
+        quarter-hour mean, the middle of the time that mean covers), or None
+        without a measurement from this or the previous quarter hour - e.g. the
+        PV sensor stops reporting at night."""
 
         if not measured:
             return None
@@ -159,15 +161,60 @@ class StateManager:
 
         # A running quarter hour's mean covers its start up to now.
         latest_end = min(latest_start + step, pd.Timestamp(now))
-        value = nowcast_solar(
-            measured[-1].value,
+
+        return (
+            quarter,
+            float(measured[-1].value),
             latest_start + (latest_end - latest_start) / 2,
-            quarter + step / 2,
+        )
+
+    def _current_quarter_nowcast(
+        self, measured: list[SeriesPoint], now: datetime
+    ) -> tuple[pd.Timestamp, float] | None:
+        """(start of the quarter hour running at `now`, PV output expected over
+        it) from the latest measurement (see nowcast_solar), or None."""
+
+        latest = self._latest_measurement(measured, now)
+
+        if latest is None:
+            return None
+
+        quarter, measured_w, measured_time = latest
+        value = nowcast_solar(
+            measured_w,
+            measured_time,
+            quarter + timedelta(minutes=PREDICT_STEP_MINUTES) / 2,
             self.latitude,
             self.longitude,
         )
 
         return None if value is None else (quarter, value)
+
+    def baseload_forecast(
+        self, state: State, times: list[datetime], now: datetime
+    ) -> list[float]:
+        """Baseload forecast aligned to `times`, 0.0 where there is none (see
+        align_predictions). The quarter hour running at `now` - the step the
+        optimizer acts on - takes the measurement so far instead: load that is on
+        right now is real. On real data, for the rest of that quarter hour over
+        28 days, that cut the error from 105.6 to 95.0 W. It does expect more load
+        that then isn't drawn (21.9 -> 47.1 W, an appliance run ending within the
+        quarter hour), but that only delays heating until the next replan minutes
+        later, while missing load that is on (83.8 -> 47.9 W) starts a run that
+        imports from the grid for at least its minimum runtime. The lower of
+        forecast and measurement was tried first: least phantom load (8.9 W), but
+        the most missed load (92.5 W) - the costlier error.
+        """
+
+        forecast = self.align_predictions(
+            state.predictions.baseload, times, default=math.nan
+        )
+        latest = self._latest_measurement(state.measurements.baseload, now)
+
+        if latest is not None and times and pd.Timestamp(times[0]) == latest[0]:
+            forecast[0] = latest[1]
+
+        return [0.0 if math.isnan(value) else value for value in forecast]
 
     @staticmethod
     def _series_points(series: pd.Series) -> list[SeriesPoint]:

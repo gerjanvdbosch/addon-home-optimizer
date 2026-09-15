@@ -323,6 +323,40 @@ def test_validate_input_rejects_a_solar_band_of_the_wrong_length():
         optimizer.solve(_make_input(solar_p10_w=tuple(SOLAR_FORECAST_W)))
 
 
+def test_baseload_takes_its_share_of_the_sun_first():
+    """Only solar beyond the rest of the house's own draw is available to the
+    heat pump: with a baseload as large as the solar forecast, heating costs the
+    same as with no sun at all."""
+
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[18] = 45.0
+    optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig())
+
+    no_sun = optimizer.solve(
+        _make_input(
+            solar_forecast_w=[0.0] * len(SOLAR_FORECAST_W),
+            target_temperature_top=tuple(target),
+        )
+    )
+    all_sun_used_by_the_house = optimizer.solve(
+        _make_input(
+            target_temperature_top=tuple(target),
+            baseload_forecast_w=tuple(SOLAR_FORECAST_W),
+        )
+    )
+
+    assert all_sun_used_by_the_house.objective_value == pytest.approx(
+        no_sun.objective_value
+    )
+
+
+def test_validate_input_rejects_a_baseload_forecast_of_the_wrong_length():
+    data = _make_input(baseload_forecast_w=(0.0,))
+
+    with pytest.raises(ValueError, match="baseload_forecast_w"):
+        MPCOptimizer(THERMAL_MODEL, MPCConfig()).solve(data)
+
+
 def test_validate_input_rejects_mismatched_target_length():
     data = _make_input(target_temperature_top=(10.0, 10.0))  # wrong length
 

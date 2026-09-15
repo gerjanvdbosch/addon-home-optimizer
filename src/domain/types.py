@@ -555,6 +555,10 @@ class MPCInput:
     # available": plan on solar_forecast_w alone.
     solar_p10_w: tuple[float, ...] = ()
     solar_p90_w: tuple[float, ...] = ()
+    # Baseload forecast (W) aligned to the horizon: the rest of the house draws
+    # this first, so only solar beyond it is available to the heat pump. Empty
+    # means no forecast - all solar counts as available.
+    baseload_forecast_w: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)

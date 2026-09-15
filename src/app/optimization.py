@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 from app.state import StateManager
@@ -135,6 +136,11 @@ class Optimization:
             outdoor_temperature_forecast=outdoor_temperature_forecast,
             solar_p10_w=solar_p10,
             solar_p90_w=solar_p90,
+            baseload_forecast_w=tuple(
+                self.state_manager.baseload_forecast(
+                    state, forecast_times, datetime.now(timezone.utc)
+                )
+            ),
         )
 
         optimizer = MPCOptimizer(

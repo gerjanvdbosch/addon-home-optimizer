@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from domain.types import BoilerThermalModel, MPCConfig, MPCInput
 from features.boiler import BoilerThermalIdentifier, booster_active
@@ -124,3 +125,27 @@ def test_booster_heats_above_the_heat_pump_limit_and_only_there():
     assert booster_steps
     assert all(temperatures[i] >= 55.0 - 1e-6 for i in booster_steps)
     assert all(temperatures[i + 1] <= 55.0 + 1e-6 for i in heat_pump_steps)
+
+
+def test_a_run_started_by_the_booster_counts_as_a_start():
+    """A booster-only run (tank already above the heat pump's limit) is still a
+    DHW run that has to be started - its start carries the switching cost."""
+
+    target = [10.0] * HORIZON
+    target[8] = 57.0
+    data = MPCInput(
+        solar_forecast_w=[0.0] * HORIZON,
+        ambient_temperature=20.0,
+        current_temp_top=56.0,
+        current_temp_bottom=56.0,
+        boiler_on_current=False,
+        target_temperature_top=tuple(target),
+    )
+
+    free = MPCOptimizer(BOOSTER_MODEL, MPCConfig(weight_switching=0.0)).solve(data)
+    charged = MPCOptimizer(BOOSTER_MODEL, MPCConfig()).solve(data)
+
+    assert any(charged.schedule)
+    assert charged.objective_value == pytest.approx(
+        free.objective_value + MPCConfig().weight_switching
+    )

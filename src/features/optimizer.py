@@ -123,6 +123,12 @@ class MPCOptimizer:
                 f"{len(data.solar_p10_w)} and {len(data.solar_p90_w)}."
             )
 
+        if data.baseload_forecast_w and len(data.baseload_forecast_w) != horizon:
+            raise ValueError(
+                "baseload_forecast_w must be empty or have the same length as "
+                f"solar_forecast_w ({horizon}), got {len(data.baseload_forecast_w)}."
+            )
+
         if self.config.step_hours <= 0:
             raise ValueError("step_hours must be greater than zero.")
 
@@ -197,8 +203,22 @@ class MPCOptimizer:
             if data.solar_p10_w
             else [(1.0, data.solar_forecast_w)]
         )
+        # Only solar beyond the rest of the house's own draw (the baseload) is
+        # available to the heat pump - taken per fine step, before a coarse block
+        # is averaged, since the surplus is not linear in solar.
+        baseload_w = data.baseload_forecast_w or (0.0,) * horizon
         solar_scenarios = [
-            (weight, self._aggregate(values, plan, mean))
+            (
+                weight,
+                self._aggregate(
+                    [
+                        max(0.0, float(solar) - float(baseload))
+                        for solar, baseload in zip(values, baseload_w, strict=True)
+                    ],
+                    plan,
+                    mean,
+                ),
+            )
             for weight, values in scenarios
         ]
         tap_w = self._aggregate(
@@ -268,11 +288,20 @@ class MPCOptimizer:
         # apparently-wasteful "never stops heating" result before this fix).
         # weight_switching in the objective still drives it to 0 except at real
         # starts, since setting it higher only adds cost.
+        # A run is a start of heating by either source: a booster-only run is
+        # still a DHW run the heat pump has to start, and handing over from the
+        # compressor to the booster within a run is not a second start (the two
+        # never heat together - see heat_source_constraints). Counting only
+        # compressor starts once let a free night-time booster run beat a
+        # cheaper solar heat pump run the next day on its start cost alone.
+        def heating(m: pyo.ConcreteModel, k: int):
+            return m.boiler_on[k] + m.booster_on[k]
+
         def startup_rule(m: pyo.ConcreteModel, k: int):
             if k == 0:
-                return m.boiler_start[k] >= (m.boiler_on[k] - initial_boiler_on)
+                return m.boiler_start[k] >= (heating(m, k) - initial_boiler_on)
 
-            return m.boiler_start[k] >= (m.boiler_on[k] - m.boiler_on[k - 1])
+            return m.boiler_start[k] >= (heating(m, k) - heating(m, k - 1))
 
         model.startup_constraint = pyo.Constraint(
             model.K,
@@ -296,7 +325,7 @@ class MPCOptimizer:
                     continue
 
                 model.minimum_runtime.add(
-                    model.boiler_on[k] >= model.boiler_start[start]
+                    heating(model, k) >= model.boiler_start[start]
                 )
 
         # Exact zero-order-hold dynamics for the lumped tank node. Unlike the
