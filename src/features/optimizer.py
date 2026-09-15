@@ -214,6 +214,8 @@ class MPCOptimizer:
         # neighboring step.
         target_c = self._aggregate(data.target_temperature_top, plan, max)
         overall_target_max = max(data.target_temperature_top)
+        heat_pump_max_c = self.thermal_model.heat_pump_max_tank_temperature_c
+        booster_heat_w = self.thermal_model.booster_heat_w
 
         model = pyo.ConcreteModel()
 
@@ -224,6 +226,16 @@ class MPCOptimizer:
         model.boiler_on = pyo.Var(model.K, domain=pyo.Binary)
 
         model.boiler_start = pyo.Var(model.K, domain=pyo.Binary)
+
+        # Heat pump heat (W): continuous up to q_in_nominal_w while on - the
+        # compressor modulates down near its tank limit (real data: ~7 kW at
+        # 36-47 degC, ~3 kW at 55 degC) rather than stopping abruptly.
+        model.q_heat_pump_w = pyo.Var(
+            model.K, bounds=(0.0, self.thermal_model.q_in_nominal_w)
+        )
+
+        # The booster heater, all-or-nothing at its identified rating.
+        model.booster_on = pyo.Var(model.K, domain=pyo.Binary)
 
         model.slack = pyo.Var(model.K, domain=pyo.NonNegativeReals)
 
@@ -314,8 +326,43 @@ class MPCOptimizer:
                 model.T[k + 1]
                 == a_d[0, 0] * model.T[k]
                 + b_d[0, 0] * float(data.ambient_temperature)
-                + b_d[0, 1] * self.thermal_model.q_in_nominal_w * model.boiler_on[k]
+                + b_d[0, 1] * model.q_heat_pump_w[k]
+                + b_d[0, 1] * (booster_heat_w or 0.0) * model.booster_on[k]
                 + b_d[0, 2] * float(tap_w[k])
+            )
+
+        # The heat pump cannot lift the tank past its own limit; above it only
+        # the booster heats, never together with the compressor (real data: 0 Hz
+        # throughout). Both identified from booster runs (see
+        # BoilerThermalIdentifier._identify_booster) - until one has been
+        # observed, planning stays heat-pump-only and unlimited, as before. The
+        # heat pump is still costed at full power while on (see active_power_w),
+        # a conservative overestimate for a last, modulated-down step.
+        model.heat_source_constraints = pyo.ConstraintList()
+
+        for k in range(num_steps):
+            model.heat_source_constraints.add(
+                model.q_heat_pump_w[k]
+                <= self.thermal_model.q_in_nominal_w * model.boiler_on[k]
+            )
+
+            if heat_pump_max_c is not None and k + 1 < num_steps:
+                t_upper = model.T[k + 1].bounds[1]
+                model.heat_source_constraints.add(
+                    model.T[k + 1]
+                    <= heat_pump_max_c
+                    + (t_upper - heat_pump_max_c) * (1 - model.boiler_on[k])
+                )
+
+            if heat_pump_max_c is None or booster_heat_w is None:
+                model.booster_on[k].fix(0)
+                continue
+
+            model.heat_source_constraints.add(
+                model.boiler_on[k] + model.booster_on[k] <= 1
+            )
+            model.heat_source_constraints.add(
+                model.T[k] >= heat_pump_max_c * model.booster_on[k]
             )
 
         # active_power_w[k, s] represents boiler_on[k] * max(0,
@@ -360,6 +407,15 @@ class MPCOptimizer:
                     - big_m * (1 - model.boiler_on[k])
                 )
 
+                # A resistive element: its electrical power equals its heat
+                # (COP 1 - real data: 1.37 kWh heat for 1.38 kWh electrical).
+                if booster_heat_w is not None:
+                    model.active_power_constraint.add(
+                        model.active_power_w[k, s]
+                        >= (booster_heat_w - solar_available_w)
+                        - booster_heat_w * (1 - model.booster_on[k])
+                    )
+
         # Heat still in the tank when the horizon ends is not lost: it covers
         # demand after the horizon that would otherwise need heating then.
         # Without a value for it, heat stored from (partly free) solar ahead of
@@ -393,15 +449,10 @@ class MPCOptimizer:
         )
 
         # Credited only up to the tank temperature the heat pump itself can
-        # reach (its supply limit minus the supply-to-tank margin, see
-        # _power_line_coefficients); above that the booster element takes over,
-        # which this model does not plan with.
+        # reach: heat above it can only come from the booster at COP 1, never
+        # cheaper than the grid heat pump heat the value is priced at.
         model.stored_temperature = pyo.Var(
-            bounds=(
-                None,
-                HeatPumpCOPIdentifier.POWER_FIT_T_HIGH_C
-                - self._supply_margin_c(overall_target_max),
-            )
+            bounds=(None, self._heat_pump_max_tank_temperature_c(overall_target_max))
         )
         model.stored_temperature_constraint = pyo.Constraint(
             expr=model.stored_temperature <= model.T[num_steps - 1]
@@ -524,6 +575,21 @@ class MPCOptimizer:
             self.cop_model.reference_supply_temperature_c - overall_target_max, 0.0
         )
 
+    def _heat_pump_max_tank_temperature_c(self, overall_target_max: float) -> float:
+        """The highest tank temperature the heat pump reaches on its own,
+        identified from booster runs (see BoilerThermalIdentifier._identify_booster).
+        Until one has been observed, estimated as its supply limit minus the
+        supply-to-tank margin."""
+
+        identified = self.thermal_model.heat_pump_max_tank_temperature_c
+
+        if identified is not None:
+            return identified
+
+        return HeatPumpCOPIdentifier.POWER_FIT_T_HIGH_C - self._supply_margin_c(
+            overall_target_max
+        )
+
     def _build_objective(
         self,
         model: pyo.ConcreteModel,
@@ -558,10 +624,20 @@ class MPCOptimizer:
 
         objective_value = float(pyo.value(model.objective))
 
-        boiler_on_model = [
-            round(float(pyo.value(model.boiler_on[k]))) for k in range(plan.num_steps)
+        booster_heat_w = self.thermal_model.booster_heat_w or 0.0
+        booster_on_model = [
+            round(float(pyo.value(model.booster_on[k]))) for k in range(plan.num_steps)
         ]
-        schedule = tuple(boiler_on_model[plan.fine_to_model[i]] for i in range(horizon))
+        heat_w_model = [
+            float(pyo.value(model.q_heat_pump_w[k]))
+            + booster_heat_w * booster_on_model[k]
+            for k in range(plan.num_steps)
+        ]
+        # "On" whenever the boiler is heated, by either source.
+        schedule = tuple(
+            max(round(float(pyo.value(model.boiler_on[m]))), booster_on_model[m])
+            for m in plan.fine_to_model
+        )
 
         # Replayed at the input's own fine resolution using the
         # *un-aggregated* ambient/tap data - only the on/off decision is
@@ -580,12 +656,11 @@ class MPCOptimizer:
 
         for i in range(horizon - 1):
             t = temperatures[-1]
-            on = schedule[i]
 
             next_t = (
                 a_d[0, 0] * t
                 + b_d[0, 0] * float(data.ambient_temperature)
-                + b_d[0, 1] * self.thermal_model.q_in_nominal_w * on
+                + b_d[0, 1] * heat_w_model[plan.fine_to_model[i]]
                 + b_d[0, 2] * float(tap_forecast_w[i])
             )
             temperatures.append(float(next_t))
@@ -601,6 +676,11 @@ class MPCOptimizer:
         electrical_power_w = []
 
         for i in range(horizon):
+            if booster_on_model[plan.fine_to_model[i]]:
+                # Resistive element: electrical power equals its heat (COP 1).
+                electrical_power_w.append(booster_heat_w)
+                continue
+
             T_outdoor = (
                 data.outdoor_temperature_forecast[i]
                 if data.outdoor_temperature_forecast

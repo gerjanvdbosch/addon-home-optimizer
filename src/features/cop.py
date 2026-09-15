@@ -13,7 +13,7 @@ from domain.types import (
     Config,
     HeatPumpCOPModel,
 )
-from features.boiler import CP_WATER_J_PER_KG_K, RHO_WATER_KG_PER_L
+from features.boiler import CP_WATER_J_PER_KG_K, RHO_WATER_KG_PER_L, booster_active
 from features.dataset import DatasetBuilder, DatasetDefinition
 from features.identifier import SystemIdentifier
 
@@ -44,16 +44,6 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
     # instance's own mode filter excludes it anyway.
     HEAT_PUMP_OFF_STATE = "Uit"
 
-    # Whitelist (only explicitly reported "on" excludes a row) - same
-    # principle as HEAT_PUMP_OFF_STATE above: a resistive backup/booster
-    # heater is a fundamentally different heat source (no compressor, no
-    # refrigerant cycle - COP is trivially ~1 by definition), so any row
-    # where it is confirmed active must not contribute to the heat pump's
-    # own COP fit. Only applied when HeatPumpConfig.booster is configured
-    # (see dataset()) - not every installation has a separate sensor for
-    # this. Home Assistant's own binary_sensor convention.
-    BOOSTER_ACTIVE_STATE = "on"
-
     MIN_FLOW_LPM = 0.0
     # Watts, not kW - matches the rest of this codebase's convention (e.g.
     # boiler.py's q_in_nominal_w, MPCConfig.boiler_electrical_power_w) and the
@@ -62,10 +52,14 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
     MIN_ELECTRICAL_POWER_W = 100.0
 
     # COP=1 is the theoretical floor for any heat pump (no better than pure
-    # resistive heating); COP=10 is a generous ceiling far above what a real
-    # residential compressor achieves even at its most favorable operating
-    # point - both are sanity bounds to reject nonsensical measurements (e.g.
-    # a near-zero electrical reading), not a claim about typical performance.
+    # resistive heating) - it clamps the model's own predictions (see
+    # clamped_cop) but does not filter measurements: a measured COP around 1 is
+    # exactly what booster-heater rows look like (real data: 0.99), so as a
+    # filter it silently dropped some of them and let others through. Those
+    # rows are excluded explicitly instead (see prepare()). COP=10 is a generous
+    # ceiling far above what a real residential compressor achieves even at its
+    # most favorable operating point - a sanity bound that still rejects
+    # nonsensical measurements (e.g. a near-zero electrical reading).
     MIN_COP = 1.0
     MAX_COP = 10.0
 
@@ -279,37 +273,37 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         # A single combined fit across modes would average over genuinely
         # different compressor operating points (see class docstring) - only
         # this instance's own mode may contribute evidence to its fit.
+        # A resistive booster heater follows entirely different physics (no
+        # compressor, COP ~1 - real data: 1.37 kWh heat for 1.38 kWh
+        # electrical) and must not be mixed into the heat pump's own COP fit.
+        # Recognised with or without its own sensor (see booster_active) - it
+        # engages above ~55 degC tank temperature, exactly the top of the
+        # T_supply range this fit would otherwise treat as heat-pump behavior.
+        booster = booster_active(df, self.mode)
+        in_mode = df["state"] == self.mode
+
         valid = (
-            (df["state"] == self.mode)
+            in_mode
+            & ~booster
             & (df["flow_lpm"] > self.MIN_FLOW_LPM)
             & (df["P_el"] > self.MIN_ELECTRICAL_POWER_W)
             & (df["delta_t_water"] > 0.0)
             & (df["Q_th"] > 0.0)
-            & (df["COP_measured"] > self.MIN_COP)
             & (df["COP_measured"] < self.MAX_COP)
         )
 
-        # Only present when HeatPumpConfig.booster is configured (see
-        # dataset()) - a resistive backup heater's electrical draw follows
-        # entirely different physics (no compressor, COP trivially ~1) and
-        # must not be mixed into the heat pump's own COP fit (see
-        # BOOSTER_ACTIVE_STATE's class docstring). Real data on this
-        # installation showed this heater engaging above roughly 55-60 degC
-        # supply temperature - exactly the noisy, physically inconsistent
-        # tail end of the T_supply range this identifier otherwise had to
-        # treat as heat-pump behavior.
-        if "booster" in df.columns:
-            valid = valid & (df["booster"] != self.BOOSTER_ACTIVE_STATE)
-
         invalid_count = int((~valid).sum())
+        booster_count = int((in_mode & booster).sum())
 
         df = df.loc[valid].copy()
 
         logger.info(
-            "Heat pump COP preparation (%s): %d valid points, %d points removed",
+            "Heat pump COP preparation (%s): %d valid points, %d points removed "
+            "(%d of them booster heater)",
             self.mode,
             len(df),
             invalid_count,
+            booster_count,
         )
 
         if df.empty:
@@ -939,6 +933,25 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
                 right_on=("target_time",),
                 how="left",
             )
+        )
+
+        # Recognises the booster heater without its own sensor (see
+        # booster_active). Only reported on change - also the change to 0 Hz
+        # when the compressor stops - so the previous reading is the current
+        # one: fill="none" hid booster rows sitting at a constant 0 Hz, and
+        # fill=0 turned a compressor running at a constant frequency into false
+        # booster rows (both confirmed on real data).
+        builder = builder.timeseries(
+            "compressor_frequency",
+            config.heat_pump.compressor_frequency,
+            interval="5m",
+            aggregation="mean",
+            fill="previous",
+        ).join(
+            left="T_supply",
+            right="compressor_frequency",
+            on=("time",),
+            how="left",
         )
 
         # Optional: only some installations report this separately (see

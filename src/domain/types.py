@@ -430,6 +430,13 @@ class BoilerThermalModel:
     ua_mix_idle_w_per_k: float
     ua_mix_active_w_per_k: float
     q_in_nominal_w: float
+    # Identified from heating runs where the booster heater took over (see
+    # BoilerThermalIdentifier._identify_booster): the highest tank temperature
+    # the heat pump reaches on its own, and the booster's heat input (W). None
+    # until such a run has been observed - the optimizer then does not plan
+    # with the booster.
+    heat_pump_max_tank_temperature_c: float | None = None
+    booster_heat_w: float | None = None
 
 
 # Exact by definition of the Kelvin scale (0 degC = 273.15 K) - used

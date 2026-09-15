@@ -125,6 +125,52 @@ def lumped_state_space(
     return a, b
 
 
+# Home Assistant's binary_sensor convention; InfluxDB stores the same state as 1.
+BOOSTER_ACTIVE_STATE = "on"
+
+
+def booster_active(df: pd.DataFrame, active_state: str) -> pd.Series:
+    """Rows where the resistive booster heater, not the compressor, heats.
+
+    The booster sensor is authoritative where configured. Without it - including
+    all history from before it was added - the booster shows by its physics: the
+    heat pump stays in `active_state` with water circulating while the
+    compressor is fully stopped (0 Hz), so the heat cannot come from the
+    refrigerant cycle. Two moments of a normal run look the same and are ruled
+    out (both confirmed on real data): its start, where the pump circulates
+    before the compressor ramps up - so the compressor must already have run in
+    this run, as the booster takes over from it - and its last row, where the
+    pump overruns after the compressor stops - so the run must continue, unless
+    the row before was already the booster.
+    """
+
+    active = pd.Series(False, index=df.index)
+
+    if "booster" in df.columns:
+        active |= (df["booster"] == BOOSTER_ACTIVE_STATE) | (
+            pd.to_numeric(df["booster"], errors="coerce") == 1
+        )
+
+    if {"state", "compressor_frequency", "flow_lpm"} <= set(df.columns):
+        in_state = df["state"] == active_state
+        frequency = pd.to_numeric(df["compressor_frequency"], errors="coerce")
+        run_id = (in_state != in_state.shift()).cumsum()
+        compressor_ran = (
+            (in_state & (frequency > 0)).groupby(run_id).cummax().astype(bool)
+        )
+        candidate = (
+            in_state
+            & compressor_ran
+            & (frequency <= 0)
+            & (pd.to_numeric(df["flow_lpm"], errors="coerce") > 0)
+        )
+        active |= candidate & (
+            in_state.shift(-1, fill_value=False) | candidate.shift(fill_value=False)
+        )
+
+    return active
+
+
 def _model_from_parameters(
     parameters: np.ndarray,
     volume_l: float,
@@ -456,6 +502,11 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
         if "flow_lpm" in df.columns:
             df = self._bridge_flow_reporting_gaps(df)
+
+        # Booster heat still reaches the tank through the coil (it heats the
+        # primary water), so the calorimetric override below covers it - this
+        # only tells the two heat sources apart (see _identify_booster).
+        df["booster_on"] = booster_active(df, self.DHW_ACTIVE_STATE)
 
         # Calorimetric heat input: Q = (rho*cp/60) * flow_lpm * max(T_supply -
         # T_return, 0) replaces the fitted constant Q_in_nominal_w wherever
@@ -1172,7 +1223,54 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
         self.model = _model_from_parameters(robust_fit.x, self.volume_l)
 
+        heat_pump_max_c, booster_heat_w = self._identify_booster(df)
+        self.model.heat_pump_max_tank_temperature_c = heat_pump_max_c
+        self.model.booster_heat_w = booster_heat_w
+
+        if heat_pump_max_c is None:
+            logger.info(
+                "Boiler thermal calibration: no booster heater run found - the "
+                "heat pump's tank limit and the booster's heat stay unidentified, "
+                "so the optimizer does not plan with the booster."
+            )
+        else:
+            logger.info(
+                "Boiler thermal calibration: booster took over at a median tank "
+                "temperature of %.1f degC (the heat pump's own limit), delivering "
+                "%s W.",
+                heat_pump_max_c,
+                "unknown" if booster_heat_w is None else f"{booster_heat_w:.0f}",
+            )
+
         return self.model
+
+    def _identify_booster(
+        self, df: pd.DataFrame
+    ) -> tuple[float | None, float | None]:
+        """(heat pump max tank temperature degC, booster heat W) from the heating
+        runs where the booster took over; None for what the data cannot show.
+
+        The booster engages because the compressor cannot lift the tank any
+        further (its supply temperature limit minus the coil's approach), so
+        the tank temperature at booster onset is the heat pump's own limit
+        (real data: 55.0-55.5 degC in every session). The booster is a resistive
+        element with a fixed rating, so its heat is the median calorimetric heat
+        over its rows - robust to the partial first and last rows.
+        """
+
+        booster = df["booster_on"] & df["boiler_on"]
+
+        if not booster.any():
+            return None, None
+
+        onset = booster & ~booster.shift(fill_value=False)
+        T_average = (df["T_top"] + df["T_bottom"]) / 2.0
+        booster_heat_w = df.loc[booster, "q_in_override_w"].median()
+
+        return (
+            float(T_average[onset].median()),
+            None if np.isnan(booster_heat_w) else float(booster_heat_w),
+        )
 
     def _exclude_forecast_tap_draws(
         self,
@@ -1361,6 +1459,12 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         T_average = ((df["T_top"] + df["T_bottom"]) / 2.0).to_numpy(dtype=float)
         T_ambient = df["T_ambient"].to_numpy(dtype=float)
         on = df["boiler_on"].to_numpy(dtype=bool)
+        booster = (
+            df["booster_on"].to_numpy(dtype=bool)
+            if "booster_on" in df.columns
+            else np.zeros(len(df), dtype=bool)
+        )
+        heat_pump_max_c = model.heat_pump_max_tank_temperature_c
         max_gap_seconds = self.MAX_DT_SECONDS_MULTIPLE * float(
             np.median(np.diff(seconds))
         )
@@ -1399,8 +1503,23 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
                     discretized[dt] = discretize_zoh(a, b, dt)
                 a_d, b_d = discretized[dt]
 
-                q_in = model.q_in_nominal_w if on[i] else 0.0
-                T = a_d[0, 0] * T + b_d[0, 0] * T_ambient[i] + b_d[0, 1] * q_in
+                # Same heat sources MPCOptimizer plans with: the booster at its
+                # identified heat, the heat pump at q_in_nominal_w but never
+                # lifting the tank past its own limit (it modulates down there).
+                booster_step = bool(on[i] and booster[i])
+                booster_heat_w = model.booster_heat_w
+
+                if booster_step and booster_heat_w is not None:
+                    q_in = booster_heat_w
+                else:
+                    q_in = model.q_in_nominal_w if on[i] else 0.0
+
+                T_next = a_d[0, 0] * T + b_d[0, 0] * T_ambient[i] + b_d[0, 1] * q_in
+
+                if on[i] and not booster_step and heat_pump_max_c is not None:
+                    T_next = min(T_next, max(heat_pump_max_c, T))
+
+                T = T_next
 
                 if i + 1 == first_check:
                     first_step_errors.append(T - T_average[i + 1])
@@ -1843,7 +1962,30 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
                 aggregation="last",
                 fill="previous",
             )
+            # Tells booster heat from heat pump heat (see booster_active). Only
+            # reported on change - also the change to 0 Hz when the compressor
+            # stops - so the previous reading is the current one: fill="none"
+            # hid booster rows sitting at a constant 0 Hz, and fill=0 turned a
+            # compressor running at a constant frequency into false booster rows
+            # (both confirmed on real data).
+            .timeseries(
+                "compressor_frequency",
+                config.heat_pump.compressor_frequency,
+                interval="5m",
+                aggregation="mean",
+                fill="previous",
+            )
         )
+
+        # Optional booster sensor, an event-driven on/off state like "state".
+        if config.heat_pump.booster is not None:
+            builder = builder.timeseries(
+                "booster",
+                config.heat_pump.booster,
+                interval="5m",
+                aggregation="last",
+                fill="previous",
+            )
 
         # Device trackers are an independent, exogenous signal (not derived from
         # boiler temperature at all): nobody home rules out a tap draw (barring a
