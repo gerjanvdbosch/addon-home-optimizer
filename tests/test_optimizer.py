@@ -1,3 +1,5 @@
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -182,6 +184,8 @@ def test_thermal_dynamics_matches_manual_discretization():
 
     # Minimum runtime of 1 so an arbitrary short on/off pattern doesn't conflict
     # with the (unrelated) scheduling constraint this test isn't exercising.
+    # THERMAL_MODEL has no identified tank maximum, so nothing caps the
+    # trajectory either.
     optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig(boiler_min_runtime_steps=1))
     model = optimizer._build_model(data)
 
@@ -191,6 +195,9 @@ def test_thermal_dynamics_matches_manual_discretization():
 
     for k, v in enumerate(pattern):
         model.boiler_on[k].fix(v)
+        # Heat input is continuous (the compressor modulates), so fix it to the
+        # nominal output this test re-derives by hand.
+        model.q_heat_pump_w[k].fix(THERMAL_MODEL.q_in_nominal_w if v else 0.0)
 
     from pyomo.contrib.appsi.solvers.highs import Highs
 
@@ -355,6 +362,36 @@ def test_validate_input_rejects_a_baseload_forecast_of_the_wrong_length():
 
     with pytest.raises(ValueError, match="baseload_forecast_w"):
         MPCOptimizer(THERMAL_MODEL, MPCConfig()).solve(data)
+
+
+MAX_TANK_C = 60.0
+LIMITED_MODEL = dataclasses.replace(THERMAL_MODEL, max_tank_temperature_c=MAX_TANK_C)
+
+
+def test_planning_never_heats_above_the_tank_maximum():
+    """A target above the tank's identified maximum cannot be met by heating past
+    it - that shortfall belongs in the slack, not in an impossible plan."""
+
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[18] = MAX_TANK_C + 10.0
+
+    result = MPCOptimizer(LIMITED_MODEL, MPCConfig()).solve(
+        _make_input(target_temperature_top=tuple(target))
+    )
+
+    assert max(result.temperatures) <= MAX_TANK_C + 1e-6
+    assert any(result.schedule)
+
+
+def test_a_tank_hotter_than_the_maximum_is_simply_not_heated():
+    """A tank above the maximum (e.g. after a manual legionella cycle) must leave
+    the plan solvable."""
+
+    result = MPCOptimizer(LIMITED_MODEL, MPCConfig()).solve(
+        _make_input(current_temp_top=65.0, current_temp_bottom=65.0)
+    )
+
+    assert not any(result.schedule)
 
 
 def _running_run_input(elapsed_hours: float) -> MPCInput:

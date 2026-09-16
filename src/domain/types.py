@@ -432,10 +432,12 @@ class BoilerThermalModel:
     q_in_nominal_w: float
     # Identified from heating runs where the booster heater took over (see
     # BoilerThermalIdentifier._identify_booster): the highest tank temperature
-    # the heat pump reaches on its own, and the booster's heat input (W). None
-    # until such a run has been observed - the optimizer then does not plan
-    # with the booster.
+    # the heat pump reaches on its own, the tank's maximum (where the thermostat
+    # cuts the booster out - the setpoint those runs used), and the booster's
+    # heat input (W). None until such a run has been observed - the optimizer
+    # then plans with neither the booster nor a tank maximum.
     heat_pump_max_tank_temperature_c: float | None = None
+    max_tank_temperature_c: float | None = None
     booster_heat_w: float | None = None
 
 

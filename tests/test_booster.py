@@ -1,8 +1,12 @@
 import pandas as pd
-import pytest
 
 from domain.types import BoilerThermalModel, MPCConfig, MPCInput
-from features.boiler import BoilerThermalIdentifier, booster_active
+from features.boiler import (
+    CP_WATER_J_PER_KG_K,
+    RHO_WATER_KG_PER_L,
+    BoilerThermalIdentifier,
+    booster_active,
+)
 from features.cop import HeatPumpCOPIdentifier
 from features.optimizer import MPCOptimizer
 
@@ -49,19 +53,39 @@ def test_booster_sensor_counts_in_home_assistant_and_influxdb_form():
 
 
 def test_heat_pump_limit_and_booster_heat_are_identified_from_booster_runs():
+    nan = float("nan")
+    # A full run - heat pump, booster, then settling after the cut-out - and a
+    # second run stopped early.
+    T = [50.0, 54.0, 55.0, 57.0, 59.0, 60.0, 61.0, 60.8, 60.6]
+    T += [54.0, 55.0, 56.0, 56.5, 56.4]
     df = pd.DataFrame(
         {
-            "boiler_on": [True] * 6,
-            "booster_on": [False, False, True, True, True, True],
-            "T_top": [50.0, 54.0, 55.0, 57.0, 59.0, 61.0],
-            "T_bottom": [50.0, 54.0, 55.0, 57.0, 59.0, 61.0],
-            "q_in_override_w": [6000.0, 3000.0, 1500.0, 2000.0, 2000.0, 2000.0],
+            "time": pd.date_range("2026-09-15 10:00", periods=14, freq="5min"),
+            "boiler_on": [True] * 6 + [False] * 3 + [True] * 3 + [False] * 2,
+            "booster_on": [False, False]
+            + [True] * 4
+            + [False] * 4
+            + [True] * 2
+            + [False] * 2,
+            "T_top": T,
+            "T_bottom": T,
+            "q_in_override_w": [6000.0, 3000.0, 1500.0, 2000.0, 2000.0, 2000.0]
+            + [nan] * 3
+            + [3000.0, 2000.0, 2000.0]
+            + [nan] * 2,
         }
     )
     identifier = BoilerThermalIdentifier()
 
-    assert identifier._identify_booster(df) == (55.0, 2000.0)
-    assert identifier._identify_booster(df.assign(booster_on=False)) == (None, None)
+    # Both runs hand over at 55 degC (heat pump limit). The full run keeps warming
+    # after the booster is cut out, to 61 degC - the tank's maximum, whatever the
+    # early-stopped run reached.
+    assert identifier._identify_booster(df) == (55.0, 61.0, 2000.0)
+    assert identifier._identify_booster(df.assign(booster_on=False)) == (
+        None,
+        None,
+        None,
+    )
 
 
 def test_cop_fit_excludes_booster_rows_recognised_without_a_sensor():
@@ -93,6 +117,7 @@ BOOSTER_MODEL = BoilerThermalModel(
     ua_mix_active_w_per_k=9638.6,
     q_in_nominal_w=3700.0,
     heat_pump_max_tank_temperature_c=55.0,
+    max_tank_temperature_c=60.0,
     booster_heat_w=2000.0,
 )
 HORIZON = 24
@@ -110,26 +135,30 @@ def test_booster_heats_above_the_heat_pump_limit_and_only_there():
         target_temperature_top=tuple(target),
     )
 
-    result = MPCOptimizer(BOOSTER_MODEL, MPCConfig()).solve(data)
+    config = MPCConfig()
+    result = MPCOptimizer(BOOSTER_MODEL, config).solve(data)
     temperatures = result.temperatures
-    booster_steps = [
-        i
-        for i, on in enumerate(result.schedule)
-        if on and result.electrical_power_w[i] == BOOSTER_MODEL.booster_heat_w
-    ]
-    heat_pump_steps = [
-        i for i, on in enumerate(result.schedule) if on and i not in booster_steps
-    ]
+    # Only the booster can have raised the tank above the heat pump's own limit.
+    above_the_limit = [t for t in temperatures if t > 55.0 + 1e-6]
+    # It cannot modulate, so the step it is cut out in may overshoot by its own
+    # full heat input.
+    booster_step_k = (
+        BOOSTER_MODEL.booster_heat_w
+        * config.step_hours
+        * 3600.0
+        / (RHO_WATER_KG_PER_L * BOOSTER_MODEL.volume_l * CP_WATER_J_PER_KG_K)
+    )
 
     assert temperatures[20] >= 60.0 - 1e-6
-    assert booster_steps
-    assert all(temperatures[i] >= 55.0 - 1e-6 for i in booster_steps)
-    assert all(temperatures[i + 1] <= 55.0 + 1e-6 for i in heat_pump_steps)
+    assert above_the_limit
+    assert max(temperatures) <= BOOSTER_MODEL.max_tank_temperature_c + booster_step_k
 
 
-def test_a_run_started_by_the_booster_counts_as_a_start():
-    """A booster-only run (tank already above the heat pump's limit) is still a
-    DHW run that has to be started - its start carries the switching cost."""
+def test_the_booster_cannot_start_a_run_by_itself():
+    """The booster only takes over from a compressor that cannot lift the tank
+    further - it never starts a DHW run on its own. With the tank already above
+    the heat pump's limit, that leaves the target unreachable rather than served
+    by a booster-only run."""
 
     target = [10.0] * HORIZON
     target[8] = 57.0
@@ -142,10 +171,6 @@ def test_a_run_started_by_the_booster_counts_as_a_start():
         target_temperature_top=tuple(target),
     )
 
-    free = MPCOptimizer(BOOSTER_MODEL, MPCConfig(weight_switching=0.0)).solve(data)
-    charged = MPCOptimizer(BOOSTER_MODEL, MPCConfig()).solve(data)
+    result = MPCOptimizer(BOOSTER_MODEL, MPCConfig()).solve(data)
 
-    assert any(charged.schedule)
-    assert charged.objective_value == pytest.approx(
-        free.objective_value + MPCConfig().weight_switching
-    )
+    assert not any(result.schedule)

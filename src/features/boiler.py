@@ -1,4 +1,5 @@
 import logging
+from datetime import timedelta
 
 import numpy as np
 import pandas as pd
@@ -1223,22 +1224,24 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
         self.model = _model_from_parameters(robust_fit.x, self.volume_l)
 
-        heat_pump_max_c, booster_heat_w = self._identify_booster(df)
+        heat_pump_max_c, max_tank_c, booster_heat_w = self._identify_booster(df)
         self.model.heat_pump_max_tank_temperature_c = heat_pump_max_c
+        self.model.max_tank_temperature_c = max_tank_c
         self.model.booster_heat_w = booster_heat_w
 
         if heat_pump_max_c is None:
             logger.info(
                 "Boiler thermal calibration: no booster heater run found - the "
-                "heat pump's tank limit and the booster's heat stay unidentified, "
-                "so the optimizer does not plan with the booster."
+                "heat pump's tank limit, the tank's maximum and the booster's heat "
+                "stay unidentified, so the optimizer does not plan with them."
             )
         else:
             logger.info(
                 "Boiler thermal calibration: booster took over at a median tank "
-                "temperature of %.1f degC (the heat pump's own limit), delivering "
-                "%s W.",
+                "temperature of %.1f degC (the heat pump's own limit), heated the "
+                "tank to a median %.1f degC (its maximum), delivering %s W.",
                 heat_pump_max_c,
+                max_tank_c,
                 "unknown" if booster_heat_w is None else f"{booster_heat_w:.0f}",
             )
 
@@ -1246,29 +1249,57 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
     def _identify_booster(
         self, df: pd.DataFrame
-    ) -> tuple[float | None, float | None]:
-        """(heat pump max tank temperature degC, booster heat W) from the heating
-        runs where the booster took over; None for what the data cannot show.
+    ) -> tuple[float | None, float | None, float | None]:
+        """(heat pump max tank temperature degC, max tank temperature degC,
+        booster heat W) from the heating runs where the booster took over; None
+        for what the data cannot show.
 
         The booster engages because the compressor cannot lift the tank any
         further (its supply temperature limit minus the coil's approach), so
         the tank temperature at booster onset is the heat pump's own limit
-        (real data: 55.0-55.5 degC in every session). The booster is a resistive
-        element with a fixed rating, so its heat is the median calorimetric heat
-        over its rows - robust to the partial first and last rows.
+        (real data: 55.0-55.5 degC in every session). It then heats until the
+        tank's thermostat cuts it out, and the tank keeps warming a little after
+        that from the heat still in the loop and from mixing (real data: 0.5-1.3 K
+        within PLANNER_CHECK_SETTLE_S). So a run's peak is taken over its booster
+        rows plus that settling time (cut short if heating starts again), and the
+        tank's maximum is the highest peak over runs (real data: 61.1 degC, runs
+        reaching 57.0-61.1): the thermostat cuts out at the highest setpoint a
+        run was made with, while lower peaks only show runs stopped early or made
+        at a lower setpoint. Each peak is a 5-minute mean of both sensors, which
+        already damps a one-off reading. It is still the most the tank has been
+        shown to reach, not necessarily the most the boiler could take. The
+        booster is a resistive element with a fixed rating, so its heat is the
+        median calorimetric heat over its rows - robust to the partial first and
+        last rows.
         """
 
         booster = df["booster_on"] & df["boiler_on"]
 
         if not booster.any():
-            return None, None
+            return None, None, None
 
         onset = booster & ~booster.shift(fill_value=False)
+        last = booster & ~booster.shift(-1, fill_value=False)
         T_average = (df["T_top"] + df["T_bottom"]) / 2.0
+        settle = timedelta(seconds=self.PLANNER_CHECK_SETTLE_S)
+        peaks = []
+
+        for start, stop in zip(df.index[onset], df.index[last], strict=True):
+            following = df.loc[stop:].iloc[1:]
+            settling = following[following["time"] <= df.at[stop, "time"] + settle]
+            heating_again = settling["boiler_on"].to_numpy(dtype=bool)
+
+            if heating_again.any():
+                settling = settling.iloc[: int(heating_again.argmax())]
+
+            end = settling.index[-1] if len(settling) else stop
+            peaks.append(float(T_average.loc[start:end].max()))
+
         booster_heat_w = df.loc[booster, "q_in_override_w"].median()
 
         return (
             float(T_average[onset].median()),
+            float(np.max(peaks)),
             None if np.isnan(booster_heat_w) else float(booster_heat_w),
         )
 
