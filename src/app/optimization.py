@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -7,21 +8,29 @@ from domain.types import MPCConfig, MPCInput, OptimizeConfig
 from features.boiler import BoilerThermalIdentifier
 from features.cop import HeatPumpCOPIdentifier
 from features.optimizer import MPCOptimizer
+from infrastructure.home_assistant import HomeAssistant
 from infrastructure.repositories import ConfigRepository
 
 logger = logging.getLogger(__name__)
 
 
 class Optimization:
+    # What a Home Assistant automation acts on: whether the quarter hour running
+    # now is planned to heat the hot water, and when the next planned run starts.
+    DHW_STATUS_ENTITY = "binary_sensor.home_optimizer_dhw_status"
+    DHW_START_ENTITY = "sensor.home_optimizer_dhw_start"
+
     def __init__(
         self,
         state_manager: StateManager,
         config_repository: ConfigRepository,
         models_path: Path,
+        home_assistant: HomeAssistant,
     ) -> None:
         self.state_manager = state_manager
         self.config_repository = config_repository
         self.models_path = models_path
+        self.home_assistant = home_assistant
 
     def run(self, optimize_config: OptimizeConfig) -> None:
         state = self.state_manager.load()
@@ -178,4 +187,27 @@ class Optimization:
             temperatures=result.temperatures,
             power_w=result.electrical_power_w,
             times=forecast_times,
+        )
+
+        self.publish_dhw(result.schedule, forecast_times)
+
+    def publish_dhw(self, schedule: Sequence[int], times: list[datetime]) -> None:
+        """Writes the plan's hot water decision to Home Assistant: on/off for the
+        quarter hour running now, and the start of the next planned run (the
+        current one if it is heating now, 'unknown' without any)."""
+
+        heating_now = bool(schedule) and schedule[0] == 1
+        next_start = next(
+            (t for on, t in zip(schedule, times, strict=True) if on), None
+        )
+
+        self.home_assistant.set_state(
+            self.DHW_STATUS_ENTITY,
+            "on" if heating_now else "off",
+            {"friendly_name": "Home Optimizer DHW status"},
+        )
+        self.home_assistant.set_state(
+            self.DHW_START_ENTITY,
+            next_start.isoformat() if next_start is not None else "unknown",
+            {"friendly_name": "Home Optimizer DHW start", "device_class": "timestamp"},
         )

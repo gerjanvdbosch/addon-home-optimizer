@@ -25,9 +25,10 @@ from features.cop import HeatPumpCOPIdentifier
 
 logger = logging.getLogger(__name__)
 
-# Liquid water's boiling point at atmospheric pressure (deg C) - the tank's only
-# known ceiling before any booster run has shown its actual maximum.
-WATER_BOILING_POINT_C = 100.0
+# The tank's maximum water temperature (deg C) until a booster run has shown the
+# real one (see BoilerThermalIdentifier._identify_booster) - a typical limit for a
+# domestic hot water tank, chosen for this installation.
+DEFAULT_MAX_TANK_TEMPERATURE_C = 65.0
 
 # How close to optimal a plan must be proven (EUR): one cent, the precision the
 # price itself is given in. The solver's default tolerance is relative to the
@@ -254,7 +255,12 @@ class MPCOptimizer:
         target_c = self._aggregate(data.target_temperature_top, plan, max)
         overall_target_max = max(data.target_temperature_top)
         heat_pump_max_c = self.thermal_model.heat_pump_max_tank_temperature_c
-        max_tank_c = self.thermal_model.max_tank_temperature_c
+        identified_max_c = self.thermal_model.max_tank_temperature_c
+        max_tank_c = (
+            identified_max_c
+            if identified_max_c is not None
+            else DEFAULT_MAX_TANK_TEMPERATURE_C
+        )
         booster_heat_w = self.thermal_model.booster_heat_w
 
         model = pyo.ConcreteModel()
@@ -273,7 +279,6 @@ class MPCOptimizer:
         booster_possible = (
             booster_heat_w is not None
             and heat_pump_max_c is not None
-            and max_tank_c is not None
             and (
                 initial_temperature > heat_pump_max_c
                 or overall_target_max > heat_pump_max_c
@@ -295,13 +300,12 @@ class MPCOptimizer:
             * 3600.0
             / (RHO_WATER_KG_PER_L * self.thermal_model.volume_l * CP_WATER_J_PER_KG_K)
         )
-        if booster_possible and max_tank_c is not None:
+        if booster_possible:
             reachable_c = max_tank_c + booster_step_k
         elif heat_pump_max_c is not None:
-            reachable_c = heat_pump_max_c
+            reachable_c = min(heat_pump_max_c, max_tank_c)
         else:
-            # Nothing identified yet: only liquid water's own ceiling applies.
-            reachable_c = WATER_BOILING_POINT_C
+            reachable_c = max_tank_c
         t_upper = max(initial_temperature, reachable_c)
 
         # Exact zero-order-hold dynamics for the lumped tank node. Unlike the
@@ -479,13 +483,10 @@ class MPCOptimizer:
         # heat pump is still costed at full power while on (see active_power_w),
         # a conservative overestimate for a last, modulated-down step.
         model.heat_source_constraints = pyo.ConstraintList()
-        # The tank's identified maximum, or just its bound while none has been
-        # observed - then only the bound limits heating.
-        max_tank_bound = max_tank_c if max_tank_c is not None else t_upper
         heat_pump_limit_c = (
-            min(heat_pump_max_c, max_tank_bound)
+            min(heat_pump_max_c, max_tank_c)
             if heat_pump_max_c is not None
-            else max_tank_bound
+            else max_tank_c
         )
 
         # The tank temperature while each source runs, 0 otherwise: the products
@@ -553,7 +554,7 @@ class MPCOptimizer:
                 model.booster_temperature[k] >= heat_pump_max_c * booster
             )
             model.heat_source_constraints.add(
-                model.booster_temperature[k] <= max_tank_bound * booster
+                model.booster_temperature[k] <= max_tank_c * booster
             )
             # And only as the continuation of a run already heating: the booster
             # takes over from a compressor that cannot lift the tank any further,
@@ -655,7 +656,7 @@ class MPCOptimizer:
                 None,
                 min(
                     self._heat_pump_max_tank_temperature_c(overall_target_max),
-                    max_tank_bound,
+                    max_tank_c,
                 ),
             )
         )

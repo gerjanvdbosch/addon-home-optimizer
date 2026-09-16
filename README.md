@@ -372,6 +372,15 @@ actions:
         } | to_json }}
 ```
 
+## Sensors
+
+Home Optimizer writes the following entities to Home Assistant:
+
+| Entity                                    | Description                                                      |
+|-------------------------------------------|------------------------------------------------------------------|
+| `binary_sensor.home_optimizer_dhw_status` | `on` while the current quarter hour is planned to heat hot water |
+| `sensor.home_optimizer_dhw_start`         | Start of the next planned hot water run (`unknown` if none)      |
+
 ## Development
 
 To run Home Optimizer locally:

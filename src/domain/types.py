@@ -435,7 +435,8 @@ class BoilerThermalModel:
     # the heat pump reaches on its own, the tank's maximum (where the thermostat
     # cuts the booster out - the setpoint those runs used), and the booster's
     # heat input (W). None until such a run has been observed - the optimizer
-    # then plans with neither the booster nor a tank maximum.
+    # then plans without the booster, and with a default tank maximum (see
+    # optimizer.DEFAULT_MAX_TANK_TEMPERATURE_C).
     heat_pump_max_tank_temperature_c: float | None = None
     max_tank_temperature_c: float | None = None
     booster_heat_w: float | None = None

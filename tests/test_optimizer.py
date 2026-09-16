@@ -184,13 +184,12 @@ def test_thermal_dynamics_matches_manual_discretization():
 
     # Minimum runtime of 1 so an arbitrary short on/off pattern doesn't conflict
     # with the (unrelated) scheduling constraint this test isn't exercising.
-    # THERMAL_MODEL has no identified tank maximum, so nothing caps the
-    # trajectory either.
     optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig(boiler_min_runtime_steps=1))
     model = optimizer._build_model(data)
 
-    # Force a known, arbitrary on/off pattern and re-derive T by hand.
-    pattern = [1, 1, 0, 0, 1, 0] * 4
+    # Force a known, arbitrary on/off pattern and re-derive T by hand - one that
+    # stays below the tank's (default) maximum, which is not what is tested here.
+    pattern = [1, 1, 0, 0, 0, 0] * 4
     pattern = pattern[: len(SOLAR_FORECAST_W)]
 
     for k, v in enumerate(pattern):

@@ -117,6 +117,9 @@ def create_container() -> Container:
         state_manager=state_manager,
         config_repository=config_repository,
         models_path=models_path,
+        # Only the add-on has a Supervisor token; without one (a local run) the
+        # client logs its writes instead of sending them.
+        home_assistant=HomeAssistant(os.environ.get("SUPERVISOR_TOKEN")),
     )
 
     container = Container(
