@@ -4,8 +4,6 @@ from multiprocessing import Process, Queue
 
 from joblib import parallel_backend
 
-from app.bootstrap import Container
-from app.identification import Identification
 from domain.types import Job, JobType
 
 

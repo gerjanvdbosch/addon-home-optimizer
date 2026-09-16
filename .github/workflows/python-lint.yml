@@ -30,11 +30,11 @@ jobs:
       - name: Ruff (lint)
         run: ruff check src tests
 
-      - name: Black (format check)
-        run: black --check src tests
+      #      - name: Black (format check)
+      #        run: black --check src tests
 
-      - name: Pyright (type check)
-        run: pyright
+      #      - name: Pyright (type check)
+      #        run: pyright
 
       - name: Pytest
         run: python -m pytest

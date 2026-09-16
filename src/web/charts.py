@@ -372,7 +372,7 @@ def backtest_chart(result: BacktestResult | None) -> str:
 
     fig = go.Figure()
 
-    for i, bp in enumerate(result.points):
+    for bp in result.points:
         df = pd.DataFrame(bp.points)
         df["x_time"] = to_local_series(pd.to_datetime(df["time"]))
 
