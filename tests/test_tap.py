@@ -121,8 +121,8 @@ def test_prepare_builds_target_and_presence_columns(tmp_path):
     # No NaNs left in the target (boiler_on periods are filled with 0, not NaN).
     assert not prepared["excess_loss_w"].isna().any()
 
-    # Every excess-loss value is non-negative (clipped, see excess_loss_w()).
-    assert (prepared["excess_loss_w"] >= 0).all()
+    # The target is signed (see excess_loss_w()): noise must average out.
+    assert (prepared["excess_loss_w"] < 0).any()
 
     # present is a real 0/1 signal, not constant (both present and away periods
     # exist in the synthetic data).

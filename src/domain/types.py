@@ -528,7 +528,7 @@ class MPCInput:
     current_temp_bottom: float
     boiler_on_current: bool
     target_temperature_top: tuple[float, ...] = ()
-    # Forecasted additional heat-sink power (W) from tap draws (see
+    # Forecasted expected additional heat-sink power (W) from tap draws (see
     # features/tap.py's TapForecaster), on top of the passive UA loss already in
     # the dynamics - empty means "no forecast available", treated as no draws
     # (the same assumption implicitly made before this field existed), not a

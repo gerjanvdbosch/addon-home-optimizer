@@ -18,9 +18,6 @@ SystemModel = TypeVar("SystemModel")
 class SystemIdentifier(Generic[SystemModel]):
     def __init__(self) -> None:
         self.model: SystemModel | None = None
-        # Remembered so a subclass can locate sibling model files saved alongside
-        # its own (see BoilerThermalIdentifier's use of the tap-demand forecaster).
-        self.models_path: Path | None = None
 
     @property
     @abstractmethod
@@ -63,8 +60,6 @@ class SystemIdentifier(Generic[SystemModel]):
         dump(self.model, target_file)
 
     def load(self, path: Path) -> None:
-        self.models_path = path
-
         target_file = path / f"{self.name}.joblib"
 
         if not target_file.exists():

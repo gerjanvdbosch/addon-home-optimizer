@@ -5,7 +5,6 @@ import numpy as np
 import pandas as pd
 from scipy.linalg import expm
 from scipy.optimize import least_squares
-from skforecast.model_selection import TimeSeriesFold, backtesting_forecaster
 from sklearn.metrics import (
     mean_absolute_error,
     mean_squared_error,
@@ -901,7 +900,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         # assumed constant. This is parameter-identification machinery only - it does
         # not claim to detect tap draws, it just limits their influence on the fit.
         # Kept to one-step residuals only, same meaning as before decay_residuals
-        # existed (also reused as-is by _exclude_forecast_tap_draws below).
+        # existed.
         ordinary_residuals = one_step_residuals(ordinary_fit.x)
 
         f_scale = self.MAD_TO_STD * float(
@@ -951,13 +950,6 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         idle_indices = np.nonzero(idle_mask_train)[0]
         idle_row_residuals = full_row_residuals[idle_mask_train]
 
-        # Populated below (if this run has any idle evidence) with which rows
-        # the same-run, model-free residual threshold flags - used to sanity
-        # check the tap-forecast exclusion below against this independent
-        # signal, since the two use unrelated methods (a same-run temperature
-        # residual vs. a separately-trained forecast).
-        same_run_flagged_full = np.zeros(len(clean_transition), dtype=bool)
-
         if len(idle_row_residuals) > 0:
             flagged = np.any(
                 np.abs(idle_row_residuals)
@@ -975,7 +967,6 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             # this helps distinguish "many short real disturbances" from "isolated
             # sensor noise/outliers" - it still cannot prove either is tap water.
             flagged_indices = idle_indices[flagged]
-            same_run_flagged_full[flagged_indices] = True
             clustered_fraction = float("nan")
             expected_by_chance = float("nan")
 
@@ -1168,14 +1159,12 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
                 flag_rate(cool_residuals) * 100,
             )
 
-        clean_transition = self._exclude_forecast_tap_draws(
-            train_df,
-            clean_transition,
-            boiler_on,
-            f_scale,
-            median_dt,
-            same_run_flagged_full,
-        )
+        # Rows are deliberately not excluded where the tap forecaster predicts a
+        # draw: that forecaster is trained on this model's own residual, and on
+        # 90 days of real data excluding them raised UA_top+UA_bottom from 2.07
+        # to 2.56 W/K, turning the post-heating 6 h cooling bias from +0.05 K
+        # into +0.33 K while validation stayed equal. The robust loss below
+        # already limits the influence of draws.
 
         robust_fit = least_squares(
             lambda parameters: combined_residuals(parameters, decay_weight),
@@ -1302,166 +1291,6 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             float(np.max(peaks)),
             None if np.isnan(booster_heat_w) else float(booster_heat_w),
         )
-
-    def _exclude_forecast_tap_draws(
-        self,
-        train_df: pd.DataFrame,
-        clean_transition: np.ndarray,
-        boiler_on: np.ndarray,
-        f_scale: float,
-        median_dt: float,
-        same_run_flagged: np.ndarray,
-    ) -> np.ndarray:
-        """Extends clean_transition with IDLE rows the tap-demand forecaster (see
-        features/tap.py) predicts as a likely real draw. Uses the forecaster
-        exactly as already trained (initial_train_size=None, refit=False - no
-        retraining happens here, keeping this lightweight) to produce a genuine
-        one-step-ahead prediction at every row from its own learned
-        hour/day-of-week/presence pattern, instead of relying only on this
-        same-run's own residual: a model trained across many past cycles gives a
-        more stable signal than one noisy single-row measurement, which is the
-        only reason this is a meaningful addition on top of the robust loss
-        above (already limits the influence of any large one-off residual on
-        its own). Restricted to idle transitions only, same as excess_loss_w()
-        itself (NaN while boiler_on): the tap forecaster has no boiler_on input
-        and can output a large value during a heating transition too, but a
-        heating transition is the only evidence Q_in has - excluding one would
-        starve that estimate, not clean it. Falls back to the unchanged mask
-        whenever no tap model exists yet, or train_df is too short for even one
-        prediction. Best effort only: any failure here must never break the
-        physical model fit itself, so exceptions are swallowed and logged.
-
-        `same_run_flagged` (aligned to clean_transition) is the same-run,
-        model-free residual flag computed above, passed in purely to log how
-        much the two independent signals agree - it does not affect the mask.
-        """
-
-        if self.models_path is None:
-            return clean_transition
-
-        try:
-            from features.tap import TapForecaster  # local: tap.py imports this
-            # module at top level, so importing it back here would be a
-            # module-level cycle if done at the top of this file.
-
-            tap_forecaster = TapForecaster(models_path=self.models_path)
-            tap_forecaster.load(self.models_path)
-
-            if not tap_forecaster.forecaster.is_fitted:
-                return clean_transition
-
-            # The forecaster trains on 15-minute data (see TapForecaster.dataset());
-            # resample this calibration window the same way instead of re-fetching
-            # it, using the same aggregation as that dataset (mean for
-            # temperatures, last for the event-like state/presence columns).
-            presence_columns = [
-                c for c in self.presence_columns if c in train_df.columns
-            ]
-            indexed = train_df.set_index("time")
-            resampled = pd.concat(
-                [
-                    indexed[["T_ambient", "T_top", "T_bottom"]]
-                    .resample("15min")
-                    .mean(),
-                    indexed[["state"] + presence_columns].resample("15min").last(),
-                ],
-                axis=1,
-            ).dropna(subset=["T_ambient", "T_top", "T_bottom", "state"])
-
-            prepared = tap_forecaster.prepare(resampled.reset_index())
-
-            if len(prepared) <= tap_forecaster.forecaster.window_size:
-                return clean_transition
-
-            _, backtest = backtesting_forecaster(
-                forecaster=tap_forecaster.forecaster,
-                y=prepared["excess_loss_w"],
-                exog=prepared[["present"]],
-                cv=TimeSeriesFold(steps=1, initial_train_size=None, refit=False),
-                metric="mean_absolute_error",
-                n_jobs=1,
-            )
-
-            # A 15-minute prediction applies to every native-resolution row inside
-            # that bucket.
-            predicted_frame = backtest[["pred"]].rename(
-                columns={"pred": "predicted_excess_loss_w"}
-            )
-            predicted_frame.index.name = "time"
-
-            aligned = pd.merge_asof(
-                train_df[["time"]].sort_values("time"),
-                predicted_frame.sort_index().reset_index(),
-                on="time",
-                direction="backward",
-                tolerance=pd.Timedelta(minutes=15),
-            )["predicted_excess_loss_w"].to_numpy()
-
-            # f_scale (see calibrate()) is a Kelvin-domain per-node residual
-            # noise scale - not directly comparable to excess_loss_w (Watts).
-            # excess_loss_w() itself is mostly exact zeros with occasional
-            # positive spikes (a rectified, zero-inflated quantity), so a MAD
-            # taken directly on it collapses to 0 (over half the values are
-            # identically 0) and is not usable as a noise scale either.
-            # Converting f_scale through excess_loss_w()'s own definition
-            # (excess_energy_j = sum(top, bottom residuals) * c_node, divided by
-            # dt) instead gives the Watts-scale noise floor implied by the same
-            # temperature-measurement/model noise the Kelvin threshold already
-            # represents - two independent node residuals of scale f_scale sum
-            # to a scale of sqrt(2)*f_scale.
-            c_node = RHO_WATER_KG_PER_L * (self.volume_l / 2.0) * CP_WATER_J_PER_KG_K
-            f_scale_w = c_node * np.sqrt(2.0) * f_scale / median_dt
-
-            # Reusing EXCESS_LOSS_FLAG_SCALE_MULTIPLE - the exact same
-            # statistically-derived sensitivity already used for the same-run
-            # diagnostic flag above - rather than inventing a second one. A
-            # missing (unaligned) prediction must never exclude a row.
-            tap_predicted_high = np.where(
-                np.isnan(aligned),
-                False,
-                aligned > self.EXCESS_LOSS_FLAG_SCALE_MULTIPLE * f_scale_w,
-            )
-
-            idle_transition = ~boiler_on[:-1]
-            tap_excluded_idle = tap_predicted_high[1:] & idle_transition
-            newly_excluded = tap_excluded_idle & clean_transition
-            excluded = int(np.sum(newly_excluded))
-
-            if excluded > 0:
-                # Sanity check against a completely independent signal: the
-                # same-run diagnostic flags timesteps from this run's own
-                # temperature residual alone, with no forecaster involved. High
-                # overlap means both methods point at the same rows (the
-                # forecaster is not inventing contamination nobody else sees);
-                # low overlap would mean the forecaster's (now deliberately
-                # conservative - see TapForecaster.TAP_FORECAST_QUANTILE)
-                # predictions are excluding rows the raw residual itself does
-                # not consider unusual, worth revisiting the exclusion
-                # threshold or quantile if that shows up repeatedly.
-                same_run_flagged_count = int(
-                    np.sum(same_run_flagged & clean_transition)
-                )
-                overlap = int(np.sum(newly_excluded & same_run_flagged))
-
-                logger.info(
-                    "Boiler thermal calibration: excluding %d additional idle "
-                    "training timesteps the tap-demand forecaster predicts as a "
-                    "likely real draw (%.0f%% of these are also flagged by the "
-                    "independent same-run residual threshold above, which "
-                    "flags %d idle timesteps in total).",
-                    excluded,
-                    100.0 * overlap / excluded,
-                    same_run_flagged_count,
-                )
-
-            return clean_transition & ~tap_excluded_idle
-        except Exception:
-            logger.info(
-                "Boiler thermal calibration: skipping tap-forecast cleaning "
-                "(no usable tap model yet for this window).",
-                exc_info=True,
-            )
-            return clean_transition
 
     # validate() compares the planning model with the tank this long after a run
     # ends: heating mixes the tank within a sample (UA_mix_active sits at its
@@ -1863,8 +1692,10 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
         `df` must already be prepared (see prepare()). Returns a DataFrame with
         "time" and "excess_loss_w" columns, one row shorter than `df` (there is no
-        prediction for the first row). Values are clipped at 0 (only genuine excess
-        *loss* is meaningful for this purpose) and are NaN while boiler_on - a real
+        prediction for the first row). Values are signed and not clipped at 0:
+        sensor noise then averages out instead of only its positive half counting
+        as heat loss (on real data clipping raised the mean from 99 to 147 W). They
+        are NaN while boiler_on - a real
         draw during active heating is confounded with Q_in and out of scope, same
         as the calibration diagnostics. This does NOT prove tap-water usage any
         more than the calibration diagnostics do - it is the same unproven,
@@ -1914,7 +1745,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
         c_node = RHO_WATER_KG_PER_L * (self.model.volume_l / 2.0) * CP_WATER_J_PER_KG_K
         excess_energy_j = np.sum(residual_k, axis=1) * c_node
-        excess_power_w = np.clip(excess_energy_j / dt_seconds[1:], 0.0, None)
+        excess_power_w = excess_energy_j / dt_seconds[1:]
 
         idle_mask = ~boiler_on[:-1]
         excess_power_w = np.where(idle_mask, excess_power_w, np.nan)

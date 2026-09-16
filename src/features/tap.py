@@ -1,13 +1,11 @@
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
 from optuna import Trial
-from skforecast.preprocessing import CalendarFeatures, RollingFeatures
+from skforecast.preprocessing import CalendarFeatures
 from skforecast.recursive import ForecasterRecursive
 from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.preprocessing import FunctionTransformer
 
 from domain.types import Config, ForecasterType
 from features.boiler import BoilerThermalIdentifier
@@ -16,8 +14,8 @@ from features.forecasters import SkforecastForecaster
 
 
 class TapForecaster(SkforecastForecaster):
-    """Forecasts hot-water tap demand as a conservative (see
-    TAP_FORECAST_QUANTILE) estimate of excess-heat-loss power (W), using the
+    """Forecasts hot-water tap demand as the expected excess-heat-loss power (W),
+    using the
     calibrated boiler thermal model's own residual diagnostic
     (BoilerThermalIdentifier.excess_loss_w) as the training target and presence
     as an exogenous feature.
@@ -25,10 +23,8 @@ class TapForecaster(SkforecastForecaster):
     This does NOT predict a validated tap event or volume - no flow meter exists,
     and the underlying signal is the same unproven "candidate excess heat loss"
     used during calibration (see boiler.py). It is a forecast of that same
-    residual quantity, useful as an exogenous input (e.g. for cleaning the
-    boiler's own calibration data, or for MPC planning), not a claim of
-    validated hot-water usage. It is also not an expected/average value - see
-    TAP_FORECAST_QUANTILE for why an upper quantile is used instead.
+    residual quantity, useful as an exogenous input for MPC planning, not a claim of
+    validated hot-water usage.
 
     Further, the target itself is a mix of two effects, not purely tap draws:
     real data shows the excess-loss flag rate is far more sensitive to the
@@ -40,19 +36,14 @@ class TapForecaster(SkforecastForecaster):
     gap - not tap draws alone.
     """
 
-    # excess_loss_w is extremely zero-inflated with a heavy tail (confirmed on
-    # real data: 82% exactly 0, but up to ~7.8 kW when a draw occurs) and its
-    # timing is uncertain. A squared-error point forecast is then optimized
-    # towards a diluted "probability-of-a-draw x typical size" expected value,
-    # not the size of an actual draw when one occurs - confirmed on real data,
-    # where the model never predicted above ~200 W despite training on spikes
-    # up to 7.8 kW. For sizing an MPC's heating margin, understating a real
-    # heat sink is the costlier mistake (a missed temperature target) than
-    # overstating one (a little extra, still solar-first heating), so this
-    # forecasts a conservative upper quantile instead of the mean. Quantiles
-    # are monotonic-transform-equivariant (unlike the mean), so this stays
-    # valid together with the sqrt/square transformer below.
-    TAP_FORECAST_QUANTILE = 0.85
+    # The planning model is linear, so its expected tank temperature follows from
+    # the expected heat sink: this forecasts the mean, not a quantile. Backtested
+    # on real data (6 h blocks, tap energy in K of tank): the former 0.85 quantile
+    # was unbiased in total (-0.15 K) but spread a noise floor over quiet hours,
+    # planning 1.1 K too much cooling in the 6 h after heating; the mean with
+    # only a same-time-yesterday lag gives -0.12 K overall and +0.5 K there.
+    # Short lags on this noisy residual (the former 1-4 steps and rolling
+    # windows) made the mean miss the evening draws (-1.2 K).
 
     def __init__(self, models_path: Path) -> None:
         self.models_path = models_path
@@ -84,8 +75,7 @@ class TapForecaster(SkforecastForecaster):
             estimator=overrides.pop(
                 "estimator",
                 HistGradientBoostingRegressor(
-                    loss="quantile",
-                    quantile=self.TAP_FORECAST_QUANTILE,
+                    loss="squared_error",
                     learning_rate=0.03,
                     max_depth=7,
                     max_iter=120,
@@ -94,34 +84,17 @@ class TapForecaster(SkforecastForecaster):
                     random_state=42,
                 ),
             ),
-            # No weekly lags (unlike BaseloadForecaster): tap draws are driven by
-            # daily human activity rhythm, already covered by the daily lags below
-            # plus the hour/day_of_week/weekend calendar features; a residual
-            # same-time-last-week effect on top of that (real for whole-household
-            # baseload, e.g. work-from-home patterns) is not a justified
-            # assumption for tap draws specifically. This forecaster's prepare()
-            # also drops a few rows from the history Forecasting.predict()
-            # supplies (the first row has no dt_seconds, oversized gaps are
-            # filtered, excess_loss_w() drops the last row), so short lags keep it
-            # robust to that.
-            lags=overrides.pop("lags", [1, 2, 3, 4, 95, 96, 97]),
+            # Tap draws follow the daily activity rhythm, so the same quarter
+            # yesterday plus the calendar features carry the signal (see above).
+            lags=overrides.pop("lags", [96]),
             calendar_features=overrides.pop(
                 "calendar_features",
                 CalendarFeatures(
                     features=["hour", "day_of_week", "weekend"], encoding="onehot"
                 ),
             ),
-            window_features=overrides.pop(
-                "window_features",
-                RollingFeatures(
-                    stats=["mean", "mean", "max", "max"],
-                    window_sizes=[4, 96, 4, 96],
-                ),
-            ),
-            # excess_loss_w is non-negative and right-skewed (mostly near zero,
-            # occasional spikes) - same distributional shape as baseload, same
-            # variance-stabilizing transform.
-            transformer_y=FunctionTransformer(func=np.sqrt, inverse_func=np.square),
+            # No sqrt transform: the target is signed, and a mean does not
+            # survive a nonlinear transform.
             **overrides,
         )
 
@@ -168,9 +141,11 @@ class TapForecaster(SkforecastForecaster):
         )
         future_exog = pd.DataFrame({"present": 1.0}, index=future_index)
 
+        # The target is signed (noise, model error), but a tap draw can only
+        # remove heat.
         return self.forecaster.predict(
             steps=steps, last_window=last_window, exog=future_exog
-        )
+        ).clip(lower=0.0)
 
     def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
         identifier = BoilerThermalIdentifier()
