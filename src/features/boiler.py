@@ -1217,6 +1217,14 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         self.model.heat_pump_max_tank_temperature_c = heat_pump_max_c
         self.model.max_tank_temperature_c = max_tank_c
         self.model.booster_heat_w = booster_heat_w
+        self.model.setpoint_overshoot_k = self._identify_setpoint_overshoot(df)
+
+        if self.model.setpoint_overshoot_k is not None:
+            logger.info(
+                "Boiler thermal calibration: a heat pump run ends with the settled "
+                "tank a median %.2f K above its setpoint.",
+                self.model.setpoint_overshoot_k,
+            )
 
         if heat_pump_max_c is None:
             logger.info(
@@ -1291,6 +1299,54 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             float(np.max(peaks)),
             None if np.isnan(booster_heat_w) else float(booster_heat_w),
         )
+
+    def _identify_setpoint_overshoot(self, df: pd.DataFrame) -> float | None:
+        """Median of how far the tank average ends above the SWW setpoint,
+        PLANNER_CHECK_SETTLE_S after a heat pump run that stopped by itself on
+        it; None without such a run.
+
+        The heat pump stops when its own sensor reaches the setpoint, while the
+        tank sensors still read below it; the heat left in the coil and loop
+        then flows in, and the settled tank ends above the setpoint (real data:
+        a median 1.75 K, quartiles 1.55-1.8 K over 69 runs). Runs with the
+        booster are left out - it has its own thermostat - and so are runs that
+        settled below the setpoint: those stopped on the heat pump's own limit
+        instead. Runs that start close to the setpoint end somewhat higher (up to
+        2.8 K, the compressor's own minimum run), which the median is robust to.
+        """
+
+        if "setpoint" not in df.columns:
+            return None
+
+        setpoint = pd.to_numeric(df["setpoint"], errors="coerce")
+        heating = df["boiler_on"]
+        run = (heating & ~heating.shift(fill_value=False)).cumsum()
+        with_booster = df["booster_on"].groupby(run).transform("any")
+        last = heating & ~heating.shift(-1, fill_value=False) & ~with_booster
+        T_average = (df["T_top"] + df["T_bottom"]) / 2.0
+        settle = timedelta(seconds=self.PLANNER_CHECK_SETTLE_S)
+        overshoots = []
+
+        for stop in df.index[last]:
+            following = df.loc[stop:].iloc[1:]
+            settled_at = following.index[
+                following["time"] >= df.at[stop, "time"] + settle
+            ]
+
+            if len(settled_at) == 0:
+                continue
+
+            settled = settled_at[0]
+
+            if following.loc[:settled, "boiler_on"].any():
+                continue
+
+            overshoot = T_average[settled] - setpoint[stop]
+
+            if overshoot > 0:
+                overshoots.append(float(overshoot))
+
+        return float(np.median(overshoots)) if overshoots else None
 
     # validate() compares the planning model with the tank this long after a run
     # ends: heating mixes the tank within a sample (UA_mix_active sits at its
@@ -1820,6 +1876,15 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             .timeseries(
                 "state",
                 config.heat_pump.state,
+                interval="5m",
+                aggregation="last",
+                fill="previous",
+            )
+            # The SWW setpoint a run stops on (see _identify_setpoint_overshoot),
+            # a state that only changes when it is set.
+            .timeseries(
+                "setpoint",
+                config.heat_pump.boiler.setpoint,
                 interval="5m",
                 aggregation="last",
                 fill="previous",

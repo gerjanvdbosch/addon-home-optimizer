@@ -437,6 +437,12 @@ class BoilerThermalModel:
     heat_pump_max_tank_temperature_c: float | None = None
     max_tank_temperature_c: float | None = None
     booster_heat_w: float | None = None
+    # How far the settled tank ends above the SWW setpoint of a heat pump run
+    # that stopped by itself on it (see
+    # BoilerThermalIdentifier._identify_setpoint_overshoot): the setpoint for a
+    # planned run is its planned end temperature minus this. None until such a
+    # run has been observed.
+    setpoint_overshoot_k: float | None = None
 
 
 # Exact by definition of the Kelvin scale (0 degC = 273.15 K) - used
@@ -568,13 +574,16 @@ class MPCInput:
 class MPCResult:
     schedule: tuple[int, ...]
     temperatures: tuple[float, ...]
-    # The electrical power (W) assumed for each step while boiler_on - from
+    # The electrical power (W) assumed for each step, averaged over the step
+    # (a partly used last step of a run draws only for its part) - from
     # the calibrated COP model where available, otherwise the flat
     # boiler_electrical_power_w fallback (see
     # MPCOptimizer._electrical_power_w) - reported alongside the schedule so
     # StateManager.update_schedule() can log the actual assumed consumption
     # per step, not a single flat number.
     electrical_power_w: tuple[float, ...]
+    # Planned heat into the tank per step (W), by either source.
+    heat_w: tuple[float, ...]
     objective_value: float
     solver_status: str
     termination_condition: str

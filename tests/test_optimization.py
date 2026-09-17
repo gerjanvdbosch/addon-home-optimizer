@@ -2,9 +2,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from app.optimization import Optimization
+from domain.types import MPCResult
 
 START = datetime(2026, 9, 17, 10, 0, tzinfo=UTC)
 TIMES = [START + timedelta(minutes=15 * i) for i in range(4)]
+TEMPERATURES = (40.0, 44.0, 48.3, 48.2)
 
 
 class _RecordingHomeAssistant:
@@ -15,7 +17,9 @@ class _RecordingHomeAssistant:
         self.states[entity_id] = (state, attributes)
 
 
-def _published(schedule: tuple[int, ...]) -> dict[str, str]:
+def _published(
+    schedule: tuple[int, ...], overshoot_k: float | None = 1.75
+) -> dict[str, str]:
     home_assistant = _RecordingHomeAssistant()
     optimization = Optimization(
         state_manager=None,  # type: ignore[arg-type]
@@ -23,28 +27,50 @@ def _published(schedule: tuple[int, ...]) -> dict[str, str]:
         models_path=Path("."),
         home_assistant=home_assistant,  # type: ignore[arg-type]
     )
+    result = MPCResult(
+        schedule=schedule,
+        temperatures=TEMPERATURES,
+        electrical_power_w=(0.0,) * len(schedule),
+        heat_w=(0.0,) * len(schedule),
+        objective_value=0.0,
+        solver_status="optimal",
+        termination_condition="optimal",
+    )
 
-    optimization.publish_dhw(schedule, TIMES)
+    optimization.publish_dhw(result, TIMES, overshoot_k)
 
     return {entity: state for entity, (state, _) in home_assistant.states.items()}
 
 
 def test_a_run_planned_later_is_off_now_with_its_start_time():
-    assert _published((0, 0, 1, 1)) == {
-        Optimization.DHW_STATUS_ENTITY: "off",
-        Optimization.DHW_START_ENTITY: TIMES[2].isoformat(),
-    }
+    published = _published((0, 1, 1, 0))
+
+    assert published[Optimization.DHW_STATUS_ENTITY] == "off"
+    assert published[Optimization.DHW_START_ENTITY] == TIMES[1].isoformat()
 
 
 def test_a_run_planned_now_is_on_and_starts_now():
-    assert _published((1, 1, 0, 0)) == {
-        Optimization.DHW_STATUS_ENTITY: "on",
-        Optimization.DHW_START_ENTITY: TIMES[0].isoformat(),
-    }
+    published = _published((1, 1, 0, 0))
+
+    assert published[Optimization.DHW_STATUS_ENTITY] == "on"
+    assert published[Optimization.DHW_START_ENTITY] == TIMES[0].isoformat()
 
 
-def test_no_planned_run_leaves_the_start_unknown():
+def test_no_planned_run_leaves_the_start_and_setpoint_unknown():
     assert _published((0, 0, 0, 0)) == {
         Optimization.DHW_STATUS_ENTITY: "off",
         Optimization.DHW_START_ENTITY: "unknown",
+        Optimization.DHW_SETPOINT_ENTITY: "unknown",
     }
+
+
+def test_the_setpoint_ends_the_run_at_its_planned_temperature():
+    """The tank is at 48.2 degC after the run's last step; it settles 1.75 K
+    above the setpoint, so 46.45 degC - rounded up to the heat pump's half
+    degrees."""
+
+    assert _published((0, 1, 1, 0))[Optimization.DHW_SETPOINT_ENTITY] == "46.5"
+
+
+def test_without_a_known_overshoot_the_setpoint_is_the_planned_temperature():
+    assert _published((0, 1, 1, 0), None)[Optimization.DHW_SETPOINT_ENTITY] == "48.5"

@@ -1,10 +1,10 @@
 import logging
-from collections.abc import Sequence
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 
 from app.state import StateManager
-from domain.types import MPCConfig, MPCInput, OptimizeConfig
+from domain.types import MPCConfig, MPCInput, MPCResult, OptimizeConfig
 from features.boiler import BoilerThermalIdentifier
 from features.cop import HeatPumpCOPIdentifier
 from features.optimizer import MPCOptimizer
@@ -16,9 +16,11 @@ logger = logging.getLogger(__name__)
 
 class Optimization:
     # What a Home Assistant automation acts on: whether the quarter hour running
-    # now is planned to heat the hot water, and when the next planned run starts.
+    # now is planned to heat the hot water, and when the next planned run starts
+    # and with which SWW setpoint.
     DHW_STATUS_ENTITY = "binary_sensor.home_optimizer_dhw_status"
     DHW_START_ENTITY = "sensor.home_optimizer_dhw_start"
+    DHW_SETPOINT_ENTITY = "sensor.home_optimizer_dhw_setpoint"
 
     def __init__(
         self,
@@ -189,17 +191,41 @@ class Optimization:
             times=forecast_times,
         )
 
-        self.publish_dhw(result.schedule, forecast_times)
+        self.publish_dhw(result, forecast_times, thermal_model.setpoint_overshoot_k)
 
-    def publish_dhw(self, schedule: Sequence[int], times: list[datetime]) -> None:
+    def publish_dhw(
+        self,
+        result: MPCResult,
+        times: list[datetime],
+        setpoint_overshoot_k: float | None,
+    ) -> None:
         """Writes the plan's hot water decision to Home Assistant: on/off for the
-        quarter hour running now, and the start of the next planned run (the
-        current one if it is heating now, 'unknown' without any)."""
+        quarter hour running now, and the start and SWW setpoint of the next
+        planned run (the current one if it is heating now, 'unknown' without
+        any).
 
+        The heat pump heats until its setpoint and stops by itself, so the
+        setpoint is what ends a run where the plan does: its planned end
+        temperature, less how far the tank settles above the setpoint (see
+        BoilerThermalModel.setpoint_overshoot_k). Rounded up to the heat pump's
+        half degree, so rounding never misses the plan.
+        """
+
+        schedule = result.schedule
         heating_now = bool(schedule) and schedule[0] == 1
-        next_start = next(
-            (t for on, t in zip(schedule, times, strict=True) if on), None
-        )
+        start = next((k for k, on in enumerate(schedule) if on), None)
+        next_start = "unknown"
+        setpoint = "unknown"
+
+        if start is not None:
+            end = start
+            while end + 1 < len(schedule) and schedule[end + 1]:
+                end += 1
+
+            end_temperature = result.temperatures[min(end + 1, len(schedule) - 1)]
+            next_start = times[start].isoformat()
+            setpoint_c = end_temperature - (setpoint_overshoot_k or 0.0)
+            setpoint = str(math.ceil(round(2 * setpoint_c, 2)) / 2)
 
         self.home_assistant.set_state(
             self.DHW_STATUS_ENTITY,
@@ -208,6 +234,15 @@ class Optimization:
         )
         self.home_assistant.set_state(
             self.DHW_START_ENTITY,
-            next_start.isoformat() if next_start is not None else "unknown",
+            next_start,
             {"friendly_name": "Home Optimizer DHW start", "device_class": "timestamp"},
+        )
+        self.home_assistant.set_state(
+            self.DHW_SETPOINT_ENTITY,
+            setpoint,
+            {
+                "friendly_name": "Home Optimizer DHW setpoint",
+                "device_class": "temperature",
+                "unit_of_measurement": "°C",
+            },
         )
