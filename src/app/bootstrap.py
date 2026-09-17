@@ -1,16 +1,11 @@
-import json
-import logging
 import os
 from dataclasses import dataclass
-from pathlib import Path
-
-from dotenv import load_dotenv
 
 from app.forecasting import Forecasting
 from app.identification import Identification
 from app.optimization import Optimization
+from app.settings import configure_logger, create_repositories, load_settings
 from app.state import StateManager
-from domain.types import Settings
 from features.baseload import BaseloadForecaster
 from features.boiler import BoilerThermalIdentifier
 from features.cop import HeatPumpCOPIdentifier
@@ -24,12 +19,7 @@ from features.solar import SolarBiasIdentifier
 from features.tap import TapForecaster
 from infrastructure.home_assistant import HomeAssistant
 from infrastructure.influx import InfluxDatabase, InfluxSensorResolver
-from infrastructure.repositories import (
-    BacktestRepository,
-    ConfigRepository,
-    StateRepository,
-)
-from infrastructure.storage import JsonStorage
+from infrastructure.repositories import BacktestRepository, ConfigRepository
 
 
 @dataclass(slots=True)
@@ -58,19 +48,10 @@ def create_container() -> Container:
         ],
     )
 
-    config_repository = ConfigRepository(
-        JsonStorage(settings.data_path / "config.json"),
-    )
-
-    state_repository = StateRepository(
-        JsonStorage(
-            settings.data_path / "state.json",
-        )
-    )
-
-    backtest_repository = BacktestRepository(
-        JsonStorage(settings.data_path / "backtest.json"),
-    )
+    repositories = create_repositories(settings)
+    config_repository = repositories.config
+    state_repository = repositories.state
+    backtest_repository = repositories.backtest
 
     models_path = settings.data_path / "models"
 
@@ -132,51 +113,3 @@ def create_container() -> Container:
     )
 
     return container
-
-
-def load_settings() -> Settings:
-    options = Path("/data/options.json")
-
-    if options.exists():
-        latitude, longitude = HomeAssistant(os.environ["SUPERVISOR_TOKEN"]).location()
-
-        return Settings(
-            **json.loads(options.read_text()),
-            data_path=Path("/data"),
-            latitude=latitude,
-            longitude=longitude,
-        )
-
-    load_dotenv()
-
-    return Settings(
-        influx_host=os.getenv("INFLUX_HOST", "homeassistant.local"),
-        influx_port=int(os.getenv("INFLUX_PORT", 8086)),
-        influx_username=os.getenv("INFLUX_USERNAME", ""),
-        influx_password=os.getenv("INFLUX_PASSWORD", ""),
-        influx_database=os.getenv("INFLUX_DATABASE", "home_assistant"),
-        log_level=os.getenv("LOG_LEVEL", "DEBUG"),
-        latitude=_required_float_env("LATITUDE"),
-        longitude=_required_float_env("LONGITUDE"),
-    )
-
-
-def _required_float_env(name: str) -> float:
-    value = os.getenv(name)
-
-    if value is None:
-        raise ValueError(
-            f"{name} must be set (e.g. in .env): the installation's location "
-            "is required for the solar position."
-        )
-
-    return float(value)
-
-
-def configure_logger(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    logging.getLogger("urllib3").setLevel(logging.INFO)

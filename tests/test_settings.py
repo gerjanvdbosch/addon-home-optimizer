@@ -1,11 +1,11 @@
 import pytest
 
-from app import bootstrap
+from app import settings
 
 
 @pytest.fixture
 def no_dotenv(monkeypatch):
-    monkeypatch.setattr(bootstrap, "load_dotenv", lambda: None)
+    monkeypatch.setattr(settings, "load_dotenv", lambda: None)
 
 
 def test_load_settings_requires_a_location(monkeypatch, no_dotenv):
@@ -16,15 +16,13 @@ def test_load_settings_requires_a_location(monkeypatch, no_dotenv):
     monkeypatch.delenv("LONGITUDE", raising=False)
 
     with pytest.raises(ValueError, match="LATITUDE"):
-        bootstrap.load_settings()
+        settings.load_settings()
 
 
-def test_load_settings_reads_the_location_from_the_environment(
-    monkeypatch, no_dotenv
-):
+def test_load_settings_reads_the_location_from_the_environment(monkeypatch, no_dotenv):
     monkeypatch.setenv("LATITUDE", "53.2")
     monkeypatch.setenv("LONGITUDE", "6.5")
 
-    settings = bootstrap.load_settings()
+    loaded = settings.load_settings()
 
-    assert (settings.latitude, settings.longitude) == (53.2, 6.5)
+    assert (loaded.latitude, loaded.longitude) == (53.2, 6.5)

@@ -1,6 +1,5 @@
 import logging
 from contextlib import asynccontextmanager
-from multiprocessing import Manager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -10,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.responses import JSONResponse
 
-from app.bootstrap import create_container
+from app.settings import configure_logger, create_repositories, load_settings
 from app.worker import Worker
 from domain.types import (
     BacktestConfig,
@@ -34,21 +33,19 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.container = create_container()
+    settings = load_settings()
 
-    app.state.manager = Manager()
+    configure_logger(settings.log_level)
 
-    app.state.worker = Worker(
-        create_container,
-        app.state.manager,
-    )
+    app.state.repositories = create_repositories(settings)
+
+    app.state.worker = Worker()
 
     app.state.worker.start()
 
     yield
 
     app.state.worker.stop()
-    app.state.manager.shutdown()
 
 
 app = FastAPI(
@@ -78,15 +75,15 @@ async def validation_exception_handler(request: Request, error: RequestValidatio
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    container = request.app.state.container
+    repositories = request.app.state.repositories
 
     try:
-        container.config_repository.load()
+        repositories.config.load()
     except Exception:
         return templates.TemplateResponse(request=request, name="setup.html")
 
-    state = container.state_manager.load()
-    backtest = container.backtest_repository.load()
+    state = repositories.state.load()
+    backtest = repositories.backtest.load()
 
     return templates.TemplateResponse(
         request=request,
@@ -105,7 +102,7 @@ async def status(request: Request):
 
 @app.get("/api/state")
 async def state(request: Request):
-    return request.app.state.container.state_manager.load()
+    return request.app.state.repositories.state.load()
 
 
 @app.post("/api/config")
