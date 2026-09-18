@@ -246,12 +246,53 @@ def test_minimum_runtime_is_respected():
             while j < len(schedule) and schedule[j] == 1:
                 run_length += 1
                 j += 1
-            assert run_length >= config.boiler_min_runtime_steps or j == len(
-                schedule
-            )
+            assert run_length >= config.boiler_min_runtime_steps or j == len(schedule)
             k = j
         else:
             k += 1
+
+
+def test_the_heat_pump_stays_off_for_a_while_after_a_run():
+    """Two targets a few steps apart: the second must be served by the same run
+    or a later one, never by a second run within the pause (see
+    MPCConfig.heat_pump_min_off_steps)."""
+
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[8] = 40.0
+    target[12] = 45.0
+
+    config = MPCConfig(heat_pump_min_off_steps=4, boiler_min_runtime_steps=1)
+    result = MPCOptimizer(THERMAL_MODEL, config).solve(
+        _make_input(target_temperature_top=tuple(target))
+    )
+
+    schedule = result.schedule
+    off_steps = 0
+
+    for k, on in enumerate(schedule):
+        if on and k > 0 and schedule[k - 1] == 0:
+            assert off_steps >= config.heat_pump_min_off_steps
+        off_steps = 0 if on else off_steps + 1
+
+
+def test_no_run_starts_before_the_pause_since_the_last_one_has_passed():
+    """The pause counts from the last real run, not from the horizon's start:
+    with half of it gone, only the remaining steps stay off."""
+
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[6] = 45.0
+
+    config = MPCConfig(heat_pump_min_off_steps=4, boiler_min_runtime_steps=1)
+    optimizer = MPCOptimizer(THERMAL_MODEL, config)
+    data = _make_input(
+        target_temperature_top=tuple(target),
+        idle_elapsed_hours=0.5,  # two of the four steps have passed
+    )
+
+    schedule = optimizer.solve(data).schedule
+
+    assert schedule[:2] == (0, 0)
+    assert any(schedule[2:])
 
 
 def test_identical_solar_band_matches_planning_on_p50_alone():

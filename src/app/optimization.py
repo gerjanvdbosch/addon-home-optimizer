@@ -120,6 +120,29 @@ class Optimization:
                 0.0, (datetime.now(timezone.utc) - run_start).total_seconds() / 3600.0
             )
 
+        # The other way round for the pause between runs (see
+        # MPCConfig.boiler_min_off_steps): how long ago the last run ended. The
+        # first reading that is not DHW is the earliest the run can have ended,
+        # so this too errs short and the pause is kept rather than cut.
+        idle_elapsed_hours = 0.0
+
+        if not boiler_on_current:
+            idle_start = heat_pump_state[-1].time if heat_pump_state else None
+
+            for point in reversed(heat_pump_state):
+                if point.value == BoilerThermalIdentifier.DHW_ACTIVE_STATE:
+                    break
+                idle_start = point.time
+
+            idle_elapsed_hours = (
+                max(
+                    0.0,
+                    (datetime.now(timezone.utc) - idle_start).total_seconds() / 3600.0,
+                )
+                if idle_start is not None
+                else 0.0
+            )
+
         # Aligned against solar's own forecast timestamps, not assumed to share
         # them: the tap forecaster is fit/predicted independently (see
         # features/tap.py) and may not have been run at all, or over a
@@ -166,6 +189,7 @@ class Optimization:
             solar_p10_w=solar_p10,
             solar_p90_w=solar_p90,
             heating_elapsed_hours=heating_elapsed_hours,
+            idle_elapsed_hours=idle_elapsed_hours,
             baseload_forecast_w=tuple(
                 self.state_manager.baseload_forecast(
                     state, forecast_times, datetime.now(timezone.utc)

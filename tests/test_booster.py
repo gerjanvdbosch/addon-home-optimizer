@@ -181,7 +181,7 @@ def test_setpoint_overshoot_is_learned_from_runs_that_stopped_on_the_setpoint():
     """Four runs, each followed by 20 minutes idle: two heat pump runs that
     settle 1.8 and 1.5 K above their setpoint, one that stopped on the heat
     pump's limit below its setpoint, and a booster run - only the first two
-    count."""
+    count, at SETPOINT_OVERSHOOT_QUANTILE of the two."""
 
     runs = [
         # (setpoint, booster, tank temperature: two heating rows, four idle)
@@ -204,4 +204,6 @@ def test_setpoint_overshoot_is_learned_from_runs_that_stopped_on_the_setpoint():
 
     overshoot = BoilerThermalIdentifier()._identify_setpoint_overshoot(df)
 
-    assert overshoot == pytest.approx((1.8 + 1.5) / 2)
+    assert overshoot == pytest.approx(
+        1.5 + (1.8 - 1.5) * BoilerThermalIdentifier.SETPOINT_OVERSHOOT_QUANTILE
+    )

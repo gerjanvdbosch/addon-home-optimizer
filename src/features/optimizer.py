@@ -485,6 +485,35 @@ class MPCOptimizer:
             for k in range(min(max(remaining_steps, 0), num_steps)):
                 model.running_run.add(heating(model, k) >= 1)
 
+        # The heat pump stays off for heat_pump_min_off_steps after a run ends,
+        # and does not start at all until that long after the last real run
+        # ended. Only enforced in the fine region, like the minimum runtime
+        # above: a coarse step already spans longer than the pause.
+        model.minimum_off_time = pyo.ConstraintList()
+        min_off = self.config.heat_pump_min_off_steps
+
+        for stop in range(fine_steps):
+            for offset in range(1, min_off + 1):
+                k = stop + offset
+
+                if k >= num_steps:
+                    continue
+
+                model.minimum_off_time.add(
+                    heating(model, k)
+                    <= 1 - (heating(model, stop) - heating(model, stop + 1))
+                )
+
+        if not data.boiler_on_current:
+            waiting_steps = math.ceil(
+                (min_off * self.config.step_hours - data.idle_elapsed_hours)
+                / self.config.step_hours
+                - 1e-9
+            )
+
+            for k in range(min(max(waiting_steps, 0), num_steps)):
+                model.minimum_off_time.add(heating(model, k) == 0)
+
         model.thermal_dynamics = pyo.ConstraintList()
 
         for k in range(num_steps - 1):

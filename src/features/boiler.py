@@ -1300,10 +1300,18 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             None if np.isnan(booster_heat_w) else float(booster_heat_w),
         )
 
+    # The setpoint for a run is its planned end temperature less this, so a low
+    # estimate ends a run high rather than short: ending short leaves the plan
+    # needing another run for a fraction of a degree. Taken over the runs' own
+    # spread (real data: 1.55 K at this quantile against a 1.75 K median), not
+    # as a made-up margin.
+    SETPOINT_OVERSHOOT_QUANTILE = 0.25
+
     def _identify_setpoint_overshoot(self, df: pd.DataFrame) -> float | None:
-        """Median of how far the tank average ends above the SWW setpoint,
+        """How far the tank average ends above the SWW setpoint,
         PLANNER_CHECK_SETTLE_S after a heat pump run that stopped by itself on
-        it; None without such a run.
+        it, at SETPOINT_OVERSHOOT_QUANTILE over those runs; None without such a
+        run.
 
         The heat pump stops when its own sensor reaches the setpoint, while the
         tank sensors still read below it; the heat left in the coil and loop
@@ -1346,7 +1354,10 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             if overshoot > 0:
                 overshoots.append(float(overshoot))
 
-        return float(np.median(overshoots)) if overshoots else None
+        if not overshoots:
+            return None
+
+        return float(np.quantile(overshoots, self.SETPOINT_OVERSHOOT_QUANTILE))
 
     # validate() compares the planning model with the tank this long after a run
     # ends: heating mixes the tank within a sample (UA_mix_active sits at its
