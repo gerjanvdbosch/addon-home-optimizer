@@ -83,7 +83,7 @@ def test_schedules_heating_during_solar_peak_when_sufficient():
 
 def test_boiler_can_turn_off_after_reaching_target():
     """Regression test for a real bug: an equality startup constraint
-    (boiler_start[k] == boiler_on[k] - boiler_on[k-1]) forces boiler_start to -1
+    (compressor_start[k] == boiler_on[k] - boiler_on[k-1]) forces compressor_start to -1
     on every stop event, which is infeasible against its own binary domain -
     making any schedule that ever turns the boiler back off unsolvable, so the
     optimizer was forced to keep it on forever once started. A schedule that
@@ -443,7 +443,7 @@ def _running_run_input(elapsed_hours: float) -> MPCInput:
         current_temp_top=40.0,
         current_temp_bottom=40.0,
         boiler_on_current=True,
-        heating_elapsed_hours=elapsed_hours,
+        compressor_elapsed_hours=elapsed_hours,
     )
 
 
@@ -830,3 +830,43 @@ def test_coarsened_long_horizon_still_meets_a_late_target_with_fewer_variables()
 
     # Fully fine resolution would need one boiler_on per fine step.
     assert coarse_variable_count < horizon
+
+
+def test_target_holds_through_a_coarse_look_ahead_block():
+    """A target must hold for the whole step, not just where it starts.
+
+    T[k] is the temperature at the START of step k, so checking only that
+    leaves a coasting tank free to sag below the target before the step ends.
+    Over a quarter hour that is worth hundredths of a kelvin; over the one-hour
+    blocks the far end of the horizon is aggregated into it is around 0.25 K,
+    and a real plan met its 18:00 target while dropping under it by 18:45.
+    """
+
+    # Long enough that the far half is aggregated into coarse blocks.
+    horizon = int((MPCConfig().fine_horizon_hours + 12.0) * 4)
+    solar = (0.0,) * horizon
+
+    # A deadline inside the coarse region, held for a few hours so the tank has
+    # to still be above it at the end of a block and not only at its start.
+    # Kept clear of the very last step, whose end the model deliberately does
+    # not represent - see end_temperature_rule.
+    target = [10.0] * horizon
+    deadline, closes = horizon - 24, horizon - 8
+    for k in range(deadline, closes):
+        target[k] = 45.0
+
+    optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig(), cop_model=COP_MODEL)
+    result = optimizer.solve(
+        _make_input(
+            solar_forecast_w=list(solar),
+            target_temperature_top=tuple(target),
+        )
+    )
+
+    shortfall = [
+        target[k] - result.temperatures[k]
+        for k in range(deadline, closes)
+        if target[k] - result.temperatures[k] > 0.0
+    ]
+
+    assert not shortfall, f"plan dips up to {max(shortfall):.3f} K below target"

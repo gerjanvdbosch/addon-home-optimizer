@@ -8,6 +8,10 @@ from app.settings import configure_logger, create_repositories, load_settings
 from app.state import StateManager
 from features.baseload import BaseloadForecaster
 from features.boiler import BoilerThermalIdentifier
+from features.building import (
+    BuildingLumpedIdentifier,
+    BuildingThermalIdentifier,
+)
 from features.cop import HeatPumpCOPIdentifier
 from features.dataset import (
     AttributeSeriesLoader,
@@ -87,6 +91,16 @@ def create_container() -> Container:
             BoilerThermalIdentifier(),
             HeatPumpCOPIdentifier(
                 mode=BoilerThermalIdentifier.DHW_ACTIVE_STATE, key="dhw"
+            ),
+            BuildingThermalIdentifier(
+                latitude=settings.latitude, longitude=settings.longitude
+            ),
+            # Both building structures are calibrated against the same data on
+            # purpose: their own skill_vs_persistence and implausible_aperture
+            # metrics then decide which one the data supports, instead of the
+            # choice being an untested assumption.
+            BuildingLumpedIdentifier(
+                latitude=settings.latitude, longitude=settings.longitude
             ),
             SolarBiasIdentifier(
                 latitude=settings.latitude, longitude=settings.longitude

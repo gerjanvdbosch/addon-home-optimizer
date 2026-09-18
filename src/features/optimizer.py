@@ -140,8 +140,8 @@ class MPCOptimizer:
                 f"{len(data.solar_p10_w)} and {len(data.solar_p90_w)}."
             )
 
-        if data.heating_elapsed_hours < 0:
-            raise ValueError("heating_elapsed_hours cannot be negative.")
+        if data.compressor_elapsed_hours < 0:
+            raise ValueError("compressor_elapsed_hours cannot be negative.")
 
         if data.baseload_forecast_w and len(data.baseload_forecast_w) != horizon:
             raise ValueError(
@@ -241,9 +241,7 @@ class MPCOptimizer:
             )
             for weight, values in scenarios
         ]
-        tap_w = self._aggregate(
-            data.tap_forecast_w or (0.0,) * horizon, plan, mean
-        )
+        tap_w = self._aggregate(data.tap_forecast_w or (0.0,) * horizon, plan, mean)
         outdoor_c = (
             self._aggregate(data.outdoor_temperature_forecast, plan, mean)
             if data.outdoor_temperature_forecast
@@ -372,7 +370,7 @@ class MPCOptimizer:
 
         model.boiler_on = pyo.Var(model.K, domain=pyo.Binary)
 
-        model.boiler_start = pyo.Var(model.K, domain=pyo.Binary)
+        model.compressor_start = pyo.Var(model.K, domain=pyo.Binary)
 
         # Heat pump heat (W): continuous up to q_in_nominal_w while on. Below
         # that, a step is only partly used: the heat pump stops by itself once
@@ -411,32 +409,73 @@ class MPCOptimizer:
             rule=temperature_rule,
         )
 
+        # T[k] is the temperature at the START of step k, so the rule above only
+        # checks a step's warmest moment while the tank is coasting. Over a
+        # quarter hour that is worth about 0.03 K and does not matter; over a
+        # one-hour look-ahead block (see _build_step_plan) it is around 0.25 K,
+        # and the plan then satisfies its target at 18:00 while the tank really
+        # sags below it by 18:45 - seen exactly that way on this installation.
+        #
+        # Requiring the same target at the step's end closes it. With constant
+        # inputs a first-order tank moves monotonically within a step, so its
+        # extremes are the two endpoints: constraining both bounds the whole
+        # step, whether it is heating or coasting.
+        def end_temperature_rule(m: pyo.ConcreteModel, k: int):
+            # The final step has no T[k + 1]: the state vector describes the
+            # starts of num_steps intervals, so the very end of the horizon is
+            # not represented. Left that way on purpose - it is the far edge of
+            # a look-ahead that is re-solved many times before it is ever acted
+            # on, and a terminal state would add a variable and a constraint to
+            # bound a moment no decision depends on.
+            if k + 1 > max(m.K):
+                return pyo.Constraint.Skip
+
+            return m.T[k + 1] + m.slack[k] >= min(float(target_c[k]), t_ceiling[k])
+
+        model.end_temperature_constraint = pyo.Constraint(
+            model.K,
+            rule=end_temperature_rule,
+        )
+
         initial_boiler_on = int(data.boiler_on_current)
 
-        # Inequality, not equality: boiler_start must be 1 on a real 0->1
-        # transition (RHS=1, forcing boiler_start[k]>=1), but on a 1->0 stop the
-        # RHS is -1 and boiler_start[k]=0 already satisfies ">=-1" trivially. An
-        # equality here would force boiler_start=-1 on every stop, which is
+        # Inequality, not equality: compressor_start must be 1 on a real 0->1
+        # transition (RHS=1, forcing compressor_start[k]>=1), but on a 1->0 stop the
+        # RHS is -1 and compressor_start[k]=0 already satisfies ">=-1" trivially. An
+        # equality here would force compressor_start=-1 on every stop, which is
         # infeasible against its own binary domain - making any schedule that
         # ever turns the boiler back off unsolvable, and forcing it to stay on
         # forever once started (confirmed: this was the actual cause of an
         # apparently-wasteful "never stops heating" result before this fix).
         # weight_switching in the objective still drives it to 0 except at real
         # starts, since setting it higher only adds cost.
-        # A run is a start of heating by either source: a booster-only run is
-        # still a DHW run the heat pump has to start, and handing over from the
-        # compressor to the booster within a run is not a second start (the two
-        # never heat together - see heat_source_constraints). Counting only
-        # compressor starts once let a free night-time booster run beat a
-        # cheaper solar heat pump run the next day on its start cost alone.
+        # Two different questions, deliberately not one helper.
+        #
+        # heating() answers "was anything putting heat into the tank", which is
+        # what the booster's continuation rule needs: it may only take over from
+        # a run already under way, and a booster step must be able to follow
+        # another booster step.
+        #
+        # compressor() answers "was the compressor running", which is what a
+        # start costs. The booster is resistive, so it runs with the compressor
+        # off; a handover from compressor to booster is therefore the end of a
+        # compressor run, and anything that needs the compressor afterwards is a
+        # genuine second start. Counting the booster as compressor heating hid
+        # exactly that. The two were the same expression before, which also made
+        # a booster-only run look like a compressor start - it cannot occur at
+        # all (see the continuation rule in heat_source_constraints), so nothing
+        # is lost by no longer pricing it.
         def heating(m: pyo.ConcreteModel, k: int):
             return m.boiler_on[k] + m.booster_on[k]
 
+        def compressor(m: pyo.ConcreteModel, k: int):
+            return m.boiler_on[k]
+
         def startup_rule(m: pyo.ConcreteModel, k: int):
             if k == 0:
-                return m.boiler_start[k] >= (heating(m, k) - initial_boiler_on)
+                return m.compressor_start[k] >= (compressor(m, k) - initial_boiler_on)
 
-            return m.boiler_start[k] >= (heating(m, k) - heating(m, k - 1))
+            return m.compressor_start[k] >= (compressor(m, k) - compressor(m, k - 1))
 
         model.startup_constraint = pyo.Constraint(
             model.K,
@@ -459,8 +498,17 @@ class MPCOptimizer:
                 if k >= num_steps:
                     continue
 
+                # heating(), not compressor(), and deliberately so. The booster
+                # may only run once the compressor has reached its own limit
+                # (see heat_source_constraints), so "something is still heating"
+                # already means "the compressor is still running unless it
+                # physically cannot". Demanding compressor() here removes that
+                # escape: a tank one degree under the limit cannot give the
+                # compressor two steps of work, so the solver dropped the run
+                # altogether and paid the slack rather than start, missing a
+                # target it could have reached by handing over to the booster.
                 model.minimum_runtime.add(
-                    heating(model, k) >= model.boiler_start[start]
+                    heating(model, k) >= model.compressor_start[start]
                 )
 
         # A run already heating keeps heating until its minimum runtime has
@@ -470,7 +518,7 @@ class MPCOptimizer:
         # model cannot represent that run: a tank above the heat pump's limit
         # with no booster to plan with.
         remaining_steps = math.ceil(
-            (min_runtime * self.config.step_hours - data.heating_elapsed_hours)
+            (min_runtime * self.config.step_hours - data.compressor_elapsed_hours)
             / self.config.step_hours
             - 1e-9
         )
@@ -841,7 +889,7 @@ class MPCOptimizer:
 
             objective += self.config.price_eur_per_kwh * grid_energy_kwh
 
-            objective += self.config.weight_switching * model.boiler_start[k]
+            objective += self.config.weight_switching * model.compressor_start[k]
 
             objective += self.config.weight_temperature_slack * model.slack[k]
 

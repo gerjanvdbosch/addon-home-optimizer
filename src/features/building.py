@@ -1,0 +1,1629 @@
+"""Two-node (2R2C) grey-box thermal model of one building zone.
+
+One model serves both space heating and space cooling. The envelope physics -
+transmission to outdoors, thermal mass, solar gain through south glazing,
+internal gains - is the same in both modes, and the heat pump's contribution
+enters as a *measured* calorimetric term carrying its own sign, so cooling is
+simply a negative heat input. Nothing in BuildingThermalModel describes the
+heat pump, so there is no parameter that could differ per mode. Mode-dependence
+belongs in the COP model (already one instance per mode, see features/cop.py),
+not in this heat balance. Floor cooling is additionally limited by condensation
+on the floor surface, which is a constraint on how the zone may be cooled rather
+than a term in its energy balance - not modelled here, and not yet anywhere.
+"""
+
+import logging
+
+import numpy as np
+import pandas as pd
+from pvlib import irradiance, solarposition
+from scipy.optimize import least_squares
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+from domain.types import (
+    BuildingLumpedModel,
+    BuildingThermalModel,
+    Config,
+    SensorReference,
+)
+from features.boiler import (
+    CP_WATER_J_PER_KG_K,
+    RHO_WATER_KG_PER_L,
+    discretize_zoh,
+)
+from features.dataset import DatasetBuilder, DatasetDefinition
+from features.identifier import SystemIdentifier
+from infrastructure.influx import Aggregation, FillMethod
+
+logger = logging.getLogger(__name__)
+
+# Physical constants of indoor air at room conditions, not fit parameters.
+RHO_AIR_KG_PER_M3 = 1.2
+CP_AIR_J_PER_KG_K = 1005.0
+
+# Sensible heat released by one adult at rest / light activity (ASHRAE
+# Fundamentals, Handbook chapter on internal heat gain). Only the sensible part
+# enters a temperature balance; the ~45 W latent part adds moisture, which does
+# not affect this ODE - stated here as an explicit modelling assumption rather
+# than silently dropped.
+Q_PERSON_SENSIBLE_W = 75.0
+
+# The modelled glazing faces due south on a vertical facade. Both are geometry
+# of this installation, expressed in pvlib's convention (azimuth clockwise from
+# north, tilt from horizontal).
+SOUTH_FACADE_AZIMUTH_DEG = 180.0
+VERTICAL_FACADE_TILT_DEG = 90.0
+
+
+def state_space(model: BuildingThermalModel) -> tuple[np.ndarray, np.ndarray]:
+    """Continuous state-space for dx/dt = A x + B u.
+
+    x = [T_air, T_mass], u = [T_outdoor, Q_internal, Q_solar, Q_floor]:
+
+        C_air  dT_air/dt  = UA_env (T_out - T_air) + UA_am (T_mass - T_air) + Q_int
+        C_mass dT_mass/dt = UA_am  (T_air - T_mass) + Q_sol + Q_floor
+
+    Q_solar and Q_floor drive the mass node, not the air node. The floor
+    circuit physically runs inside the screed, and air is effectively
+    transparent to shortwave radiation, which is absorbed by floor and
+    furnishings - this is the same structure as the boiler's, where heat is
+    supplied at the bottom rather than uniformly. It is also what produces the
+    observed lag between sun or compressor and room temperature, without any
+    added delay term.
+    """
+
+    ua_env = model.ua_envelope_w_per_k
+    ua_am = model.ua_air_mass_w_per_k
+    c_air = model.c_air_j_per_k
+    c_mass = model.c_mass_j_per_k
+
+    a = np.array(
+        [
+            [-(ua_env + ua_am) / c_air, ua_am / c_air],
+            [ua_am / c_mass, -ua_am / c_mass],
+        ]
+    )
+
+    b = np.array(
+        [
+            [ua_env / c_air, 1.0 / c_air, 0.0, 0.0],
+            [0.0, 0.0, 1.0 / c_mass, 1.0 / c_mass],
+        ]
+    )
+
+    return a, b
+
+
+def lumped_state_space(
+    model: BuildingLumpedModel,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Continuous state-space for the single-node model.
+
+    x = [T], u = [T_outdoor, Q_internal, Q_solar, Q_floor]:
+
+        C dT/dt = UA (T_out - T) + Q_int + Q_sol + Q_floor
+
+    All three heat inputs enter the one node, because there is only one. Where
+    they physically land - air or screed - is exactly the distinction this
+    model gives up, and the reason the two-node form still exists.
+    """
+
+    ua = model.ua_w_per_k
+    c = model.c_j_per_k
+
+    a = np.array([[-ua / c]])
+    b = np.array([[ua / c, 1.0 / c, 1.0 / c, 1.0 / c]])
+
+    return a, b
+
+
+def facade_irradiance_w_per_m2(
+    interval_midpoints: pd.Series,
+    direct_normal: np.ndarray,
+    diffuse_horizontal: np.ndarray,
+    global_horizontal: np.ndarray,
+    latitude: float,
+    longitude: float,
+) -> np.ndarray:
+    """Plane-of-array irradiance on the vertical south facade (W/m2).
+
+    The Open-Meteo `global_tilted_irradiance` attribute already in the config is
+    computed for the PV array's own tilt and azimuth, so it does not describe
+    this facade; the transposition is redone here from the three components
+    Open-Meteo reports independently of any surface (DNI, DHI, GHI).
+
+    The irradiance values are means over a step, so the transposition uses the
+    sun's position at that step's MIDPOINT rather than its start - over 15
+    minutes the sun moves nearly four degrees in azimuth, which a vertical
+    facade sees directly in its angle of incidence.
+
+    Uses pvlib's isotropic sky-diffuse model: the simplest transposition with no
+    free parameters. A Perez-type model would be more accurate for diffuse on a
+    vertical surface, but its extra empirical coefficients cannot be checked
+    against anything measured at this installation, and the identified effective
+    aperture a_eff_m2 would silently absorb the difference.
+    """
+
+    position = solarposition.get_solarposition(
+        pd.DatetimeIndex(interval_midpoints), latitude=latitude, longitude=longitude
+    )
+
+    total = irradiance.get_total_irradiance(
+        surface_tilt=VERTICAL_FACADE_TILT_DEG,
+        surface_azimuth=SOUTH_FACADE_AZIMUTH_DEG,
+        solar_zenith=position["apparent_zenith"].to_numpy(),
+        solar_azimuth=position["azimuth"].to_numpy(),
+        dni=direct_normal,
+        ghi=global_horizontal,
+        dhi=diffuse_horizontal,
+        model="isotropic",
+    )
+
+    return np.nan_to_num(np.asarray(total["poa_global"], dtype=float), nan=0.0)
+
+
+def solar_gain_w(
+    a_eff_m2: float,
+    shutter_open_fraction: np.ndarray,
+    facade_irradiance: np.ndarray,
+) -> np.ndarray:
+    """Q_sol = A_eff * f_shutter * I_facade.
+
+    A roller shutter covers the glass from the top down, so the *unobstructed
+    glass area* scales linearly with its open position - the linearity is
+    geometric, not an assumed response curve. A fully closed shutter is taken as
+    fully opaque; real slat gaps transmit a few percent, which would show up as
+    an underprediction on sunny days with the shutter shut, and only then is
+    there evidence for a residual-transmittance parameter.
+    """
+
+    return a_eff_m2 * shutter_open_fraction * facade_irradiance
+
+
+def internal_gain_w(
+    baseload_w: np.ndarray,
+    internal_gain_fraction: float,
+    occupants: np.ndarray,
+) -> np.ndarray:
+    """Q_int = f_indoor * P_baseload + n_occupants * Q_PERSON_SENSIBLE_W.
+
+    Household electricity ends up as heat inside the building, so the measured
+    baseload power is a direct measurement of appliance and lighting gain rather
+    than something to fit. Only its in-zone fraction is identified, because the
+    sensor covers the whole house while the model covers one zone.
+    """
+
+    return internal_gain_fraction * baseload_w + occupants * Q_PERSON_SENSIBLE_W
+
+
+def floor_heat_w(
+    flow_lpm: np.ndarray,
+    supply_temperature_c: np.ndarray,
+    return_temperature_c: np.ndarray,
+) -> np.ndarray:
+    """Calorimetric heat delivered to the floor circuit: Q = m_dot * cp * dT.
+
+    Signed by construction: during heating the supply is warmer than the return
+    and Q is positive, during cooling it is colder and Q is negative. That is
+    precisely why one model covers both modes - no mode flag enters here.
+    """
+
+    mass_flow_kg_per_s = RHO_WATER_KG_PER_L * flow_lpm / 60.0
+
+    return (
+        mass_flow_kg_per_s
+        * CP_WATER_J_PER_KG_K
+        * (supply_temperature_c - return_temperature_c)
+    )
+
+
+def kalman_states(
+    a: np.ndarray,
+    b: np.ndarray,
+    measured: np.ndarray,
+    inputs: np.ndarray,
+    dt_seconds: np.ndarray,
+    process_noise_w: float,
+    measurement_variance: float,
+) -> np.ndarray:
+    """Filtered state estimate at every sample, from the measured air
+    temperature alone.
+
+    Only the first state is observed - the room thermometer - so any other
+    state has to be inferred from how the measured one moves relative to what
+    the model predicted. That is what a Kalman filter does, and it is the
+    honest way to start a rollout: hard-resetting the measured state while
+    letting an unmeasured one free-run leaves the two inconsistent with each
+    other, which flatters a single-state model and penalises a multi-state one.
+
+    It is also not only an evaluation device. An MPC must know where it starts
+    from at solve time, including a screed temperature nothing measures, so
+    this is a missing part of the system rather than a test harness.
+
+    Process noise is expressed as an unmodelled HEAT FLOW (W) entering through
+    the same channel as the internal gains, not as an abstract covariance: the
+    disturbance this is standing in for - ventilation through an opened window,
+    a wood stove, a visitor - is a heat flow, so its magnitude can be reasoned
+    about physically.
+    """
+
+    n = a.shape[0]
+
+    state = np.concatenate(([measured[0]], np.full(n - 1, measured[0])))
+    covariance = np.eye(n) * measurement_variance
+
+    estimates = np.empty((len(measured), n))
+    estimates[0] = state
+
+    cache: dict[float, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+
+    for i in range(1, len(measured)):
+        dt = float(dt_seconds[i])
+        key = round(dt, 3)
+
+        if key not in cache:
+            a_d, b_d = discretize_zoh(a, b, dt)
+            # The disturbance enters where an unmodelled indoor heat flow
+            # would, and its effect on the state is what the DISCRETE input
+            # matrix says an input of that size does over one step. Building it
+            # from the continuous B instead understates it by a factor dt^2 -
+            # here about a million - which silently turns the filter into a
+            # free-running simulation that ignores the measurement.
+            disturbance = b_d[:, 1:2]
+            cache[key] = (
+                a_d,
+                b_d,
+                (process_noise_w**2) * (disturbance @ disturbance.T),
+            )
+
+        a_d, b_d, process_covariance = cache[key]
+
+        state = a_d @ state + b_d @ inputs[i - 1]
+        covariance = a_d @ covariance @ a_d.T + process_covariance
+
+        # The air temperature is the first state and the only measured one, so
+        # the observation matrix is a unit vector and the usual matrix products
+        # reduce to indexing.
+        innovation = measured[i] - state[0]
+        innovation_covariance = covariance[0, 0] + measurement_variance
+
+        gain = covariance[:, 0] / innovation_covariance
+
+        state = state + gain * innovation
+        covariance = covariance - np.outer(gain, covariance[0, :])
+
+        estimates[i] = state
+
+    return estimates
+
+
+def _rollout(
+    a: np.ndarray,
+    b: np.ndarray,
+    initial_state: np.ndarray,
+    inputs: np.ndarray,
+    dt_seconds: np.ndarray,
+) -> np.ndarray:
+    """Forward-simulate a window from one initial state, for either structure.
+
+    `inputs` holds u = [T_outdoor, Q_internal, Q_solar, Q_floor] per sample, and
+    only the initial state is taken from measurements - no mid-window room
+    temperature is used - so this measures genuine forward-simulation accuracy
+    rather than one-step curve fitting. Zero-order hold: the input at the START
+    of each interval governs that interval, matching the discretization.
+    """
+
+    n = len(dt_seconds)
+
+    simulated = np.empty((n, len(initial_state)))
+    simulated[0] = initial_state
+
+    cache: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+
+    for i in range(1, n):
+        dt = float(dt_seconds[i])
+        key = round(dt, 3)
+
+        if key not in cache:
+            cache[key] = discretize_zoh(a, b, dt)
+
+        a_d, b_d = cache[key]
+
+        simulated[i] = a_d @ simulated[i - 1] + b_d @ inputs[i - 1]
+
+    return simulated
+
+
+class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
+    """Identifies the zone's envelope parameters from measured room temperature.
+
+    Both the heating and the cooling season feed the same fit: Q_floor is a
+    measured calorimetric input (see floor_heat_w), so a cooling run is just a
+    negative heat input and no parameter here is mode-specific.
+
+    Parameters are identified from multi-hour rollouts, not one-step residuals.
+    This installation's room sensor reports on change, roughly every half hour
+    at 0.1 K resolution, so the true one-step temperature change over a 15
+    minute step is largely inside the quantisation and interpolation noise - the
+    same reason BoilerThermalIdentifier scores its passive-loss parameters over
+    2 hour decay windows rather than single steps.
+
+    Windows where the floor circuit is running are deliberately kept in: during
+    free float the air and mass nodes drift together, so the coupling between
+    them (ua_air_mass_w_per_k) is only really excited when heat is injected into
+    the floor. Free-float windows in turn carry almost all the information about
+    the envelope loss. The fit needs both, and validate() reports each regime
+    separately so one cannot hide a poor result in the other.
+    """
+
+    # Whitelist, not a blacklist of "anything that isn't Uit": during "SWW" and
+    # "Legionellapreventie" the three-way valve sends the same measured flow to
+    # the DHW tank, not to the floor circuit, so those states must read as zero
+    # heat into the building. Only states that actually drive the floor belong
+    # here. "Verwarmen" is listed although this installation has not logged it
+    # yet - the model is the same either way, and a heating run must not be
+    # silently dropped once one occurs.
+    SPACE_ACTIVE_STATES = ("Koelen", "Verwarmen")
+
+    # The only state prepare()'s flow-gap bridging may trust as "compressor
+    # definitely off" - same principle and same value as
+    # BoilerThermalIdentifier.HEAT_PUMP_OFF_STATE.
+    HEAT_PUMP_OFF_STATE = "Uit"
+
+    # A flow reading must be strictly positive to mean anything physically.
+    MIN_FLOW_LPM = 0.0
+
+    TRAIN_RATIO = 0.80
+
+    # Excludes transitions spanning a data gap far larger than the nominal
+    # sampling interval, which would test steady-state convergence rather than
+    # the dynamics - same role and value as in BoilerThermalIdentifier.
+    MAX_DT_SECONDS_MULTIPLE = 6.0
+
+    # Length of a scored rollout. Long enough for the building's own time
+    # constants (hours, set by c_mass over ua_envelope) to produce a temperature
+    # change well clear of the 0.1 K sensor resolution, short enough that
+    # unmeasured disturbances - an opened window, a wood stove, an unmodelled
+    # zone exchanging air - are unlikely to span a whole window.
+    ROLLOUT_HORIZON_HOURS = 6.0
+
+    # T_mass is never measured, so a simulation has to start it somewhere: each
+    # contiguous run starts it equal to the air temperature and scores nothing
+    # until this much has elapsed. It must outlast the mass node's own time
+    # constant c_mass / ua_air_mass, which for a floor-heated dwelling is around
+    # half a day (tens of MJ/K over a few hundred W/K); a day of lead-in leaves
+    # a few percent of the initial error. A shorter warm-up was tried and
+    # rejected: at 6 hours the fit traded the unresolved initial mass
+    # temperature against the envelope conductance and recovered it several
+    # times too small on synthetic data with known parameters.
+    MASS_WARMUP_HOURS = 24.0
+
+    # The zone sensors report in 0.1 K steps. A uniform quantisation error of
+    # that width has variance step^2/12, which is what the filter is told about
+    # the measurement - taken from the instrument, not tuned.
+    SENSOR_RESOLUTION_K = 0.1
+
+    # Standard deviation of the heat flow the model does not account for, which
+    # is what the filter's process noise stands in for. Its scale is what an
+    # unmodelled ventilation path actually moves: three air changes per hour
+    # through a 200 m3 zone - a window wide open - shifts about 1 kW at a 5 K
+    # indoor-outdoor difference and some 3 kW at the 15 K of a winter day.
+    # Measured unexplained flows on this installation are the same order (about
+    # 1.3 kW during cooling runs).
+    #
+    # Stating it as a heat flow rather than an abstract covariance is what makes
+    # that argument possible at all. It also has to be large relative to the
+    # 0.03 K sensor noise, because the model is demonstrably the less reliable
+    # of the two: below roughly 1 kW the filter starts trusting the model over
+    # the thermometer and both structures get worse. Above it the two-node
+    # result is flat across two orders of magnitude, so nothing here hinges on
+    # the exact number - the tests check that.
+    PROCESS_NOISE_W = 3000.0
+
+    # Standard MAD-to-std conversion for a normal distribution, used to set the
+    # robust loss scale from the data's own residual spread (not physical).
+    MAD_TO_STD = 1.4826
+    MIN_F_SCALE = 1e-6
+
+    # Envelope conductance of a whole dwelling of this size, from a very well
+    # insulated new build to a poorly insulated older one. A sanity range, not
+    # an expected value.
+    MIN_UA_ENVELOPE_W_PER_K = 30.0
+    MAX_UA_ENVELOPE_W_PER_K = 500.0
+    INITIAL_UA_ENVELOPE_W_PER_K = 150.0
+
+    # Convective/radiative coupling between the internal mass surfaces (floor,
+    # internal walls) and room air: a combined surface coefficient of roughly
+    # 3-8 W/m2K over an internal surface area of tens to a few hundred m2.
+    MIN_UA_AIR_MASS_W_PER_K = 50.0
+    MAX_UA_AIR_MASS_W_PER_K = 2000.0
+    INITIAL_UA_AIR_MASS_W_PER_K = 400.0
+
+    # The air node's capacity is at least the zone's own air (rho*V*cp) and at
+    # most that many times more, covering the light furnishings and surface
+    # layers that follow the air almost instantly. Both bounds are derived from
+    # the configured volume, never asserted in Joules. Ten times air is about
+    # what furnishings can physically account for: roughly 10 kg/m2 of wood over
+    # the floor area is 2.1 MJ/K against 0.3 MJ/K of air, so about 8x.
+    #
+    # On real data this pins at the upper bound, which is reported rather than
+    # tuned away. Raising a ceiling a parameter is chasing is not evidence for a
+    # larger true value - the same trap already documented for
+    # HeatPumpCOPIdentifier.MAX_DELTA_T_EVAP. The likely physical cause is that
+    # the zone temperature comes from wall-mounted thermostats, whose own
+    # response lags the air they measure, so the fit needs a slower "air" node
+    # than air actually is.
+    MIN_AIR_CAPACITY_MULTIPLE = 1.0
+    MAX_AIR_CAPACITY_MULTIPLE = 10.0
+    INITIAL_AIR_CAPACITY_MULTIPLE = 3.0
+
+    # Screed, floor slab and internal walls. 2 MJ/K is about a tonne of
+    # concrete (cp ~ 880 J/kgK), the least a floor-heated dwelling can have;
+    # 50 MJ/K is tens of tonnes, more structure than a house of this size has.
+    MIN_C_MASS_J_PER_K = 2.0e6
+    MAX_C_MASS_J_PER_K = 50.0e6
+    INITIAL_C_MASS_J_PER_K = 15.0e6
+
+    # Fraction of the configured south glass area used as the starting guess
+    # for the effective aperture: a typical double-glazing g-value times a
+    # yearly-average incidence/soiling factor lands near half the geometric
+    # area. The bounds themselves are [0, glass area] - see calibrate().
+    INITIAL_APERTURE_FRACTION = 0.5
+
+    # Share of the house-wide baseload dissipated inside the modelled zone.
+    # Physically a fraction, hence [0, 1]; the living zone is a substantial but
+    # not dominant part of the house, so the fit starts mid-range.
+    INITIAL_INTERNAL_GAIN_FRACTION = 0.5
+
+    def __init__(self, latitude: float, longitude: float) -> None:
+        super().__init__()
+        self.latitude = latitude
+        self.longitude = longitude
+        # Overwritten by dataset() from ClimateConfig once available; the
+        # defaults only keep prepare()/calibrate() callable on their own.
+        self.volume_m3: float = 0.0
+        self.glazing_areas_m2: list[float] = []
+        self.shutter_areas_m2: list[float] = []
+        self.zone_temperature_columns: list[str] = []
+        self.zone_areas_m2: list[float] = []
+        self.shutter_columns: list[str] = []
+        self.presence_columns: list[str] = []
+        self.parameter_std_errors: dict[str, float] | None = None
+
+    @property
+    def name(self) -> str:
+        return "building"
+
+    @property
+    def label(self) -> str:
+        return "Room temperature"
+
+    @property
+    def unit(self) -> str:
+        return "°C"
+
+    # Home Assistant device_tracker convention, and the numeric form InfluxDB
+    # exports these trackers as. Whitelist, not a blacklist of "anything that
+    # isn't not_home": "unknown"/"unavailable" or a missing reading means the
+    # tracker is unreliable right now and must not be counted as a person
+    # sitting in the room radiating 75 W.
+    HOME_PRESENCE_STATE = "home"
+    HOME_PRESENCE_VALUE = 1.0
+
+    # Home Assistant cover convention: current_position is a percentage with
+    # 100 meaning fully open.
+    FULLY_OPEN_POSITION = 100.0
+
+    # a_eff_m2 = glass area * g-value * frame factor * soiling. The geometric
+    # angle of incidence is NOT in there - the transposition to the facade
+    # already accounts for it - so from the glazing alone the product has a
+    # floor: even solar-control glass has a g-value around 0.25, and a frame
+    # factor below 0.7 would mean more frame than glass, giving about 0.17.
+    #
+    # The threshold sits deliberately BELOW that floor, because a_eff also
+    # absorbs facade shading the transposition knows nothing about - an
+    # overhang, a neighbouring building, a tree - which can legitimately push
+    # the effective aperture under what the glazing alone allows. That makes
+    # this a test for values no combination of glass and shade could produce,
+    # not a test for good glass. A result between this threshold and 0.17 is
+    # therefore not an endorsement: it passes only if there is real shading to
+    # point at.
+    MIN_PLAUSIBLE_APERTURE_FRACTION = 0.15
+
+    # A thermal model has to beat holding the last measurement for the length of
+    # a rollout. That baseline is free, needs no parameters, and is genuinely
+    # hard to beat indoors over a few hours: room temperature is a slow random
+    # walk. Anything at or below zero skill means the model's own dynamics are
+    # adding error rather than information, however small its MAE looks next to
+    # the sensor resolution - which is exactly what happened here on
+    # cooling-season data, where the model scored 0.36 K against persistence's
+    # 0.16 K.
+    MIN_SKILL_VS_PERSISTENCE = 0.0
+
+    # Samples inside one rollout are highly correlated - they come from a single
+    # forward simulation - so the independent unit is the WINDOW, not the
+    # sample. Below this many windows containing floor activity, the difference
+    # between two mean absolute errors cannot be told from the spread between
+    # individual rollouts, and the active-regime skill is reported as
+    # insufficient evidence rather than as a verdict. Same principle as
+    # BoilerThermalIdentifier.MIN_CALORIMETRIC_Q_IN_SAMPLES.
+    MIN_ACTIVE_WINDOWS = 10
+
+    PARAMETER_NAMES = (
+        "ua_envelope_w_per_k",
+        "ua_air_mass_w_per_k",
+        "c_air_j_per_k",
+        "c_mass_j_per_k",
+        "a_eff_m2",
+        "internal_gain_fraction",
+    )
+
+    @staticmethod
+    def _state_space(model) -> tuple[np.ndarray, np.ndarray]:
+        """The structure this identifier fits. Overridden by the single-node
+        variant; everything else in this class is shared between the two.
+        """
+
+        return state_space(model)
+
+    @staticmethod
+    def _parameters(model: BuildingThermalModel) -> np.ndarray:
+        return np.array(
+            [
+                model.ua_envelope_w_per_k,
+                model.ua_air_mass_w_per_k,
+                model.c_air_j_per_k,
+                model.c_mass_j_per_k,
+                model.a_eff_m2,
+                model.internal_gain_fraction,
+            ]
+        )
+
+    def _model_from_parameters(self, x: np.ndarray) -> BuildingThermalModel:
+        return BuildingThermalModel(
+            ua_envelope_w_per_k=float(x[0]),
+            ua_air_mass_w_per_k=float(x[1]),
+            c_air_j_per_k=float(x[2]),
+            c_mass_j_per_k=float(x[3]),
+            a_eff_m2=float(x[4]),
+            internal_gain_fraction=float(x[5]),
+        )
+
+    def _shutter_open_fraction(self, df: pd.DataFrame) -> pd.Series:
+        """Area-weighted unshaded fraction of the zone's south glazing.
+
+        sum(area_i * open_i) / sum(area_i): shading is an area effect, so a
+        small bedroom window may not carry the same weight as a large living
+        room screen. Confirmed necessary on this installation's data - the four
+        south shutters move almost independently, and an unweighted mean differs
+        from this by a median of 8.8 percentage points.
+
+        Glazing without a cover contributes its full area as permanently
+        unshaded, which is what keeps this a fraction of the TOTAL south glass
+        that a_eff_m2 is bounded by.
+        """
+
+        total_area = sum(self.glazing_areas_m2)
+
+        if total_area <= 0.0:
+            return pd.Series(1.0, index=df.index)
+
+        unshaded_area = total_area - sum(self.shutter_areas_m2)
+        weighted = pd.Series(unshaded_area, index=df.index)
+
+        for column, area in zip(
+            self.shutter_columns, self.shutter_areas_m2, strict=True
+        ):
+            position = pd.to_numeric(df[column], errors="coerce")
+            # A missing position reading must not silently mean "shut": an
+            # absent cover reading says nothing about the glass, and assuming
+            # full shading would attribute real solar gain to the envelope.
+            open_fraction = (position / self.FULLY_OPEN_POSITION).fillna(1.0)
+            weighted = weighted + area * open_fraction.clip(0.0, 1.0)
+
+        return (weighted / total_area).clip(0.0, 1.0)
+
+    def _occupants(self, df: pd.DataFrame) -> pd.Series:
+        if not self.presence_columns:
+            return pd.Series(0.0, index=df.index)
+
+        at_home = [
+            (df[column] == self.HOME_PRESENCE_STATE)
+            | (pd.to_numeric(df[column], errors="coerce") == self.HOME_PRESENCE_VALUE)
+            for column in self.presence_columns
+        ]
+
+        return pd.concat(at_home, axis=1).sum(axis=1).astype(float)
+
+    def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Turns the loaded frame into the model's inputs on one regular grid.
+
+        The weather frame is a series of forecast snapshots, so each valid time
+        appears once per snapshot that covered it. Only the freshest snapshot
+        that still looked forward is kept - the closest thing to a measurement
+        of irradiance this installation has, since no pyranometer is installed.
+        """
+
+        df = df.copy()
+
+        # One representative temperature for the zone, weighted by floor area.
+        # Averaging rather than picking a room: the heat this is weighed against
+        # (Q_floor, the baseload) is delivered to the whole dwelling, and the
+        # sensors' own 0.1 K reporting steps partly cancel across them. The
+        # weighting matters because thermostats are not spread evenly over a
+        # dwelling - see ZoneSensor. A room that has dropped out is left out of
+        # that step's mean, and its weight with it, instead of voiding the step.
+        if self.zone_temperature_columns:
+            zone = df[self.zone_temperature_columns].apply(
+                pd.to_numeric, errors="coerce"
+            )
+            weights = pd.Series(self.zone_areas_m2, index=self.zone_temperature_columns)
+            available = zone.notna() * weights
+            df["T_air"] = (zone * weights).sum(axis=1) / available.sum(axis=1)
+
+        # Without a configured outdoor sensor, Open-Meteo's own temperature is
+        # the only outdoor air temperature available (see
+        # HeatPumpConfig.outdoor_temperature for why the measurement is
+        # preferred when there is one).
+        if "T_out" not in df.columns and "temperature" in df.columns:
+            df["T_out"] = df["temperature"]
+
+        # Every one of these is requested unconditionally by dataset(), so a
+        # missing column means a misconfigured sensor, not an optional input -
+        # better to say which one than to quietly model it as zero.
+        required_columns = [
+            "time",
+            "target_time",
+            "T_air",
+            "T_out",
+            "state",
+            "flow_lpm",
+            "T_supply",
+            "T_return",
+            "baseload_w",
+            "direct_radiation",
+            "diffuse_radiation",
+            "direct_normal_irradiance",
+        ]
+        missing_columns = [
+            column for column in required_columns if column not in df.columns
+        ]
+
+        if missing_columns:
+            raise ValueError(
+                f"Missing required columns for building identification: "
+                f"{missing_columns}"
+            )
+
+        df["lead_time_hours"] = (
+            df["target_time"] - df["time"]
+        ).dt.total_seconds() / 3600.0
+
+        df = df[df["lead_time_hours"] >= 0.0]
+        df = df.sort_values(["target_time", "lead_time_hours"])
+        df = df.drop_duplicates(subset="target_time", keep="first")
+
+        df = df.drop(columns=["time", "lead_time_hours"])
+        df = df.rename(columns={"target_time": "time"})
+        df = df.sort_values("time").reset_index(drop=True)
+
+        df = df.dropna(subset=["T_air", "T_out"]).reset_index(drop=True)
+
+        if df.empty:
+            raise ValueError(
+                "No overlapping room temperature, outdoor temperature and "
+                "weather data in the requested range."
+            )
+
+        numeric_columns = [
+            "T_air",
+            "T_out",
+            "flow_lpm",
+            "T_supply",
+            "T_return",
+            "baseload_w",
+            "direct_radiation",
+            "diffuse_radiation",
+            "direct_normal_irradiance",
+        ]
+
+        for column in numeric_columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+
+        # flow_lpm is rate-like and fetched without an InfluxDB fill, so a
+        # reporting gap arrives as NaN. The compressor's own state settles what
+        # a gap means - identical reasoning to
+        # BoilerThermalIdentifier._bridge_flow_reporting_gaps.
+        flow = df["flow_lpm"].ffill()
+        df["flow_lpm"] = flow.where(
+            df["state"] != self.HEAT_PUMP_OFF_STATE, 0.0
+        ).fillna(0.0)
+
+        # Heat only reaches the floor circuit while the heat pump is actually
+        # serving the space; during SWW the same flow goes to the tank instead.
+        measurable = (
+            df["state"].isin(self.SPACE_ACTIVE_STATES)
+            & (df["flow_lpm"] > self.MIN_FLOW_LPM)
+            & df["T_supply"].notna()
+            & df["T_return"].notna()
+        )
+
+        df["Q_floor_w"] = np.where(
+            measurable,
+            floor_heat_w(
+                df["flow_lpm"].to_numpy(dtype=float),
+                df["T_supply"].to_numpy(dtype=float),
+                df["T_return"].to_numpy(dtype=float),
+            ),
+            0.0,
+        )
+
+        # dt_seconds[i] is the step ENDING at row i, matching _rollout, which
+        # advances from i-1 to i over it.
+        df["dt_seconds"] = df["time"].diff().dt.total_seconds()
+        df.loc[df.index[0], "dt_seconds"] = df["dt_seconds"].median()
+
+        # The step DRIVEN by row i is the one starting there, so its midpoint
+        # uses the forward gap, not the backward one.
+        forward_dt = df["dt_seconds"].shift(-1)
+        forward_dt = forward_dt.fillna(df["dt_seconds"].median())
+
+        df["I_facade_w_per_m2"] = facade_irradiance_w_per_m2(
+            df["time"] + pd.to_timedelta(forward_dt / 2.0, unit="s"),
+            direct_normal=df["direct_normal_irradiance"].to_numpy(dtype=float),
+            diffuse_horizontal=df["diffuse_radiation"].to_numpy(dtype=float),
+            # Open-Meteo reports the direct component on the horizontal plane
+            # separately from the diffuse one, and GHI is their sum by
+            # definition of global horizontal irradiance.
+            global_horizontal=(
+                df["direct_radiation"].fillna(0.0) + df["diffuse_radiation"].fillna(0.0)
+            ).to_numpy(dtype=float),
+            latitude=self.latitude,
+            longitude=self.longitude,
+        )
+
+        df["shutter_open_fraction"] = self._shutter_open_fraction(df)
+        df["occupants"] = self._occupants(df)
+        df["baseload_w"] = df["baseload_w"].fillna(0.0)
+
+        return df
+
+    def _inputs(self, model, df: pd.DataFrame) -> np.ndarray:
+        """u = [T_outdoor, Q_internal, Q_solar, Q_floor] per sample.
+
+        Rebuilt per fit iteration because two of the four depend on identified
+        parameters (the effective aperture and the in-zone baseload fraction).
+        Takes the model rather than the raw parameter vector, so both the
+        two-node and the single-node structure feed it the same way.
+        """
+
+        q_solar = solar_gain_w(
+            a_eff_m2=model.a_eff_m2,
+            shutter_open_fraction=df["shutter_open_fraction"].to_numpy(dtype=float),
+            facade_irradiance=df["I_facade_w_per_m2"].to_numpy(dtype=float),
+        )
+
+        q_internal = internal_gain_w(
+            baseload_w=df["baseload_w"].to_numpy(dtype=float),
+            internal_gain_fraction=model.internal_gain_fraction,
+            occupants=df["occupants"].to_numpy(dtype=float),
+        )
+
+        return np.column_stack(
+            [
+                df["T_out"].to_numpy(dtype=float),
+                q_internal,
+                q_solar,
+                df["Q_floor_w"].to_numpy(dtype=float),
+            ]
+        )
+
+    def _rollout_plan(
+        self,
+        df: pd.DataFrame,
+        median_dt: float,
+    ) -> tuple[list[tuple[int, int]], int, int]:
+        """(contiguous runs, warm-up samples, horizon samples).
+
+        A run is a stretch with no sampling gap. Within a run, T_air is
+        re-anchored to the measurement every horizon so errors cannot accumulate
+        without bound, while T_mass is carried straight through - it is never
+        measured, so there is nothing to re-anchor it to, and restarting it from
+        the air temperature at every window would inject a fresh error each time.
+        """
+
+        # Zero is meaningful, not a degenerate case: a structure whose only
+        # state is the measurement has nothing to settle, so every window
+        # scores and a six-hour gap-free stretch is already usable.
+        warmup_samples = max(int(round(self.MASS_WARMUP_HOURS * 3600.0 / median_dt)), 0)
+        horizon_samples = max(
+            int(round(self.ROLLOUT_HORIZON_HOURS * 3600.0 / median_dt)), 2
+        )
+
+        contiguous = (
+            df["dt_seconds"].to_numpy(dtype=float)
+            <= self.MAX_DT_SECONDS_MULTIPLE * median_dt
+        )
+
+        runs: list[tuple[int, int]] = []
+        run_start = 0
+
+        for i in range(1, len(df) + 1):
+            if i < len(df) and contiguous[i]:
+                continue
+
+            if i - run_start >= warmup_samples + horizon_samples:
+                runs.append((run_start, i))
+
+            run_start = i
+
+        if not runs:
+            raise ValueError(
+                "No usable rollout windows: the data has no gap-free stretch of "
+                f"{self.MASS_WARMUP_HOURS + self.ROLLOUT_HORIZON_HOURS:.0f} hours."
+            )
+
+        return runs, warmup_samples, horizon_samples
+
+    def _simulate_windows(
+        self,
+        x: np.ndarray,
+        df: pd.DataFrame,
+        plan: tuple[list[tuple[int, int]], int, int],
+        include_partial: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Forward-simulate every scored window; returns (predicted, measured,
+        active, row indices).
+
+        `active` marks the samples where the floor circuit was actually serving
+        the space, so calibration diagnostics and validation can report the
+        free-floating and actively conditioned regimes apart instead of letting
+        a good result in one hide a poor one in the other.
+
+        `include_partial` keeps a run's trailing window even when it is shorter
+        than the horizon. Scoring must not: a shorter window accumulates error
+        over less time, so its residuals come out systematically smaller and
+        would flatter the metrics. Display must, or the curve stops up to a
+        full horizon - six hours here - short of the last measurement.
+        """
+
+        runs, warmup_samples, horizon_samples = plan
+
+        model = self._model_from_parameters(x)
+        inputs = self._inputs(model, df)
+        a, b = self._state_space(model)
+
+        measured = df["T_air"].to_numpy(dtype=float)
+        dt_seconds = df["dt_seconds"].to_numpy(dtype=float)
+        floor_heat = df["Q_floor_w"].to_numpy(dtype=float)
+
+        predicted_parts: list[np.ndarray] = []
+        measured_parts: list[np.ndarray] = []
+        active_parts: list[np.ndarray] = []
+        index_parts: list[np.ndarray] = []
+
+        measurement_variance = self.SENSOR_RESOLUTION_K**2 / 12.0
+
+        for run_start, run_end in runs:
+            # Every window starts from the filter's estimate of the WHOLE state
+            # at that moment, so its measured and unmeasured parts stay
+            # consistent with each other. For a single-state model that is the
+            # measurement, lightly smoothed; for a two-state one it is the only
+            # principled way to know where the mass node is.
+            estimates = kalman_states(
+                a,
+                b,
+                measured[run_start:run_end],
+                inputs[run_start:run_end],
+                dt_seconds[run_start:run_end],
+                self.PROCESS_NOISE_W,
+                measurement_variance,
+            )
+
+            window_start = run_start
+
+            # Two samples is the shortest window _rollout can step through.
+            minimum = 2 if include_partial else horizon_samples
+
+            while window_start + minimum <= run_end:
+                window_end = min(window_start + horizon_samples, run_end)
+
+                simulated = _rollout(
+                    a,
+                    b,
+                    initial_state=estimates[window_start - run_start],
+                    inputs=inputs[window_start:window_end],
+                    dt_seconds=dt_seconds[window_start:window_end],
+                )
+
+                if window_start - run_start >= warmup_samples:
+                    predicted_parts.append(simulated[:, 0])
+                    measured_parts.append(measured[window_start:window_end])
+                    active_parts.append(floor_heat[window_start:window_end] != 0.0)
+                    index_parts.append(np.arange(window_start, window_end))
+
+                window_start = window_end
+
+        if not predicted_parts:
+            raise ValueError(
+                "No usable rollout windows left after the "
+                f"{self.MASS_WARMUP_HOURS:.0f} hour warm-up."
+            )
+
+        return (
+            np.concatenate(predicted_parts),
+            np.concatenate(measured_parts),
+            np.concatenate(active_parts),
+            np.concatenate(index_parts),
+        )
+
+    def _window_residuals(
+        self,
+        x: np.ndarray,
+        df: pd.DataFrame,
+        plan: tuple[list[tuple[int, int]], int, int],
+    ) -> np.ndarray:
+        predicted, measured, _, _ = self._simulate_windows(x, df, plan)
+
+        return predicted - measured
+
+    def _bounds(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(lower, initial, upper) for the parameter vector.
+
+        The two capacity-related bounds are derived from configuration rather
+        than asserted: the air node cannot hold less than the zone's own air,
+        and the effective solar aperture cannot exceed the geometric glass area
+        because it is that area times a g-value and an incidence factor, both at
+        most one.
+        """
+
+        if self.volume_m3 <= 0.0:
+            raise ValueError(
+                "climate.ceiling_height and climate.zone_temperatures "
+                "areas must be configured: the air node's heat capacity bounds "
+                "are derived from the zone's air volume, not assumed."
+            )
+
+        air_capacity = RHO_AIR_KG_PER_M3 * self.volume_m3 * CP_AIR_J_PER_KG_K
+
+        # least_squares needs a strictly positive bound width, so a zone with no
+        # configured south glass gets a numerically-zero aperture rather than a
+        # degenerate bound - solar gain is then simply absent from the model.
+        max_aperture = max(sum(self.glazing_areas_m2), self.MIN_F_SCALE)
+
+        lower = np.array(
+            [
+                self.MIN_UA_ENVELOPE_W_PER_K,
+                self.MIN_UA_AIR_MASS_W_PER_K,
+                self.MIN_AIR_CAPACITY_MULTIPLE * air_capacity,
+                self.MIN_C_MASS_J_PER_K,
+                0.0,
+                0.0,
+            ]
+        )
+
+        upper = np.array(
+            [
+                self.MAX_UA_ENVELOPE_W_PER_K,
+                self.MAX_UA_AIR_MASS_W_PER_K,
+                self.MAX_AIR_CAPACITY_MULTIPLE * air_capacity,
+                self.MAX_C_MASS_J_PER_K,
+                max_aperture,
+                1.0,
+            ]
+        )
+
+        initial = np.array(
+            [
+                self.INITIAL_UA_ENVELOPE_W_PER_K,
+                self.INITIAL_UA_AIR_MASS_W_PER_K,
+                self.INITIAL_AIR_CAPACITY_MULTIPLE * air_capacity,
+                self.INITIAL_C_MASS_J_PER_K,
+                self.INITIAL_APERTURE_FRACTION * max_aperture,
+                self.INITIAL_INTERNAL_GAIN_FRACTION,
+            ]
+        )
+
+        return lower, np.clip(initial, lower, upper), upper
+
+    def _log_drive_collinearity(self, df: pd.DataFrame) -> None:
+        """Warn when solar gain and envelope loss cannot be told apart.
+
+        Both drives peak in the afternoon, and in summer they do so partly
+        together: the sun that shines through the glass is also what warmed the
+        outdoor air. Where the two are strongly correlated over the calibration
+        window, any split of the afternoon warming between a_eff_m2 and
+        ua_envelope_w_per_k fits about equally well and the fit will hand it to
+        one of them, so this number says whether the reported split means
+        anything.
+
+        It is a necessary check, not a sufficient one. On this installation's
+        August/September data the correlation is only about +0.3 while a_eff_m2
+        still collapsed to zero, so a low value here does not by itself prove
+        the two are separable - the daily indoor swing there is under 1 K at a
+        0.1 K sensor resolution, which limits what any diagnostic can resolve.
+
+        An identification diagnostic, not a validation result: it says what the
+        data can determine, never whether the model is right.
+        """
+
+        solar_drive = (df["shutter_open_fraction"] * df["I_facade_w_per_m2"]).to_numpy(
+            dtype=float
+        )
+        envelope_drive = (df["T_out"] - df["T_air"]).to_numpy(dtype=float)
+
+        if np.std(solar_drive) == 0.0 or np.std(envelope_drive) == 0.0:
+            return
+
+        correlation = float(np.corrcoef(solar_drive, envelope_drive)[0, 1])
+
+        logger.info(
+            "Building thermal calibration: solar and envelope drives correlate "
+            "%+.2f over this window - a_eff_m2 and ua_envelope_w_per_k are "
+            "separable only where this is well below 1.",
+            correlation,
+        )
+
+    def calibrate(self, df: pd.DataFrame) -> BuildingThermalModel:
+        df = self.prepare(df)
+
+        median_dt = float(df["dt_seconds"].median())
+
+        split_index = int(len(df) * self.TRAIN_RATIO)
+
+        if split_index <= 1 or split_index >= len(df):
+            raise ValueError("Invalid train/test split.")
+
+        train_df = df.iloc[:split_index].reset_index(drop=True)
+
+        plan = self._rollout_plan(train_df, median_dt)
+        lower, initial, upper = self._bounds()
+
+        if sum(self.glazing_areas_m2) <= 0.0:
+            logger.warning(
+                "Building thermal calibration: climate.south_glazing is not "
+                "configured, so solar gain is bounded to zero - any real solar "
+                "gain will be absorbed by the envelope and capacity parameters."
+            )
+
+        def residuals(x: np.ndarray) -> np.ndarray:
+            return self._window_residuals(x, train_df, plan)
+
+        # x_scale="jac": the parameters span conductances (10^2 W/K) and heat
+        # capacities (10^7 J/K), so an unscaled trust region would step
+        # meaninglessly in one or the other.
+        ordinary = least_squares(
+            residuals, initial, bounds=(lower, upper), x_scale="jac"
+        )
+
+        # Robust loss scaled by the data's own residual spread, so a window
+        # containing an unmodelled disturbance (an opened window, a visitor,
+        # a wood stove) is down-weighted instead of dragging the fit.
+        deviation = np.abs(ordinary.fun - np.median(ordinary.fun))
+        f_scale = max(self.MAD_TO_STD * float(np.median(deviation)), self.MIN_F_SCALE)
+
+        result = least_squares(
+            residuals,
+            ordinary.x,
+            bounds=(lower, upper),
+            loss="soft_l1",
+            f_scale=f_scale,
+            x_scale="jac",
+        )
+
+        std_errors = self._parameter_std_errors(result)
+        self.parameter_std_errors = dict(
+            zip(self.PARAMETER_NAMES, std_errors, strict=True)
+        )
+
+        self.model = self._model_from_parameters(result.x)
+
+        predicted, _, active, _ = self._simulate_windows(result.x, train_df, plan)
+
+        logger.info(
+            "Building thermal calibration: %d training points, %d validation "
+            "points, %d scored rollout samples (%.0f%% with the floor circuit "
+            "active), f_scale=%.4g K",
+            len(train_df),
+            len(df) - len(train_df),
+            len(predicted),
+            100.0 * float(np.mean(active)) if active.size else 0.0,
+            f_scale,
+        )
+
+        self._log_drive_collinearity(train_df)
+
+        logger.info(
+            "Building thermal calibration: %s",
+            " ".join(
+                f"{name}={value:.4g}±{error:.4g}"
+                for name, value, error in zip(
+                    self.PARAMETER_NAMES, result.x, std_errors, strict=True
+                )
+            ),
+        )
+
+        return self.model
+
+    @staticmethod
+    def _skill(
+        measured: np.ndarray,
+        predicted: np.ndarray,
+        persistence: np.ndarray,
+    ) -> float:
+        """How much of persistence's error the model removes, 0 = no better."""
+
+        baseline = float(mean_absolute_error(measured, persistence))
+
+        if baseline <= 0.0:
+            return float("nan")
+
+        return 1.0 - float(mean_absolute_error(measured, predicted)) / baseline
+
+    def validate(self, df: pd.DataFrame) -> dict[str, float]:
+        """Forward-simulation accuracy over independent rollout windows.
+
+        These are prediction metrics, kept strictly apart from the fit
+        diagnostics reported by calibrate(): a parameter's standard error says
+        how well the data determined it, and is reported here too, but it is
+        never evidence that the model is physically right.
+        """
+
+        model = self.get_model()
+
+        df = self.prepare(df)
+        median_dt = float(df["dt_seconds"].median())
+        plan = self._rollout_plan(df, median_dt)
+
+        x = self._parameters(model)
+
+        predicted, measured, active, _ = self._simulate_windows(x, df, plan)
+
+        metrics = {
+            "scored_samples": float(len(predicted)),
+            "r2": float(r2_score(measured, predicted)),
+            "mae": float(mean_absolute_error(measured, predicted)),
+            "rmse": float(np.sqrt(mean_squared_error(measured, predicted))),
+            # A systematic offset is what matters for planning a setpoint, and
+            # it is invisible in MAE alone.
+            "bias_k": float(np.mean(predicted - measured)),
+        }
+
+        _, _, horizon_samples = plan
+
+        # Persistence: hold each window's own first measurement for that whole
+        # window. Reshaping is safe because validate() never asks for the
+        # partial trailing window, so every scored window has the same length.
+        windows = len(predicted) // horizon_samples
+        anchors = measured.reshape(windows, horizon_samples)[:, :1]
+        persistence = np.repeat(anchors, horizon_samples, axis=1).ravel()
+
+        metrics["mae_persistence"] = float(mean_absolute_error(measured, persistence))
+        metrics["skill_vs_persistence"] = self._skill(measured, predicted, persistence)
+
+        # The overall skill is an average over both regimes, and one of them
+        # normally dominates by count: on cooling-season data the floor circuit
+        # ran in 1.3% of quarter hours, so a headline skill is almost entirely
+        # the free-floating one. Planning acts on the other regime, so it gets
+        # its own baseline and its own number rather than being averaged away.
+        active_windows = int(active.reshape(windows, horizon_samples).any(axis=1).sum())
+        metrics["active_windows"] = float(active_windows)
+
+        for label, mask in (("free_float", ~active), ("active", active)):
+            if not mask.any():
+                continue
+
+            metrics[f"samples_{label}"] = float(mask.sum())
+            metrics[f"mae_{label}"] = float(
+                mean_absolute_error(measured[mask], predicted[mask])
+            )
+            metrics[f"bias_{label}_k"] = float(
+                np.mean(predicted[mask] - measured[mask])
+            )
+            metrics[f"mae_persistence_{label}"] = float(
+                mean_absolute_error(measured[mask], persistence[mask])
+            )
+            metrics[f"skill_{label}"] = self._skill(
+                measured[mask], predicted[mask], persistence[mask]
+            )
+
+        skill_active = metrics.get("skill_active")
+
+        if skill_active is None or active_windows < self.MIN_ACTIVE_WINDOWS:
+            logger.warning(
+                "Building thermal validation: only %d rollout window(s) "
+                "contain floor activity, fewer than the %d needed to judge it "
+                "- the model is effectively untested on the regime planning "
+                "acts in, whatever its overall skill says.",
+                active_windows,
+                self.MIN_ACTIVE_WINDOWS,
+            )
+        elif skill_active <= self.MIN_SKILL_VS_PERSISTENCE:
+            logger.warning(
+                "Building thermal validation: with the floor circuit running "
+                "the model scores %.3f K against %.3f K for holding the last "
+                "measurement - skill %+.2f. It cannot predict the response to "
+                "heating or cooling, which is the only thing planning needs.",
+                metrics["mae_active"],
+                metrics["mae_persistence_active"],
+                skill_active,
+            )
+
+        lower, _, upper = self._bounds()
+
+        # A parameter sitting exactly on a bound, or with a standard error
+        # larger than the estimate itself, was not determined by this data. Both
+        # are reported rather than hidden: summer data in particular excites the
+        # envelope conductance only weakly, because indoor and outdoor
+        # temperatures stay close.
+        pinned = 0
+
+        for index, name in enumerate(self.PARAMETER_NAMES):
+            value = float(x[index])
+
+            if np.isclose(value, lower[index]) or np.isclose(value, upper[index]):
+                pinned += 1
+                logger.warning(
+                    "Building thermal validation: %s is pinned at a bound "
+                    "(%.4g) - not identified by this data.",
+                    name,
+                    value,
+                )
+
+        metrics["pinned_parameters"] = float(pinned)
+
+        if metrics["skill_vs_persistence"] <= self.MIN_SKILL_VS_PERSISTENCE:
+            logger.warning(
+                "Building thermal validation: overall the model scores %.3f K "
+                "against %.3f K for simply holding the last measurement over a "
+                "%.0f hour window - skill %+.2f. Its dynamics are adding "
+                "error, not information.",
+                metrics["mae"],
+                metrics["mae_persistence"],
+                self.ROLLOUT_HORIZON_HOURS,
+                metrics["skill_vs_persistence"],
+            )
+
+        total_glass_m2 = sum(self.glazing_areas_m2)
+
+        if total_glass_m2 > 0.0:
+            aperture_fraction = model.a_eff_m2 / total_glass_m2
+            metrics["aperture_fraction"] = aperture_fraction
+            implausible = aperture_fraction < self.MIN_PLAUSIBLE_APERTURE_FRACTION
+            metrics["implausible_aperture"] = float(implausible)
+
+            if implausible:
+                logger.warning(
+                    "Building thermal validation: a_eff_m2 = %.2f m2 is only "
+                    "%.3f of the %.1f m2 of configured south glass, which "
+                    "would need a g-value no real glazing has. The fit may be "
+                    "statistically converged and still not describe this "
+                    "window - most likely the data covers too little sunlit "
+                    "time with the shutters open.",
+                    model.a_eff_m2,
+                    aperture_fraction,
+                    total_glass_m2,
+                )
+
+        if self.parameter_std_errors is not None:
+            weakly_identified = 0
+
+            for index, name in enumerate(self.PARAMETER_NAMES):
+                error = self.parameter_std_errors[name]
+                metrics[f"std_error_{name}"] = error
+
+                if not np.isfinite(error) or error >= abs(float(x[index])):
+                    weakly_identified += 1
+                    logger.warning(
+                        "Building thermal validation: %s = %.4g has a standard "
+                        "error of %.4g - the data does not determine it.",
+                        name,
+                        float(x[index]),
+                        error,
+                    )
+
+            metrics["weakly_identified_parameters"] = float(weakly_identified)
+
+        return metrics
+
+    def simulate(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Predicted and measured zone temperature over a window, by time.
+
+        Returns both, because the measured column is the zone average over
+        config.climate.zone_temperatures - not any single room's thermostat -
+        and comparing the prediction against anything else would compare two
+        different quantities.
+
+        Exactly the view validate() scores - the room temperature is re-anchored
+        to the measurement every ROLLOUT_HORIZON_HOURS while the unmeasured mass
+        node carries through - so what the dashboard draws is the same quantity
+        the reported metrics describe, not a more flattering variant of it.
+
+        Every input is measured. This is deliberately a reconstruction of what
+        the model says the house did, not a forecast: predicting forward would
+        need future shutter positions and occupancy, which nothing reports and
+        which are not the model's to invent.
+        """
+
+        model = self.get_model()
+
+        prepared = self.prepare(df)
+        median_dt = float(prepared["dt_seconds"].median())
+        plan = self._rollout_plan(prepared, median_dt)
+
+        predicted, measured, _, positions = self._simulate_windows(
+            self._parameters(model), prepared, plan, include_partial=True
+        )
+
+        return pd.DataFrame(
+            {"predicted": predicted, "measured": measured},
+            index=prepared["time"].to_numpy()[positions],
+        ).sort_index()
+
+    def estimate(self, df: pd.DataFrame) -> pd.DataFrame:
+        """The filter's running estimate of every state, indexed by time.
+
+        Unlike simulate(), this never restarts: the filter corrects at every
+        step, so the result is continuous by construction and has none of the
+        jumps a sequence of fixed-horizon rollouts necessarily shows. That
+        makes it the right thing to draw, and for the two-node model it is the
+        only way to see the mass node at all - no sensor measures the screed.
+
+        It is also what an MPC has to start from, so this is the same quantity
+        planning will consume, not a display-only variant of it.
+        """
+
+        model = self.get_model()
+        prepared = self.prepare(df)
+
+        a, b = self._state_space(model)
+
+        estimates = kalman_states(
+            a,
+            b,
+            prepared["T_air"].to_numpy(dtype=float),
+            self._inputs(model, prepared),
+            prepared["dt_seconds"].to_numpy(dtype=float),
+            self.PROCESS_NOISE_W,
+            self.SENSOR_RESOLUTION_K**2 / 12.0,
+        )
+
+        names = ["air", "mass"][: estimates.shape[1]]
+
+        return pd.DataFrame(
+            estimates[:, : len(names)],
+            columns=names,
+            index=prepared["time"].to_numpy(),
+        )
+
+    def dataset(self, config: Config) -> DatasetDefinition:
+        self.zone_areas_m2 = [zone.area_m2 for zone in config.climate.zone_temperatures]
+        # Derived, not configured: the same areas already drive the weighting.
+        self.volume_m3 = sum(self.zone_areas_m2) * config.climate.ceiling_height
+        self.glazing_areas_m2 = [
+            glazing.glass_m2 for glazing in config.climate.south_glazing
+        ]
+        shaded = [
+            glazing
+            for glazing in config.climate.south_glazing
+            if glazing.cover is not None
+        ]
+        self.shutter_areas_m2 = [glazing.glass_m2 for glazing in shaded]
+        self.zone_temperature_columns = [
+            f"zone_temperature_{i}" for i in range(len(self.zone_areas_m2))
+        ]
+        self.shutter_columns = [f"shutter_{i}" for i in range(len(shaded))]
+        self.presence_columns = [f"presence_{i}" for i in range(len(config.presence))]
+
+        # Open-Meteo snapshots are the base frame because they are the only
+        # source of irradiance. The sensor uses the minutely_15 endpoint, so its
+        # horizon already lands on the 15 minute model grid; taking one snapshot
+        # per hour keeps the row count bounded while still giving every valid
+        # time a forecast at most an hour old.
+        #
+        # target_shift corrects a real misalignment: Open-Meteo documents the
+        # radiation fields as the mean over the PRECEDING 15 minutes, so the
+        # value stamped at t describes [t-15min, t], while zero-order hold needs
+        # the mean over [t, t+15min] to drive the step starting at t. Shifting
+        # those columns one row earlier lines them up. Temperature is
+        # instantaneous in the same API and must NOT be shifted with them.
+        builder = DatasetBuilder().attribute_timeseries(
+            "weather",
+            config.forecast.open_meteo,
+            attributes=[
+                "direct_radiation",
+                "diffuse_radiation",
+                "direct_normal_irradiance",
+                "temperature",
+            ],
+            interval="1h",
+            aggregation="last",
+            target_interval="15min",
+            target_shift=[
+                "direct_radiation",
+                "diffuse_radiation",
+                "direct_normal_irradiance",
+            ],
+        )
+
+        # Numeric series are averaged onto a 5 minute grid first and only then
+        # onto the 15 minute model grid: with fill="previous" that makes each
+        # model step a time-weighted average of a sensor that only reports on
+        # change, rather than a mean over however many raw points happened to
+        # land in the step.
+        #
+        # Temperatures are continuous and only reported on change, so the
+        # previous reading is the current one; flow is rate-like and physically
+        # drops to zero when the pump stops, so a reporting gap must stay a gap
+        # for prepare() to resolve against the compressor state.
+        numeric: list[tuple[str, SensorReference, Aggregation, FillMethod]] = [
+            ("T_air", config.climate.temperature, "mean", "previous"),
+            *[
+                (name, zone.sensor, "mean", "previous")
+                for name, zone in zip(
+                    self.zone_temperature_columns,
+                    config.climate.zone_temperatures,
+                    strict=True,
+                )
+            ],
+            ("T_supply", config.heat_pump.supply_temperature, "mean", "previous"),
+            ("T_return", config.heat_pump.return_temperature, "mean", "previous"),
+            ("flow_lpm", config.heat_pump.flow, "mean", "none"),
+            ("baseload_w", config.baseload, "mean", "previous"),
+        ]
+
+        if config.heat_pump.outdoor_temperature is not None:
+            numeric.append(
+                ("T_out", config.heat_pump.outdoor_temperature, "mean", "previous")
+            )
+
+        # Cover position is an event-driven state - it only changes when a
+        # shutter actually moves - so it is carried forward, not averaged.
+        shutters: list[tuple[str, SensorReference, Aggregation, FillMethod]] = [
+            (name, glazing.cover, "last", "previous")
+            for name, glazing in zip(self.shutter_columns, shaded, strict=True)
+            if glazing.cover is not None
+        ]
+        numeric += shutters
+
+        # The compressor state and the device trackers arrive as strings, which
+        # cannot be resampled by averaging: they are taken directly on the model
+        # grid, keeping the value in force at the step's end.
+        textual: list[tuple[str, SensorReference]] = [
+            ("state", config.heat_pump.state),
+            *zip(self.presence_columns, config.presence, strict=True),
+        ]
+
+        for name, sensor, aggregation, fill in numeric:
+            builder = builder.timeseries(
+                name,
+                sensor,
+                interval="5m",
+                aggregation=aggregation,
+                fill=fill,
+                target_interval="15min",
+            )
+
+        for name, sensor in textual:
+            builder = builder.timeseries(
+                name,
+                sensor,
+                interval="15m",
+                aggregation="last",
+                fill="previous",
+            )
+
+        for name in [entry[0] for entry in numeric + textual]:
+            builder = builder.join(
+                left="weather",
+                right=name,
+                left_on=("target_time",),
+                right_on=("time",),
+                how="left",
+            )
+
+        return builder.build()
+
+
+class BuildingLumpedIdentifier(BuildingThermalIdentifier):
+    """Identifies the single-node form of the same zone.
+
+    Deliberately a subclass: the dataset, the input assembly, the rollout
+    windowing and every diagnostic are identical, and only the structure and
+    its parameters differ. Running both against the same data is the point -
+    `skill_vs_persistence` and `implausible_aperture` then say which structure
+    the data actually supports, rather than the choice being an assumption.
+
+    On cooling-season data this one wins clearly: 0.11 K against 0.36 K over
+    six-hour rollouts, positive skill against persistence where the two-node
+    model scores -1.24, and an effective aperture of 50% of the glass area
+    where the two-node model reports a physically impossible 6%. That is not
+    evidence the two-node structure is wrong - floor heating really does lag -
+    but that this data, with the floor circuit active in 2.4% of quarter hours,
+    cannot identify it.
+    """
+
+    # No hidden state to settle: the single node IS the measured temperature,
+    # so a rollout can be anchored on it directly. The two-node model needs a
+    # day of lead-in for its unmeasured mass node; this one needs none, which
+    # also makes far shorter gap-free stretches usable.
+    MASS_WARMUP_HOURS = 0.0
+
+    PARAMETER_NAMES = (
+        "ua_w_per_k",
+        "c_j_per_k",
+        "a_eff_m2",
+        "internal_gain_fraction",
+    )
+
+    # One node has to hold everything that stores heat, so its capacity spans
+    # the two-node model's air and mass bounds combined: from a light structure
+    # to a heavy one. The lower bound is the zone's own air, derived from the
+    # configured volume as before, and never asserted in Joules.
+    MIN_C_J_PER_K = 2.0e6
+    MAX_C_J_PER_K = 60.0e6
+    INITIAL_C_J_PER_K = 20.0e6
+
+    @property
+    def name(self) -> str:
+        return "building_lumped"
+
+    @property
+    def label(self) -> str:
+        return "Room temperature (single node)"
+
+    @staticmethod
+    def _state_space(model) -> tuple[np.ndarray, np.ndarray]:
+        return lumped_state_space(model)
+
+    @staticmethod
+    def _parameters(model: BuildingLumpedModel) -> np.ndarray:
+        return np.array(
+            [
+                model.ua_w_per_k,
+                model.c_j_per_k,
+                model.a_eff_m2,
+                model.internal_gain_fraction,
+            ]
+        )
+
+    def _model_from_parameters(self, x: np.ndarray) -> BuildingLumpedModel:
+        return BuildingLumpedModel(
+            ua_w_per_k=float(x[0]),
+            c_j_per_k=float(x[1]),
+            a_eff_m2=float(x[2]),
+            internal_gain_fraction=float(x[3]),
+        )
+
+    def _bounds(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if self.volume_m3 <= 0.0:
+            raise ValueError(
+                "climate.ceiling_height and climate.zone_temperatures "
+                "areas must be configured: the node's heat capacity bounds are "
+                "derived from the zone's air volume, not assumed."
+            )
+
+        air_capacity = RHO_AIR_KG_PER_M3 * self.volume_m3 * CP_AIR_J_PER_KG_K
+        max_aperture = max(sum(self.glazing_areas_m2), self.MIN_F_SCALE)
+
+        lower = np.array(
+            [
+                self.MIN_UA_ENVELOPE_W_PER_K,
+                max(self.MIN_C_J_PER_K, air_capacity),
+                0.0,
+                0.0,
+            ]
+        )
+        upper = np.array(
+            [self.MAX_UA_ENVELOPE_W_PER_K, self.MAX_C_J_PER_K, max_aperture, 1.0]
+        )
+        initial = np.array(
+            [
+                self.INITIAL_UA_ENVELOPE_W_PER_K,
+                self.INITIAL_C_J_PER_K,
+                self.INITIAL_APERTURE_FRACTION * max_aperture,
+                self.INITIAL_INTERNAL_GAIN_FRACTION,
+            ]
+        )
+
+        return lower, np.clip(initial, lower, upper), upper

@@ -11,6 +11,7 @@ from domain.types import (
     SeriesPoint,
     State,
 )
+from features.building import BuildingThermalIdentifier
 from features.dataset import DatasetBuilder, DatasetDefinition, DatasetLoader
 from features.solar import (
     PREDICT_STEP_MINUTES,
@@ -64,8 +65,59 @@ class StateManager:
         state = self._map(df, self.load(), config=config)
 
         self._predict_solar(state, now)
+        self._simulate_climate(state, config, now)
 
         self.state_repository.save(state)
+
+    def _simulate_climate(self, state: State, config: Config, now: datetime) -> None:
+        """Reconstructs the zone temperature the calibrated building model
+        implies, so the dashboard can show it against the measurement.
+
+        Draws the filter's running state estimate rather than a sequence of
+        fixed-horizon rollouts. The filter corrects every step, so its output
+        is continuous instead of jumping back to the measurement every horizon
+        - those jumps are the model's own forecast error, which belongs in
+        validate()'s metrics, not in a line that is supposed to be read as a
+        temperature.
+
+        That needs the two-node structure, even though the single-node one
+        currently scores better: only this one HAS a thermal mass, and its
+        temperature is the interesting quantity here because nothing measures
+        it. The air estimate alone would just retrace the sensors.
+
+        Loads its own window because the building model needs inputs the state
+        dataset does not carry - irradiance components, shutter positions.
+
+        Leaves an existing curve untouched whenever the model is not calibrated
+        yet or the window has no gap-free stretch long enough to simulate,
+        rather than replacing a real curve with an empty one.
+        """
+
+        identifier = BuildingThermalIdentifier(self.latitude, self.longitude)
+        identifier.load(self.models_path)
+
+        if identifier.model is None:
+            return
+
+        dataset = identifier.dataset(config)
+
+        warmup = timedelta(hours=identifier.MASS_WARMUP_HOURS)
+        start = local_day_start(now, days=-1).astimezone(timezone.utc) - warmup
+
+        try:
+            loaded = self.loader.load(dataset, start, now)
+            estimated = identifier.estimate(loaded)
+            measured = identifier.prepare(loaded).set_index("time")["T_air"]
+        except ValueError:
+            return
+
+        # The air estimate is not stored: with the process noise set from the
+        # model's own unreliability the filter gain is essentially one, so it
+        # reproduces the measurement exactly and a second identical line says
+        # nothing. How far the model's own forecast drifts belongs in
+        # validate()'s metrics, not in a line read as a temperature.
+        state.predictions.thermal_mass = self._series_points(estimated["mass"])
+        state.measurements.climate.zone_temperature = self._series_points(measured)
 
     def _predict_solar(self, state: State, now: datetime) -> None:
         """Builds state.predictions.solar and its calibrated p10/p90 band from
@@ -275,6 +327,9 @@ class StateManager:
         state.measurements.baseload = self._parse_series(df, "baseload")
         state.measurements.heat_pump.state = self._parse_series(df, "heat_pump_state")
         state.measurements.heat_pump.power = self._parse_series(df, "heat_pump_power")
+        state.measurements.heat_pump.compressor_frequency = self._parse_series(
+            df, "heat_pump_compressor_frequency"
+        )
         state.measurements.heat_pump.boiler.top_temperature = self._parse_series(
             df, "boiler_top_temperature"
         )
@@ -391,6 +446,19 @@ class StateManager:
                 aggregation="first",
                 fill="previous",
             )
+            # Distinguishes the compressor from the resistive booster within a
+            # run: the operating state stays "SWW" while the booster finishes
+            # the tank, but the compressor is off at 0 Hz. Only reported on
+            # change - including the change to 0 Hz - so the previous reading
+            # is the current one (see BoilerThermalIdentifier.dataset for the
+            # two fills that were tried and rejected here).
+            .timeseries(
+                "heat_pump_compressor_frequency",
+                config.heat_pump.compressor_frequency,
+                interval="15m",
+                aggregation="last",
+                fill="previous",
+            )
             .timeseries(
                 "heat_pump_power",
                 config.heat_pump.power,
@@ -419,6 +487,12 @@ class StateManager:
                 interval="5m",
                 fill="previous",
                 target_interval="15min",
+                # A temperature is a state, not a flow: planning must start from
+                # the most recent reading, and the quarter's average lags it
+                # while the tank is heating. A plan made minutes after a run
+                # ended started from a tank 1.5-2 K colder than it really was
+                # and added a second run for the shortfall that followed.
+                target_resample="last",
             )
             .timeseries(
                 "boiler_bottom_temperature",
@@ -427,6 +501,8 @@ class StateManager:
                 interval="5m",
                 fill="previous",
                 target_interval="15min",
+                # See boiler_top_temperature.
+                target_resample="last",
             )
             .timeseries(
                 "boiler_ambient_temperature",
@@ -435,6 +511,8 @@ class StateManager:
                 interval="5m",
                 fill="previous",
                 target_interval="15min",
+                # See boiler_top_temperature.
+                target_resample="last",
             )
             .build()
         )

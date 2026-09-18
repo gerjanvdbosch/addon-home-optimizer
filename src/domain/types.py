@@ -11,7 +11,9 @@ HeatPumpMode = Literal["heat", "cool"]
 
 ForecasterType = Literal["baseload", "tap"]
 
-IdentificationType = Literal["boiler", "cop_dhw", "solar"]
+IdentificationType = Literal[
+    "boiler", "cop_dhw", "solar", "building", "building_lumped"
+]
 
 
 class JobType(str, Enum):
@@ -147,13 +149,106 @@ class HeatPumpConfig(BaseModel):
     # electrical draw follows entirely different physics and must not be
     # mixed into the heat pump's own COP calibration).
     booster: SensorReference | None = Field(default=None)
+    # The unit's own outdoor air temperature sensor, if it really measures
+    # outdoor air. Optional, and deliberately unset on this installation: the
+    # heat pump stands in a shed, so its sensor reads shed air, which runs on
+    # average 1.8 K warmer than the 2 m air temperature and carries a strongly
+    # diurnal bias (+2.8 K at night against +0.9 K at midday) because the shed
+    # retains heat and damps the real outdoor swing. Driving an envelope loss
+    # with that would fold a sensor artifact into the building's own dynamics.
+    # Without it, Open-Meteo's temperature attribute is used instead - which
+    # planning has to use for the future in any case.
+    outdoor_temperature: SensorReference | None = Field(default=None)
     boiler: BoilerConfig = Field()
+
+
+class SouthGlazing(BaseModel):
+    """One group of south-facing windows and the shutter in front of it.
+
+    Areas are per group rather than one house total because shading has to be
+    weighted by them: the shaded fraction of the glazing is
+    sum(area_i * open_i) / sum(area_i), and a plain average over shutters would
+    give a small bedroom window the same say as a large living room screen.
+    Confirmed on this installation's data, where the four south shutters move
+    almost independently (pairwise correlations of 0.07 to 0.23, one of them
+    shut continuously for 90 days), so an unweighted mean differs from the
+    area-weighted one by a median of 8.8 percentage points.
+    """
+
+    glass_m2: float = Field()
+    # The cover entity in front of this glazing, reporting current_position
+    # (100 = fully open). None means the glass is never shaded.
+    cover: SensorReference | None = Field(default=None)
+
+    @model_validator(mode="before")
+    @classmethod
+    def resolve(cls, value):
+        if isinstance(value, (int, float)):
+            return {"glass_m2": value, "cover": None}
+
+        if isinstance(value, (list, tuple)):
+            return {"glass_m2": value[0], "cover": value[1]}
+
+        return value
+
+
+class ZoneSensor(BaseModel):
+    """One room sensor and the floor area it stands for.
+
+    The area is what makes the zone temperature a weighted mean rather than a
+    plain average over sensors. Without it the average is weighted by how many
+    thermostats a floor happens to have: on this installation four of the five
+    Danfoss zones are upstairs, so the ground floor counted for 20% of a
+    dwelling temperature while being half its floor area. With warm air
+    collecting upstairs that biased the modelled temperature by +0.085 K on
+    average (p95 0.42 K); weighting by area brings that to +0.008 K (p95
+    0.11 K).
+    """
+
+    area_m2: float = Field()
+    sensor: SensorReference = Field()
+
+    @model_validator(mode="before")
+    @classmethod
+    def resolve(cls, value):
+        if isinstance(value, (list, tuple)):
+            return {"area_m2": value[0], "sensor": value[1]}
+
+        return value
 
 
 class ClimateConfig(BaseModel):
     temperature: SensorReference = Field()
     setpoint: SensorReference = Field()
     target_temperature: float | list[tuple[time, float]] = Field()
+    # Every room sensor that belongs to the modelled zone. The building model
+    # averages these into one representative zone temperature, which is what a
+    # whole-dwelling energy balance needs: the delivered heat and the baseload
+    # it is weighed against are both house-wide, so a single room's thermometer
+    # would be an arbitrary sample of the zone. Confirmed on this
+    # installation's data, where the five Danfoss room sensors sit within a
+    # median 0.33 K of each other - one zone, sampled five times - while the
+    # attic runs 3.5 K warmer and tracks outdoor temperature, and so must be
+    # left out. Averaging also suppresses the sensors' 0.1 K reporting
+    # quantisation, which is a real limit on identifying a building whose daily
+    # indoor swing is around 1 K. Empty falls back to `temperature`.
+    zone_temperatures: list[ZoneSensor] = Field(default_factory=list)
+    # Net floor-to-ceiling height of the conditioned zone. The air volume is
+    # derived from it and the zone_temperatures areas, rather than configured
+    # separately: those areas are already required for the weighting, so a
+    # hand-computed volume would be a second place for the same fact to be
+    # wrong. It covers only the rooms that have a sensor, so it slightly
+    # undercounts hall, landing and stairwell - acceptable because the volume
+    # only sets bounds on a heat capacity (and for the single-node model does
+    # not bind at all, since air capacity stays far below MIN_C_J_PER_K for
+    # any dwelling-sized zone).
+    ceiling_height: float = Field(default=2.6)
+    # The zone's south-facing glazing, window group by window group. Not the
+    # solar gain itself: the total area is the physical upper bound on the
+    # identified effective aperture a_eff_m2 = area * g_value *
+    # incidence/soiling factor, all of which are <= 1 (see
+    # BuildingThermalIdentifier.calibrate).
+    south_glazing: list[SouthGlazing] = Field(default_factory=list)
 
 
 class SolcastAttributes(BaseModel):
@@ -297,6 +392,11 @@ class HeatPumpMeasurement(BaseModel):
 class ClimateMeasurement(BaseModel):
     temperature: list[SeriesPoint[float]] = Field(default_factory=list)
     setpoint: list[SeriesPoint[float]] = Field(default_factory=list)
+    # The average over config.climate.zone_temperatures - what the building
+    # model predicts, as opposed to `temperature`, which is the single
+    # thermostat the climate setpoint refers to. Kept apart so the dashboard
+    # compares the model against the quantity it actually models.
+    zone_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
 
 
 class Measurements(BaseModel):
@@ -356,6 +456,12 @@ class Predictions(BaseModel):
     baseload: list[SeriesPoint[float]] = Field(default_factory=list)
     tap: list[SeriesPoint[float]] = Field(default_factory=list)
     boiler: list[SeriesPoint[float]] = Field(default_factory=list)
+    # The filter's estimate of the building's thermal mass - screed and
+    # internal walls - which no sensor measures. Continuous by construction,
+    # because the filter corrects every step rather than restarting each
+    # horizon, and lagging and damped relative to the air as a heavy mass
+    # should be. This is also the state an MPC must start a plan from.
+    thermal_mass: list[SeriesPoint[float]] = Field(default_factory=list)
 
 
 class BoilerSchedule(BaseModel):
@@ -443,6 +549,77 @@ class BoilerThermalModel:
     # planned run is its planned end temperature minus this. None until such a
     # run has been observed.
     setpoint_overshoot_k: float | None = None
+
+
+@dataclass
+class BuildingThermalModel:
+    """Two-node (2R2C) grey-box model of one thermal zone.
+
+    x = [T_air, T_mass]:
+
+        C_air  dT_air/dt  = UA_env (T_out - T_air) + UA_am (T_mass - T_air) + Q_int
+        C_mass dT_mass/dt = UA_am  (T_air - T_mass) + Q_sol + Q_floor
+
+    Q_floor and Q_sol enter the mass node rather than the air node because that
+    is where the physics puts them: the floor circuit runs inside the screed,
+    and air is effectively transparent to shortwave radiation, which is
+    absorbed by the floor and furnishings. Q_int (metabolic and appliance
+    heat) is released convectively into the air.
+
+    One model serves both heating and cooling: none of these parameters
+    describes the heat pump. Q_floor is a measured calorimetric input carrying
+    its own sign, so cooling is simply a negative Q. Mode-dependence lives in
+    the COP model and in the condensation limit, not in this balance.
+
+    Simplification, stated explicitly: the mass node has no direct path to
+    outdoors, so envelope mass is lumped with the air node rather than given a
+    third node. With a single measured zone temperature a third capacity is not
+    identifiable, and inventing one would be a fit term without evidence.
+    """
+
+    ua_envelope_w_per_k: float
+    ua_air_mass_w_per_k: float
+    c_air_j_per_k: float
+    c_mass_j_per_k: float
+    # Effective solar aperture of the zone's south glazing (m2): glass area
+    # times g-value times an incidence/soiling factor. Identified as one
+    # lumped parameter because those three factors only ever appear as their
+    # product in the heat balance, and the g-value is not separately measured.
+    a_eff_m2: float
+    # Fraction of the house-wide baseload electrical power that is released as
+    # heat inside this zone. The baseload sensor measures the whole house; the
+    # modelled zone is only part of it.
+    internal_gain_fraction: float
+
+
+@dataclass
+class BuildingLumpedModel:
+    """Single-node (1R1C) model of the same zone: C dT/dt = UA (T_out - T) +
+    Q_internal + Q_solar + Q_floor.
+
+    One capacity covering everything that stores heat - air, furnishings,
+    screed, internal walls together - and one conductance to outdoors. Its
+    parameters are NOT a reduction of BuildingThermalModel's: both are fitted
+    to the same data and land on genuinely different values, because a single
+    node has to account for the whole response with one time constant.
+
+    It exists because the two-node model's mass node is never measured, and on
+    cooling-season data that hidden state was the largest single error source:
+    dropping it took the six-hour rollout error from 0.36 K to 0.11 K and
+    turned an effective solar aperture of 6% of the glass area - which no
+    glazing can have - into a perfectly ordinary 50%. Here the state IS the
+    measurement, so nothing has to be inferred.
+
+    The cost is real and physical: this cannot represent the floor being warmer
+    than the air, so it cannot describe charging the screed as thermal storage.
+    That is what the two-node model is for, once data with daily floor-circuit
+    transitions can actually identify it - see BuildingLumpedIdentifier.
+    """
+
+    ua_w_per_k: float
+    c_j_per_k: float
+    a_eff_m2: float
+    internal_gain_fraction: float
 
 
 # Exact by definition of the Kelvin scale (0 degC = 273.15 K) - used
@@ -573,9 +750,12 @@ class MPCInput:
     # this first, so only solar beyond it is available to the heat pump. Empty
     # means no forecast - all solar counts as available.
     baseload_forecast_w: tuple[float, ...] = ()
-    # How long the run in progress has been heating (hours), 0 when not heating -
-    # it keeps heating until its minimum runtime has passed (see MPCOptimizer).
-    heating_elapsed_hours: float = 0.0
+    # How long the COMPRESSOR in the run in progress has been running (hours),
+    # 0 when it is not - the run keeps going until its minimum runtime has
+    # passed (see MPCOptimizer). Compressor time, not run time: the resistive
+    # booster finishes a run with the compressor off, and that does not protect
+    # the compressor from short cycling.
+    compressor_elapsed_hours: float = 0.0
     # How long ago the last run ended (hours), 0 while heating - no new run
     # starts until MPCConfig.heat_pump_min_off_steps have passed since then.
     idle_elapsed_hours: float = 0.0

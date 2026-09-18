@@ -207,3 +207,33 @@ def test_setpoint_overshoot_is_learned_from_runs_that_stopped_on_the_setpoint():
     assert overshoot == pytest.approx(
         1.5 + (1.8 - 1.5) * BoilerThermalIdentifier.SETPOINT_OVERSHOOT_QUANTILE
     )
+
+
+def test_a_tank_near_the_limit_still_starts_and_hands_over():
+    """The minimum runtime must not outlaw a handover the physics requires.
+
+    One degree under the heat pump's own limit there is not two steps of
+    compressor work to be had. Requiring compressor time specifically for the
+    whole minimum runtime made the solver drop the run and pay the slack
+    instead - missing a target it could have reached by letting the booster
+    finish. The booster may only run once the compressor is at its limit, so
+    "still heating" already implies "compressor still running unless it cannot".
+    """
+
+    target = [10.0] * HORIZON
+    target[20] = 60.0
+    data = MPCInput(
+        solar_forecast_w=[0.0] * HORIZON,
+        ambient_temperature=20.0,
+        # Just under the heat pump's 55 degC limit: it can lift the tank by
+        # about a degree, the booster has to do the rest.
+        current_temp_top=54.0,
+        current_temp_bottom=54.0,
+        boiler_on_current=False,
+        target_temperature_top=tuple(target),
+    )
+
+    result = MPCOptimizer(BOOSTER_MODEL, MPCConfig()).solve(data)
+
+    assert any(result.schedule), "expected the tank to be heated at all"
+    assert result.temperatures[20] >= 60.0 - 1e-6

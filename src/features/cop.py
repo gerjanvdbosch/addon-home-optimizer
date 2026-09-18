@@ -33,6 +33,19 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
     supply temperature than Verwarmen), hiding real per-mode efficiency
     differences relevant to the optimizer's costing - hence one instance per
     mode rather than one shared model.
+
+    HEATING MODES ONLY ("SWW", "Verwarmen"). This does not describe cooling,
+    and instantiating it with mode="Koelen" was tried and removed. Two
+    independent reasons: prepare() requires delta_t_water = T_supply - T_return
+    to be positive, which it never is while cooling (the supply is the colder
+    side), so every genuine cooling row is discarded and only transitional
+    artifacts survive; and the formula itself assumes the water is the hot
+    side. Cooling reverses the roles - the chilled water is the evaporator and
+    outdoor air the condenser - so its efficiency is EER = eta * T_evap_K /
+    (T_cond_K - T_evap_K), with the useful output being heat removed. Applying
+    the expression above to cooling gives T_cond < T_evap and hence a negative
+    COP. A cooling model needs its own identifier, not another instance of
+    this one.
     """
 
     TRAIN_RATIO = 0.80

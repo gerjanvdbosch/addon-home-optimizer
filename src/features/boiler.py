@@ -1300,12 +1300,18 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             None if np.isnan(booster_heat_w) else float(booster_heat_w),
         )
 
-    # The setpoint for a run is its planned end temperature less this, so a low
-    # estimate ends a run high rather than short: ending short leaves the plan
-    # needing another run for a fraction of a degree. Taken over the runs' own
-    # spread (real data: 1.55 K at this quantile against a 1.75 K median), not
-    # as a made-up margin.
-    SETPOINT_OVERSHOOT_QUANTILE = 0.25
+    # The setpoint for a run is its planned end temperature less this, so the
+    # estimate is deliberately taken at the low end of what runs really do
+    # (real data: 0.88 to 2.77 K, mean 1.67, standard deviation 0.34 - this
+    # quantile is 1.07 K, about mean minus two standard deviations). The two
+    # mistakes are not equal: overestimating it ends a run short of what the
+    # plan needs, and the tank misses its target by a fraction of a degree -
+    # which costs a whole extra run, its compressor start included.
+    # Underestimating it only leaves the tank about a degree warmer than
+    # planned, some 0.2 kWh of heat. Nothing physical predicts the spread: over
+    # those runs it correlates only weakly with a run's length (-0.35), its
+    # temperature lift (-0.34) or the tank it started from (0.26).
+    SETPOINT_OVERSHOOT_QUANTILE = 0.05
 
     def _identify_setpoint_overshoot(self, df: pd.DataFrame) -> float | None:
         """How far the tank average ends above the SWW setpoint,

@@ -198,6 +198,7 @@ def dashboard_chart(state: State) -> str:
         row=2,
         col=1,
         line=dict(width=1, color="#FECB52", shape="hv", dash="dot"),
+        visible="legendonly",
         unit="°C",
         decimal=1,
     )
@@ -207,21 +208,37 @@ def dashboard_chart(state: State) -> str:
         state.measurements.climate.temperature,
         row=2,
         col=1,
-        line=dict(width=2, color="#FECB52", shape="spline"),
+        line=dict(width=1.5, color="#FECB52", shape="spline"),
         unit="°C",
         decimal=2,
     )
 
-    # add_series(
-    #     fig,
-    #     "Climate setpoint",
-    #     state.measurements.climate.setpoint,
-    #     row=2,
-    #     col=1,
-    #     line=dict(width=1, color="#FF6692", shape="hv", dash="dot"),
-    #     unit="°C",
-    #     decimal=1,
-    # )
+    # The zone average the model actually predicts - `Climate temp` above is
+    # the single thermostat the setpoint refers to, which is a different
+    # quantity and would make the model look biased against it.
+    series(
+        "Zone temp",
+        state.measurements.climate.zone_temperature,
+        row=2,
+        col=1,
+        line=dict(width=1, color="#00CC96", shape="spline"),
+        unit="°C",
+        decimal=2,
+    )
+
+    # The building's thermal mass - screed and internal walls - as the filter
+    # infers it. No sensor measures this, so unlike the air trace it shows
+    # something the other lines cannot: it lags the air by hours and swings
+    # about a third less, which is the storage an MPC would be charging.
+    series(
+        "Thermal mass",
+        state.predictions.thermal_mass,
+        row=2,
+        col=1,
+        line=dict(width=1, color="#FFA15A", shape="spline"),
+        unit="°C",
+        decimal=2,
+    )
 
     series(
         "Outside",
@@ -229,6 +246,7 @@ def dashboard_chart(state: State) -> str:
         row=2,
         col=1,
         line=dict(width=1, color="rgba(255, 255, 255, 0.4)"),
+        visible="legendonly",
         unit="°C",
         decimal=1,
     )

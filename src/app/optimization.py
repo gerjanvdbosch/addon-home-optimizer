@@ -102,21 +102,42 @@ class Optimization:
             heat_pump_state[-1].value == BoilerThermalIdentifier.DHW_ACTIVE_STATE
         )
 
-        # From the first quarter hour of the trailing run of DHW readings. Each
-        # reading is the state at its quarter hour's start, so the run may have
-        # begun up to a quarter hour earlier: the elapsed time errs short, and the
-        # run in progress is protected that much longer rather than too briefly.
-        heating_elapsed_hours = 0.0
+        # From the first quarter hour of the trailing run of COMPRESSOR
+        # readings. The operating state alone is not enough: it stays on DHW
+        # while the resistive booster finishes the tank, and the booster runs
+        # with the compressor off (see BoilerThermalIdentifier.booster_active),
+        # so counting those quarter hours would credit the minimum runtime with
+        # time the compressor did not run. The frequency reports 0 Hz exactly
+        # then, which is the compressor's own account of itself.
+        #
+        # Each reading is the state at its quarter hour's start, so the run may
+        # have begun up to a quarter hour earlier: the elapsed time errs short,
+        # and the run in progress is protected that much longer rather than too
+        # briefly.
+        frequency = {
+            point.time: point.value
+            for point in state.measurements.heat_pump.compressor_frequency
+        }
+
+        def compressor_running(point) -> bool:
+            if point.value != BoilerThermalIdentifier.DHW_ACTIVE_STATE:
+                return False
+
+            # Without a frequency reading the state is all there is, and
+            # assuming the compressor ran keeps a real run protected.
+            return frequency.get(point.time, 1.0) > 0.0
+
+        compressor_elapsed_hours = 0.0
 
         if boiler_on_current:
             run_start = heat_pump_state[-1].time
 
             for point in reversed(heat_pump_state):
-                if point.value != BoilerThermalIdentifier.DHW_ACTIVE_STATE:
+                if not compressor_running(point):
                     break
                 run_start = point.time
 
-            heating_elapsed_hours = max(
+            compressor_elapsed_hours = max(
                 0.0, (datetime.now(timezone.utc) - run_start).total_seconds() / 3600.0
             )
 
@@ -188,7 +209,7 @@ class Optimization:
             outdoor_temperature_forecast=outdoor_temperature_forecast,
             solar_p10_w=solar_p10,
             solar_p90_w=solar_p90,
-            heating_elapsed_hours=heating_elapsed_hours,
+            compressor_elapsed_hours=compressor_elapsed_hours,
             idle_elapsed_hours=idle_elapsed_hours,
             baseload_forecast_w=tuple(
                 self.state_manager.baseload_forecast(
