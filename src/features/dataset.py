@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from domain.time import parse_datetime
 from domain.types import (
+    InfluxSensor,
     SensorAttributesReference,
     SensorReference,
 )
@@ -491,51 +492,33 @@ class AttributeSeriesLoader(DataLoader):
             )
         )
 
-        time_point = self.influx.find(
-            measurement=time_sensor.measurement,
-            entity_id=time_sensor.entity_id,
-            field=time_sensor.field,
-        )
+        published = self._published(definition, sensors, time_sensor)
+        frame = self._frame(definition, published)
 
-        if time_point is None or time_point.get("value") is None:
-            return pd.DataFrame(
-                columns=["time", *definition.attributes],
+        if frame.empty:
+            return frame
+
+        # A forecast covering whole UTC days starts at 00:00 UTC, while a
+        # request starting at local midnight asks for the hours before that
+        # (confirmed on real data: Open-Meteo left the first two hours of the
+        # local day empty). Only a forecast published before those hours covers
+        # them, so the newest of those fills them in; where both cover a time,
+        # the newer forecast wins.
+        if frame["time"].iloc[0] > start:
+            earlier = self._frame(
+                definition,
+                self._published(
+                    definition, sensors, time_sensor, start, frame["time"].iloc[0]
+                ),
             )
 
-        times = ast.literal_eval(str(time_point["value"]))
-
-        frame = pd.DataFrame(
-            {
-                "time": [parse_datetime(str(value)) for value in times],
-            }
-        )
-
-        for name in definition.attributes:
-            sensor = sensors.get(name)
-
-            if sensor is None:
-                continue
-
-            point = self.influx.find(
-                measurement=sensor.measurement,
-                entity_id=sensor.entity_id,
-                field=sensor.field,
-            )
-
-            if point is None or point.get("value") is None:
-                continue
-
-            values = ast.literal_eval(str(point["value"]))
-
-            if len(values) != len(times):
-                raise ValueError(
-                    f"Attribute '{name}' has {len(values)} values, "
-                    f"expected {len(times)}"
+            if not earlier.empty:
+                frame = (
+                    pd.concat([earlier, frame], ignore_index=True)
+                    .drop_duplicates(subset="time", keep="last")
+                    .sort_values("time")
+                    .reset_index(drop=True)
                 )
-
-            frame[name] = [
-                float(value) if value is not None else None for value in values
-            ]
 
         if definition.target_interval is not None and not frame.empty:
             frame = frame.set_index("time")
@@ -557,6 +540,74 @@ class AttributeSeriesLoader(DataLoader):
                         frame[shift_col] = frame[shift_col].shift(-1)
 
             frame = frame.reset_index()
+
+        return frame
+
+    def _published(
+        self,
+        definition: AttributeSeriesDefinition,
+        sensors: dict[str, InfluxSensor],
+        time_sensor: InfluxSensor,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> dict[str, list]:
+        """One published forecast as {attribute: values}: the newest one there
+        is, or the newest published within [start, end). All of a forecast's
+        attributes are stored in the same reading, so they share its time."""
+
+        published: dict[str, list] = {}
+
+        for name, sensor in {definition.time_attribute: time_sensor, **sensors}.items():
+            if start is None or end is None:
+                point = self.influx.find(
+                    measurement=sensor.measurement,
+                    entity_id=sensor.entity_id,
+                    field=sensor.field,
+                )
+            else:
+                points = self.influx.find_series(
+                    measurement=sensor.measurement,
+                    entity_id=sensor.entity_id,
+                    field=sensor.field,
+                    start=start,
+                    end=end,
+                )
+                point = points[-1] if points else None
+
+            if point is None or point.get("value") is None:
+                continue
+
+            published[name] = ast.literal_eval(str(point["value"]))
+
+        return published
+
+    def _frame(
+        self,
+        definition: AttributeSeriesDefinition,
+        published: dict[str, list],
+    ) -> pd.DataFrame:
+        times = published.get(definition.time_attribute)
+
+        if times is None:
+            return pd.DataFrame(columns=["time", *definition.attributes])
+
+        frame = pd.DataFrame({"time": [parse_datetime(str(value)) for value in times]})
+
+        for name in definition.attributes:
+            values = published.get(name)
+
+            if values is None:
+                continue
+
+            if len(values) != len(times):
+                raise ValueError(
+                    f"Attribute '{name}' has {len(values)} values, "
+                    f"expected {len(times)}"
+                )
+
+            frame[name] = [
+                float(value) if value is not None else None for value in values
+            ]
 
         return frame
 

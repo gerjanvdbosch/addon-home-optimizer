@@ -505,14 +505,14 @@ class MPCConfig:
     # by the calibrated, outdoor-temperature-dependent COP model.
     boiler_electrical_power_w: float = 3000.0
     boiler_min_runtime_steps: int = 2
-    # The heat pump stays off this many steps after a run (1 hour). A start is not
+    # The heat pump stays off this many steps after a run (0.5 hour). A start is not
     # free: real runs put an estimated 0.4-0.5 kWh into reheating the loop and
     # coil before the tank gains anything (see
     # BoilerThermalIdentifier._identify_setpoint_overshoot's own data), so
     # topping the tank up by a fraction of a degree right after a run costs far
     # more than it stores. It also makes a run end high enough by itself: the
     # plan knows it cannot top up afterwards.
-    heat_pump_min_off_steps: int = 4
+    heat_pump_min_off_steps: int = 2
     # Flat price for now - will become a per-installation config option later.
     price_eur_per_kwh: float = 0.23
     weight_switching: float = 0.1

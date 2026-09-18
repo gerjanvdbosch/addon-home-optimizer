@@ -229,7 +229,6 @@ def dashboard_chart(state: State) -> str:
         row=2,
         col=1,
         line=dict(width=1, color="rgba(255, 255, 255, 0.4)"),
-        visible="legendonly",
         unit="°C",
         decimal=1,
     )
