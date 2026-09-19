@@ -398,10 +398,12 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # times too small on synthetic data with known parameters.
     MASS_WARMUP_HOURS = 24.0
 
-    # The zone sensors report in 0.1 K steps. A uniform quantisation error of
-    # that width has variance step^2/12, which is what the filter is told about
-    # the measurement - taken from the instrument, not tuned.
-    SENSOR_RESOLUTION_K = 0.1
+    # The zone sensors report on a 0.01 K grid - verified against 30 days of
+    # raw readings, which sit on it exactly and do not fit a coarser one. A
+    # uniform quantisation error of that width has variance step^2/12, which is
+    # what the filter is told about the measurement: taken from the instrument,
+    # not tuned.
+    SENSOR_RESOLUTION_K = 0.01
 
     # Standard deviation of the heat flow the model does not account for, which
     # is what the filter's process noise stands in for. Its scale is what an
@@ -548,6 +550,19 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # insufficient evidence rather than as a verdict. Same principle as
     # BoilerThermalIdentifier.MIN_CALORIMETRIC_Q_IN_SAMPLES.
     MIN_ACTIVE_WINDOWS = 10
+
+    # Below this many windows a slope fitted through them says more about which
+    # windows happened to occur than about the model.
+    MIN_WINDOWS_FOR_A_TREND = 20
+
+    # Below this the sun is doing nothing a 0.1 K sensor could notice over a
+    # rollout: a watt per square metre of facade through the whole configured
+    # aperture is a few watts into a dwelling.
+    NEGLIGIBLE_SOLAR_GAIN_W = 1.0
+
+    # Two standard errors: the ordinary convention for "not zero", applied to
+    # the fitted slope rather than to a single measurement.
+    SIGNIFICANT_SLOPE_STD_ERRORS = 2.0
 
     PARAMETER_NAMES = (
         "ua_envelope_w_per_k",
@@ -1177,7 +1192,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         x = self._parameters(model)
 
-        predicted, measured, active, _ = self._simulate_windows(x, df, plan)
+        predicted, measured, active, positions = self._simulate_windows(x, df, plan)
 
         metrics = {
             "scored_samples": float(len(predicted)),
@@ -1303,6 +1318,83 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                     model.a_eff_m2,
                     aperture_fraction,
                     total_glass_m2,
+                )
+
+        # A model can score well on average and still respond wrongly to the one
+        # input that drives it. If the envelope conductance is off, the error a
+        # window ends with grows with the indoor-outdoor difference that drove
+        # it - in BOTH directions, since the sign of the drive flips with the
+        # season and the time of day. A slope of zero is what a correctly
+        # identified envelope looks like; anything else is structural, and
+        # invisible to a mean absolute error.
+        drive = (df["T_out"] - df["T_air"]).to_numpy(dtype=float)[positions]
+        sunlit = (df["shutter_open_fraction"] * df["I_facade_w_per_m2"]).to_numpy(
+            dtype=float
+        )[positions]
+
+        window_drive = drive.reshape(windows, horizon_samples).mean(axis=1)
+        window_error = (predicted - measured).reshape(windows, horizon_samples)[:, -1]
+
+        # Dark windows only. Solar gain and the indoor-outdoor difference both
+        # peak in the afternoon - on this installation they correlate about
+        # +0.4 - so a trend fitted over all windows measures the NET of two
+        # errors and can read clean while both are large. Measured directly:
+        # over all windows the single-node model slopes +0.0009 K/K, but after
+        # dark it slopes -0.0218, its oversized solar term having cancelled its
+        # own envelope error. After dark the envelope stands alone.
+        dark = (
+            sunlit.reshape(windows, horizon_samples).max(axis=1)
+            < self.NEGLIGIBLE_SOLAR_GAIN_W
+        )
+
+        metrics["dark_windows"] = float(dark.sum())
+
+        if (
+            dark.sum() >= self.MIN_WINDOWS_FOR_A_TREND
+            and np.std(window_drive[dark]) > 0
+        ):
+            window_drive = window_drive[dark]
+            window_error = window_error[dark]
+            slope = float(np.polyfit(window_drive, window_error, 1)[0])
+            span = float(
+                np.quantile(window_drive, 0.95) - np.quantile(window_drive, 0.05)
+            )
+
+            metrics["envelope_bias_slope_k_per_k"] = slope
+            metrics["envelope_bias_span_k"] = abs(slope) * span
+
+            # A slope is only evidence if it can be told from zero. Its standard
+            # error comes from the scatter around the fitted line, which is the
+            # honest yardstick here - a fixed threshold in kelvin would either
+            # fire on noise or hide a real trend depending on how spread out the
+            # conditions happened to be.
+            fitted = slope * window_drive + np.polyfit(window_drive, window_error, 1)[1]
+            degrees_of_freedom = max(len(window_drive) - 2, 1)
+            variance = float(np.sum((window_error - fitted) ** 2)) / (
+                degrees_of_freedom
+            )
+            spread = float(np.sum((window_drive - window_drive.mean()) ** 2))
+            standard_error = float(np.sqrt(variance / spread)) if spread > 0 else 0.0
+
+            metrics["envelope_bias_slope_std_error"] = standard_error
+
+            significant = standard_error > 0.0 and abs(slope) > (
+                self.SIGNIFICANT_SLOPE_STD_ERRORS * standard_error
+            )
+
+            if significant and metrics["envelope_bias_span_k"] > (
+                self.SENSOR_RESOLUTION_K
+            ):
+                logger.warning(
+                    "Building thermal validation: the window error slopes "
+                    "%+.4f K per K of indoor-outdoor difference, worth %.2f K "
+                    "across the range seen after dark - the envelope "
+                    "response is too %s. A mean error cannot show this: the "
+                    "model is right on average and wrong in how it reacts to "
+                    "the drive.",
+                    slope,
+                    metrics["envelope_bias_span_k"],
+                    "weak" if slope < 0.0 else "strong",
                 )
 
         if self.parameter_std_errors is not None:

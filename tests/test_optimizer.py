@@ -3,7 +3,13 @@ import dataclasses
 import numpy as np
 import pytest
 
-from domain.types import BoilerThermalModel, HeatPumpCOPModel, MPCConfig, MPCInput
+from domain.types import (
+    BoilerThermalModel,
+    BuildingLumpedModel,
+    HeatPumpCOPModel,
+    MPCConfig,
+    MPCInput,
+)
 from features.boiler import (
     CP_WATER_J_PER_KG_K,
     RHO_WATER_KG_PER_L,
@@ -870,3 +876,189 @@ def test_target_holds_through_a_coarse_look_ahead_block():
     ]
 
     assert not shortfall, f"plan dips up to {max(shortfall):.3f} K below target"
+
+
+BUILDING_MODEL = BuildingLumpedModel(
+    ua_w_per_k=130.0,
+    c_j_per_k=40.0e6,
+    a_eff_m2=9.0,
+    internal_gain_fraction=1.0,
+)
+
+
+def _zone_input(**overrides) -> MPCInput:
+    """A zone starting below a target it has to reach later in the horizon."""
+
+    target = [10.0] * len(SOLAR_FORECAST_W)
+
+    for k in range(len(SOLAR_FORECAST_W) // 2, len(SOLAR_FORECAST_W)):
+        target[k] = 20.0
+
+    defaults = dict(
+        zone_temperature=19.5,
+        zone_target_temperature=tuple(target),
+        zone_gain_w=(0.0,) * len(SOLAR_FORECAST_W),
+    )
+    defaults.update(overrides)
+
+    return _make_input(**defaults)
+
+
+def _compressor_starts(result) -> int:
+    """Starts of the compressor, whichever demand it was serving."""
+
+    on = [
+        max(dhw, space)
+        for dhw, space in zip(
+            result.schedule,
+            result.space_schedule or (0,) * len(result.schedule),
+            strict=True,
+        )
+    ]
+
+    return sum(1 for k, value in enumerate(on) if value and (k == 0 or not on[k - 1]))
+
+
+def test_without_a_building_model_nothing_about_the_tank_changes():
+    """Space heating is opt-in: no model, no second demand, same plan."""
+
+    data = _zone_input(target_temperature_top=(45.0,) * len(SOLAR_FORECAST_W))
+
+    without = MPCOptimizer(THERMAL_MODEL, MPCConfig(), cop_model=COP_MODEL).solve(data)
+    assert without.space_schedule == ()
+    assert without.zone_temperatures == ()
+
+    # And the tank plan is the one it would have made on its own.
+    plain = MPCOptimizer(THERMAL_MODEL, MPCConfig(), cop_model=COP_MODEL).solve(
+        _make_input(target_temperature_top=(45.0,) * len(SOLAR_FORECAST_W))
+    )
+    assert without.schedule == plain.schedule
+
+
+def test_the_zone_and_the_tank_are_never_served_at_once():
+    """One compressor, one three-way valve: sequential is what the hardware does."""
+
+    result = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=BUILDING_MODEL,
+    ).solve(_zone_input(target_temperature_top=(45.0,) * len(SOLAR_FORECAST_W)))
+
+    assert result.space_schedule, "expected the zone to be heated at all"
+
+    for dhw, space in zip(result.schedule, result.space_schedule, strict=True):
+        assert not (dhw and space), "tank and zone served in the same step"
+
+
+def test_both_demands_are_served_in_one_compressor_start():
+    """The point of counting compressor starts rather than boiler starts.
+
+    Nothing rewards chaining the two demands - it simply stops costing extra,
+    because the compressor never stops while the valve switches. A plan that
+    heats the tank and the zone in two separate runs pays a second start for
+    nothing.
+    """
+
+    result = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=BUILDING_MODEL,
+    ).solve(_zone_input(target_temperature_top=(45.0,) * len(SOLAR_FORECAST_W)))
+
+    assert any(result.schedule), "expected the tank to be heated"
+    assert any(result.space_schedule), "expected the zone to be heated"
+    assert _compressor_starts(result) == 1
+
+
+def test_the_zone_reaches_its_target():
+    result = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=BUILDING_MODEL,
+    ).solve(_zone_input())
+
+    data = _zone_input()
+
+    for k, target in enumerate(data.zone_target_temperature):
+        assert result.zone_temperatures[k] >= target - 1e-6
+
+
+def test_heating_the_zone_is_not_free():
+    """It draws through the same compressor, so it has to be costed."""
+
+    optimizer = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=BUILDING_MODEL,
+    )
+
+    heated = optimizer.solve(_zone_input())
+    # The same zone with nothing asked of it.
+    idle = optimizer.solve(
+        _zone_input(zone_target_temperature=(10.0,) * len(SOLAR_FORECAST_W))
+    )
+
+    assert sum(heated.space_heat_w) > 0.0
+    assert sum(idle.space_heat_w) == pytest.approx(0.0, abs=1e-6)
+    assert heated.objective_value > idle.objective_value
+
+
+def _blocks(schedule) -> int:
+    return sum(
+        1
+        for k, value in enumerate(schedule)
+        if value and (k == 0 or not schedule[k - 1])
+    )
+
+
+def test_the_tank_does_not_get_a_second_turn_within_one_run():
+    """Once the tank stops it has reached its target, so it will not need
+    heating again before the compressor stops.
+
+    Without this the plan flapped the three-way valve - five steps of tank, six
+    of zone, then a single step of tank. That single step delivers almost
+    nothing: a DHW start spends an estimated 0.4-0.5 kWh reheating the loop and
+    coil before the tank gains at all.
+    """
+
+    result = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=BUILDING_MODEL,
+    ).solve(_zone_input(target_temperature_top=(45.0,) * len(SOLAR_FORECAST_W)))
+
+    assert _blocks(result.schedule) == 1, "the tank was served in more than one block"
+    assert _compressor_starts(result) == 1
+
+    # Both demands still met, so the rule did not simply forbid one of them.
+    assert max(result.temperatures) >= 45.0 - 1e-6
+    assert result.zone_temperatures[-1] >= 20.0 - 1e-6
+
+
+def test_the_zone_may_still_be_served_before_and_after_the_tank():
+    """The restriction is on the tank, not on the valve.
+
+    The heat pump interrupts space heating for a tank that calls and returns to
+    it afterwards, so the zone may be served in more than one block within a
+    run - only the tank may not.
+    """
+
+    optimizer = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=BUILDING_MODEL,
+    )
+    result = optimizer.solve(
+        _zone_input(target_temperature_top=(45.0,) * len(SOLAR_FORECAST_W))
+    )
+
+    # Nothing in the model forbids it; this only records that the tank's rule
+    # was not accidentally applied to the zone as well.
+    assert not hasattr(optimizer, "_space_done")
+    assert _blocks(result.space_schedule) >= 1

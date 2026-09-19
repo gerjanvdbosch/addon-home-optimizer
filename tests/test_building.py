@@ -752,3 +752,72 @@ def test_filter_result_does_not_hinge_on_the_process_noise():
         scores.append(identifier.validate(df)["skill_vs_persistence"])
 
     assert max(scores) - min(scores) < 0.05
+
+
+def test_validate_flags_an_envelope_that_reacts_too_weakly(caplog):
+    """A mean error cannot show a wrong reaction to the drive.
+
+    If the envelope conductance is off, the error a window ends with grows with
+    the indoor-outdoor difference that drove it - and it does so in both
+    directions, so the two halves cancel in any average. Halving the
+    conductance is exactly that failure.
+    """
+
+    identifier = _identifier()
+    df = _simulate(np.random.default_rng(19))
+    identifier.calibrate(df)
+
+    identifier.model.ua_envelope_w_per_k *= 0.5
+
+    with caplog.at_level("WARNING"):
+        metrics = identifier.validate(df)
+
+    assert metrics["envelope_bias_slope_k_per_k"] < 0.0
+    assert metrics["envelope_bias_span_k"] > identifier.SENSOR_RESOLUTION_K
+    assert "envelope response is too weak" in caplog.text
+
+
+def test_validate_reports_no_envelope_trend_for_the_calibrated_model(caplog):
+    identifier = _identifier()
+    df = _simulate(np.random.default_rng(20))
+    identifier.calibrate(df)
+
+    with caplog.at_level("WARNING"):
+        metrics = identifier.validate(df)
+
+    # Fitted to data this model generated, so its reaction to the drive must
+    # not be distinguishable from no reaction at all. The raw slope is never
+    # exactly zero - what matters is that it stays within its own uncertainty.
+    assert abs(metrics["envelope_bias_slope_k_per_k"]) <= (
+        identifier.SIGNIFICANT_SLOPE_STD_ERRORS
+        * metrics["envelope_bias_slope_std_error"]
+    )
+    assert "envelope response is too" not in caplog.text
+
+
+def test_envelope_trend_ignores_sunlit_windows():
+    """Solar gain and the outdoor difference move together, so a trend fitted
+    over every window measures the net of two errors instead of the envelope.
+
+    Measured on real data: over all windows the single-node model slopes
+    +0.0009 K/K and looks clean, while after dark it slopes -0.0218 - its
+    oversized solar term cancelling its own envelope error. Only dark windows
+    isolate the envelope.
+    """
+
+    identifier = _lumped_identifier()
+    df = _simulate_lumped(np.random.default_rng(21))
+    identifier.calibrate(df)
+
+    metrics = identifier.validate(df)
+
+    prepared = identifier.prepare(df)
+    sunlit = prepared["shutter_open_fraction"] * prepared["I_facade_w_per_m2"]
+
+    assert metrics["dark_windows"] > 0
+    # The trend must rest on fewer windows than the run has in total, or it is
+    # not excluding anything.
+    assert (sunlit >= identifier.NEGLIGIBLE_SOLAR_GAIN_W).any()
+    assert metrics["dark_windows"] < metrics["scored_samples"] / (
+        identifier.ROLLOUT_HORIZON_HOURS * 4
+    )

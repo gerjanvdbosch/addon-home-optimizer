@@ -43,12 +43,14 @@ class Forecasting:
                 forecaster, df = self._prepare(forecaster, config.days)
                 forecaster.fit(df)
             except ValueError as error:
-                if "feature names should match" not in str(error):
-                    raise
-
+                # Whatever went wrong, a saved model is the one thing that can
+                # be stale here, so it is dropped and the fit retried once.
+                # Matching on the message text to decide that only recognised
+                # one library's wording, and would have gone quietly unhandled
+                # the day that wording changed.
                 logging.warning(
-                    "Saved %s model does not match the current features, deleting "
-                    "it and fitting a new one: %s",
+                    "Fitting %s failed with a saved model in place, dropping "
+                    "it and fitting from scratch: %s",
                     forecaster.name,
                     error,
                 )

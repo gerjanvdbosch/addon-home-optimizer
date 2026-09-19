@@ -12,7 +12,12 @@ HeatPumpMode = Literal["heat", "cool"]
 ForecasterType = Literal["baseload", "tap"]
 
 IdentificationType = Literal[
-    "boiler", "cop_dhw", "solar", "building", "building_lumped"
+    "boiler",
+    "cop_dhw",
+    "cop_heating",
+    "solar",
+    "building",
+    "building_lumped",
 ]
 
 
@@ -755,6 +760,23 @@ class MPCInput:
     # passed (see MPCOptimizer). Compressor time, not run time: the resistive
     # booster finishes a run with the compressor off, and that does not protect
     # the compressor from short cycling.
+    # Space heating. All empty or None means none is planned, and the model is
+    # exactly the domestic-hot-water one it was before - the heat pump serves
+    # one demand at a time, so adding the second only ever constrains it.
+    #
+    # The zone's own temperature now, which the plan starts from.
+    zone_temperature: float | None = None
+    # Comfort floor per step, as a schedule rather than one number.
+    zone_target_temperature: tuple[float, ...] = ()
+    # Heat entering the zone that no decision can change (W): solar through the
+    # glazing plus internal gains. Passed as one series because a single-node
+    # zone cannot tell them apart - they enter the same node with the same
+    # coefficient - and the split would be a distinction the model does not
+    # make.
+    zone_gain_w: tuple[float, ...] = ()
+    # Whether the heat pump is serving the zone right now, the space-heating
+    # counterpart of boiler_on_current.
+    space_on_current: bool = False
     compressor_elapsed_hours: float = 0.0
     # How long ago the last run ended (hours), 0 while heating - no new run
     # starts until MPCConfig.heat_pump_min_off_steps have passed since then.
@@ -778,3 +800,9 @@ class MPCResult:
     objective_value: float
     solver_status: str
     termination_condition: str
+    # Space heating, empty when none was planned: whether the heat pump serves
+    # the zone in each step, the heat it delivers there (W), and the zone
+    # temperature that results.
+    space_schedule: tuple[int, ...] = ()
+    space_heat_w: tuple[float, ...] = ()
+    zone_temperatures: tuple[float, ...] = ()

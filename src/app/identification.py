@@ -33,26 +33,49 @@ class Identification:
             if config.target and identifier.name != config.target:
                 continue
 
-            try:
-                identifier, df = self._prepare(identifier, config.days)
-                identifier.calibrate(df)
-            except ValueError as error:
-                if "feature names should match" not in str(error):
-                    raise
+            saved = self.path / f"{identifier.name}.joblib"
 
-                logger.warning(
-                    "Saved %s model does not match the current features, deleting "
-                    "it and calibrating a new one: %s",
-                    identifier.name,
-                    error,
-                )
-                (self.path / f"{identifier.name}.joblib").unlink(missing_ok=True)
-                identifier.model = None
+            # Two attempts, and only where there is something to retry with: a
+            # previously saved model is the one thing here that can be stale, so
+            # a first failure drops it and refits from scratch. Deciding that by
+            # matching the message text was worse than useless - it recognised
+            # one library's wording and would have gone quietly unhandled the
+            # day that wording changed.
+            for attempt in range(2):
+                try:
+                    identifier, df = self._prepare(identifier, config.days)
+                    identifier.calibrate(df)
+                    identifier.save(self.path)
+                    break
+                except Exception as error:
+                    if attempt == 0 and saved.exists():
+                        logger.warning(
+                            "Calibrating %s failed with a saved model in "
+                            "place, dropping it and fitting from scratch: %s",
+                            identifier.name,
+                            error,
+                        )
+                        saved.unlink(missing_ok=True)
+                        identifier.model = None
+                        continue
 
-                identifier, df = self._prepare(identifier, config.days)
-                identifier.calibrate(df)
+                    # Asking for one model by name is a direct instruction: it
+                    # fails loudly, with the traceback that says why.
+                    # Calibrating everything is a batch, and one model that
+                    # cannot be fitted is normal there - a mode the heat pump
+                    # has not run yet, a sensor not configured. Letting that
+                    # abort the loop has twice taken down models that were
+                    # perfectly fittable, so here it is reported and the rest
+                    # still run.
+                    if config.target:
+                        raise
 
-            identifier.save(self.path)
+                    logger.error(
+                        "Calibrating %s failed, continuing with the rest: %s",
+                        identifier.name,
+                        error,
+                    )
+                    break
 
     def validate(self, config: ValidateConfig) -> None:
         identifier, df = self._prepare(config.target, config.days, end=config.end)

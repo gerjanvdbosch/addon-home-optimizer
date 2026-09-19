@@ -92,6 +92,14 @@ def create_container() -> Container:
             HeatPumpCOPIdentifier(
                 mode=BoilerThermalIdentifier.DHW_ACTIVE_STATE, key="dhw"
             ),
+            # Space heating runs the compressor at a far lower supply
+            # temperature than DHW, so it needs its own fit - one instance per
+            # mode is what HeatPumpCOPIdentifier is built for. Registered
+            # before the season starts so it calibrates from the first runs
+            # rather than from whatever is left when someone remembers.
+            # Cooling is deliberately absent: there the water is the COLD side
+            # and this model does not describe it (see the class docstring).
+            HeatPumpCOPIdentifier(mode="Verwarmen", key="heating"),
             BuildingThermalIdentifier(
                 latitude=settings.latitude, longitude=settings.longitude
             ),
