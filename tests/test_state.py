@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from app.state import StateManager
-from domain.types import SeriesPoint, State
+from domain.state import SeriesPoint, State
 from features.solar import nowcast_solar
 
 LATITUDE = 52.0

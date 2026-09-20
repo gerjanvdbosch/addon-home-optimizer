@@ -7,8 +7,9 @@ import pandas as pd
 from pvlib import solarposition
 from scipy import stats
 
-from domain.types import Config
-from features.dataset import DatasetBuilder, DatasetDefinition
+from domain.config import Config
+from domain.dataset import DatasetDefinition
+from features.dataset import DatasetBuilder
 from features.identifier import SystemIdentifier
 
 logger = logging.getLogger(__name__)

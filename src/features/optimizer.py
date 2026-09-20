@@ -8,23 +8,20 @@ import pyomo.environ as pyo
 from pyomo.contrib.appsi.base import TerminationCondition
 from pyomo.contrib.appsi.solvers.highs import Highs
 
-from domain.types import (
+from domain.dynamics import discretize_zoh
+from domain.models import (
     BoilerThermalModel,
     BuildingLumpedModel,
     BuildingThermalModel,
     HeatPumpCOPModel,
-    MPCConfig,
-    MPCInput,
-    MPCResult,
 )
-from features.boiler import (
+from domain.mpc import MPCConfig, MPCInput, MPCResult
+from domain.physics import (
     CP_WATER_J_PER_KG_K,
     RHO_WATER_KG_PER_L,
-    discretize_zoh,
-    lumped_state_space,
+    lumped_tank_state_space,
+    zone_state_space,
 )
-from features.building import zone_state_space
-from features.cop import HeatPumpCOPIdentifier
 
 logger = logging.getLogger(__name__)
 
@@ -284,7 +281,7 @@ class MPCOptimizer:
         # coefficient, depends on boiler_on), so (A_d, B_d) depends only on
         # each step's own duration - cached per distinct duration (fine vs.
         # coarse - see _build_step_plan) rather than recomputed per step.
-        a, b = lumped_state_space(
+        a, b = lumped_tank_state_space(
             self.thermal_model.volume_l,
             self.thermal_model.ua_top_w_per_k + self.thermal_model.ua_bottom_w_per_k,
         )
@@ -828,7 +825,7 @@ class MPCOptimizer:
         segments), adding real complexity. Real data on this installation
         confirmed electrical power is very close to linear in supply
         temperature over a DHW cycle's normal active-heating range
-        (HeatPumpCOPIdentifier.POWER_FIT_T_LOW_C to ...HIGH_C) - so a single
+        (HeatPumpCOPModel.POWER_FIT_T_LOW_C to ...HIGH_C) - so a single
         secant line through the two ends of that range is an adequate, much
         simpler stand-in, and (being a genuine straight line, not a bound)
         is usable directly inside the objective, exactly as used for
@@ -881,15 +878,11 @@ class MPCOptimizer:
         margin = self._supply_margin_c(overall_target_max)
 
         power_low, power_high = map(
-            float,
-            HeatPumpCOPIdentifier.planned_power_at_reference_points(
-                self.cop_model, T_outdoor
-            ),
+            float, self.cop_model.planned_power_at_reference_points(T_outdoor)
         )
 
         fit_range_c = (
-            HeatPumpCOPIdentifier.POWER_FIT_T_HIGH_C
-            - HeatPumpCOPIdentifier.POWER_FIT_T_LOW_C
+            HeatPumpCOPModel.POWER_FIT_T_HIGH_C - HeatPumpCOPModel.POWER_FIT_T_LOW_C
         )
         beta = (power_high - power_low) / fit_range_c
 
@@ -899,7 +892,7 @@ class MPCOptimizer:
         # POWER_FIT_T_LOW_C itself, for the line to be correct in T[k]
         # terms (beta is unaffected: margin is a constant shift common to
         # both endpoints, so it cancels out of their difference).
-        t_k_low = HeatPumpCOPIdentifier.POWER_FIT_T_LOW_C - margin
+        t_k_low = HeatPumpCOPModel.POWER_FIT_T_LOW_C - margin
         alpha = power_low - beta * t_k_low
 
         return alpha, beta
@@ -933,11 +926,7 @@ class MPCOptimizer:
                 self.config.boiler_electrical_power_w, 1.0
             )
 
-        return float(
-            HeatPumpCOPIdentifier.clamped_cop(
-                self.cop_model, outdoor_c, self.SPACE_HEATING_SUPPLY_C
-            )
-        )
+        return float(self.cop_model.clamped_cop(outdoor_c, self.SPACE_HEATING_SUPPLY_C))
 
     def _add_space_heating(
         self,
@@ -1185,7 +1174,7 @@ class MPCOptimizer:
         # coarse for the far, look-ahead-only portion of the horizon (see
         # _build_step_plan); the physics used to report the resulting
         # trajectory stays exactly as fine-grained as the input.
-        a, b = lumped_state_space(
+        a, b = lumped_tank_state_space(
             self.thermal_model.volume_l,
             self.thermal_model.ua_top_w_per_k + self.thermal_model.ua_bottom_w_per_k,
         )

@@ -6,14 +6,12 @@ from typing import Sequence
 
 import pandas as pd
 
+from domain.config import Config
+from domain.dataset import DatasetDefinition
+from domain.state import SeriesPoint, State
 from domain.time import local_day_start, to_local_time
-from domain.types import (
-    Config,
-    SeriesPoint,
-    State,
-)
 from features.building import BuildingLumpedIdentifier, BuildingThermalIdentifier
-from features.dataset import DatasetBuilder, DatasetDefinition, DatasetLoader
+from features.dataset import DatasetBuilder, DatasetLoader
 from features.solar import (
     PREDICT_STEP_MINUTES,
     SolarBiasIdentifier,

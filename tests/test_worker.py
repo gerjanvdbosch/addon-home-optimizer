@@ -1,7 +1,7 @@
 import logging
 
 from app.worker import Worker
-from domain.types import Job, JobType, UpdateConfig
+from domain.jobs import Job, JobType, UpdateConfig
 
 
 def test_a_failing_job_is_reported_and_leaves_the_worker_running(

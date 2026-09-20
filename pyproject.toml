@@ -82,3 +82,34 @@ testpaths = ["tests"]
 # single test serially - spawning workers costs more than it saves there.
 addopts = ["-n", "auto"]
 
+[tool.importlinter]
+root_packages = ["domain", "infrastructure", "features", "app", "web"]
+
+# The architecture as a check rather than a convention: each layer may only
+# reach downwards. domain sits at the bottom and imports nothing of ours, so
+# the balances, the constants and the models stay usable by the identifiers
+# that fit them, the filter that estimates their states and the planner that
+# acts on them alike.
+[[tool.importlinter.contracts]]
+name = "Layers"
+type = "layers"
+layers = ["web", "app", "features", "infrastructure", "domain"]
+
+# domain must not learn about the database, the web or the workflow: it is
+# physics and data shapes, and the one dependency that broke this (the dataset
+# vocabulary living in the InfluxDB adapter) now points the other way.
+[[tool.importlinter.contracts]]
+name = "Domain knows nothing of the rest"
+type = "forbidden"
+source_modules = ["domain"]
+forbidden_modules = ["infrastructure", "features", "app", "web"]
+
+# A model says what data it needs in domain/dataset.py terms; which database
+# that comes out of is the composition root's choice, injected as a list of
+# DataLoader. So no feature may name a concrete adapter - if this breaks, an
+# identifier has started depending on InfluxDB instead of on its own inputs.
+[[tool.importlinter.contracts]]
+name = "Features stay off infrastructure"
+type = "forbidden"
+source_modules = ["features"]
+forbidden_modules = ["infrastructure"]

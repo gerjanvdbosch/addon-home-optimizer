@@ -6,7 +6,7 @@ from multiprocessing.context import SpawnProcess
 from queue import Queue
 from threading import Thread
 
-from domain.types import Job, JobType
+from domain.jobs import Job, JobType
 
 
 class Worker:

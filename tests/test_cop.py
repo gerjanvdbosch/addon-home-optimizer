@@ -4,8 +4,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from domain.types import HeatPumpCOPModel
-from features.boiler import CP_WATER_J_PER_KG_K, RHO_WATER_KG_PER_L
+from domain.models import HeatPumpCOPModel
+from domain.physics import CP_WATER_J_PER_KG_K, RHO_WATER_KG_PER_L
 from features.cop import HeatPumpCOPIdentifier
 
 TRUE_ETA_CARNOT = 0.45
@@ -105,7 +105,7 @@ def _power_rows(T_supply, q_th_w, T_outdoor: float = 10.0) -> pd.DataFrame:
 
     T_supply = np.asarray(T_supply, dtype=float)
     q_th_w = np.broadcast_to(np.asarray(q_th_w, dtype=float), T_supply.shape)
-    cop = HeatPumpCOPIdentifier.clamped_cop(TRUE_COP_MODEL, T_outdoor, T_supply)
+    cop = TRUE_COP_MODEL.clamped_cop(T_outdoor, T_supply)
 
     return pd.DataFrame(
         {"T_supply": T_supply, "T_outdoor": T_outdoor, "P_el": q_th_w / cop}

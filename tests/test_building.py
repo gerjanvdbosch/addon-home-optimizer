@@ -5,21 +5,20 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from domain.types import BuildingLumpedModel, BuildingThermalModel, Config
-from features.boiler import discretize_zoh
-from features.building import (
+from domain.config import Config
+from domain.dynamics import discretize_zoh, kalman_states
+from domain.models import BuildingLumpedModel, BuildingThermalModel
+from domain.physics import (
     CP_AIR_J_PER_KG_K,
     Q_PERSON_SENSIBLE_W,
     RHO_AIR_KG_PER_M3,
-    BuildingLumpedIdentifier,
-    BuildingThermalIdentifier,
     floor_heat_w,
-    kalman_states,
-    lumped_state_space,
+    lumped_zone_state_space,
     solar_gain_w,
-    state_space,
+    two_node_zone_state_space,
     zone_state_space,
 )
+from features.building import BuildingLumpedIdentifier, BuildingThermalIdentifier
 
 TRUE_VOLUME_M3 = 120.0
 TRUE_ZONE_AREA_M2 = 46.0
@@ -196,7 +195,7 @@ def _simulate(rng: np.random.Generator) -> pd.DataFrame:
 
     inputs = identifier._inputs(TRUE_MODEL, prepared)
 
-    a_d, b_d = discretize_zoh(*state_space(TRUE_MODEL), DT_SECONDS)
+    a_d, b_d = discretize_zoh(*two_node_zone_state_space(TRUE_MODEL), DT_SECONDS)
 
     state = np.array([21.0, 21.0])
     air = np.empty(len(prepared))
@@ -510,7 +509,7 @@ def _simulate_lumped(rng: np.random.Generator) -> pd.DataFrame:
     prepared = identifier.prepare(_raw_frame())
     inputs = identifier._inputs(TRUE_LUMPED, prepared)
 
-    a_d, b_d = discretize_zoh(*lumped_state_space(TRUE_LUMPED), DT_SECONDS)
+    a_d, b_d = discretize_zoh(*lumped_zone_state_space(TRUE_LUMPED), DT_SECONDS)
 
     state = np.array([21.0])
     room = np.empty(len(prepared))

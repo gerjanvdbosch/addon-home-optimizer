@@ -7,9 +7,11 @@ from skforecast.preprocessing import CalendarFeatures
 from skforecast.recursive import ForecasterRecursive
 from sklearn.ensemble import HistGradientBoostingRegressor
 
-from domain.types import Config, ForecasterType
+from domain.config import Config
+from domain.dataset import DatasetDefinition
+from domain.jobs import ForecasterType
 from features.boiler import BoilerThermalIdentifier
-from features.dataset import DatasetBuilder, DatasetDefinition
+from features.dataset import DatasetBuilder
 from features.forecasters import SkforecastForecaster
 
 

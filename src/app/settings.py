@@ -13,7 +13,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from domain.types import Settings
+from domain.config import Settings
 from infrastructure.home_assistant import HomeAssistant
 from infrastructure.repositories import (
     BacktestRepository,

@@ -9,12 +9,12 @@ from sklearn.metrics import (
     r2_score,
 )
 
-from domain.types import (
-    Config,
-    HeatPumpCOPModel,
-)
-from features.boiler import CP_WATER_J_PER_KG_K, RHO_WATER_KG_PER_L, booster_active
-from features.dataset import DatasetBuilder, DatasetDefinition
+from domain.config import Config
+from domain.dataset import DatasetDefinition
+from domain.models import HeatPumpCOPModel
+from domain.physics import CP_WATER_J_PER_KG_K, RHO_WATER_KG_PER_L
+from features.boiler import booster_active
+from features.dataset import DatasetBuilder
 from features.identifier import SystemIdentifier
 
 logger = logging.getLogger(__name__)
@@ -63,18 +63,6 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
     # Home Assistant sensor's own native unit, avoiding an unnecessary
     # kW<->W conversion.
     MIN_ELECTRICAL_POWER_W = 100.0
-
-    # COP=1 is the theoretical floor for any heat pump (no better than pure
-    # resistive heating) - it clamps the model's own predictions (see
-    # clamped_cop) but does not filter measurements: a measured COP around 1 is
-    # exactly what booster-heater rows look like (real data: 0.99), so as a
-    # filter it silently dropped some of them and let others through. Those
-    # rows are excluded explicitly instead (see prepare()). COP=10 is a generous
-    # ceiling far above what a real residential compressor achieves even at its
-    # most favorable operating point - a sanity bound that still rejects
-    # nonsensical measurements (e.g. a near-zero electrical reading).
-    MIN_COP = 1.0
-    MAX_COP = 10.0
 
     # eta_carnot is the fraction of the theoretical (Carnot) COP a real
     # compressor achieves - a standard "second-law efficiency". Real
@@ -126,20 +114,14 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
     MAX_DELTA_T_EVAP = 20.0
     INITIAL_DELTA_T_EVAP = 5.0
 
-    # Reference points MPCOptimizer fits its linear electrical-power-vs-
-    # tank-temperature approximation through (see
-    # MPCOptimizer._power_line_coefficients) - the normal active-heating
-    # operating range for a DHW cycle on this installation. Q_th (real,
-    # calorimetric thermal output - see prepare()'s diagnostic) at each
-    # reference point comes from a line fitted to real data rather than
-    # assumed constant (see _fit_q_th_line()): real data confirmed Q_th is NOT
-    # constant across a cycle - using a single fixed q_in_nominal_w (the
-    # boiler's own separately calibrated nominal thermal output, validated
-    # for the tank's temperature *trajectory*, a different purpose)
-    # understated real electrical draw by up to ~40% through the middle of a
-    # cycle.
-    POWER_FIT_T_LOW_C = 30.0
-    POWER_FIT_T_HIGH_C = 60.0
+    # Q_th (real, calorimetric thermal output - see prepare()'s diagnostic) at
+    # HeatPumpCOPModel.POWER_FIT_T_LOW_C/HIGH_C comes from a line fitted to
+    # real data rather than assumed constant (see _fit_q_th_line()): real data
+    # confirmed Q_th is NOT constant across a cycle - using a single fixed
+    # q_in_nominal_w (the boiler's own separately calibrated nominal thermal
+    # output, validated for the tank's temperature *trajectory*, a different
+    # purpose) understated real electrical draw by up to ~40% through the
+    # middle of a cycle.
     # Rows below this supply temperature are left out of that Q_th fit: the
     # compressor is still ramping up there (real data: ~600 W electrical and
     # ~2.8 kW thermal at 20-30 degC supply, against ~6.5 kW thermal once
@@ -302,7 +284,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             & (df["P_el"] > self.MIN_ELECTRICAL_POWER_W)
             & (df["delta_t_water"] > 0.0)
             & (df["Q_th"] > 0.0)
-            & (df["COP_measured"] < self.MAX_COP)
+            & (df["COP_measured"] < HeatPumpCOPModel.MAX_COP)
         )
 
         invalid_count = int((~valid).sum())
@@ -515,8 +497,8 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             "%.2f degC, Q_th at %.0f/%.0f degC = %.1f/%.1f W",
             self.mode,
             reference_supply_temperature_c,
-            self.POWER_FIT_T_LOW_C,
-            self.POWER_FIT_T_HIGH_C,
+            HeatPumpCOPModel.POWER_FIT_T_LOW_C,
+            HeatPumpCOPModel.POWER_FIT_T_HIGH_C,
             q_th_at_power_fit_low_w,
             q_th_at_power_fit_high_w,
         )
@@ -531,29 +513,6 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         )
 
         return self.model
-
-    @classmethod
-    def clamped_cop(cls, model: HeatPumpCOPModel, T_outdoor, T_supply):
-        """model.cop() clamped to the [MIN_COP, MAX_COP] sanity range, so an
-        outdoor/supply combination outside anything the model was fitted on
-        cannot turn into an absurd power estimate. Scalars or arrays."""
-
-        return np.clip(model.cop(T_outdoor, T_supply), cls.MIN_COP, cls.MAX_COP)
-
-    @classmethod
-    def planned_power_at_reference_points(cls, model: HeatPumpCOPModel, T_outdoor):
-        """Electrical power (W) at POWER_FIT_T_LOW_C and POWER_FIT_T_HIGH_C
-        supply temperature - the two points MPCOptimizer's linear planning
-        power line passes through (see MPCOptimizer._power_line_coefficients).
-        Shared with validate() so it scores exactly the line planning costs
-        with. Scalars or arrays."""
-
-        return (
-            model.q_th_at_power_fit_low_w
-            / cls.clamped_cop(model, T_outdoor, cls.POWER_FIT_T_LOW_C),
-            model.q_th_at_power_fit_high_w
-            / cls.clamped_cop(model, T_outdoor, cls.POWER_FIT_T_HIGH_C),
-        )
 
     def _fit_q_th_line(
         self, df: pd.DataFrame, cop_model: HeatPumpCOPModel
@@ -582,8 +541,8 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
 
         T_supply = rows["T_supply"].to_numpy(dtype=float)
         P_el = rows["P_el"].to_numpy(dtype=float)
-        inverse_cop = 1.0 / self.clamped_cop(
-            cop_model, rows["T_outdoor"].to_numpy(dtype=float), T_supply
+        inverse_cop = 1.0 / cop_model.clamped_cop(
+            rows["T_outdoor"].to_numpy(dtype=float), T_supply
         )
 
         design = np.column_stack([inverse_cop, T_supply * inverse_cop])
@@ -594,8 +553,8 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             q_slope = 0.0
 
         return (
-            float(q_0 + q_slope * self.POWER_FIT_T_LOW_C),
-            float(q_0 + q_slope * self.POWER_FIT_T_HIGH_C),
+            float(q_0 + q_slope * HeatPumpCOPModel.POWER_FIT_T_LOW_C),
+            float(q_0 + q_slope * HeatPumpCOPModel.POWER_FIT_T_HIGH_C),
         )
 
     def _planned_power_w(self, df: pd.DataFrame) -> np.ndarray:
@@ -604,12 +563,12 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         temperature there, but shifting by the constant reference margin
         leaves it this same straight line in supply-temperature terms."""
 
-        power_low, power_high = self.planned_power_at_reference_points(
-            self.model, df["T_outdoor"].to_numpy(dtype=float)
+        power_low, power_high = self.model.planned_power_at_reference_points(
+            df["T_outdoor"].to_numpy(dtype=float)
         )
-        fraction = (df["T_supply"].to_numpy(dtype=float) - self.POWER_FIT_T_LOW_C) / (
-            self.POWER_FIT_T_HIGH_C - self.POWER_FIT_T_LOW_C
-        )
+        fraction = (
+            df["T_supply"].to_numpy(dtype=float) - HeatPumpCOPModel.POWER_FIT_T_LOW_C
+        ) / (HeatPumpCOPModel.POWER_FIT_T_HIGH_C - HeatPumpCOPModel.POWER_FIT_T_LOW_C)
 
         return power_low + (power_high - power_low) * fraction
 
@@ -770,7 +729,9 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             run_peak_ratio = float((peaks["planned"] / peaks["measured"]).median())
 
             supply_bins = np.arange(
-                self.POWER_FIT_MIN_SUPPLY_C, self.POWER_FIT_T_HIGH_C + 5.0, 5.0
+                self.POWER_FIT_MIN_SUPPLY_C,
+                HeatPumpCOPModel.POWER_FIT_T_HIGH_C + 5.0,
+                5.0,
             )
             by_supply = power.groupby(
                 pd.cut(power["T_supply"], bins=supply_bins, right=False),

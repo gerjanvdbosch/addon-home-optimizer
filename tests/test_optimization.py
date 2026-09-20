@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from app.optimization import Optimization
-from domain.types import MPCResult
+from domain.mpc import MPCResult
 
 START = datetime(2026, 9, 17, 10, 0, tzinfo=UTC)
 TIMES = [START + timedelta(minutes=15 * i) for i in range(4)]

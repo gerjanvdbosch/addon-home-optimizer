@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from domain.types import (
+from domain.jobs import (
     BacktestConfig,
     FitConfig,
     ForecasterType,

@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 
 from app.identification import Identification
-from domain.types import CalibrateConfig
+from domain.jobs import CalibrateConfig
 
 
 class _Identifier:

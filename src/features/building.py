@@ -1,4 +1,8 @@
-"""Two-node (2R2C) grey-box thermal model of one building zone.
+"""Identification of the building zone's thermal parameters.
+
+The balances themselves live in domain/physics.py; this module is how their
+parameters are obtained from measurements - the dataset, the rollout windows,
+the fit and the diagnostics that say whether the result may be believed.
 
 One model serves both space heating and space cooling. The envelope physics -
 transmission to outdoors, thermal mass, solar gain through south glazing,
@@ -21,119 +25,30 @@ from pvlib import irradiance, solarposition
 from scipy.optimize import least_squares
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-from domain.types import (
-    BuildingLumpedModel,
-    BuildingThermalModel,
-    Config,
-    SensorReference,
+from domain.config import Config
+from domain.dataset import DatasetDefinition
+from domain.dynamics import discretize_zoh, kalman_states
+from domain.models import BuildingLumpedModel, BuildingThermalModel
+from domain.physics import (
+    CP_AIR_J_PER_KG_K,
+    RHO_AIR_KG_PER_M3,
+    floor_heat_w,
+    internal_gain_w,
+    lumped_zone_state_space,
+    solar_gain_w,
+    two_node_zone_state_space,
 )
-from features.boiler import (
-    CP_WATER_J_PER_KG_K,
-    RHO_WATER_KG_PER_L,
-    discretize_zoh,
-)
-from features.dataset import DatasetBuilder, DatasetDefinition
+from domain.sensors import Aggregation, FillMethod, SensorReference
+from features.dataset import DatasetBuilder
 from features.identifier import SystemIdentifier
-from infrastructure.influx import Aggregation, FillMethod
 
 logger = logging.getLogger(__name__)
-
-# Physical constants of indoor air at room conditions, not fit parameters.
-RHO_AIR_KG_PER_M3 = 1.2
-CP_AIR_J_PER_KG_K = 1005.0
-
-# Sensible heat released by one adult at rest / light activity (ASHRAE
-# Fundamentals, Handbook chapter on internal heat gain). Only the sensible part
-# enters a temperature balance; the ~45 W latent part adds moisture, which does
-# not affect this ODE - stated here as an explicit modelling assumption rather
-# than silently dropped.
-Q_PERSON_SENSIBLE_W = 75.0
 
 # The modelled glazing faces due south on a vertical facade. Both are geometry
 # of this installation, expressed in pvlib's convention (azimuth clockwise from
 # north, tilt from horizontal).
 SOUTH_FACADE_AZIMUTH_DEG = 180.0
 VERTICAL_FACADE_TILT_DEG = 90.0
-
-
-def state_space(model: BuildingThermalModel) -> tuple[np.ndarray, np.ndarray]:
-    """Continuous state-space for dx/dt = A x + B u.
-
-    x = [T_air, T_mass], u = [T_outdoor, Q_internal, Q_solar, Q_floor]:
-
-        C_air  dT_air/dt  = UA_env (T_out - T_air) + UA_am (T_mass - T_air) + Q_int
-        C_mass dT_mass/dt = UA_am  (T_air - T_mass) + Q_sol + Q_floor
-
-    Q_solar and Q_floor drive the mass node, not the air node. The floor
-    circuit physically runs inside the screed, and air is effectively
-    transparent to shortwave radiation, which is absorbed by floor and
-    furnishings - this is the same structure as the boiler's, where heat is
-    supplied at the bottom rather than uniformly. It is also what produces the
-    observed lag between sun or compressor and room temperature, without any
-    added delay term.
-    """
-
-    ua_env = model.ua_envelope_w_per_k
-    ua_am = model.ua_air_mass_w_per_k
-    c_air = model.c_air_j_per_k
-    c_mass = model.c_mass_j_per_k
-
-    a = np.array(
-        [
-            [-(ua_env + ua_am) / c_air, ua_am / c_air],
-            [ua_am / c_mass, -ua_am / c_mass],
-        ]
-    )
-
-    b = np.array(
-        [
-            [ua_env / c_air, 1.0 / c_air, 0.0, 0.0],
-            [0.0, 0.0, 1.0 / c_mass, 1.0 / c_mass],
-        ]
-    )
-
-    return a, b
-
-
-def lumped_state_space(
-    model: BuildingLumpedModel,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Continuous state-space for the single-node model.
-
-    x = [T], u = [T_outdoor, Q_internal, Q_solar, Q_floor]:
-
-        C dT/dt = UA (T_out - T) + Q_int + Q_sol + Q_floor
-
-    All three heat inputs enter the one node, because there is only one. Where
-    they physically land - air or screed - is exactly the distinction this
-    model gives up, and the reason the two-node form still exists.
-    """
-
-    ua = model.ua_w_per_k
-    c = model.c_j_per_k
-
-    a = np.array([[-ua / c]])
-    b = np.array([[ua / c, 1.0 / c, 1.0 / c, 1.0 / c]])
-
-    return a, b
-
-
-def zone_state_space(
-    model: BuildingThermalModel | BuildingLumpedModel,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Continuous state-space of whichever zone structure was identified.
-
-    Both forms share the same input vector u = [T_outdoor, Q_internal, Q_solar,
-    Q_floor] and the same first state (the air temperature the thermostats
-    measure), so anything driving the zone - the Kalman filter, a rollout, the
-    MPC - can work from this without knowing which structure it was handed.
-    They differ only in how many states there are and where the heat lands.
-    """
-
-    if isinstance(model, BuildingLumpedModel):
-        return lumped_state_space(model)
-
-    return state_space(model)
 
 
 def facade_irradiance_w_per_m2(
@@ -179,141 +94,6 @@ def facade_irradiance_w_per_m2(
     )
 
     return np.nan_to_num(np.asarray(total["poa_global"], dtype=float), nan=0.0)
-
-
-def solar_gain_w(
-    a_eff_m2: float,
-    shutter_open_fraction: np.ndarray,
-    facade_irradiance: np.ndarray,
-) -> np.ndarray:
-    """Q_sol = A_eff * f_shutter * I_facade.
-
-    A roller shutter covers the glass from the top down, so the *unobstructed
-    glass area* scales linearly with its open position - the linearity is
-    geometric, not an assumed response curve. A fully closed shutter is taken as
-    fully opaque; real slat gaps transmit a few percent, which would show up as
-    an underprediction on sunny days with the shutter shut, and only then is
-    there evidence for a residual-transmittance parameter.
-    """
-
-    return a_eff_m2 * shutter_open_fraction * facade_irradiance
-
-
-def internal_gain_w(
-    baseload_w: np.ndarray,
-    internal_gain_fraction: float,
-    occupants: np.ndarray,
-) -> np.ndarray:
-    """Q_int = f_indoor * P_baseload + n_occupants * Q_PERSON_SENSIBLE_W.
-
-    Household electricity ends up as heat inside the building, so the measured
-    baseload power is a direct measurement of appliance and lighting gain rather
-    than something to fit. Only its in-zone fraction is identified, because the
-    sensor covers the whole house while the model covers one zone.
-    """
-
-    return internal_gain_fraction * baseload_w + occupants * Q_PERSON_SENSIBLE_W
-
-
-def floor_heat_w(
-    flow_lpm: np.ndarray,
-    supply_temperature_c: np.ndarray,
-    return_temperature_c: np.ndarray,
-) -> np.ndarray:
-    """Calorimetric heat delivered to the floor circuit: Q = m_dot * cp * dT.
-
-    Signed by construction: during heating the supply is warmer than the return
-    and Q is positive, during cooling it is colder and Q is negative. That is
-    precisely why one model covers both modes - no mode flag enters here.
-    """
-
-    mass_flow_kg_per_s = RHO_WATER_KG_PER_L * flow_lpm / 60.0
-
-    return (
-        mass_flow_kg_per_s
-        * CP_WATER_J_PER_KG_K
-        * (supply_temperature_c - return_temperature_c)
-    )
-
-
-def kalman_states(
-    a: np.ndarray,
-    b: np.ndarray,
-    measured: np.ndarray,
-    inputs: np.ndarray,
-    dt_seconds: np.ndarray,
-    process_noise_w: float,
-    measurement_variance: float,
-) -> np.ndarray:
-    """Filtered state estimate at every sample, from the measured air
-    temperature alone.
-
-    Only the first state is observed - the room thermometer - so any other
-    state has to be inferred from how the measured one moves relative to what
-    the model predicted. That is what a Kalman filter does, and it is the
-    honest way to start a rollout: hard-resetting the measured state while
-    letting an unmeasured one free-run leaves the two inconsistent with each
-    other, which flatters a single-state model and penalises a multi-state one.
-
-    It is also not only an evaluation device. An MPC must know where it starts
-    from at solve time, including a screed temperature nothing measures, so
-    this is a missing part of the system rather than a test harness.
-
-    Process noise is expressed as an unmodelled HEAT FLOW (W) entering through
-    the same channel as the internal gains, not as an abstract covariance: the
-    disturbance this is standing in for - ventilation through an opened window,
-    a wood stove, a visitor - is a heat flow, so its magnitude can be reasoned
-    about physically.
-    """
-
-    n = a.shape[0]
-
-    state = np.concatenate(([measured[0]], np.full(n - 1, measured[0])))
-    covariance = np.eye(n) * measurement_variance
-
-    estimates = np.empty((len(measured), n))
-    estimates[0] = state
-
-    cache: dict[float, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-
-    for i in range(1, len(measured)):
-        dt = float(dt_seconds[i])
-        key = round(dt, 3)
-
-        if key not in cache:
-            a_d, b_d = discretize_zoh(a, b, dt)
-            # The disturbance enters where an unmodelled indoor heat flow
-            # would, and its effect on the state is what the DISCRETE input
-            # matrix says an input of that size does over one step. Building it
-            # from the continuous B instead understates it by a factor dt^2 -
-            # here about a million - which silently turns the filter into a
-            # free-running simulation that ignores the measurement.
-            disturbance = b_d[:, 1:2]
-            cache[key] = (
-                a_d,
-                b_d,
-                (process_noise_w**2) * (disturbance @ disturbance.T),
-            )
-
-        a_d, b_d, process_covariance = cache[key]
-
-        state = a_d @ state + b_d @ inputs[i - 1]
-        covariance = a_d @ covariance @ a_d.T + process_covariance
-
-        # The air temperature is the first state and the only measured one, so
-        # the observation matrix is a unit vector and the usual matrix products
-        # reduce to indexing.
-        innovation = measured[i] - state[0]
-        innovation_covariance = covariance[0, 0] + measurement_variance
-
-        gain = covariance[:, 0] / innovation_covariance
-
-        state = state + gain * innovation
-        covariance = covariance - np.outer(gain, covariance[0, :])
-
-        estimates[i] = state
-
-    return estimates
 
 
 def _rollout(
@@ -598,7 +378,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         variant; everything else in this class is shared between the two.
         """
 
-        return state_space(model)
+        return two_node_zone_state_space(model)
 
     @staticmethod
     def _parameters(model: BuildingThermalModel) -> np.ndarray:
@@ -1777,7 +1557,7 @@ class BuildingLumpedIdentifier(BuildingThermalIdentifier):
 
     @staticmethod
     def _state_space(model) -> tuple[np.ndarray, np.ndarray]:
-        return lumped_state_space(model)
+        return lumped_zone_state_space(model)
 
     @staticmethod
     def _parameters(model: BuildingLumpedModel) -> np.ndarray:

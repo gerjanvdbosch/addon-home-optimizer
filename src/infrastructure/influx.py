@@ -1,35 +1,17 @@
 from datetime import datetime
-from typing import Any, Iterable, Literal, Protocol, cast
+from typing import Any, Iterable, Protocol, cast
 
 from influxdb import InfluxDBClient
 from influxdb.resultset import ResultSet
 
-from domain.types import (
+from domain.config import Settings
+from domain.sensors import (
+    Aggregation,
+    FillMethod,
     InfluxSensor,
     SensorAttributesReference,
     SensorReference,
-    Settings,
 )
-
-Aggregation = Literal[
-    "mean",
-    "count",
-    "last",
-    "first",
-    "min",
-    "max",
-    "sum",
-    "median",
-    "spread",
-    "stddev",
-]
-
-FillMethod = Literal[
-    "none",
-    "null",
-    "previous",
-    "linear",
-]
 
 
 class AttributeDefinition(Protocol):

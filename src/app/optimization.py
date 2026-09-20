@@ -4,7 +4,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.state import StateManager
-from domain.types import MPCConfig, MPCInput, MPCResult, OptimizeConfig
+from domain.jobs import OptimizeConfig
+from domain.mpc import MPCConfig, MPCInput, MPCResult
 from features.boiler import BoilerThermalIdentifier
 from features.cop import HeatPumpCOPIdentifier
 from features.optimizer import MPCOptimizer

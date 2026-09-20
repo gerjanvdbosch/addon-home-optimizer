@@ -7,8 +7,8 @@ import numpy as np
 import pandas as pd
 from joblib import dump, load
 
-from domain.types import Config
-from features.dataset import DatasetDefinition
+from domain.config import Config
+from domain.dataset import DatasetDefinition
 
 logger = logging.getLogger(__name__)
 

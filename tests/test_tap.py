@@ -4,8 +4,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from domain.types import BoilerThermalModel
-from features.boiler import BoilerThermalIdentifier, _state_space, discretize_zoh
+from domain.dynamics import discretize_zoh
+from domain.models import BoilerThermalModel
+from domain.physics import tank_state_space
+from features.boiler import BoilerThermalIdentifier
 from features.tap import TapForecaster
 
 TRUE_MODEL = BoilerThermalModel(
@@ -28,13 +30,13 @@ def _simulate_with_draws_when_present(rng: np.random.Generator, days: int):
     should learn to predict near-zero excess loss when present=False.
     """
 
-    a_idle, b_idle = _state_space(
+    a_idle, b_idle = tank_state_space(
         TRUE_MODEL.volume_l,
         TRUE_MODEL.ua_top_w_per_k,
         TRUE_MODEL.ua_bottom_w_per_k,
         TRUE_MODEL.ua_mix_idle_w_per_k,
     )
-    a_active, b_active = _state_space(
+    a_active, b_active = tank_state_space(
         TRUE_MODEL.volume_l,
         TRUE_MODEL.ua_top_w_per_k,
         TRUE_MODEL.ua_bottom_w_per_k,

@@ -7,8 +7,10 @@ from skforecast.recursive import ForecasterRecursive
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.preprocessing import FunctionTransformer
 
-from domain.types import Config, ForecasterType
-from features.dataset import DatasetBuilder, DatasetDefinition
+from domain.config import Config
+from domain.dataset import DatasetDefinition
+from domain.jobs import ForecasterType
+from features.dataset import DatasetBuilder
 from features.forecasters import SkforecastForecaster
 
 

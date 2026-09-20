@@ -11,10 +11,10 @@ from starlette.responses import JSONResponse
 
 from app.settings import configure_logger, create_repositories, load_settings
 from app.worker import Worker
-from domain.types import (
+from domain.config import Config
+from domain.jobs import (
     BacktestConfig,
     CalibrateConfig,
-    Config,
     FitConfig,
     Job,
     JobType,

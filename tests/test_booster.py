@@ -1,13 +1,10 @@
 import pandas as pd
 import pytest
 
-from domain.types import BoilerThermalModel, MPCConfig, MPCInput
-from features.boiler import (
-    CP_WATER_J_PER_KG_K,
-    RHO_WATER_KG_PER_L,
-    BoilerThermalIdentifier,
-    booster_active,
-)
+from domain.models import BoilerThermalModel
+from domain.mpc import MPCConfig, MPCInput
+from domain.physics import CP_WATER_J_PER_KG_K, RHO_WATER_KG_PER_L
+from features.boiler import BoilerThermalIdentifier, booster_active
 from features.cop import HeatPumpCOPIdentifier
 from features.optimizer import MPCOptimizer
 

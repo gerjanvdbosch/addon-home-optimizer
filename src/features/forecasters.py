@@ -17,8 +17,10 @@ from skforecast.utils import load_forecaster, save_forecaster
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_squared_error, r2_score
 
-from domain.types import BacktestPoint, BacktestResult, Config, ForecasterType
-from features.dataset import DatasetDefinition
+from domain.config import Config
+from domain.dataset import DatasetDefinition
+from domain.jobs import ForecasterType
+from domain.state import BacktestPoint, BacktestResult
 
 
 class Forecaster(Protocol):

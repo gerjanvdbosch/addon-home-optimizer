@@ -1,7 +1,8 @@
 from datetime import UTC, datetime
 
-from domain.types import InfluxSensor, SensorAttributesReference
-from features.dataset import AttributeSeriesDefinition, AttributeSeriesLoader
+from domain.dataset import AttributeSeriesDefinition
+from domain.sensors import InfluxSensor, SensorAttributesReference
+from infrastructure.loaders import AttributeSeriesLoader
 
 # A forecast covering whole UTC days, published twice: yesterday's covers the
 # hours before 00:00 UTC that the local day already asks for.

@@ -3,21 +3,19 @@ import dataclasses
 import numpy as np
 import pytest
 
-from domain.types import (
+from domain.dynamics import discretize_zoh
+from domain.models import (
     BoilerThermalModel,
     BuildingLumpedModel,
     BuildingThermalModel,
     HeatPumpCOPModel,
-    MPCConfig,
-    MPCInput,
 )
-from features.boiler import (
+from domain.mpc import MPCConfig, MPCInput
+from domain.physics import (
     CP_WATER_J_PER_KG_K,
     RHO_WATER_KG_PER_L,
-    discretize_zoh,
-    lumped_state_space,
+    lumped_tank_state_space,
 )
-from features.cop import HeatPumpCOPIdentifier
 from features.optimizer import MIP_ABSOLUTE_GAP_EUR, MPCOptimizer
 
 THERMAL_MODEL = BoilerThermalModel(
@@ -215,7 +213,7 @@ def test_thermal_dynamics_matches_manual_discretization():
 
     solved_T = [pyo.value(model.T[k]) for k in range(len(pattern))]
 
-    a, b = lumped_state_space(
+    a, b = lumped_tank_state_space(
         THERMAL_MODEL.volume_l,
         THERMAL_MODEL.ua_top_w_per_k + THERMAL_MODEL.ua_bottom_w_per_k,
     )
@@ -582,10 +580,10 @@ def test_power_line_evaluates_cop_at_the_real_supply_reference_not_margin_shifte
     margin = COP_MODEL.reference_supply_temperature_c - max(target)
     assert margin > 0.0  # sanity-check the setup
 
-    t_k_high = HeatPumpCOPIdentifier.POWER_FIT_T_HIGH_C - margin
+    t_k_high = HeatPumpCOPModel.POWER_FIT_T_HIGH_C - margin
     power_at_high = alpha + beta * t_k_high
 
-    expected_cop = COP_MODEL.cop(5.0, HeatPumpCOPIdentifier.POWER_FIT_T_HIGH_C)
+    expected_cop = COP_MODEL.cop(5.0, HeatPumpCOPModel.POWER_FIT_T_HIGH_C)
     expected_power_at_high = COP_MODEL.q_th_at_power_fit_high_w / expected_cop
 
     assert power_at_high == pytest.approx(expected_power_at_high)
@@ -662,7 +660,7 @@ def test_electrical_power_falls_back_without_outdoor_forecast_even_with_cop_mode
 def test_cop_clamped_to_sanity_range_for_implausible_inputs():
     """An outdoor/target combination outside anything the model was fit on
     must not translate into an absurd electrical-power estimate - COP is
-    clamped to HeatPumpCOPIdentifier's own [MIN_COP, MAX_COP] sanity range
+    clamped to HeatPumpCOPModel's own [MIN_COP, MAX_COP] sanity range
     before the linear (alpha, beta) fit is built (see
     _power_line_coefficients), so the fit itself never sees an implausible
     endpoint.
@@ -684,8 +682,8 @@ def test_cop_clamped_to_sanity_range_for_implausible_inputs():
         outdoor_temperature_forecast=outdoor_forecast,
     )
 
-    raw_cop = COP_MODEL.cop(60.0, HeatPumpCOPIdentifier.POWER_FIT_T_HIGH_C)
-    assert raw_cop > HeatPumpCOPIdentifier.MAX_COP  # sanity-check the setup
+    raw_cop = COP_MODEL.cop(60.0, HeatPumpCOPModel.POWER_FIT_T_HIGH_C)
+    assert raw_cop > HeatPumpCOPModel.MAX_COP  # sanity-check the setup
 
     optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig(), cop_model=COP_MODEL)
     result = optimizer.solve(data)
@@ -703,10 +701,10 @@ def test_cop_clamped_to_sanity_range_for_implausible_inputs():
     # is valid in T[k] terms, so the high reference point corresponds to
     # T[k] = POWER_FIT_T_HIGH_C - margin (T_supply = T[k] + margin).
     unclamped_power_at_high = COP_MODEL.q_th_at_power_fit_high_w / raw_cop
-    t_k_high = HeatPumpCOPIdentifier.POWER_FIT_T_HIGH_C - margin
+    t_k_high = HeatPumpCOPModel.POWER_FIT_T_HIGH_C - margin
     clamped_power_at_high = alpha + beta * t_k_high
     assert clamped_power_at_high == pytest.approx(
-        COP_MODEL.q_th_at_power_fit_high_w / HeatPumpCOPIdentifier.MAX_COP
+        COP_MODEL.q_th_at_power_fit_high_w / HeatPumpCOPModel.MAX_COP
     )
     assert clamped_power_at_high != pytest.approx(unclamped_power_at_high)
 
@@ -715,7 +713,7 @@ def test_lumped_state_space_matches_full_tank_capacity():
     c_expected = RHO_WATER_KG_PER_L * THERMAL_MODEL.volume_l * CP_WATER_J_PER_KG_K
     ua_total = THERMAL_MODEL.ua_top_w_per_k + THERMAL_MODEL.ua_bottom_w_per_k
 
-    a, b = lumped_state_space(THERMAL_MODEL.volume_l, ua_total)
+    a, b = lumped_tank_state_space(THERMAL_MODEL.volume_l, ua_total)
 
     assert a.shape == (1, 1)
     assert b.shape == (1, 3)

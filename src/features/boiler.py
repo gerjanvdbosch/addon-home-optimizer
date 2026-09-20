@@ -3,7 +3,6 @@ from datetime import timedelta
 
 import numpy as np
 import pandas as pd
-from scipy.linalg import expm
 from scipy.optimize import least_squares
 from sklearn.metrics import (
     mean_absolute_error,
@@ -11,119 +10,21 @@ from sklearn.metrics import (
     r2_score,
 )
 
-from domain.types import BoilerThermalModel, Config, MPCConfig
-from features.dataset import DatasetBuilder, DatasetDefinition
+from domain.config import Config
+from domain.dataset import DatasetDefinition
+from domain.dynamics import discretize_zoh
+from domain.models import BoilerThermalModel
+from domain.mpc import MPCConfig
+from domain.physics import (
+    CP_WATER_J_PER_KG_K,
+    RHO_WATER_KG_PER_L,
+    lumped_tank_state_space,
+    tank_state_space,
+)
+from features.dataset import DatasetBuilder
 from features.identifier import SystemIdentifier
 
 logger = logging.getLogger(__name__)
-
-# Physical constants (water), not fit parameters.
-RHO_WATER_KG_PER_L = 1.0
-CP_WATER_J_PER_KG_K = 4186.0
-
-
-def _state_space(
-    volume_l: float,
-    ua_top_w_per_k: float,
-    ua_bottom_w_per_k: float,
-    ua_mix_w_per_k: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Continuous state-space matrices for dx/dt = A x + B u.
-
-    x = [T_top, T_bottom], u = [T_ambient, Q_in]. Equal top/bottom volume split is the
-    simplest unbiased assumption available: there is no sensor for the thermocline
-    position, so both nodes share one capacity C_node.
-    """
-
-    c_node = RHO_WATER_KG_PER_L * (volume_l / 2.0) * CP_WATER_J_PER_KG_K
-
-    a = (
-        np.array(
-            [
-                [-(ua_mix_w_per_k + ua_top_w_per_k), ua_mix_w_per_k],
-                [ua_mix_w_per_k, -(ua_mix_w_per_k + ua_bottom_w_per_k)],
-            ]
-        )
-        / c_node
-    )
-
-    b = (
-        np.array(
-            [
-                [ua_top_w_per_k, 0.0],
-                [ua_bottom_w_per_k, 1.0],
-            ]
-        )
-        / c_node
-    )
-
-    return a, b
-
-
-def discretize_zoh(
-    a: np.ndarray,
-    b: np.ndarray,
-    dt_seconds: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Exact zero-order-hold discretization via the matrix exponential (Van Loan).
-
-    Keeps the discrete step physically identical to the continuous ODE for any dt,
-    instead of introducing Euler-integration error.
-    """
-
-    n, m = b.shape
-
-    augmented = np.zeros((n + m, n + m))
-    augmented[:n, :n] = a
-    augmented[:n, n:] = b
-
-    exponent = expm(augmented * dt_seconds)
-
-    return exponent[:n, :n], exponent[:n, n:]
-
-
-# A start dead time was tried for this planning model and rejected: no heat into
-# the tank for a run's first 15 minutes, since real runs show the supply water
-# 7-11 degC colder than the tank for ~10 minutes (the loop between heat pump and
-# boiler cools down between runs, so heat first flows out of the tank). Scored
-# per real run with BoilerThermalIdentifier._planner_run_errors() (72 runs over
-# 90 days), it cut the error after the first 15-minute step from ~7.0 K to
-# ~2.3 K - but with a heat input the heat pump actually delivers (4.8-6.2 kW)
-# every run ended 4-6 K too cold, and matching run ends needed ~7.6 kW, more
-# than measured calorimetric output: a fit factor compensating for the sensor
-# nearest the coil running ahead of the rest of the tank, not physical heat
-# input. Capturing both the start dip and the run total needs more than the
-# two-sensor average of a stratified tank.
-def lumped_state_space(
-    volume_l: float,
-    ua_total_w_per_k: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Continuous state-space for a single lumped tank node: dT/dt = A T + B u,
-    u = [T_ambient, Q_in_effective, Q_tap_forecast].
-
-    Used only for MPC planning (and validating that planning model), not for
-    the calibrated two-node identification model. Mixing during active heating
-    was found to saturate at the sampling-resolution ceiling (UA_mix_active
-    pinned at its bound), meaning the tank is practically fully mixed within
-    one MPC step - so a single node using the well-identified UA_top+UA_bottom
-    sum is a defensible simplification. It also keeps these dynamics linear in
-    the binary boiler_on decision: the full two-node model would need a
-    disjunctive/big-M reformulation to let UA_mix switch with boiler_on, for
-    precision in the individual UA_top/UA_bottom split that isn't there anyway.
-
-    Q_tap_forecast is an additional heat-sink term (cold mains water entering,
-    warm water drawn out) - the third B column carries a negative coefficient
-    since, unlike Q_in, it removes energy from the tank: C dT/dt = Q_in -
-    UA*(T-T_ambient) - Q_tap.
-    """
-
-    c_total = RHO_WATER_KG_PER_L * volume_l * CP_WATER_J_PER_KG_K
-
-    a = np.array([[-ua_total_w_per_k / c_total]])
-    b = np.array([[ua_total_w_per_k / c_total, 1.0 / c_total, -1.0 / c_total]])
-
-    return a, b
-
 
 # Home Assistant's binary_sensor convention; InfluxDB stores the same state as 1.
 BOOSTER_ACTIVE_STATE = "on"
@@ -239,7 +140,7 @@ def _predict_next_states(
 
         if key not in cache:
             ua_mix = model.ua_mix_active_w_per_k if on else model.ua_mix_idle_w_per_k
-            a, b = _state_space(
+            a, b = tank_state_space(
                 model.volume_l,
                 model.ua_top_w_per_k,
                 model.ua_bottom_w_per_k,
@@ -289,7 +190,7 @@ def _rollout(
 
         if key not in cache:
             ua_mix = model.ua_mix_active_w_per_k if on else model.ua_mix_idle_w_per_k
-            a, b = _state_space(
+            a, b = tank_state_space(
                 model.volume_l,
                 model.ua_top_w_per_k,
                 model.ua_bottom_w_per_k,
@@ -1373,7 +1274,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
     PLANNER_CHECK_SETTLE_S = 900.0
 
     def _planner_run_errors(self, df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-        """Replays MPCOptimizer's single-node planning model (lumped_state_space
+        """Replays MPCOptimizer's single-node planning model (lumped_tank_state_space
         with a constant q_in_nominal_w while on) over every real heating run in
         `df` it can follow without a data gap or a following run interfering,
         starting from the measured tank average at the run's start with the
@@ -1385,7 +1286,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         """
 
         model = self.model
-        a, b = lumped_state_space(
+        a, b = lumped_tank_state_space(
             model.volume_l, model.ua_top_w_per_k + model.ua_bottom_w_per_k
         )
         seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()

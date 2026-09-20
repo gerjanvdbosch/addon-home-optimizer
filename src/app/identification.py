@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from domain.types import CalibrateConfig, ValidateConfig
+from domain.jobs import CalibrateConfig, ValidateConfig
 from features.dataset import DatasetLoader
 from features.identifier import SystemIdentifier
 from infrastructure.repositories import BacktestRepository, ConfigRepository

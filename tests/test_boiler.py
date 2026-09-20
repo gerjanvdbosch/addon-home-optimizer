@@ -10,14 +10,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from domain.types import BoilerThermalModel
-from features.boiler import (
-    BoilerThermalIdentifier,
-    _rollout,
-    _state_space,
-    discretize_zoh,
-    lumped_state_space,
-)
+from domain.dynamics import discretize_zoh
+from domain.models import BoilerThermalModel
+from domain.physics import lumped_tank_state_space, tank_state_space
+from features.boiler import BoilerThermalIdentifier, _rollout
 
 TRUE_VOLUME_L = 200.0
 TRUE_UA_TOP_W_PER_K = 1.2
@@ -119,13 +115,13 @@ def _simulate(rng: np.random.Generator) -> pd.DataFrame:
     heating_start_sample = 100
     heating_duration_samples = 15  # 75 minutes
 
-    a_idle, b_idle = _state_space(
+    a_idle, b_idle = tank_state_space(
         TRUE_VOLUME_L,
         TRUE_UA_TOP_W_PER_K,
         TRUE_UA_BOTTOM_W_PER_K,
         TRUE_UA_MIX_IDLE_W_PER_K,
     )
-    a_active, b_active = _state_space(
+    a_active, b_active = tank_state_space(
         TRUE_VOLUME_L,
         TRUE_UA_TOP_W_PER_K,
         TRUE_UA_BOTTOM_W_PER_K,
@@ -228,13 +224,13 @@ def _simulate_slow_decay(rng: np.random.Generator, days: int) -> pd.DataFrame:
     heating_start_sample = 100
     heating_duration_samples = 15
 
-    a_idle, b_idle = _state_space(
+    a_idle, b_idle = tank_state_space(
         TRUE_VOLUME_L,
         SLOW_UA_TOP_W_PER_K,
         SLOW_UA_BOTTOM_W_PER_K,
         SLOW_UA_MIX_IDLE_W_PER_K,
     )
-    a_active, b_active = _state_space(
+    a_active, b_active = tank_state_space(
         TRUE_VOLUME_L,
         SLOW_UA_TOP_W_PER_K,
         SLOW_UA_BOTTOM_W_PER_K,
@@ -402,13 +398,13 @@ def _simulate_with_frequent_bottom_heavy_draws(
     heating_start_sample = 100
     heating_duration_samples = 15
 
-    a_idle, b_idle = _state_space(
+    a_idle, b_idle = tank_state_space(
         TRUE_VOLUME_L,
         TRUE_UA_TOP_W_PER_K,
         TRUE_UA_BOTTOM_W_PER_K,
         TRUE_UA_MIX_IDLE_W_PER_K,
     )
-    a_active, b_active = _state_space(
+    a_active, b_active = tank_state_space(
         TRUE_VOLUME_L,
         TRUE_UA_TOP_W_PER_K,
         TRUE_UA_BOTTOM_W_PER_K,
@@ -495,13 +491,13 @@ def test_excess_loss_clustering_flags_multi_sample_disturbances(caplog):
     heating_start_sample = 100
     heating_duration_samples = 15
 
-    a_idle, b_idle = _state_space(
+    a_idle, b_idle = tank_state_space(
         TRUE_VOLUME_L,
         TRUE_UA_TOP_W_PER_K,
         TRUE_UA_BOTTOM_W_PER_K,
         TRUE_UA_MIX_IDLE_W_PER_K,
     )
-    a_active, b_active = _state_space(
+    a_active, b_active = tank_state_space(
         TRUE_VOLUME_L,
         TRUE_UA_TOP_W_PER_K,
         TRUE_UA_BOTTOM_W_PER_K,
@@ -599,13 +595,13 @@ def _simulate_fine_resolution_with_misaligned_cycles(
     bucket_seconds = DT_SECONDS
     steps_per_bucket = int(bucket_seconds / fine_dt)
 
-    a_idle, b_idle = _state_space(
+    a_idle, b_idle = tank_state_space(
         TRUE_VOLUME_L,
         TRUE_UA_TOP_W_PER_K,
         TRUE_UA_BOTTOM_W_PER_K,
         TRUE_UA_MIX_IDLE_W_PER_K,
     )
-    a_active, b_active = _state_space(
+    a_active, b_active = tank_state_space(
         TRUE_VOLUME_L,
         TRUE_UA_TOP_W_PER_K,
         TRUE_UA_BOTTOM_W_PER_K,
@@ -842,13 +838,13 @@ def test_presence_diagnostic_isolates_draws_from_confirmed_away_periods(caplog):
     heating_duration_samples = 15
     days = 90
 
-    a_idle, b_idle = _state_space(
+    a_idle, b_idle = tank_state_space(
         TRUE_VOLUME_L,
         TRUE_UA_TOP_W_PER_K,
         TRUE_UA_BOTTOM_W_PER_K,
         TRUE_UA_MIX_IDLE_W_PER_K,
     )
-    a_active, b_active = _state_space(
+    a_active, b_active = tank_state_space(
         TRUE_VOLUME_L,
         TRUE_UA_TOP_W_PER_K,
         TRUE_UA_BOTTOM_W_PER_K,
@@ -1169,13 +1165,13 @@ def test_calibration_anchors_q_in_to_calorimetric_mean_not_free_fit():
     heating_duration_samples = 15
     flow_ramp_samples = 2  # no valid override for the first 2 samples of a cycle
 
-    a_idle, b_idle = _state_space(
+    a_idle, b_idle = tank_state_space(
         TRUE_VOLUME_L,
         TRUE_UA_TOP_W_PER_K,
         TRUE_UA_BOTTOM_W_PER_K,
         TRUE_UA_MIX_IDLE_W_PER_K,
     )
-    a_active, b_active = _state_space(
+    a_active, b_active = tank_state_space(
         TRUE_VOLUME_L,
         TRUE_UA_TOP_W_PER_K,
         TRUE_UA_BOTTOM_W_PER_K,
@@ -1291,7 +1287,7 @@ def _single_node_runs(start_delay_s: float) -> tuple[BoilerThermalModel, pd.Data
         ua_mix_active_w_per_k=TRUE_UA_MIX_ACTIVE_W_PER_K,
         q_in_nominal_w=TRUE_Q_IN_NOMINAL_W,
     )
-    a, b = lumped_state_space(
+    a, b = lumped_tank_state_space(
         model.volume_l, model.ua_top_w_per_k + model.ua_bottom_w_per_k
     )
     a_d, b_d = discretize_zoh(a, b, DT_SECONDS)

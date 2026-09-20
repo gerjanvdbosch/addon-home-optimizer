@@ -13,16 +13,16 @@ from features.building import (
     BuildingThermalIdentifier,
 )
 from features.cop import HeatPumpCOPIdentifier
-from features.dataset import (
-    AttributeSeriesLoader,
-    AttributeTimeSeriesLoader,
-    DatasetLoader,
-    TimeSeriesLoader,
-)
+from features.dataset import DatasetLoader
 from features.solar import SolarBiasIdentifier
 from features.tap import TapForecaster
 from infrastructure.home_assistant import HomeAssistant
 from infrastructure.influx import InfluxDatabase, InfluxSensorResolver
+from infrastructure.loaders import (
+    AttributeSeriesLoader,
+    AttributeTimeSeriesLoader,
+    TimeSeriesLoader,
+)
 from infrastructure.repositories import BacktestRepository, ConfigRepository
 
 
