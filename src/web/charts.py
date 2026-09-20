@@ -226,6 +226,29 @@ def dashboard_chart(state: State) -> str:
         decimal=2,
     )
 
+    # Two forecasts of the same thing, drawn together on purpose: they disagree
+    # mainly about how much sun gets in, and the measured line catching up to
+    # them a day later is the test that settles it. Neither is privileged.
+    series(
+        "Zone forecast (1 node)",
+        state.predictions.zone_forecast_lumped,
+        row=2,
+        col=1,
+        line=dict(width=1, color="#00CC96", shape="spline", dash="dot"),
+        unit="°C",
+        decimal=2,
+    )
+
+    series(
+        "Zone forecast (2 node)",
+        state.predictions.zone_forecast_two_node,
+        row=2,
+        col=1,
+        line=dict(width=1, color="#EF553B", shape="spline", dash="dot"),
+        unit="°C",
+        decimal=2,
+    )
+
     # The building's thermal mass - screed and internal walls - as the filter
     # infers it. No sensor measures this, so unlike the air trace it shows
     # something the other lines cannot: it lags the air by hours and swings

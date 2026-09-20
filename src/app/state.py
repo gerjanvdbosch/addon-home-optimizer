@@ -1,3 +1,4 @@
+import logging
 import math
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
@@ -11,7 +12,7 @@ from domain.types import (
     SeriesPoint,
     State,
 )
-from features.building import BuildingThermalIdentifier
+from features.building import BuildingLumpedIdentifier, BuildingThermalIdentifier
 from features.dataset import DatasetBuilder, DatasetDefinition, DatasetLoader
 from features.solar import (
     PREDICT_STEP_MINUTES,
@@ -21,6 +22,13 @@ from features.solar import (
     predict_solar_band,
 )
 from infrastructure.repositories import ConfigRepository, StateRepository
+
+logger = logging.getLogger(__name__)
+
+# How far past the present the zone forecast reaches. Open-Meteo's own
+# horizon on this installation is about 38 hours, so asking for two days takes
+# whatever it has without ever being the binding limit.
+FORECAST_HORIZON = timedelta(days=2)
 
 
 class StateManager:
@@ -116,8 +124,70 @@ class StateManager:
         # reproduces the measurement exactly and a second identical line says
         # nothing. How far the model's own forecast drifts belongs in
         # validate()'s metrics, not in a line read as a temperature.
-        state.predictions.thermal_mass = self._series_points(estimated["mass"])
         state.measurements.climate.zone_temperature = self._series_points(measured)
+
+        # The mass line runs straight on into the forecast: the filter's last
+        # estimate is what the rollout starts from, so there is no seam.
+        mass = estimated["mass"]
+
+        forecasts = self._forecast_zone(dataset, start, now)
+
+        if forecasts is not None:
+            two_node, lumped = forecasts
+            mass = pd.concat([mass, two_node["mass"].iloc[1:]])
+            state.predictions.zone_forecast_two_node = self._series_points(
+                two_node["air"]
+            )
+            state.predictions.zone_forecast_lumped = self._series_points(lumped["air"])
+
+        state.predictions.thermal_mass = self._series_points(mass)
+
+    def _forecast_zone(
+        self,
+        dataset: DatasetDefinition,
+        start: datetime,
+        now: datetime,
+    ) -> tuple[pd.DataFrame, pd.DataFrame] | None:
+        """Both structures rolled forward, or None if either cannot be.
+
+        Loaded past the present so the weather forecast's own rows come along -
+        that is where the irradiance and outdoor temperature a forecast needs
+        actually live.
+        """
+
+        loaded = self.loader.load(dataset, start, now + FORECAST_HORIZON)
+
+        state = self.load()
+        baseload = pd.Series(
+            {point.time: point.value for point in state.predictions.baseload}
+        )
+
+        results = []
+
+        for cls in (BuildingThermalIdentifier, BuildingLumpedIdentifier):
+            identifier = cls(self.latitude, self.longitude)
+            identifier.load(self.models_path)
+
+            if identifier.model is None:
+                return None
+
+            identifier.dataset(self.config_repository.load())
+
+            try:
+                results.append(
+                    identifier.forecast(
+                        loaded, now, baseload if not baseload.empty else None
+                    )
+                )
+            except ValueError as error:
+                # Normal before the weather sensor's horizon reaches past now,
+                # or right after a restart with no measurements yet. Logged
+                # rather than swallowed: a silent None here once hid a plain
+                # coding mistake for a whole run.
+                logger.warning("No zone forecast from %s: %s", identifier.name, error)
+                return None
+
+        return results[0], results[1]
 
     def _predict_solar(self, state: State, now: datetime) -> None:
         """Builds state.predictions.solar and its calibrated p10/p90 band from

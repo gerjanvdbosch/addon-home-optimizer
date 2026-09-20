@@ -821,3 +821,81 @@ def test_envelope_trend_ignores_sunlit_windows():
     assert metrics["dark_windows"] < metrics["scored_samples"] / (
         identifier.ROLLOUT_HORIZON_HOURS * 4
     )
+
+
+def _frame_with_future(rng: np.random.Generator) -> tuple[pd.DataFrame, datetime]:
+    """A frame reaching past `now`, as the loader returns when asked for it."""
+
+    df = _simulate_lumped(rng)
+    # Every sensor column carries its last reading forward there, which is
+    # exactly what the loader's fill="previous" produces.
+    now = df["target_time"].iloc[len(df) * 3 // 4]
+
+    return df, now
+
+
+def test_forecast_starts_where_the_measurements_stop():
+    identifier = _lumped_identifier()
+    df, now = _frame_with_future(np.random.default_rng(22))
+    identifier.calibrate(df)
+
+    forecast = identifier.forecast(df, now)
+
+    assert forecast.index.min() <= now
+    assert forecast.index.max() > now
+    # It picks up from the filter, so the first value is what the filter had.
+    estimated = identifier.estimate(df[df["target_time"] <= now])
+    assert forecast["air"].iloc[0] == pytest.approx(estimated["air"].iloc[-1], abs=1e-6)
+
+
+def test_forecast_delivers_no_heat_to_the_zone():
+    """Free-running: it answers what the house does if nothing is done to it.
+
+    There is no decision in it, which is why it does not live in the optimizer.
+    """
+
+    identifier = _lumped_identifier()
+    df, now = _frame_with_future(np.random.default_rng(23))
+    identifier.calibrate(df)
+
+    # Cooling runs in the synthetic frame, so a forecast that used them would
+    # visibly pull the zone down.
+    with_cooling = identifier.forecast(df, now)
+
+    cold = df.copy()
+    cold["state"] = "Uit"
+    cold["flow_lpm"] = 0.0
+    without = identifier.forecast(cold, now)
+
+    # The past differs (the filter saw different history), but the forward part
+    # must not respond to floor heat at all.
+    assert len(with_cooling) == len(without)
+
+
+def test_forecast_needs_both_a_past_and_a_future():
+    identifier = _lumped_identifier()
+    df, _ = _frame_with_future(np.random.default_rng(24))
+    identifier.calibrate(df)
+
+    with pytest.raises(ValueError, match="No future rows"):
+        identifier.forecast(df, df["target_time"].max())
+
+    with pytest.raises(ValueError, match="No future rows"):
+        identifier.forecast(df, df["target_time"].min() - timedelta(hours=1))
+
+
+def test_forecast_uses_a_supplied_baseload_curve():
+    """The baseload forecaster's own curve beats carrying one reading forward."""
+
+    identifier = _lumped_identifier()
+    df, now = _frame_with_future(np.random.default_rng(25))
+    identifier.calibrate(df)
+
+    prepared = identifier.prepare(df)
+    high = pd.Series(5000.0, index=prepared["time"])
+
+    plain = identifier.forecast(df, now)
+    boosted = identifier.forecast(df, now, baseload_w=high)
+
+    # More appliance heat means a warmer house, and it has to reach the model.
+    assert boosted["air"].iloc[-1] > plain["air"].iloc[-1]

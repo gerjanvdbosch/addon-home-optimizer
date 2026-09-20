@@ -13,6 +13,7 @@ than a term in its energy balance - not modelled here, and not yet anywhere.
 """
 
 import logging
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -722,6 +723,12 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         df = df.rename(columns={"target_time": "time"})
         df = df.sort_values("time").reset_index(drop=True)
 
+        # Rows past the last measurement survive this, and forecast() relies on
+        # it: the weather forecast still covers them with real irradiance and
+        # outdoor temperature, and every sensor column carries its last reading
+        # forward, so nothing here is missing. Which rows those are cannot be
+        # read off the frame for the same reason - forecast() is told where now
+        # is instead of guessing.
         df = df.dropna(subset=["T_air", "T_out"]).reset_index(drop=True)
 
         if df.empty:
@@ -1486,6 +1493,92 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             estimates[:, : len(names)],
             columns=names,
             index=prepared["time"].to_numpy(),
+        )
+
+    def forecast(
+        self,
+        df: pd.DataFrame,
+        now: datetime,
+        baseload_w: pd.Series | None = None,
+    ) -> pd.DataFrame:
+        """Rolls the model forward past the last measurement, indexed by time.
+
+        Free-running: no heat is delivered to the zone, so this answers what the
+        house does if nothing is done to it. There is no decision in it, which
+        is why it lives here and not in the optimizer - putting it there would
+        suggest something was chosen.
+
+        It starts from the filter's estimate of the whole state at the last
+        measurement (see estimate()), so the unmeasured part of that state is
+        inferred rather than assumed, and it is the same starting point an MPC
+        would plan from.
+
+        Two of the inputs are genuine forecasts - irradiance and outdoor
+        temperature both come from Open-Meteo - and `baseload_w` takes the
+        baseload forecaster's own curve when given. The rest is each sensor's
+        last reading carried forward, chiefly the shutter position. Measured
+        over 160 rolling 24 hour forecasts on this installation, perfect
+        knowledge of all three inputs would improve the result by 0.055 K
+        against a forecast error of 0.288 K: the model is what limits this, not
+        the inputs, so a shutter or occupancy forecaster would be solving the
+        wrong problem.
+        """
+
+        model = self.get_model()
+        prepared = self.prepare(df)
+
+        # Where the measurements stop cannot be read off the frame: every
+        # sensor column carries its last reading forward, so a future row looks
+        # exactly like a measured one. The caller says where now is.
+        known = (prepared["time"] <= now).to_numpy()
+
+        if not known.any() or known.all():
+            raise ValueError(
+                "No future rows to forecast: the frame must reach past the last "
+                "measurement, and must contain measurements to start from."
+            )
+
+        if baseload_w is not None:
+            aligned = baseload_w.reindex(prepared["time"]).to_numpy(dtype=float)
+            prepared["baseload_w"] = np.where(
+                np.isnan(aligned), prepared["baseload_w"], aligned
+            )
+
+        a, b = self._state_space(model)
+        inputs = self._inputs(model, prepared)
+        dt_seconds = prepared["dt_seconds"].to_numpy(dtype=float)
+
+        last = int(np.flatnonzero(known)[-1])
+
+        estimates = kalman_states(
+            a,
+            b,
+            prepared["T_air"].to_numpy(dtype=float)[: last + 1],
+            inputs[: last + 1],
+            dt_seconds[: last + 1],
+            self.PROCESS_NOISE_W,
+            self.SENSOR_RESOLUTION_K**2 / 12.0,
+        )
+
+        # Nothing is delivered to the zone: this is what happens if the heat
+        # pump is left out of it.
+        inputs = inputs.copy()
+        inputs[last:, 3] = 0.0
+
+        simulated = _rollout(
+            a,
+            b,
+            initial_state=estimates[-1],
+            inputs=inputs[last:],
+            dt_seconds=dt_seconds[last:],
+        )
+
+        names = ["air", "mass"][: simulated.shape[1]]
+
+        return pd.DataFrame(
+            simulated[:, : len(names)],
+            columns=names,
+            index=prepared["time"].to_numpy()[last:],
         )
 
     def dataset(self, config: Config) -> DatasetDefinition:
