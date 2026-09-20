@@ -1,4 +1,9 @@
+import copy
+import functools
+import logging
 import re
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -34,6 +39,76 @@ DRAW_DAYS = {2, 5, 8, 11, 14, 17}
 DRAW_SAMPLE_OFFSET = 200  # samples after the heating cycle ends
 DRAW_BOTTOM_DROP_C = 10.0
 DRAW_TOP_DROP_C = 3.0
+
+
+@dataclass(frozen=True)
+class _Calibration:
+    """One calibration, and what it logged while it ran.
+
+    Every calibration here is a least-squares fit over weeks of synthetic data,
+    and a handful of datasets are each used by several tests - the same fit was
+    being repeated up to three times. Running it once per dataset and handing
+    out a copy keeps the tests independent of each other while the suite pays
+    for the fit once. Tests that inspect the model take `copy()`, so no test can
+    disturb another's; tests that inspect the diagnostics read `logged()`.
+    """
+
+    _identifier: BoilerThermalIdentifier
+    prepared: pd.DataFrame
+    messages: tuple[str, ...]
+
+    def copy(self) -> BoilerThermalIdentifier:
+        return copy.deepcopy(self._identifier)
+
+    def logged(self, fragment: str) -> str:
+        """The one message containing `fragment` - each diagnostic is logged
+        exactly once per calibration, so more or fewer is itself a failure.
+        """
+
+        matches = [message for message in self.messages if fragment in message]
+        assert len(matches) == 1, f"{len(matches)} messages match {fragment!r}"
+
+        return matches[0]
+
+
+def _calibrate(simulate: Callable, seed: int, days: int | None = None):
+    """Calibrate on one synthetic dataset."""
+
+    rng = np.random.default_rng(seed)
+    df = simulate(rng) if days is None else simulate(rng, days=days)
+
+    identifier = BoilerThermalIdentifier()
+    identifier.volume_l = TRUE_VOLUME_L
+    prepared = identifier.prepare(df)
+
+    messages: list[str] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            messages.append(record.getMessage())
+
+    # Captured with a handler of its own rather than caplog, because caplog is
+    # per-test and this calibration outlives the test that first asks for it.
+    logger = logging.getLogger("features.boiler")
+    handler = _Collect()
+    level = logger.level
+
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+    try:
+        identifier.calibrate(prepared)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(level)
+
+    return _Calibration(identifier, prepared, tuple(messages))
+
+
+# Keyed by how the dataset was generated, so the tests that share a dataset
+# share its fit. A test that changes a class attribute the fit depends on calls
+# _calibrate directly instead - its result is not this dataset's calibration.
+_calibration = functools.cache(_calibrate)
 
 
 def _simulate(rng: np.random.Generator) -> pd.DataFrame:
@@ -230,15 +305,8 @@ def test_calibration_recovers_slow_passive_decay_via_multi_step_residuals():
 
 
 def test_validate_reports_segmented_prediction_error_not_draw_claims():
-    rng = np.random.default_rng(7)
-    df = _simulate(rng)
-
-    identifier = BoilerThermalIdentifier()
-    identifier.volume_l = TRUE_VOLUME_L
-
-    prepared = identifier.prepare(df)
-    identifier.calibrate(prepared)
-    metrics = identifier.validate(prepared)
+    calibration = _calibration(_simulate, 7)
+    metrics = calibration.copy().validate(calibration.prepared)
 
     # The synthetic data is generated from the exact same model structure, so a
     # correct implementation should reproduce it closely despite the injected draws.
@@ -262,12 +330,8 @@ def test_validate_flags_q_in_pinned_at_calorimetric_bound(caplog):
     ceiling, since a std_error computed at a bound is not meaningful.
     """
 
-    rng = np.random.default_rng(9)
-    df = _simulate(rng)
-
-    identifier = BoilerThermalIdentifier()
-    identifier.volume_l = TRUE_VOLUME_L
-    identifier.calibrate(df)
+    calibration = _calibration(_simulate, 9)
+    identifier = calibration.copy()
 
     # Force the exact pinned-at-edge condition directly, rather than
     # constructing a calorimetric-disagreement scenario end-to-end.
@@ -275,7 +339,7 @@ def test_validate_flags_q_in_pinned_at_calorimetric_bound(caplog):
     identifier.q_in_calorimetric_bounds = (lower, lower + 1000.0)
 
     with caplog.at_level("WARNING", logger="features.boiler"):
-        result = identifier.validate(df)
+        result = identifier.validate(calibration.prepared)
 
     assert result["implausible_q_in"] == 1.0
     assert any(
@@ -285,12 +349,8 @@ def test_validate_flags_q_in_pinned_at_calorimetric_bound(caplog):
 
 
 def test_validate_does_not_flag_q_in_away_from_calorimetric_bound(caplog):
-    rng = np.random.default_rng(9)
-    df = _simulate(rng)
-
-    identifier = BoilerThermalIdentifier()
-    identifier.volume_l = TRUE_VOLUME_L
-    identifier.calibrate(df)
+    calibration = _calibration(_simulate, 9)
+    identifier = calibration.copy()
 
     # A wide interval comfortably containing the fitted value, away from
     # either edge - must not be flagged.
@@ -298,7 +358,7 @@ def test_validate_does_not_flag_q_in_away_from_calorimetric_bound(caplog):
     identifier.q_in_calorimetric_bounds = (center - 1000.0, center + 1000.0)
 
     with caplog.at_level("WARNING", logger="features.boiler"):
-        result = identifier.validate(df)
+        result = identifier.validate(calibration.prepared)
 
     assert result["implausible_q_in"] == 0.0
     assert not any(
@@ -307,44 +367,22 @@ def test_validate_does_not_flag_q_in_away_from_calorimetric_bound(caplog):
     )
 
 
-def test_calibrate_reports_excess_loss_as_unproven_candidate(caplog):
+def test_calibrate_reports_excess_loss_as_unproven_candidate():
     """calibrate()'s residual-based diagnostic is parameter-identification support,
     not a tap-detection claim: it must be logged as 'candidate'/'unproven' excess
     heat loss, never as validated tap-water usage.
     """
 
-    rng = np.random.default_rng(7)
-    df = _simulate(rng)
+    message = _calibration(_simulate, 7).logged("excess heat loss")
 
-    identifier = BoilerThermalIdentifier()
-    identifier.volume_l = TRUE_VOLUME_L
-
-    prepared = identifier.prepare(df)
-
-    with caplog.at_level("INFO", logger="features.boiler"):
-        identifier.calibrate(prepared)
-
-    excess_loss_logs = [
-        record.message
-        for record in caplog.records
-        if "excess heat loss" in record.message
-    ]
-
-    assert len(excess_loss_logs) == 1
-    assert "NOT a validated count of tap events" in excess_loss_logs[0]
-    assert "candidate data contamination" in excess_loss_logs[0]
+    assert "NOT a validated count of tap events" in message
+    assert "candidate data contamination" in message
 
 
-def _bottom_top_ratio_from_log(caplog) -> float:
-    excess_loss_logs = [
-        record.message
-        for record in caplog.records
-        if "excess heat loss" in record.message
-    ]
-    assert len(excess_loss_logs) == 1
-
+def _bottom_top_ratio(calibration: _Calibration) -> float:
     match = re.search(
-        r"bottom/top ratio among flagged timesteps: (-?[\d.]+)", excess_loss_logs[0]
+        r"bottom/top ratio among flagged timesteps: (-?[\d.]+)",
+        calibration.logged("excess heat loss"),
     )
     assert match is not None
 
@@ -426,39 +464,21 @@ def _simulate_with_frequent_bottom_heavy_draws(
     )
 
 
-def test_bottom_top_asymmetry_distinguishes_draws_from_systematic_misfit(caplog):
+def test_bottom_top_asymmetry_distinguishes_draws_from_systematic_misfit():
     """A real tap draw injects cold mains water at the BOTTOM of the tank, so it
     should predominantly disturb T_bottom - unlike a systematic model/fit issue
     (e.g. the UA_top/UA_bottom split being only weakly identified), which tends to
     mispredict both nodes by a comparable amount.
     """
 
-    rng = np.random.default_rng(21)
-    df_with_draws = _simulate_with_frequent_bottom_heavy_draws(rng, days=90)
-
-    identifier = BoilerThermalIdentifier()
-    identifier.volume_l = TRUE_VOLUME_L
-    prepared = identifier.prepare(df_with_draws)
-
-    with caplog.at_level("INFO", logger="features.boiler"):
-        identifier.calibrate(prepared)
-
-    ratio_with_draws = _bottom_top_ratio_from_log(caplog)
+    ratio_with_draws = _bottom_top_ratio(
+        _calibration(_simulate_with_frequent_bottom_heavy_draws, 21, days=90)
+    )
     assert ratio_with_draws > 1.5
 
-    caplog.clear()
-
-    rng2 = np.random.default_rng(99)
-    df_no_draws = _simulate_fine_resolution_with_misaligned_cycles(rng2, days=60)
-
-    identifier_no_draws = BoilerThermalIdentifier()
-    identifier_no_draws.volume_l = TRUE_VOLUME_L
-    prepared_no_draws = identifier_no_draws.prepare(df_no_draws)
-
-    with caplog.at_level("INFO", logger="features.boiler"):
-        identifier_no_draws.calibrate(prepared_no_draws)
-
-    ratio_without_draws = _bottom_top_ratio_from_log(caplog)
+    ratio_without_draws = _bottom_top_ratio(
+        _calibration(_simulate_fine_resolution_with_misaligned_cycles, 99, days=60)
+    )
     assert ratio_without_draws < ratio_with_draws
 
 
@@ -617,9 +637,7 @@ def _simulate_fine_resolution_with_misaligned_cycles(
 
     bucket_T = np.array(
         [
-            fine_states[b * steps_per_bucket : (b + 1) * steps_per_bucket].mean(
-                axis=0
-            )
+            fine_states[b * steps_per_bucket : (b + 1) * steps_per_bucket].mean(axis=0)
             for b in range(n_buckets)
         ]
     )
@@ -650,24 +668,17 @@ def _simulate_fine_resolution_with_misaligned_cycles(
     )
 
 
-def _idle_training_denominator(caplog, identifier, prepared) -> int:
-    with caplog.at_level("INFO", logger="features.boiler"):
-        identifier.calibrate(prepared)
-
-    messages = [
-        record.message
-        for record in caplog.records
-        if "excess heat loss" in record.message
-    ]
-    assert len(messages) == 1
-
-    match = re.search(r"\d+/(\d+) idle training timesteps", messages[0])
+def _idle_training_denominator(calibration: _Calibration) -> int:
+    match = re.search(
+        r"\d+/(\d+) idle training timesteps",
+        calibration.logged("excess heat loss"),
+    )
     assert match is not None
 
     return int(match.group(1))
 
 
-def test_post_heating_tail_excludes_the_expected_number_of_rows(monkeypatch, caplog):
+def test_post_heating_tail_excludes_the_expected_number_of_rows(monkeypatch):
     """Regression test for a real finding: heating start/stop times don't align to
     the 5-min sampling grid, and InfluxDB labels each bucket by its LAST state while
     averaging temperature over the whole bucket - so the bucket(s) right after a real
@@ -684,27 +695,22 @@ def test_post_heating_tail_excludes_the_expected_number_of_rows(monkeypatch, cap
     comparison.
     """
 
-    rng = np.random.default_rng(99)
-    df = _simulate_fine_resolution_with_misaligned_cycles(rng, days=60)
-
-    identifier_unfixed = BoilerThermalIdentifier()
-    identifier_unfixed.volume_l = TRUE_VOLUME_L
-    prepared = identifier_unfixed.prepare(df)
-
+    # The exclusion switched off, which no other test needs, so this one fit is
+    # its own. The one with the exclusion active is the ordinary calibration of
+    # this dataset, shared with the tests either side of it.
     monkeypatch.setattr(BoilerThermalIdentifier, "POST_HEATING_TAIL_SECONDS", 0.0)
-    idle_count_without_fix = _idle_training_denominator(
-        caplog, identifier_unfixed, prepared
+    without_fix = _calibrate(
+        _simulate_fine_resolution_with_misaligned_cycles, 99, days=60
     )
-    caplog.clear()
     monkeypatch.undo()
 
-    identifier_fixed = BoilerThermalIdentifier()
-    identifier_fixed.volume_l = TRUE_VOLUME_L
-    idle_count_with_fix = _idle_training_denominator(
-        caplog, identifier_fixed, prepared
+    with_fix = _calibration(
+        _simulate_fine_resolution_with_misaligned_cycles, 99, days=60
     )
 
-    excluded_rows = idle_count_without_fix - idle_count_with_fix
+    excluded_rows = _idle_training_denominator(
+        without_fix
+    ) - _idle_training_denominator(with_fix)
 
     # ~60 days x ~1 heating stop/day x ~3 buckets (15 min at 5-min resolution) worth
     # of rows should be excluded - not zero (the mechanism must be active) and not
@@ -794,7 +800,7 @@ def test_receding_horizon_avoids_open_loop_energy_runaway():
     assert metrics["rmse"] < 5.0
 
 
-def test_tail_sensitivity_sweep_shows_the_labeling_artifact_plateau(caplog):
+def test_tail_sensitivity_sweep_shows_the_labeling_artifact_plateau():
     """The post-heating-tail sweep must show the excess-loss flag rate dropping from
     0 min toward the configured 15 min duration (the labeling artifact reproduced by
     `_simulate_fine_resolution_with_misaligned_cycles`), then roughly plateauing -
@@ -802,26 +808,13 @@ def test_tail_sensitivity_sweep_shows_the_labeling_artifact_plateau(caplog):
     than always trending one way regardless of the data.
     """
 
-    rng = np.random.default_rng(99)
-    df = _simulate_fine_resolution_with_misaligned_cycles(rng, days=60)
-
-    identifier = BoilerThermalIdentifier()
-    identifier.volume_l = TRUE_VOLUME_L
-    prepared = identifier.prepare(df)
-
-    with caplog.at_level("INFO", logger="features.boiler"):
-        identifier.calibrate(prepared)
-
-    sweep_logs = [
-        record.message
-        for record in caplog.records
-        if "if the post-heating tail exclusion had instead been" in record.message
-    ]
-    assert len(sweep_logs) == 1
+    sweep = _calibration(
+        _simulate_fine_resolution_with_misaligned_cycles, 99, days=60
+    ).logged("if the post-heating tail exclusion had instead been")
 
     rates = dict(
         (int(minutes), float(pct))
-        for minutes, pct in re.findall(r"(\d+)min=([\d.]+)%", sweep_logs[0])
+        for minutes, pct in re.findall(r"(\d+)min=([\d.]+)%", sweep)
     )
     assert set(rates) == set(BoilerThermalIdentifier.TAIL_SWEEP_MINUTES)
 
@@ -941,7 +934,7 @@ def test_presence_diagnostic_isolates_draws_from_confirmed_away_periods(caplog):
     assert present_flag_rate > away_flag_rate + 5.0
 
 
-def test_gradient_diagnostic_reports_flag_rate_by_stratification(caplog):
+def test_gradient_diagnostic_reports_flag_rate_by_stratification():
     """Sanity check for the top/bottom-gradient diagnostic (a real tap draw is
     not the only way a large gradient could produce an apparent excess-loss
     residual - see calibrate()'s comment on gradient-dependent mixing). Must
@@ -949,29 +942,14 @@ def test_gradient_diagnostic_reports_flag_rate_by_stratification(caplog):
     fit, regardless of whether this particular dataset has such an effect.
     """
 
-    rng = np.random.default_rng(31)
-    df = _simulate(rng)
+    message = _calibration(_simulate, 31).logged("starting top/bottom gradient")
 
-    identifier = BoilerThermalIdentifier()
-    identifier.volume_l = TRUE_VOLUME_L
-    prepared = identifier.prepare(df)
-
-    with caplog.at_level("INFO", logger="features.boiler"):
-        identifier.calibrate(prepared)
-
-    matches = [
-        record.message
-        for record in caplog.records
-        if "starting top/bottom gradient" in record.message
-    ]
-    assert len(matches) == 1
-
-    percentages = [float(x) for x in re.findall(r"(\d+\.\d)%", matches[0])]
+    percentages = [float(x) for x in re.findall(r"(\d+\.\d)%", message)]
     assert len(percentages) == 2
     assert all(0.0 <= p <= 100.0 for p in percentages)
 
 
-def test_temperature_diagnostic_reports_flag_rate_by_excess_temperature(caplog):
+def test_temperature_diagnostic_reports_flag_rate_by_excess_temperature():
     """Sanity check for the T-T_ambient diagnostic (a small top/bottom gradient
     often just coincides with a recently-heated, hotter tank - this isolates
     that confound from the gradient diagnostic above; see calibrate()'s
@@ -979,24 +957,9 @@ def test_temperature_diagnostic_reports_flag_rate_by_excess_temperature(caplog):
     well-formed flag-rate percentages without affecting the fit.
     """
 
-    rng = np.random.default_rng(31)
-    df = _simulate(rng)
+    message = _calibration(_simulate, 31).logged("starting T-T_ambient")
 
-    identifier = BoilerThermalIdentifier()
-    identifier.volume_l = TRUE_VOLUME_L
-    prepared = identifier.prepare(df)
-
-    with caplog.at_level("INFO", logger="features.boiler"):
-        identifier.calibrate(prepared)
-
-    matches = [
-        record.message
-        for record in caplog.records
-        if "starting T-T_ambient" in record.message
-    ]
-    assert len(matches) == 1
-
-    percentages = [float(x) for x in re.findall(r"(\d+\.\d)%", matches[0])]
+    percentages = [float(x) for x in re.findall(r"(\d+\.\d)%", message)]
     assert len(percentages) == 2
     assert all(0.0 <= p <= 100.0 for p in percentages)
 

@@ -194,7 +194,7 @@ def dashboard_chart(state: State) -> str:
 
     series(
         "Climate target",
-        state.schedule.climate.target_temperature,
+        state.schedule.building.target_temperature,
         row=2,
         col=1,
         line=dict(width=1, color="#FECB52", shape="hv", dash="dot"),
@@ -205,7 +205,7 @@ def dashboard_chart(state: State) -> str:
 
     series(
         "Climate temp",
-        state.measurements.climate.temperature,
+        state.measurements.building.temperature,
         row=2,
         col=1,
         line=dict(width=1.5, color="#FECB52", shape="spline"),
@@ -218,7 +218,7 @@ def dashboard_chart(state: State) -> str:
     # quantity and would make the model look biased against it.
     series(
         "Zone temp",
-        state.measurements.climate.zone_temperature,
+        state.measurements.building.zone_temperature,
         row=2,
         col=1,
         line=dict(width=1, color="#00CC96", shape="spline"),

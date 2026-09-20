@@ -203,14 +203,16 @@ actions:
               ]
             }
           },
-          "climate": {
-            "temperature": "sensor.danfoss_15_temperature",
-            "setpoint": ["climate.danfoss_icon_woonkamer", "temperature"],
+          "building": {
+            "thermostat": {
+              "temperature": "sensor.danfoss_15_temperature",
+              "setpoint": ["climate.danfoss_icon_woonkamer", "temperature"]
+            },
             "target_temperature": [
               ["18:00", 20.0],
               ["22:00", 19.0]
             ],
-            "zone_temperatures": [
+            "rooms": [
               [6.0, "sensor.danfoss_0_temperature"],
               [10.0, "sensor.danfoss_1_temperature"],
               [19.0, "sensor.danfoss_2_temperature"],

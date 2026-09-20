@@ -73,11 +73,11 @@ class StateManager:
         state = self._map(df, self.load(), config=config)
 
         self._predict_solar(state, now)
-        self._simulate_climate(state, config, now)
+        self._simulate_building(state, config, now)
 
         self.state_repository.save(state)
 
-    def _simulate_climate(self, state: State, config: Config, now: datetime) -> None:
+    def _simulate_building(self, state: State, config: Config, now: datetime) -> None:
         """Reconstructs the zone temperature the calibrated building model
         implies, so the dashboard can show it against the measurement.
 
@@ -124,7 +124,7 @@ class StateManager:
         # reproduces the measurement exactly and a second identical line says
         # nothing. How far the model's own forecast drifts belongs in
         # validate()'s metrics, not in a line read as a temperature.
-        state.measurements.climate.zone_temperature = self._series_points(measured)
+        state.measurements.building.zone_temperature = self._series_points(measured)
 
         # The mass line runs straight on into the forecast: the filter's last
         # estimate is what the rollout starts from, so there is no seam.
@@ -409,10 +409,12 @@ class StateManager:
         state.measurements.heat_pump.boiler.ambient_temperature = self._parse_series(
             df, "boiler_ambient_temperature"
         )
-        state.measurements.climate.temperature = self._parse_series(
-            df, "climate_temperature"
+        state.measurements.building.temperature = self._parse_series(
+            df, "thermostat_temperature"
         )
-        state.measurements.climate.setpoint = self._parse_series(df, "climate_setpoint")
+        state.measurements.building.setpoint = self._parse_series(
+            df, "thermostat_setpoint"
+        )
 
         for forecast_source in ["solcast", "open_meteo"]:
             source_obj = getattr(state.forecast, forecast_source)
@@ -428,8 +430,8 @@ class StateManager:
                         config.heat_pump.boiler.target_temperature, times
                     )
                 )
-                state.schedule.climate.target_temperature = self.resolve_schedule(
-                    config.climate.target_temperature, times
+                state.schedule.building.target_temperature = self.resolve_schedule(
+                    config.building.target_temperature, times
                 )
 
         return state
@@ -537,52 +539,56 @@ class StateManager:
                 fill=0,
             )
             .timeseries(
-                "climate_temperature",
-                config.climate.temperature,
-                interval="5m",
+                "thermostat_temperature",
+                config.building.thermostat.temperature,
+                aggregation="last",
+                interval="15m",
                 fill="previous",
-                target_interval="15min",
             )
             .timeseries(
-                "climate_setpoint",
-                config.climate.setpoint,
-                aggregation="mean",
+                "thermostat_setpoint",
+                config.building.thermostat.setpoint,
+                aggregation="last",
                 interval="15m",
                 fill="previous",
             )
             .timeseries(
                 "boiler_top_temperature",
                 config.heat_pump.boiler.top_temperature,
-                aggregation="mean",
-                interval="5m",
+                aggregation="last",
+                interval="15m",
                 fill="previous",
-                target_interval="15min",
                 # A temperature is a state, not a flow: planning must start from
                 # the most recent reading, and the quarter's average lags it
-                # while the tank is heating. A plan made minutes after a run
-                # ended started from a tank 1.5-2 K colder than it really was
-                # and added a second run for the shortfall that followed.
-                target_resample="last",
+                # while the tank is heating. This tank climbs about 0.6 K a
+                # minute on a run - it read 47.50 at 10:54:27 while the state
+                # said 46.75, exactly the mean of 10:50-10:55, so a plan made
+                # minutes after a run ended started from a tank 1.5-2 K colder
+                # than it really was and added a second run for the shortfall.
+                #
+                # Which is why nothing here averages, at either level. Given
+                # that, the bucket width no longer matters: last-of-lasts is
+                # the same reading whatever it is grouped by first (checked
+                # against minute buckets on irregular readings, every minute of
+                # a twelve hour window, identical throughout), so this asks for
+                # the quarter hours it actually needs rather than fifteen times
+                # the rows.
             )
             .timeseries(
                 "boiler_bottom_temperature",
                 config.heat_pump.boiler.bottom_temperature,
-                aggregation="mean",
-                interval="5m",
+                aggregation="last",
+                interval="15m",
                 fill="previous",
-                target_interval="15min",
                 # See boiler_top_temperature.
-                target_resample="last",
             )
             .timeseries(
                 "boiler_ambient_temperature",
                 config.heat_pump.boiler.ambient_temperature,
-                aggregation="mean",
-                interval="5m",
+                aggregation="last",
+                interval="15m",
                 fill="previous",
-                target_interval="15min",
-                # See boiler_top_temperature.
-                target_resample="last",
+                # See boiler_top_temperature - a state, so the last reading.
             )
             .build()
         )

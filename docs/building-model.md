@@ -12,17 +12,17 @@ Calibrate API in the [README](../README.md)).
 
 ## Configuration
 
-All of it lives in the `climate` block of the config payload.
+All of it lives in the `building` block of the config payload.
 
-### `zone_temperatures`
+### `rooms`
 
-The room sensors belonging to the zone, as `[floor_area_m2, sensor]` pairs, averaged
+The rooms belonging to the zone, as `[floor_area_m2, sensor]` pairs, averaged
 into one representative temperature weighted by those areas. A whole-dwelling balance
 weighs house-wide delivered heat and baseload against it, so a single room would be an
 arbitrary sample.
 
 The weighting matters because thermostats are not spread evenly over a dwelling. On this
-installation four of five zones are upstairs, so a plain average counted the ground
+installation four of five rooms are upstairs, so a plain average counted the ground
 floor for 20% of a temperature it is half the area of, biasing it by +0.085 K (p95
 0.42 K) as warm air collects upstairs. Weighting by area brings that to +0.008 K.
 

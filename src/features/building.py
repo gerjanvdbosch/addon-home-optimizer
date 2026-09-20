@@ -118,6 +118,24 @@ def lumped_state_space(
     return a, b
 
 
+def zone_state_space(
+    model: BuildingThermalModel | BuildingLumpedModel,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Continuous state-space of whichever zone structure was identified.
+
+    Both forms share the same input vector u = [T_outdoor, Q_internal, Q_solar,
+    Q_floor] and the same first state (the air temperature the thermostats
+    measure), so anything driving the zone - the Kalman filter, a rollout, the
+    MPC - can work from this without knowing which structure it was handed.
+    They differ only in how many states there are and where the heat lands.
+    """
+
+    if isinstance(model, BuildingLumpedModel):
+        return lumped_state_space(model)
+
+    return state_space(model)
+
+
 def facade_irradiance_w_per_m2(
     interval_midpoints: pd.Series,
     direct_normal: np.ndarray,
@@ -487,8 +505,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         self.volume_m3: float = 0.0
         self.glazing_areas_m2: list[float] = []
         self.shutter_areas_m2: list[float] = []
-        self.zone_temperature_columns: list[str] = []
-        self.zone_areas_m2: list[float] = []
+        self.room_temperature_columns: list[str] = []
+        self.room_areas_m2: list[float] = []
         self.shutter_columns: list[str] = []
         self.presence_columns: list[str] = []
         self.parameter_std_errors: dict[str, float] | None = None
@@ -667,15 +685,15 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # (Q_floor, the baseload) is delivered to the whole dwelling, and the
         # sensors' own 0.1 K reporting steps partly cancel across them. The
         # weighting matters because thermostats are not spread evenly over a
-        # dwelling - see ZoneSensor. A room that has dropped out is left out of
+        # dwelling - see Room. A room that has dropped out is left out of
         # that step's mean, and its weight with it, instead of voiding the step.
-        if self.zone_temperature_columns:
-            zone = df[self.zone_temperature_columns].apply(
+        if self.room_temperature_columns:
+            rooms = df[self.room_temperature_columns].apply(
                 pd.to_numeric, errors="coerce"
             )
-            weights = pd.Series(self.zone_areas_m2, index=self.zone_temperature_columns)
-            available = zone.notna() * weights
-            df["T_air"] = (zone * weights).sum(axis=1) / available.sum(axis=1)
+            weights = pd.Series(self.room_areas_m2, index=self.room_temperature_columns)
+            available = rooms.notna() * weights
+            df["T_air"] = (rooms * weights).sum(axis=1) / available.sum(axis=1)
 
         # Without a configured outdoor sensor, Open-Meteo's own temperature is
         # the only outdoor air temperature available (see
@@ -1001,7 +1019,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         if self.volume_m3 <= 0.0:
             raise ValueError(
-                "climate.ceiling_height and climate.zone_temperatures "
+                "building.ceiling_height and building.rooms "
                 "areas must be configured: the air node's heat capacity bounds "
                 "are derived from the zone's air volume, not assumed."
             )
@@ -1103,7 +1121,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         if sum(self.glazing_areas_m2) <= 0.0:
             logger.warning(
-                "Building thermal calibration: climate.south_glazing is not "
+                "Building thermal calibration: building.south_glazing is not "
                 "configured, so solar gain is bounded to zero - any real solar "
                 "gain will be absorbed by the envelope and capacity parameters."
             )
@@ -1429,7 +1447,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         """Predicted and measured zone temperature over a window, by time.
 
         Returns both, because the measured column is the zone average over
-        config.climate.zone_temperatures - not any single room's thermostat -
+        config.building.rooms - not any single room's thermostat -
         and comparing the prediction against anything else would compare two
         different quantities.
 
@@ -1582,20 +1600,20 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         )
 
     def dataset(self, config: Config) -> DatasetDefinition:
-        self.zone_areas_m2 = [zone.area_m2 for zone in config.climate.zone_temperatures]
+        self.room_areas_m2 = [room.area_m2 for room in config.building.rooms]
         # Derived, not configured: the same areas already drive the weighting.
-        self.volume_m3 = sum(self.zone_areas_m2) * config.climate.ceiling_height
+        self.volume_m3 = sum(self.room_areas_m2) * config.building.ceiling_height
         self.glazing_areas_m2 = [
-            glazing.glass_m2 for glazing in config.climate.south_glazing
+            glazing.glass_m2 for glazing in config.building.south_glazing
         ]
         shaded = [
             glazing
-            for glazing in config.climate.south_glazing
+            for glazing in config.building.south_glazing
             if glazing.cover is not None
         ]
         self.shutter_areas_m2 = [glazing.glass_m2 for glazing in shaded]
-        self.zone_temperature_columns = [
-            f"zone_temperature_{i}" for i in range(len(self.zone_areas_m2))
+        self.room_temperature_columns = [
+            f"room_temperature_{i}" for i in range(len(self.room_areas_m2))
         ]
         self.shutter_columns = [f"shutter_{i}" for i in range(len(shaded))]
         self.presence_columns = [f"presence_{i}" for i in range(len(config.presence))]
@@ -1642,12 +1660,12 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # drops to zero when the pump stops, so a reporting gap must stay a gap
         # for prepare() to resolve against the compressor state.
         numeric: list[tuple[str, SensorReference, Aggregation, FillMethod]] = [
-            ("T_air", config.climate.temperature, "mean", "previous"),
+            ("T_air", config.building.thermostat.temperature, "mean", "previous"),
             *[
-                (name, zone.sensor, "mean", "previous")
-                for name, zone in zip(
-                    self.zone_temperature_columns,
-                    config.climate.zone_temperatures,
+                (name, room.temperature, "mean", "previous")
+                for name, room in zip(
+                    self.room_temperature_columns,
+                    config.building.rooms,
                     strict=True,
                 )
             ],
@@ -1783,7 +1801,7 @@ class BuildingLumpedIdentifier(BuildingThermalIdentifier):
     def _bounds(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self.volume_m3 <= 0.0:
             raise ValueError(
-                "climate.ceiling_height and climate.zone_temperatures "
+                "building.ceiling_height and building.rooms "
                 "areas must be configured: the node's heat capacity bounds are "
                 "derived from the zone's air volume, not assumed."
             )

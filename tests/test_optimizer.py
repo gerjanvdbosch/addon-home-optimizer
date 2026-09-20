@@ -6,6 +6,7 @@ import pytest
 from domain.types import (
     BoilerThermalModel,
     BuildingLumpedModel,
+    BuildingThermalModel,
     HeatPumpCOPModel,
     MPCConfig,
     MPCInput,
@@ -897,7 +898,7 @@ def _zone_input(**overrides) -> MPCInput:
     defaults = dict(
         zone_temperature=19.5,
         zone_target_temperature=tuple(target),
-        zone_gain_w=(0.0,) * len(SOLAR_FORECAST_W),
+        zone_internal_gain_w=(0.0,) * len(SOLAR_FORECAST_W),
     )
     defaults.update(overrides)
 
@@ -1062,3 +1063,140 @@ def test_the_zone_may_still_be_served_before_and_after_the_tank():
     # was not accidentally applied to the zone as well.
     assert not hasattr(optimizer, "_space_done")
     assert _blocks(result.space_schedule) >= 1
+
+
+# The same zone as BUILDING_MODEL, split into the air it holds and the screed
+# and internal walls behind it: the capacities sum to the single node's, so the
+# two structures store the same energy and only differ in how fast the store
+# reaches the air.
+TWO_NODE_BUILDING_MODEL = BuildingThermalModel(
+    ua_envelope_w_per_k=130.0,
+    ua_air_mass_w_per_k=500.0,
+    c_air_j_per_k=2.5e6,
+    c_mass_j_per_k=37.5e6,
+    a_eff_m2=9.0,
+    internal_gain_fraction=1.0,
+)
+
+
+def test_the_two_node_zone_is_brought_to_its_target():
+    """The MPC plans against whichever structure it was handed.
+
+    The air reaches the target and holds it. It arrives slightly late, because
+    the compressor's heat enters the screed and reaches the air only through
+    the coupling - that lag is the structure telling the truth about floor
+    heating, not the plan giving up, so the transient shortfall is bounded
+    rather than forbidden.
+    """
+
+    data = _zone_input(zone_mass_temperature=19.5)
+
+    result = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE_BUILDING_MODEL,
+    ).solve(data)
+
+    assert any(result.space_schedule), "expected the zone to be heated"
+
+    shortfall = max(
+        target - temperature
+        for temperature, target in zip(
+            result.zone_temperatures, data.zone_target_temperature, strict=True
+        )
+    )
+
+    assert shortfall < 0.25, f"zone dips {shortfall:.3f} K below target"
+    assert result.zone_temperatures[-1] >= data.zone_target_temperature[-1] - 1e-6
+
+
+def test_reaching_the_air_through_the_screed_costs_more_heat():
+    """Why the structure is worth the extra state.
+
+    Both zones store the same energy per kelvin and lose it through the same
+    envelope; they differ only in that the two-node one has to raise the screed
+    before the air follows. Holding the same comfort target therefore takes
+    more heat and a longer run - which is exactly the cost a plan must know
+    about before it starts a floor run.
+    """
+
+    two_node = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE_BUILDING_MODEL,
+    ).solve(_zone_input(zone_mass_temperature=19.5))
+
+    single_node = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=BUILDING_MODEL,
+    ).solve(_zone_input())
+
+    assert sum(two_node.space_heat_w) > sum(single_node.space_heat_w)
+    assert sum(two_node.space_schedule) >= sum(single_node.space_schedule)
+
+
+def test_a_two_node_zone_is_not_planned_without_its_mass_temperature():
+    """Nothing measures the screed, so a plan that needs it must be given the
+    filter's estimate. Guessing it would silently decide whether the floor is
+    charged or cold, which is the whole question the second state answers.
+    """
+
+    result = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE_BUILDING_MODEL,
+    ).solve(_zone_input())
+
+    assert result.space_schedule == ()
+    assert result.zone_temperatures == ()
+
+
+def test_a_charged_screed_needs_less_heating_than_a_cold_one():
+    """The effect the second state exists for.
+
+    Same air temperature, same comfort target, same weather - only the heat
+    already stored in the floor differs. A single-node zone cannot express
+    this at all: its one temperature is the air's.
+    """
+
+    optimizer = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE_BUILDING_MODEL,
+    )
+
+    cold = optimizer.solve(_zone_input(zone_mass_temperature=18.0))
+    charged = optimizer.solve(_zone_input(zone_mass_temperature=24.0))
+
+    assert sum(charged.space_heat_w) < sum(cold.space_heat_w)
+
+
+def test_solar_gain_warms_the_two_node_zone_through_its_mass():
+    """Shortwave through the glazing lands on floor and furnishings, not in the
+    air, so it reaches the air node only via the coupling - but it does reach
+    it, and it displaces heating the compressor would otherwise have to deliver.
+    """
+
+    optimizer = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE_BUILDING_MODEL,
+    )
+
+    steps = len(SOLAR_FORECAST_W)
+    dark = optimizer.solve(_zone_input(zone_mass_temperature=19.5))
+    sunny = optimizer.solve(
+        _zone_input(
+            zone_mass_temperature=19.5,
+            zone_solar_gain_w=(2000.0,) * steps,
+        )
+    )
+
+    assert sum(sunny.space_heat_w) < sum(dark.space_heat_w)

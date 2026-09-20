@@ -60,6 +60,8 @@ Guidelines for coding agents in this repository.
 * A better fit is not evidence of a better physical model.
 * Actually run relevant tests and checks.
 * Prefer lightweight tests and validation.
+* Tests must be fast: reuse an expensive fit or simulation instead of repeating
+  it per test.
 
 ## Code
 
@@ -73,3 +75,8 @@ Guidelines for coding agents in this repository.
 * When in doubt, choose the **simplest solution that is physically correct and
   architecturally sound**.
 * Do not invent missing physics, parameters, or assumptions.
+
+## Git
+
+* Make changes in the current branch; do not create your own branch or worktree.
+* Do not commit or push. Leave the changes in the working tree; the user commits.

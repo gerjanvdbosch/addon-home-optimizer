@@ -36,6 +36,7 @@ dev = [
     "pyflakes>=3.2",
     "pyright>=1.1,<2.0",
     "pytest>=8.0",
+    "pytest-xdist>=3.6",
     "ruff>=0.4",
     "import-linter>=2.0",
 ]
@@ -76,4 +77,8 @@ reportMissingTypeStubs = false
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+# The suite is dominated by least-squares fits on synthetic data, which are
+# independent of each other and CPU-bound. Add "-n0" to a command to run a
+# single test serially - spawning workers costs more than it saves there.
+addopts = ["-n", "auto"]
 

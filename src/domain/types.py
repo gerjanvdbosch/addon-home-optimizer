@@ -197,13 +197,17 @@ class SouthGlazing(BaseModel):
         return value
 
 
-class ZoneSensor(BaseModel):
-    """One room sensor and the floor area it stands for.
+class Room(BaseModel):
+    """One room of the modelled zone: its floor area and its thermometer.
+
+    Rooms are the parts; the zone is the whole. The model has a single zone
+    with one air temperature, and these are the measurements it is averaged
+    from - which is why this is a room rather than a zone of its own.
 
     The area is what makes the zone temperature a weighted mean rather than a
     plain average over sensors. Without it the average is weighted by how many
     thermostats a floor happens to have: on this installation four of the five
-    Danfoss zones are upstairs, so the ground floor counted for 20% of a
+    Danfoss rooms are upstairs, so the ground floor counted for 20% of a
     dwelling temperature while being half its floor area. With warm air
     collecting upstairs that biased the modelled temperature by +0.085 K on
     average (p95 0.42 K); weighting by area brings that to +0.008 K (p95
@@ -211,23 +215,34 @@ class ZoneSensor(BaseModel):
     """
 
     area_m2: float = Field()
-    sensor: SensorReference = Field()
+    temperature: SensorReference = Field()
 
     @model_validator(mode="before")
     @classmethod
     def resolve(cls, value):
         if isinstance(value, (list, tuple)):
-            return {"area_m2": value[0], "sensor": value[1]}
+            return {"area_m2": value[0], "temperature": value[1]}
 
         return value
 
 
-class ClimateConfig(BaseModel):
+class Thermostat(BaseModel):
+    """The one thermostat the occupants actually set.
+
+    Its reading and its setpoint are one device, which is why they are grouped
+    rather than sitting loose beside `rooms`: that list is what the model
+    averages over, this is what a person turns up.
+    """
+
     temperature: SensorReference = Field()
     setpoint: SensorReference = Field()
+
+
+class BuildingConfig(BaseModel):
+    thermostat: Thermostat = Field()
     target_temperature: float | list[tuple[time, float]] = Field()
-    # Every room sensor that belongs to the modelled zone. The building model
-    # averages these into one representative zone temperature, which is what a
+    # Every room that belongs to the modelled zone. The building model averages
+    # their sensors into one representative zone temperature, which is what a
     # whole-dwelling energy balance needs: the delivered heat and the baseload
     # it is weighed against are both house-wide, so a single room's thermometer
     # would be an arbitrary sample of the zone. Confirmed on this
@@ -236,17 +251,17 @@ class ClimateConfig(BaseModel):
     # attic runs 3.5 K warmer and tracks outdoor temperature, and so must be
     # left out. Averaging also suppresses the sensors' 0.1 K reporting
     # quantisation, which is a real limit on identifying a building whose daily
-    # indoor swing is around 1 K. Empty falls back to `temperature`.
-    zone_temperatures: list[ZoneSensor] = Field(default_factory=list)
+    # indoor swing is around 1 K. Empty falls back to the thermostat.
+    rooms: list[Room] = Field(default_factory=list)
     # Net floor-to-ceiling height of the conditioned zone. The air volume is
-    # derived from it and the zone_temperatures areas, rather than configured
-    # separately: those areas are already required for the weighting, so a
-    # hand-computed volume would be a second place for the same fact to be
-    # wrong. It covers only the rooms that have a sensor, so it slightly
-    # undercounts hall, landing and stairwell - acceptable because the volume
-    # only sets bounds on a heat capacity (and for the single-node model does
-    # not bind at all, since air capacity stays far below MIN_C_J_PER_K for
-    # any dwelling-sized zone).
+    # derived from it and the room areas, rather than configured separately:
+    # those areas are already required for the weighting, so a hand-computed
+    # volume would be a second place for the same fact to be wrong. It covers
+    # only the rooms that have a sensor, so it slightly undercounts hall,
+    # landing and stairwell - acceptable because the volume only sets bounds on
+    # a heat capacity (and for the single-node model does not bind at all,
+    # since air capacity stays far below MIN_C_J_PER_K for any dwelling-sized
+    # zone).
     ceiling_height: float = Field(default=2.6)
     # The zone's south-facing glazing, window group by window group. Not the
     # solar gain itself: the total area is the physical upper bound on the
@@ -315,7 +330,7 @@ class Config(BaseModel):
     solar: SensorReference = Field()
     baseload: SensorReference = Field()
     heat_pump: HeatPumpConfig = Field()
-    climate: ClimateConfig = Field()
+    building: BuildingConfig = Field()
     forecast: ForecastConfig = Field()
     presence: list[SensorReference] = Field(default_factory=list)
 
@@ -394,13 +409,13 @@ class HeatPumpMeasurement(BaseModel):
     boiler: BoilerMeasurement = Field(default_factory=BoilerMeasurement)
 
 
-class ClimateMeasurement(BaseModel):
+class BuildingMeasurement(BaseModel):
     temperature: list[SeriesPoint[float]] = Field(default_factory=list)
     setpoint: list[SeriesPoint[float]] = Field(default_factory=list)
-    # The average over config.climate.zone_temperatures - what the building
-    # model predicts, as opposed to `temperature`, which is the single
-    # thermostat the climate setpoint refers to. Kept apart so the dashboard
-    # compares the model against the quantity it actually models.
+    # The average over config.building.rooms - what the building model
+    # predicts, as opposed to `temperature`, which is the single thermostat the
+    # setpoint refers to. Kept apart so the dashboard compares the model
+    # against the quantity it actually models.
     zone_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
 
 
@@ -408,7 +423,7 @@ class Measurements(BaseModel):
     solar: list[SeriesPoint[float]] = Field(default_factory=list)
     baseload: list[SeriesPoint[float]] = Field(default_factory=list)
     heat_pump: HeatPumpMeasurement = Field(default_factory=HeatPumpMeasurement)
-    climate: ClimateMeasurement = Field(default_factory=ClimateMeasurement)
+    building: BuildingMeasurement = Field(default_factory=BuildingMeasurement)
 
 
 class SolcastForecast(BaseModel):
@@ -486,13 +501,13 @@ class HeatPumpSchedule(BaseModel):
     boiler: BoilerSchedule = Field(default_factory=BoilerSchedule)
 
 
-class ClimateSchedule(BaseModel):
+class BuildingSchedule(BaseModel):
     target_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
 
 
 class Schedule(BaseModel):
     heat_pump: HeatPumpSchedule = Field(default_factory=HeatPumpSchedule)
-    climate: ClimateSchedule = Field(default_factory=ClimateSchedule)
+    building: BuildingSchedule = Field(default_factory=BuildingSchedule)
 
 
 class State(BaseModel):
@@ -773,14 +788,22 @@ class MPCInput:
     #
     # The zone's own temperature now, which the plan starts from.
     zone_temperature: float | None = None
+    # The thermal mass's temperature now (deg C). Nothing measures it, so it
+    # comes from the Kalman filter's estimate (see building.kalman_states); it
+    # stays None for a single-node zone, which has no such state. A two-node
+    # plan needs it: starting the screed at the air temperature would claim a
+    # cold floor is as ready to heat as a charged one.
+    zone_mass_temperature: float | None = None
     # Comfort floor per step, as a schedule rather than one number.
     zone_target_temperature: tuple[float, ...] = ()
-    # Heat entering the zone that no decision can change (W): solar through the
-    # glazing plus internal gains. Passed as one series because a single-node
-    # zone cannot tell them apart - they enter the same node with the same
-    # coefficient - and the split would be a distinction the model does not
-    # make.
-    zone_gain_w: tuple[float, ...] = ()
+    # Heat entering the zone that no decision can change (W), split by where it
+    # physically lands: appliances, lighting and people warm the air directly,
+    # while shortwave through the glazing is absorbed by floor and furnishings.
+    # A single-node zone gives both the same coefficient and the distinction
+    # costs nothing there; a two-node one does not, so the split has to be
+    # carried rather than summed away.
+    zone_internal_gain_w: tuple[float, ...] = ()
+    zone_solar_gain_w: tuple[float, ...] = ()
     # Whether the heat pump is serving the zone right now, the space-heating
     # counterpart of boiler_on_current.
     space_on_current: bool = False

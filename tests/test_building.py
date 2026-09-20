@@ -1,5 +1,4 @@
-import json
-import pathlib
+import dataclasses
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -19,6 +18,7 @@ from features.building import (
     lumped_state_space,
     solar_gain_w,
     state_space,
+    zone_state_space,
 )
 
 TRUE_VOLUME_M3 = 120.0
@@ -33,6 +33,63 @@ TRUE_MODEL = BuildingThermalModel(
     a_eff_m2=6.0,
     internal_gain_fraction=0.6,
 )
+
+
+def _config() -> Config:
+    """The configuration these tests run against.
+
+    Built here rather than read from data/config.json: that file is the live
+    installation's, and it changes whenever a room sensor is added or an entity
+    renamed - which would silently change what these tests assert, and makes
+    them fail outright wherever the file is absent. The geometry matches the
+    synthetic building the rest of this module simulates, so a test may compare
+    against TRUE_ZONE_AREA_M2 and TRUE_SOUTH_GLASS_M2.
+    """
+
+    return Config(
+        solar="sensor.pv_output",
+        baseload="sensor.baseload",
+        heat_pump={
+            "state": "sensor.heat_pump_state",
+            "power": "sensor.heat_pump_power",
+            "supply_temperature": "sensor.supply_temperature",
+            "return_temperature": "sensor.return_temperature",
+            "compressor_frequency": "sensor.compressor_frequency",
+            "flow": "sensor.flow",
+            "boiler": {
+                "setpoint": "sensor.dhw_setpoint",
+                "top_temperature": "sensor.dhw_top",
+                "bottom_temperature": "sensor.dhw_bottom",
+                "ambient_temperature": "sensor.dhw_ambient",
+                "target_temperature": 46.0,
+            },
+        },
+        building={
+            "thermostat": {
+                "temperature": "sensor.living_room",
+                "setpoint": "climate.living_room",
+            },
+            "target_temperature": 20.0,
+            # Two rooms of unequal size, so an area-weighted mean differs from
+            # a plain one - the distinction _shutter_open_fraction and the zone
+            # temperature both rest on. The second uses the compact
+            # [area, sensor] form, which must keep working.
+            "rooms": [
+                {"area_m2": 30.0, "temperature": "sensor.living_room"},
+                [TRUE_ZONE_AREA_M2 - 30.0, "sensor.bedroom"],
+            ],
+            "ceiling_height": TRUE_VOLUME_M3 / TRUE_ZONE_AREA_M2,
+            # One shaded group and one that is never covered, which is the
+            # combination the unshaded-fraction weighting has to handle.
+            "south_glazing": [
+                {"glass_m2": 10.0, "cover": "cover.living_room"},
+                TRUE_SOUTH_GLASS_M2 - 10.0,
+            ],
+        },
+        forecast={"solcast": "sensor.solcast", "open_meteo": "sensor.open_meteo"},
+        presence=["device_tracker.phone"],
+    )
+
 
 DT_SECONDS = 900.0
 SAMPLES_PER_DAY = int(24 * 3600 / DT_SECONDS)
@@ -104,7 +161,7 @@ def _raw_frame() -> pd.DataFrame:
 
 def _identifier() -> BuildingThermalIdentifier:
     identifier = BuildingThermalIdentifier(latitude=52.39, longitude=5.79)
-    identifier.zone_areas_m2 = [TRUE_ZONE_AREA_M2]
+    identifier.room_areas_m2 = [TRUE_ZONE_AREA_M2]
     identifier.volume_m3 = TRUE_VOLUME_M3
     identifier.glazing_areas_m2 = [TRUE_SOUTH_GLASS_M2]
     identifier.shutter_areas_m2 = [TRUE_SOUTH_GLASS_M2]
@@ -439,7 +496,7 @@ TRUE_LUMPED = BuildingLumpedModel(
 
 def _lumped_identifier() -> BuildingLumpedIdentifier:
     identifier = BuildingLumpedIdentifier(latitude=52.39, longitude=5.79)
-    identifier.zone_areas_m2 = [TRUE_ZONE_AREA_M2]
+    identifier.room_areas_m2 = [TRUE_ZONE_AREA_M2]
     identifier.volume_m3 = TRUE_VOLUME_M3
     identifier.glazing_areas_m2 = [TRUE_SOUTH_GLASS_M2]
     identifier.shutter_areas_m2 = [TRUE_SOUTH_GLASS_M2]
@@ -532,7 +589,7 @@ def test_both_structures_share_one_dataset_definition():
     not be comparable and the choice between them would mean nothing.
     """
 
-    config = Config(**json.loads(pathlib.Path("data/config.json").read_text()))
+    config = _config()
 
     two_node = BuildingThermalIdentifier(latitude=52.39, longitude=5.79)
     one_node = BuildingLumpedIdentifier(latitude=52.39, longitude=5.79)
@@ -651,12 +708,12 @@ def test_zone_temperature_is_weighted_by_floor_area():
     """
 
     identifier = _lumped_identifier()
-    identifier.zone_temperature_columns = ["zone_temperature_0", "zone_temperature_1"]
-    identifier.zone_areas_m2 = [36.0, 4.0]
+    identifier.room_temperature_columns = ["room_temperature_0", "room_temperature_1"]
+    identifier.room_areas_m2 = [36.0, 4.0]
 
     df = _raw_frame()
-    df["zone_temperature_0"] = 20.0
-    df["zone_temperature_1"] = 30.0
+    df["room_temperature_0"] = 20.0
+    df["room_temperature_1"] = 30.0
 
     prepared = identifier.prepare(df)
 
@@ -666,12 +723,12 @@ def test_zone_temperature_is_weighted_by_floor_area():
 
 def test_a_dropped_out_sensor_drops_its_weight_too():
     identifier = _lumped_identifier()
-    identifier.zone_temperature_columns = ["zone_temperature_0", "zone_temperature_1"]
-    identifier.zone_areas_m2 = [36.0, 4.0]
+    identifier.room_temperature_columns = ["room_temperature_0", "room_temperature_1"]
+    identifier.room_areas_m2 = [36.0, 4.0]
 
     df = _raw_frame()
-    df["zone_temperature_0"] = 20.0
-    df["zone_temperature_1"] = np.nan
+    df["room_temperature_0"] = 20.0
+    df["room_temperature_1"] = np.nan
 
     prepared = identifier.prepare(df)
 
@@ -684,18 +741,16 @@ def test_volume_is_derived_from_the_zone_areas_and_ceiling_height():
     place for the same geometry to be wrong.
     """
 
-    config = Config(**json.loads(pathlib.Path("data/config.json").read_text()))
+    config = _config()
     identifier = BuildingLumpedIdentifier(latitude=52.39, longitude=5.79)
     identifier.dataset(config)
 
-    expected = sum(z.area_m2 for z in config.climate.zone_temperatures) * (
-        config.climate.ceiling_height
+    expected = sum(room.area_m2 for room in config.building.rooms) * (
+        config.building.ceiling_height
     )
 
     assert identifier.volume_m3 == pytest.approx(expected)
-    assert identifier.zone_areas_m2 == [
-        z.area_m2 for z in config.climate.zone_temperatures
-    ]
+    assert identifier.room_areas_m2 == [room.area_m2 for room in config.building.rooms]
 
 
 def test_filter_infers_the_unmeasured_mass_node():
@@ -899,3 +954,56 @@ def test_forecast_uses_a_supplied_baseload_curve():
 
     # More appliance heat means a warmer house, and it has to reach the model.
     assert boosted["air"].iloc[-1] > plain["air"].iloc[-1]
+
+
+def test_zone_state_space_serves_both_structures():
+    """One entry point, so a filter, a rollout or the MPC can drive whichever
+    structure was identified without knowing which one it holds.
+    """
+
+    lumped = BuildingLumpedModel(
+        ua_w_per_k=140.0,
+        c_j_per_k=20.0e6,
+        a_eff_m2=6.0,
+        internal_gain_fraction=0.6,
+    )
+
+    two_node_a, two_node_b = zone_state_space(TRUE_MODEL)
+    lumped_a, lumped_b = zone_state_space(lumped)
+
+    assert two_node_a.shape == (2, 2)
+    assert lumped_a.shape == (1, 1)
+    # Same input vector for both, which is what makes them interchangeable.
+    assert two_node_b.shape[1] == lumped_b.shape[1] == 4
+
+
+def test_a_perfectly_coupled_two_node_zone_is_the_single_node_one():
+    """The two-node structure contains the single-node one as a limit.
+
+    With the air and the mass locked together, the pair holds one temperature
+    and one combined capacity, and must then move exactly as a single node of
+    that capacity does. It is the check that the coupling was written into the
+    balance rather than added to it.
+    """
+
+    locked = dataclasses.replace(TRUE_MODEL, ua_air_mass_w_per_k=1.0e7)
+    combined = BuildingLumpedModel(
+        ua_w_per_k=TRUE_MODEL.ua_envelope_w_per_k,
+        c_j_per_k=TRUE_MODEL.c_air_j_per_k + TRUE_MODEL.c_mass_j_per_k,
+        a_eff_m2=TRUE_MODEL.a_eff_m2,
+        internal_gain_fraction=TRUE_MODEL.internal_gain_fraction,
+    )
+
+    two_node = discretize_zoh(*zone_state_space(locked), DT_SECONDS)
+    single = discretize_zoh(*zone_state_space(combined), DT_SECONDS)
+
+    inputs = np.array([5.0, 300.0, 400.0, 2000.0])
+    pair = np.array([20.0, 20.0])
+    one = np.array([20.0])
+
+    for _ in range(SAMPLES_PER_DAY):
+        pair = two_node[0] @ pair + two_node[1] @ inputs
+        one = single[0] @ one + single[1] @ inputs
+
+    assert pair[0] == pytest.approx(one[0], abs=1e-3)
+    assert pair[1] == pytest.approx(one[0], abs=1e-3)
