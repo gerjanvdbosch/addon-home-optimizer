@@ -42,12 +42,6 @@ class BoilerThermalModel:
     heat_pump_max_tank_temperature_c: float | None = None
     max_tank_temperature_c: float | None = None
     booster_heat_w: float | None = None
-    # How far the settled tank ends above the SWW setpoint of a heat pump run
-    # that stopped by itself on it (see
-    # BoilerThermalIdentifier._identify_setpoint_overshoot): the setpoint for a
-    # planned run is its planned end temperature minus this. None until such a
-    # run has been observed.
-    setpoint_overshoot_k: float | None = None
 
 
 @dataclass

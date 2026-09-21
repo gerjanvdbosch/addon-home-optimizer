@@ -1,5 +1,4 @@
 import pandas as pd
-import pytest
 
 from domain.models import BoilerThermalModel
 from domain.mpc import MPCConfig, MPCInput
@@ -172,38 +171,6 @@ def test_the_booster_cannot_start_a_run_by_itself():
     result = MPCOptimizer(BOOSTER_MODEL, MPCConfig()).solve(data)
 
     assert not any(result.schedule)
-
-
-def test_setpoint_overshoot_is_learned_from_runs_that_stopped_on_the_setpoint():
-    """Four runs, each followed by 20 minutes idle: two heat pump runs that
-    settle 1.8 and 1.5 K above their setpoint, one that stopped on the heat
-    pump's limit below its setpoint, and a booster run - only the first two
-    count, at SETPOINT_OVERSHOOT_QUANTILE of the two."""
-
-    runs = [
-        # (setpoint, booster, tank temperature: two heating rows, four idle)
-        (46.0, False, [40.0, 44.0, 45.0, 47.0, 47.8, 47.8]),
-        (60.0, False, [50.0, 54.0, 54.5, 55.0, 55.2, 55.2]),
-        (60.0, True, [56.0, 59.0, 60.0, 60.6, 60.8, 60.8]),
-        (47.0, False, [41.0, 45.0, 46.0, 48.0, 48.5, 48.5]),
-    ]
-    heating = [True, True, False, False, False, False]
-    df = pd.DataFrame(
-        {
-            "time": pd.date_range("2026-09-15 10:00", periods=24, freq="5min"),
-            "setpoint": [setpoint for setpoint, _, _ in runs for _ in heating],
-            "boiler_on": heating * len(runs),
-            "booster_on": [booster and on for _, booster, _ in runs for on in heating],
-            "T_top": [T for _, _, temperatures in runs for T in temperatures],
-            "T_bottom": [T for _, _, temperatures in runs for T in temperatures],
-        }
-    )
-
-    overshoot = BoilerThermalIdentifier()._identify_setpoint_overshoot(df)
-
-    assert overshoot == pytest.approx(
-        1.5 + (1.8 - 1.5) * BoilerThermalIdentifier.SETPOINT_OVERSHOOT_QUANTILE
-    )
 
 
 def test_a_tank_near_the_limit_still_starts_and_hands_over():

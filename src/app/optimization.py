@@ -237,24 +237,22 @@ class Optimization:
             times=forecast_times,
         )
 
-        self.publish_dhw(result, forecast_times, thermal_model.setpoint_overshoot_k)
+        self.publish_dhw(result, forecast_times)
 
-    def publish_dhw(
-        self,
-        result: MPCResult,
-        times: list[datetime],
-        setpoint_overshoot_k: float | None,
-    ) -> None:
+    def publish_dhw(self, result: MPCResult, times: list[datetime]) -> None:
         """Writes the plan's hot water decision to Home Assistant: on/off for the
         quarter hour running now, and the start and SWW setpoint of the next
         planned run (the current one if it is heating now, 'unknown' without
         any).
 
         The heat pump heats until its setpoint and stops by itself, so the
-        setpoint is what ends a run where the plan does: its planned end
-        temperature, less how far the tank settles above the setpoint (see
-        BoilerThermalModel.setpoint_overshoot_k). Rounded up to the heat pump's
-        half degree, so rounding never misses the plan.
+        setpoint is the run's planned end temperature, rounded up to the heat
+        pump's half degree. The heat left in the coil and loop then still flows
+        into the tank, which settles above the setpoint (real data: 0.9-2.8 K,
+        median 1.75 K). That is deliberately not subtracted: it is the margin
+        that absorbs a tap or loss forecast that turns out worse, where
+        planning the run to end exactly on target made every replan that saw a
+        fraction of a degree short start another run.
         """
 
         schedule = result.schedule
@@ -270,8 +268,7 @@ class Optimization:
 
             end_temperature = result.temperatures[min(end + 1, len(schedule) - 1)]
             next_start = times[start].isoformat()
-            setpoint_c = end_temperature - (setpoint_overshoot_k or 0.0)
-            setpoint = str(math.ceil(round(2 * setpoint_c, 2)) / 2)
+            setpoint = str(math.ceil(round(2 * end_temperature, 2)) / 2)
 
         self.home_assistant.set_state(
             self.DHW_STATUS_ENTITY,

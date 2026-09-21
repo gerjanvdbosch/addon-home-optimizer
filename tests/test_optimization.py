@@ -17,9 +17,7 @@ class _RecordingHomeAssistant:
         self.states[entity_id] = (state, attributes)
 
 
-def _published(
-    schedule: tuple[int, ...], overshoot_k: float | None = 1.75
-) -> dict[str, str]:
+def _published(schedule: tuple[int, ...]) -> dict[str, str]:
     home_assistant = _RecordingHomeAssistant()
     optimization = Optimization(
         state_manager=None,  # type: ignore[arg-type]
@@ -37,7 +35,7 @@ def _published(
         termination_condition="optimal",
     )
 
-    optimization.publish_dhw(result, TIMES, overshoot_k)
+    optimization.publish_dhw(result, TIMES)
 
     return {entity: state for entity, (state, _) in home_assistant.states.items()}
 
@@ -64,13 +62,8 @@ def test_no_planned_run_leaves_the_start_and_setpoint_unknown():
     }
 
 
-def test_the_setpoint_ends_the_run_at_its_planned_temperature():
-    """The tank is at 48.2 degC after the run's last step; it settles 1.75 K
-    above the setpoint, so 46.45 degC - rounded up to the heat pump's half
-    degrees."""
+def test_the_setpoint_is_the_planned_end_temperature_rounded_up():
+    """The tank is at 48.2 degC after the run's last step - rounded up to the
+    heat pump's half degrees."""
 
-    assert _published((0, 1, 1, 0))[Optimization.DHW_SETPOINT_ENTITY] == "46.5"
-
-
-def test_without_a_known_overshoot_the_setpoint_is_the_planned_temperature():
-    assert _published((0, 1, 1, 0), None)[Optimization.DHW_SETPOINT_ENTITY] == "48.5"
+    assert _published((0, 1, 1, 0))[Optimization.DHW_SETPOINT_ENTITY] == "48.5"

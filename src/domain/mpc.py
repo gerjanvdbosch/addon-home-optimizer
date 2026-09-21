@@ -14,8 +14,8 @@ class MPCConfig:
     boiler_min_runtime_steps: int = 2
     # The heat pump stays off this many steps after a run (0.5 hour). A start is not
     # free: real runs put an estimated 0.4-0.5 kWh into reheating the loop and
-    # coil before the tank gains anything (see
-    # BoilerThermalIdentifier._identify_setpoint_overshoot's own data), so
+    # coil before the tank gains anything (estimated from how far the tank
+    # settles above the setpoint after a run - see Optimization.publish_dhw), so
     # topping the tank up by a fraction of a degree right after a run costs far
     # more than it stores. It also makes a run end high enough by itself: the
     # plan knows it cannot top up afterwards.

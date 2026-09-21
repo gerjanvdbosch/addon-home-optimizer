@@ -60,8 +60,8 @@ Guidelines for coding agents in this repository.
 * A better fit is not evidence of a better physical model.
 * Actually run relevant tests and checks.
 * Prefer lightweight tests and validation.
-* Tests must be fast: reuse an expensive fit or simulation instead of repeating
-  it per test.
+* Tests must be fast: reuse an expensive fit or simulation instead of repeating it per
+  test.
 
 ## Code
 
@@ -78,5 +78,8 @@ Guidelines for coding agents in this repository.
 
 ## Git
 
-* Make changes in the current branch; do not create your own branch or worktree.
-* Do not commit or push. Leave the changes in the working tree; the user commits.
+* Make final changes in the current branch/worktree.
+* A temporary worktree may be used for testing if needed.
+* Do not create or switch branches.
+* Do not commit or push.
+* Leave all final changes uncommitted for me to review and commit.
