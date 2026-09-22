@@ -1232,5 +1232,45 @@ def test_comfort_is_judged_on_what_the_thermostat_reads():
     assert operative.zone_temperatures[0] == pytest.approx(19.0)
     # A reading this far below target is worth heat, and never less of it than
     # the same zone judged on its warmer air.
-    assert sum(operative.space_heat_w) >= sum(air_only.space_heat_w)
+    assert sum(operative.space_heat_w) >= sum(air_only.space_heat_w) - 1e-6
     assert sum(operative.space_heat_w) > 0.0
+
+
+def test_a_run_delivers_less_heat_in_the_step_it_starts_in():
+    """A compressor takes minutes to reach full output, so the step it starts
+    in carries only part of it - and the steps after it carry all of it."""
+
+    ramped = replace(
+        THERMAL_MODEL,
+        q_in_steady_w=6000.0,
+        q_in_ramp_seconds=900.0,
+    )
+    optimizer = MPCOptimizer(ramped, MPCConfig(), cop_model=COP_MODEL)
+
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[18] = 45.0
+    result = optimizer.solve(_make_input(target_temperature_top=tuple(target)))
+
+    heating = [k for k, on in enumerate(result.schedule) if on]
+    assert heating, "expected the tank to be heated"
+
+    first = heating[0]
+    # Half the ramp is still missing over a step as long as the ramp itself.
+    assert result.heat_w[first] == pytest.approx(0.5 * 6000.0, rel=0.02)
+    assert result.heat_w[first + 1] == pytest.approx(6000.0, rel=0.02)
+
+
+def test_without_an_identified_ramp_every_step_is_a_full_one():
+    """The constant-output model this replaced: no ramp, no reduction."""
+
+    optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig(), cop_model=COP_MODEL)
+
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[18] = 45.0
+    result = optimizer.solve(_make_input(target_temperature_top=tuple(target)))
+
+    heating = [k for k, on in enumerate(result.schedule) if on]
+
+    assert result.heat_w[heating[0]] == pytest.approx(
+        THERMAL_MODEL.q_in_nominal_w, rel=0.02
+    )

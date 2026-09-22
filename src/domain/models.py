@@ -42,6 +42,16 @@ class BoilerThermalModel:
     heat_pump_max_tank_temperature_c: float | None = None
     max_tank_temperature_c: float | None = None
     booster_heat_w: float | None = None
+    # The heat the compressor puts into the tank once it is up to speed (W),
+    # and how long it takes to get there after a start (s). Measured
+    # calorimetrically rather than fitted to the temperature trajectory (see
+    # BoilerThermalIdentifier._identify_heat_input_ramp): a compressor
+    # modulates up over the first minutes of a run, so one constant either
+    # overstates the start or understates the rest. Planning uses both; the
+    # identification ODE keeps using q_in_nominal_w wherever the calorimetric
+    # input is missing. None until runs have shown them.
+    q_in_steady_w: float | None = None
+    q_in_ramp_seconds: float | None = None
 
 
 @dataclass

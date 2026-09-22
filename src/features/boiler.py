@@ -297,6 +297,24 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
     # could have drawn water", used purely as an identification diagnostic below.
     MIN_CONFIRMED_AWAY_SECONDS = 60.0 * 60.0
 
+    # A run must reach this far past a start before its calorimetric heat counts
+    # as the compressor's steady output: on real data the ramp is over within
+    # ~13 minutes (see _identify_heat_input_ramp), so this leaves a margin
+    # without demanding runs longer than this installation makes (median 35 min).
+    RAMP_STEADY_AFTER_SECONDS = 25.0 * 60.0
+    # How far into a run the energy delivered is compared with that steady
+    # output. Past the ramp, so the shortfall it measures has stopped growing -
+    # that is what makes it the ramp's whole missing energy rather than a
+    # snapshot of it.
+    RAMP_DEFICIT_AT_SECONDS = 30.0 * 60.0
+    # A compressor reaches its output within minutes to tens of minutes; a
+    # "ramp" longer than this is a sign of something else (a tap draw during
+    # the run, a mis-detected start) and is not used.
+    MAX_RAMP_SECONDS = 45.0 * 60.0
+    # Fewer runs than this cannot give a trustworthy median of either, so
+    # planning keeps its single constant instead.
+    MIN_RAMP_RUNS = 10
+
     # Below this many directly-measured heating timesteps, a calorimetric sample
     # mean is not yet reliable enough to anchor q_in_nominal_w's bounds (see
     # calibrate()) - same "enough samples to trust a sub-group mean" threshold
@@ -1114,6 +1132,16 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
         self.model = _model_from_parameters(robust_fit.x, self.volume_l)
 
+        steady_w, ramp_seconds = self._identify_heat_input_ramp(df)
+        self.model.q_in_steady_w = steady_w
+        self.model.q_in_ramp_seconds = ramp_seconds
+
+        logger.info(
+            "Identified heat input: steady %s, ramp %s",
+            f"{steady_w:.0f} W" if steady_w else "not shown by this data",
+            f"{ramp_seconds / 60:.1f} min" if ramp_seconds else "none",
+        )
+
         heat_pump_max_c, max_tank_c, booster_heat_w = self._identify_booster(df)
         self.model.heat_pump_max_tank_temperature_c = heat_pump_max_c
         self.model.max_tank_temperature_c = max_tank_c
@@ -1136,6 +1164,76 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             )
 
         return self.model
+
+    def _identify_heat_input_ramp(
+        self, df: pd.DataFrame
+    ) -> tuple[float | None, float | None]:
+        """(steady heat into the tank W, ramp duration s) from the calorimetry
+        of real runs; (None, None) when too few runs show both.
+
+        A compressor does not deliver its output the moment it starts: it
+        modulates up, and the loop between it and the tank has to warm through
+        first. On this installation the measured heat rises from about 1 kW in
+        the first five minutes to some 6.6 kW after twenty (80 runs), while
+        planning used one constant 4.8 kW from the first second - which is why
+        the planning model ran the tank up 7.6 K too warm over the first step
+        it executes (see validate()'s planner metrics).
+
+        The steady output is the median calorimetric heat at least
+        RAMP_STEADY_AFTER_SECONDS into a run. The ramp is then read off the
+        energy it costs rather than fitted to the curve's shape: a rise that
+        reaches full output at T delivers q_steady * T / 2 less than a constant
+        q_steady would have, and past T that shortfall stops growing. Measuring
+        it at RAMP_DEFICIT_AT_SECONDS therefore gives T = 2 * shortfall /
+        q_steady. Stating it that way is what keeps a whole run's energy right,
+        which is what the tank's end temperature - and so the setpoint a run is
+        given - depends on. Booster rows are left out: that is a resistive
+        element with its own constant rating, identified separately.
+        """
+
+        q = df["q_in_override_w"].to_numpy(dtype=float)
+        on = df["boiler_on"].to_numpy(dtype=bool)
+        booster = df["booster_on"].to_numpy(dtype=bool)
+        seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
+
+        steady_values: list[float] = []
+        deficits: list[float] = []
+
+        for start in np.flatnonzero(on & ~np.r_[True, on[:-1]]):
+            end = start
+
+            while end + 1 < len(on) and on[end + 1]:
+                end += 1
+
+            since = seconds[start : end + 1] - seconds[start]
+            heat = q[start : end + 1]
+            usable = ~np.isnan(heat) & ~booster[start : end + 1]
+            settled = usable & (since >= self.RAMP_STEADY_AFTER_SECONDS)
+
+            if settled.sum() < 2:
+                continue
+
+            steady = float(np.median(heat[settled]))
+            steady_values.append(steady)
+
+            window = usable & (since <= self.RAMP_DEFICIT_AT_SECONDS)
+
+            if window.sum() < 2 or since[window].max() < self.RAMP_DEFICIT_AT_SECONDS:
+                continue
+
+            delivered = float(np.trapezoid(heat[window], since[window]))
+            deficits.append(steady * float(since[window].max()) - delivered)
+
+        if len(deficits) < self.MIN_RAMP_RUNS:
+            return None, None
+
+        steady = float(np.median(steady_values))
+        ramp = 2.0 * float(np.median(deficits)) / steady
+
+        if not 0.0 < ramp <= self.MAX_RAMP_SECONDS:
+            return None, None
+
+        return steady, ramp
 
     def _identify_booster(
         self, df: pd.DataFrame
@@ -1272,8 +1370,16 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
                 if booster_step and booster_heat_w is not None:
                     q_in = booster_heat_w
+                elif on[i]:
+                    # Coming up to speed, exactly as the optimizer plans it
+                    # (see MPCOptimizer._ramp_fraction).
+                    q_in = model.q_in_steady_w or model.q_in_nominal_w
+                    ramp = model.q_in_ramp_seconds
+
+                    if ramp:
+                        q_in *= min(1.0, (seconds[i] - seconds[start]) / ramp)
                 else:
-                    q_in = model.q_in_nominal_w if on[i] else 0.0
+                    q_in = 0.0
 
                 T_next = a_d[0, 0] * T + b_d[0, 0] * T_ambient[i] + b_d[0, 1] * q_in
 

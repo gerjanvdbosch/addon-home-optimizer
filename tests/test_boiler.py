@@ -1351,3 +1351,57 @@ def test_planner_run_errors_show_a_tank_that_warms_later_than_planned():
 
     assert (first_step_errors > 1.0).all()
     assert (run_end_errors > 1.0).all()
+
+
+def _ramp_frame(
+    runs: int, steady_w: float, ramp_seconds: float, run_minutes: int = 40
+) -> pd.DataFrame:
+    """Runs whose calorimetric heat rises linearly to `steady_w` over
+    `ramp_seconds`, the way a modulating compressor comes up to speed."""
+
+    rows = []
+    time = pd.Timestamp("2026-01-01", tz="UTC")
+
+    for _ in range(runs):
+        for minute in range(run_minutes + 30):
+            on = minute < run_minutes
+            since = minute * 60.0
+            rows.append(
+                {
+                    "time": time + pd.Timedelta(minutes=minute),
+                    "boiler_on": on,
+                    "booster_on": False,
+                    "q_in_override_w": (
+                        steady_w * min(1.0, since / ramp_seconds) if on else np.nan
+                    ),
+                }
+            )
+
+        time += pd.Timedelta(minutes=run_minutes + 30)
+
+    return pd.DataFrame(rows)
+
+
+def test_identify_heat_input_ramp_recovers_a_known_ramp():
+    """The ramp is read off the energy it costs, so a linear rise to full
+    output is recovered from the shortfall it leaves behind."""
+
+    identifier = BoilerThermalIdentifier()
+
+    steady_w, ramp_seconds = identifier._identify_heat_input_ramp(
+        _ramp_frame(runs=12, steady_w=6000.0, ramp_seconds=600.0)
+    )
+
+    assert steady_w == pytest.approx(6000.0, rel=0.02)
+    assert ramp_seconds == pytest.approx(600.0, rel=0.1)
+
+
+def test_identify_heat_input_ramp_needs_enough_runs():
+    """Below MIN_RAMP_RUNS the medians are not worth trusting, and planning
+    keeps its single constant."""
+
+    identifier = BoilerThermalIdentifier()
+
+    assert identifier._identify_heat_input_ramp(
+        _ramp_frame(runs=3, steady_w=6000.0, ramp_seconds=600.0)
+    ) == (None, None)
