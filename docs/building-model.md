@@ -79,26 +79,53 @@ on purpose.
   coupled to each other, with solar and floor heat entering the mass. Physically the
   more faithful of the two, because floor heating really does reach the room with a lag,
   and the only one that can describe charging the screed as storage. Its mass
-  temperature is never measured.
+  temperature is never measured directly - but the thermostats see part of it, which is
+  what `sensor_mass_fraction` below is about.
 - **`building_lumped`** - one node: a single capacity covering everything that stores
   heat, and one conductance to outdoors. Cruder - it cannot represent the floor being
   warmer than the air - but its state *is* the measurement, so nothing has to be
   inferred.
 
 Which one to trust is a measurement, not an assumption. On this installation's
-cooling-season data (60 days):
+cooling-season data (43 days, both recalibrated on it):
 
 |                        | `building`      | `building_lumped` |
 |------------------------|-----------------|-------------------|
-| MAE over 6 h rollouts  | 0.154 K         | **0.129 K**       |
-| persistence baseline   | 0.153 K         | 0.162 K           |
-| `skill_vs_persistence` | **-0.005**      | **+0.205**        |
-| `aperture_fraction`    | 0.198           | **0.635**         |
+| MAE over 6 h rollouts  | 0.134 K         | **0.128 K**       |
+| persistence baseline   | 0.153 K         | 0.160 K           |
+| `skill_vs_persistence` | +0.122          | **+0.200**        |
+| `aperture_fraction`    | 0.168           | **0.647**         |
 
-The two-node model's hidden mass state is its largest single error source, and it also
-swallows the solar gain - the same data yields an ordinary double-glazing g-value once
-that node is gone. This is **not** evidence that two nodes are wrong, but that data with
-the floor circuit active in 2.4% of quarter hours cannot identify them.
+The two-node model used to score below persistence here (-0.005) with the hidden mass
+state as its largest single error source. Reading the thermostats as an operative
+temperature and letting the filter disturb the mass node closed most of that gap, and
+took `ua_air_mass` off its bound. The single node is still ahead, and still finds the
+more ordinary solar aperture, on data with the floor circuit active in 2.4% of quarter
+hours.
+
+### What the thermostat reads
+
+A wall-mounted sensor exchanges longwave radiation with the surfaces around it, so it
+reports an operative temperature between air and mass rather than air alone.
+`sensor_mass_fraction` is that share: 0 a pure air sensor, 0.5 the textbook average in
+still air, which is the bound here because the sensor sits in moving room air. It is a
+measurement equation - it moves no heat - and it is what the comfort target in planning
+is held to, since that is the quantity a setpoint is set in.
+
+It earns its place twice over. On this data it takes the rollout error from 0.153 to
+0.144 K on its own, and it makes the mass node partly observable: the filter can
+correct a state nothing measures directly, which is what planning the screed as storage
+needs.
+
+### What can disturb which node
+
+The filter carries one unmodelled heat flow per node (`DISTURBANCE_INPUTS`): through
+the air, as ventilation, a stove or a visitor; through the mass, as heat that was
+measured into the floor circuit but never reached the screed - this heat pump stands in
+a shed, so part of the supply-to-return difference happens in the pipe run. Disturbing
+the air alone, as before, left the filter certain of a mass node driven by a flow it
+cannot fully trust. Adding the second channel took the rollout error from 0.144 to
+0.134 K.
 
 ## Reading `validate()`
 
@@ -160,6 +187,15 @@ near 90 h against the ~120 h both models hold. Neither slope clears two standard
 on 45-49 windows, so it is suggestive, not established. In summer the indoor-outdoor
 difference is 2-5 K and a window's decay signal sits under the sensor resolution; in
 winter it is 20-30 K.
+
+**How much of the reading is radiant.** `sensor_mass_fraction` runs into its 0.5 ceiling
+on this data, and releasing that ceiling keeps improving the fit until the reading is
+almost entirely the mass - at which point the solar aperture falls below what any glass
+can have and the active bias grows, the signature of a fit rather than a physical
+value. What it does say is that these thermostats follow the structure at least as
+closely as they follow the air, which is also why `c_air` sits at its ceiling in both
+structures. A heating season, where the floor drives the mass hard, is what can settle
+the split.
 
 **Whether the floor coupling is mode-dependent.** A warm floor drives a buoyant plume
 and a cold one leaves stable stratification, so the combined heat transfer coefficient

@@ -1,4 +1,5 @@
 import dataclasses
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -16,6 +17,7 @@ from domain.physics import (
     lumped_zone_state_space,
     solar_gain_w,
     two_node_zone_state_space,
+    zone_observation,
     zone_state_space,
 )
 from features.building import BuildingLumpedIdentifier, BuildingThermalIdentifier
@@ -30,6 +32,9 @@ TRUE_MODEL = BuildingThermalModel(
     c_air_j_per_k=3.0 * RHO_AIR_KG_PER_M3 * TRUE_VOLUME_M3 * CP_AIR_J_PER_KG_K,
     c_mass_j_per_k=18.0e6,
     a_eff_m2=6.0,
+    # A pure air sensor, so these tests keep measuring the air node itself;
+    # the operative-temperature reading has its own test below.
+    sensor_mass_fraction=0.0,
     internal_gain_fraction=0.6,
 )
 
@@ -196,12 +201,15 @@ def _simulate(rng: np.random.Generator) -> pd.DataFrame:
     inputs = identifier._inputs(TRUE_MODEL, prepared)
 
     a_d, b_d = discretize_zoh(*two_node_zone_state_space(TRUE_MODEL), DT_SECONDS)
+    observation = zone_observation(TRUE_MODEL)
 
     state = np.array([21.0, 21.0])
     air = np.empty(len(prepared))
 
     for i in range(len(prepared)):
-        air[i] = state[0]
+        # What the thermostat reads of the state, which for TRUE_MODEL is the
+        # air node alone.
+        air[i] = observation @ state
         state = a_d @ state + b_d @ inputs[i]
 
     noisy = air + rng.normal(0.0, MEASUREMENT_NOISE_STD_C, len(air))
@@ -900,6 +908,23 @@ def test_forecast_starts_where_the_measurements_stop():
     # It picks up from the filter, so the first value is what the filter had.
     estimated = identifier.estimate(df[df["target_time"] <= now])
     assert forecast["air"].iloc[0] == pytest.approx(estimated["air"].iloc[-1], abs=1e-6)
+    # One node, so what the thermostat reads is that node itself.
+    assert forecast["reading"].equals(forecast["air"])
+
+
+def test_two_node_forecast_carries_the_thermostat_reading():
+    """The curve drawn against the measurement has to be the same quantity:
+    with two nodes the thermostat reads part of the mass as well."""
+
+    identifier = _identifier()
+    df, now = _frame_with_future(np.random.default_rng(22))
+    identifier.model = replace(identifier.calibrate(df), sensor_mass_fraction=0.4)
+
+    forecast = identifier.forecast(df, now)
+
+    assert forecast["reading"].to_numpy() == pytest.approx(
+        0.6 * forecast["air"].to_numpy() + 0.4 * forecast["mass"].to_numpy()
+    )
 
 
 def test_forecast_delivers_no_heat_to_the_zone():
@@ -1006,3 +1031,145 @@ def test_a_perfectly_coupled_two_node_zone_is_the_single_node_one():
 
     assert pair[0] == pytest.approx(one[0], abs=1e-3)
     assert pair[1] == pytest.approx(one[0], abs=1e-3)
+
+
+def test_observation_is_air_alone_without_a_radiant_share():
+    assert zone_observation(TRUE_MODEL).tolist() == [1.0, 0.0]
+    assert zone_observation(TRUE_LUMPED).tolist() == [1.0]
+
+
+def test_observation_weighs_air_against_mass():
+    """A wall thermostat reads an operative temperature: part air, part the
+    surfaces around it, and the two shares are one reading."""
+
+    model = replace(TRUE_MODEL, sensor_mass_fraction=0.3)
+
+    assert zone_observation(model).tolist() == pytest.approx([0.7, 0.3])
+    assert zone_observation(model).sum() == pytest.approx(1.0)
+
+
+def _simulate_operative(rng: np.random.Generator, fraction: float) -> pd.DataFrame:
+    """The same house, read by a thermostat that also sees the surfaces."""
+
+    identifier = _identifier()
+    prepared = identifier.prepare(_raw_frame())
+    true_model = replace(TRUE_MODEL, sensor_mass_fraction=fraction)
+    inputs = identifier._inputs(true_model, prepared)
+
+    a_d, b_d = discretize_zoh(*two_node_zone_state_space(true_model), DT_SECONDS)
+    observation = zone_observation(true_model)
+
+    state = np.array([21.0, 21.0])
+    reading = np.empty(len(prepared))
+
+    for i in range(len(prepared)):
+        reading[i] = observation @ state
+        state = a_d @ state + b_d @ inputs[i]
+
+    noisy = reading + rng.normal(0.0, MEASUREMENT_NOISE_STD_C, len(reading))
+
+    raw = _raw_frame()
+    raw["T_air"] = np.round(noisy / SENSOR_RESOLUTION_C) * SENSOR_RESOLUTION_C
+
+    return raw
+
+
+def test_calibrate_recovers_the_radiant_share_of_the_reading():
+    """Identifiable because it changes the shape of the response, not its
+    level: the mass node moves slower than the air, so how much of it the
+    reading carries sets how slowly the reading itself responds."""
+
+    identifier = _identifier()
+
+    model = identifier.calibrate(_simulate_operative(np.random.default_rng(3), 0.3))
+
+    assert model.sensor_mass_fraction == pytest.approx(0.3, abs=0.15)
+    assert model.ua_envelope_w_per_k == pytest.approx(
+        TRUE_MODEL.ua_envelope_w_per_k, rel=0.25
+    )
+
+
+def test_filter_corrects_the_mass_node_through_a_mixed_reading():
+    """With the reading carrying part of the mass, the filter can correct a
+    state nothing measures directly - air alone leaves it free-running."""
+
+    rng = np.random.default_rng(5)
+    identifier = _identifier()
+    prepared = identifier.prepare(_raw_frame())
+    true_model = replace(TRUE_MODEL, sensor_mass_fraction=0.3)
+    inputs = identifier._inputs(true_model, prepared)
+    a, b = two_node_zone_state_space(true_model)
+    a_d, b_d = discretize_zoh(a, b, DT_SECONDS)
+    observation = zone_observation(true_model)
+
+    state = np.array([21.0, 24.0])
+    states = np.empty((len(prepared), 2))
+
+    for i in range(len(prepared)):
+        states[i] = state
+        state = a_d @ state + b_d @ inputs[i]
+
+    measured = states @ observation + rng.normal(
+        0.0, MEASUREMENT_NOISE_STD_C, len(states)
+    )
+    dt_seconds = prepared["dt_seconds"].to_numpy(dtype=float)
+
+    def mass_error(obs: np.ndarray) -> float:
+        estimates = kalman_states(
+            a,
+            b,
+            measured,
+            inputs,
+            dt_seconds,
+            identifier.PROCESS_NOISE_W,
+            identifier.SENSOR_RESOLUTION_K**2 / 12.0,
+            obs,
+            identifier.DISTURBANCE_INPUTS,
+        )
+        return float(np.abs(estimates[50:, 1] - states[50:, 1]).mean())
+
+    assert mass_error(observation) < mass_error(np.array([1.0, 0.0]))
+
+
+def test_filter_lets_an_unmodelled_floor_flow_disturb_the_mass():
+    """The pipe run to this heat pump's shed loses part of what was measured
+    into the floor circuit, so the mass is not driven exactly as measured. A
+    disturbance on that channel lets the filter correct for it; one on the air
+    channel alone has to push the whole error through the air node."""
+
+    rng = np.random.default_rng(7)
+    identifier = _identifier()
+    prepared = identifier.prepare(_raw_frame())
+    inputs = identifier._inputs(TRUE_MODEL, prepared)
+    a, b = two_node_zone_state_space(TRUE_MODEL)
+    a_d, b_d = discretize_zoh(a, b, DT_SECONDS)
+
+    # The house receives four fifths of the floor heat the meter reports.
+    delivered = inputs.copy()
+    delivered[:, 3] *= 0.8
+
+    state = np.array([21.0, 21.0])
+    states = np.empty((len(prepared), 2))
+
+    for i in range(len(prepared)):
+        states[i] = state
+        state = a_d @ state + b_d @ delivered[i]
+
+    measured = states[:, 0] + rng.normal(0.0, MEASUREMENT_NOISE_STD_C, len(states))
+    dt_seconds = prepared["dt_seconds"].to_numpy(dtype=float)
+
+    def mass_error(channels: tuple[int, ...]) -> float:
+        estimates = kalman_states(
+            a,
+            b,
+            measured,
+            inputs,
+            dt_seconds,
+            identifier.PROCESS_NOISE_W,
+            identifier.SENSOR_RESOLUTION_K**2 / 12.0,
+            None,
+            channels,
+        )
+        return float(np.abs(estimates[50:, 1] - states[50:, 1]).mean())
+
+    assert mass_error(identifier.DISTURBANCE_INPUTS) < mass_error((1,))

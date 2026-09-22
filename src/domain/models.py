@@ -79,6 +79,13 @@ class BuildingThermalModel:
     # lumped parameter because those three factors only ever appear as their
     # product in the heat balance, and the g-value is not separately measured.
     a_eff_m2: float
+    # Share of the thermostat's reading that follows the mass node rather than
+    # the air. A wall-mounted sensor exchanges longwave radiation with floor
+    # and walls, so what it reports is an operative temperature somewhere
+    # between the two - 0 is a pure air sensor, 0.5 the textbook operative
+    # temperature in still air. It belongs to the sensor, not to the balance:
+    # no heat flows because of it.
+    sensor_mass_fraction: float
     # Fraction of the house-wide baseload electrical power that is released as
     # heat inside this zone. The baseload sensor measures the whole house; the
     # modelled zone is only part of it.

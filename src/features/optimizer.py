@@ -20,6 +20,7 @@ from domain.physics import (
     CP_WATER_J_PER_KG_K,
     RHO_WATER_KG_PER_L,
     lumped_tank_state_space,
+    zone_observation,
     zone_state_space,
 )
 
@@ -993,6 +994,7 @@ class MPCOptimizer:
         max_heat_w = self.thermal_model.q_in_nominal_w
 
         a, b = zone_state_space(building)
+        observation = zone_observation(building)
         num_states = a.shape[0]
 
         # State 0 is the air temperature the thermostats measure and comfort is
@@ -1100,18 +1102,30 @@ class MPCOptimizer:
                     + b_d[i, 3] * model.q_space_w[k]
                 )
 
+        # What a thermostat reads of the plan: the air alone for one node, an
+        # operative temperature for two (see zone_observation). Comfort is
+        # judged on it because that is the quantity the setpoint is set in and
+        # the occupant feels, and because it is what the model was identified
+        # against.
+        def measured(k):
+            return sum(
+                float(observation[i]) * model.zone_state[k, i]
+                for i in model.ZONE_STATES
+            )
+
+        model.zone_measured = measured
+
         # Comfort at both ends of a step, for the same reason the tank's target
         # is checked at both: T[k] is the value at a step's START, and a coarse
         # look-ahead block is an hour long.
         for k in range(num_steps):
             model.zone_constraints.add(
-                model.zone_state[k, 0] + model.zone_slack[k] >= float(target_c[k])
+                measured(k) + model.zone_slack[k] >= float(target_c[k])
             )
 
             if k + 1 < num_steps:
                 model.zone_constraints.add(
-                    model.zone_state[k + 1, 0] + model.zone_slack[k]
-                    >= float(target_c[k])
+                    measured(k + 1) + model.zone_slack[k] >= float(target_c[k])
                 )
 
     def _build_objective(
@@ -1237,10 +1251,11 @@ class MPCOptimizer:
             space_heat_model = [
                 float(pyo.value(model.q_space_w[k])) for k in range(plan.num_steps)
             ]
-            # State 0 in both structures: the air temperature, which is what
-            # the thermostats read and what comfort was judged on.
+            # What the thermostats would read, which is what comfort was
+            # judged on (see zone_observation).
             zone_model = [
-                float(pyo.value(model.zone_state[k, 0])) for k in range(plan.num_steps)
+                float(pyo.value(model.zone_measured(k)))
+                for k in range(plan.num_steps)
             ]
 
             space_schedule = tuple(space_on_model[m] for m in plan.fine_to_model)

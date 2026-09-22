@@ -191,6 +191,28 @@ def zone_state_space(
     return two_node_zone_state_space(model)
 
 
+def zone_observation(
+    model: BuildingThermalModel | BuildingLumpedModel,
+) -> np.ndarray:
+    """Row vector h with T_measured = h x: what a thermostat reads from the
+    zone's states.
+
+    A single node leaves nothing to weigh. Two make the reading an operative
+    temperature: a wall-mounted sensor exchanges longwave radiation with the
+    surfaces around it, so it follows the mass node as well as the air (see
+    BuildingThermalModel.sensor_mass_fraction). This is a measurement
+    equation, not a heat balance - it moves no energy, and dropping it would
+    only mean claiming the sensor reads pure air.
+    """
+
+    if isinstance(model, BuildingLumpedModel):
+        return np.array([1.0])
+
+    fraction = model.sensor_mass_fraction
+
+    return np.array([1.0 - fraction, fraction])
+
+
 def floor_heat_w(
     flow_lpm: np.ndarray,
     supply_temperature_c: np.ndarray,

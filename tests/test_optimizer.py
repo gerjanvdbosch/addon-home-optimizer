@@ -1,4 +1,5 @@
 import dataclasses
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -1073,6 +1074,9 @@ TWO_NODE_BUILDING_MODEL = BuildingThermalModel(
     c_air_j_per_k=2.5e6,
     c_mass_j_per_k=37.5e6,
     a_eff_m2=9.0,
+    # A pure air sensor, so the plans these tests check are judged on the air
+    # node exactly as before; the operative reading has its own test.
+    sensor_mass_fraction=0.0,
     internal_gain_fraction=1.0,
 )
 
@@ -1198,3 +1202,35 @@ def test_solar_gain_warms_the_two_node_zone_through_its_mass():
     )
 
     assert sum(sunny.space_heat_w) < sum(dark.space_heat_w)
+
+
+def test_comfort_is_judged_on_what_the_thermostat_reads():
+    """A wall thermostat reads part mass, so warm air over a cold floor reads
+    colder than the air - and that reading is what the plan is held to and
+    reports, not the air node.
+    """
+
+    data = _zone_input(
+        zone_temperature=22.0,
+        zone_mass_temperature=16.0,
+        zone_target_temperature=(20.0,) * len(SOLAR_FORECAST_W),
+    )
+
+    def solve(building):
+        return MPCOptimizer(
+            THERMAL_MODEL,
+            MPCConfig(),
+            cop_model=COP_MODEL,
+            building_model=building,
+        ).solve(data)
+
+    air_only = solve(TWO_NODE_BUILDING_MODEL)
+    operative = solve(replace(TWO_NODE_BUILDING_MODEL, sensor_mass_fraction=0.5))
+
+    # Half air, half mass against the air node alone.
+    assert air_only.zone_temperatures[0] == pytest.approx(22.0)
+    assert operative.zone_temperatures[0] == pytest.approx(19.0)
+    # A reading this far below target is worth heat, and never less of it than
+    # the same zone judged on its warmer air.
+    assert sum(operative.space_heat_w) >= sum(air_only.space_heat_w)
+    assert sum(operative.space_heat_w) > 0.0

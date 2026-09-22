@@ -144,10 +144,15 @@ class StateManager:
         if forecasts is not None:
             two_node, lumped = forecasts
             mass = pd.concat([mass, two_node["mass"].iloc[1:]])
+            # The reading, not the air node: what these curves are drawn
+            # against is the measurement, and with a two-node structure the
+            # thermostat reads part of the mass too (see zone_observation).
             state.predictions.zone_forecast_two_node = self._series_points(
-                two_node["air"]
+                two_node["reading"]
             )
-            state.predictions.zone_forecast_lumped = self._series_points(lumped["air"])
+            state.predictions.zone_forecast_lumped = self._series_points(
+                lumped["reading"]
+            )
 
         state.predictions.thermal_mass = self._series_points(mass)
 

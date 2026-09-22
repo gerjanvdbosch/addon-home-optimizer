@@ -37,6 +37,7 @@ from domain.physics import (
     lumped_zone_state_space,
     solar_gain_w,
     two_node_zone_state_space,
+    zone_observation,
 )
 from domain.sensors import Aggregation, FillMethod, SensorReference
 from features.dataset import DatasetBuilder
@@ -271,6 +272,26 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # area. The bounds themselves are [0, glass area] - see calibrate().
     INITIAL_APERTURE_FRACTION = 0.5
 
+    # A wall thermostat exchanges longwave radiation with the surfaces around
+    # it, so it reads an operative temperature between air and mass rather than
+    # air alone (see BuildingThermalModel.sensor_mass_fraction). 0.5 is that
+    # textbook average in still air, and the ceiling here: the sensor sits in
+    # moving room air, so it cannot follow the surfaces more closely than
+    # evenly. On this installation's cooling data the fit runs into that
+    # ceiling, which says the thermostats follow the structure at least that
+    # closely - reported rather than tuned away, like every other pinned bound
+    # here, and one for the heating season to settle.
+    MAX_SENSOR_MASS_FRACTION = 0.5
+    INITIAL_SENSOR_MASS_FRACTION = 0.25
+
+    # An unmodelled heat flow can enter either node: the air through
+    # ventilation, a stove or a visitor, the mass through heat that was
+    # measured into the floor circuit but lost in the pipe run before the
+    # screed (this heat pump stands in a shed). Q_internal and Q_floor are the
+    # input channels that land there, so the filter carries one disturbance per
+    # node instead of claiming the mass is driven exactly as measured.
+    DISTURBANCE_INPUTS = (1, 3)
+
     # Share of the house-wide baseload dissipated inside the modelled zone.
     # Physically a fraction, hence [0, 1]; the living zone is a substantial but
     # not dominant part of the house, so the fit starts mid-range.
@@ -369,6 +390,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         "c_air_j_per_k",
         "c_mass_j_per_k",
         "a_eff_m2",
+        "sensor_mass_fraction",
         "internal_gain_fraction",
     )
 
@@ -389,6 +411,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 model.c_air_j_per_k,
                 model.c_mass_j_per_k,
                 model.a_eff_m2,
+                model.sensor_mass_fraction,
                 model.internal_gain_fraction,
             ]
         )
@@ -400,7 +423,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             c_air_j_per_k=float(x[2]),
             c_mass_j_per_k=float(x[3]),
             a_eff_m2=float(x[4]),
-            internal_gain_fraction=float(x[5]),
+            sensor_mass_fraction=float(x[5]),
+            internal_gain_fraction=float(x[6]),
         )
 
     def _shutter_open_fraction(self, df: pd.DataFrame) -> pd.Series:
@@ -723,6 +747,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         index_parts: list[np.ndarray] = []
 
         measurement_variance = self.SENSOR_RESOLUTION_K**2 / 12.0
+        observation = zone_observation(model)
 
         for run_start, run_end in runs:
             # Every window starts from the filter's estimate of the WHOLE state
@@ -738,6 +763,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 dt_seconds[run_start:run_end],
                 self.PROCESS_NOISE_W,
                 measurement_variance,
+                observation,
+                self.DISTURBANCE_INPUTS,
             )
 
             window_start = run_start
@@ -757,7 +784,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 )
 
                 if window_start - run_start >= warmup_samples:
-                    predicted_parts.append(simulated[:, 0])
+                    # What the thermostat would have read, which is what the
+                    # residual is measured against.
+                    predicted_parts.append(simulated @ observation)
                     measured_parts.append(measured[window_start:window_end])
                     active_parts.append(floor_heat[window_start:window_end] != 0.0)
                     index_parts.append(np.arange(window_start, window_end))
@@ -819,6 +848,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.MIN_C_MASS_J_PER_K,
                 0.0,
                 0.0,
+                0.0,
             ]
         )
 
@@ -829,6 +859,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.MAX_AIR_CAPACITY_MULTIPLE * air_capacity,
                 self.MAX_C_MASS_J_PER_K,
                 max_aperture,
+                self.MAX_SENSOR_MASS_FRACTION,
                 1.0,
             ]
         )
@@ -840,6 +871,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.INITIAL_AIR_CAPACITY_MULTIPLE * air_capacity,
                 self.INITIAL_C_MASS_J_PER_K,
                 self.INITIAL_APERTURE_FRACTION * max_aperture,
+                self.INITIAL_SENSOR_MASS_FRACTION,
                 self.INITIAL_INTERNAL_GAIN_FRACTION,
             ]
         )
@@ -1283,6 +1315,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             prepared["dt_seconds"].to_numpy(dtype=float),
             self.PROCESS_NOISE_W,
             self.SENSOR_RESOLUTION_K**2 / 12.0,
+            zone_observation(model),
+            self.DISTURBANCE_INPUTS,
         )
 
         names = ["air", "mass"][: estimates.shape[1]]
@@ -1356,6 +1390,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             dt_seconds[: last + 1],
             self.PROCESS_NOISE_W,
             self.SENSOR_RESOLUTION_K**2 / 12.0,
+            zone_observation(model),
+            self.DISTURBANCE_INPUTS,
         )
 
         # Nothing is delivered to the zone: this is what happens if the heat
@@ -1373,11 +1409,18 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         names = ["air", "mass"][: simulated.shape[1]]
 
-        return pd.DataFrame(
+        forecast = pd.DataFrame(
             simulated[:, : len(names)],
             columns=names,
             index=prepared["time"].to_numpy()[last:],
         )
+
+        # What a thermostat would read of it, which is the only column that
+        # can be drawn against - or scored on - the measurement (see
+        # zone_observation). For one node that is the node itself.
+        forecast["reading"] = simulated @ zone_observation(model)
+
+        return forecast
 
     def dataset(self, config: Config) -> DatasetDefinition:
         self.room_areas_m2 = [room.area_m2 for room in config.building.rooms]
@@ -1543,6 +1586,10 @@ class BuildingLumpedIdentifier(BuildingThermalIdentifier):
     # the two-node model's air and mass bounds combined: from a light structure
     # to a heavy one. The lower bound is the zone's own air, derived from the
     # configured volume as before, and never asserted in Joules.
+    # One node, so an unmodelled flow has only one place to go, whichever
+    # channel it arrives through.
+    DISTURBANCE_INPUTS = (1,)
+
     MIN_C_J_PER_K = 2.0e6
     MAX_C_J_PER_K = 60.0e6
     INITIAL_C_J_PER_K = 20.0e6

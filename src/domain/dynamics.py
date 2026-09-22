@@ -41,12 +41,14 @@ def kalman_states(
     dt_seconds: np.ndarray,
     process_noise_w: float,
     measurement_variance: float,
+    observation: np.ndarray | None = None,
+    disturbance_inputs: tuple[int, ...] = (1,),
 ) -> np.ndarray:
-    """Filtered state estimate at every sample, from the measured air
-    temperature alone.
+    """Filtered state estimate at every sample, from one scalar measurement.
 
-    Only the first state is observed - the room thermometer - so any other
-    state has to be inferred from how the measured one moves relative to what
+    That measurement covers at most a part of each state - the room
+    thermometer reads the air, and something of the surfaces around it - so
+    the rest has to be inferred from how the reading moves relative to what
     the model predicted. That is what a Kalman filter does, and it is the
     honest way to start a rollout: hard-resetting the measured state while
     letting an unmeasured one free-run leaves the two inconsistent with each
@@ -57,13 +59,23 @@ def kalman_states(
     this is a missing part of the system rather than a test harness.
 
     Process noise is expressed as an unmodelled HEAT FLOW (W) entering through
-    the same channel as the internal gains, not as an abstract covariance: the
-    disturbance this is standing in for - ventilation through an opened window,
-    a wood stove, a visitor - is a heat flow, so its magnitude can be reasoned
-    about physically.
+    the input channels named by `disturbance_inputs`, not as an abstract
+    covariance: the disturbances this stands in for - ventilation through an
+    opened window, a wood stove, a visitor, heat that never reached the node
+    it was measured into - are heat flows, so their magnitude can be reasoned
+    about physically. One channel per node that can be disturbed
+    independently; naming them is the caller's job, since nothing here knows
+    what an input means.
+
+    `observation` is the row vector the thermometer sees, defaulting to the
+    first state alone. A sensor reading a mixture of states (an operative
+    temperature, say) makes the others partly observable, which is the only
+    way the filter can correct a state nothing measures directly.
     """
 
     n = a.shape[0]
+    # Default: the first state alone, the one a thermometer normally reads.
+    h = np.eye(1, n)[0] if observation is None else np.asarray(observation, float)
 
     state = np.concatenate(([measured[0]], np.full(n - 1, measured[0])))
     covariance = np.eye(n) * measurement_variance
@@ -79,13 +91,14 @@ def kalman_states(
 
         if key not in cache:
             a_d, b_d = discretize_zoh(a, b, dt)
-            # The disturbance enters where an unmodelled indoor heat flow
-            # would, and its effect on the state is what the DISCRETE input
-            # matrix says an input of that size does over one step. Building it
-            # from the continuous B instead understates it by a factor dt^2 -
-            # here about a million - which silently turns the filter into a
-            # free-running simulation that ignores the measurement.
-            disturbance = b_d[:, 1:2]
+            # The disturbances enter where unmodelled heat flows would, and
+            # their effect on the state is what the DISCRETE input matrix says
+            # inputs of that size do over one step. Building it from the
+            # continuous B instead understates it by a factor dt^2 - here about
+            # a million - which silently turns the filter into a free-running
+            # simulation that ignores the measurement. Independent channels, so
+            # their covariances add.
+            disturbance = b_d[:, list(disturbance_inputs)]
             cache[key] = (
                 a_d,
                 b_d,
@@ -97,16 +110,15 @@ def kalman_states(
         state = a_d @ state + b_d @ inputs[i - 1]
         covariance = a_d @ covariance @ a_d.T + process_covariance
 
-        # The air temperature is the first state and the only measured one, so
-        # the observation matrix is a unit vector and the usual matrix products
-        # reduce to indexing.
-        innovation = measured[i] - state[0]
-        innovation_covariance = covariance[0, 0] + measurement_variance
+        # One scalar measurement, so the usual matrix products reduce to
+        # vector ones: h is what the thermometer sees of the state.
+        innovation = measured[i] - h @ state
+        innovation_covariance = h @ covariance @ h + measurement_variance
 
-        gain = covariance[:, 0] / innovation_covariance
+        gain = covariance @ h / innovation_covariance
 
         state = state + gain * innovation
-        covariance = covariance - np.outer(gain, covariance[0, :])
+        covariance = covariance - np.outer(gain, h @ covariance)
 
         estimates[i] = state
 
