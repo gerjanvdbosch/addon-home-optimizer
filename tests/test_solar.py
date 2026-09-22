@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 import numpy as np
 import pandas as pd
 import pytest
+from scipy import stats
 
 from features.solar import (
     ELEVATION_BINS,
@@ -22,6 +23,7 @@ from features.solar import (
     _quantile_scale_arrays,
     _solar_elevation,
     nowcast_solar,
+    nowcast_weight,
     predict_solar,
     predict_solar_band,
 )
@@ -691,3 +693,28 @@ def test_nowcast_is_undefined_with_the_sun_below_the_horizon():
         nowcast_solar(0.0, night, night + timedelta(minutes=15), LATITUDE, LONGITUDE)
         is None
     )
+
+
+def _minutes(values: list[float]) -> pd.Series:
+    end = datetime(2026, 6, 21, 11, 40, tzinfo=UTC)
+    return pd.Series(
+        values, index=pd.date_range(end=end, periods=len(values), freq="1min")
+    )
+
+
+def test_nowcast_weight_trusts_a_steady_measurement():
+    assert nowcast_weight(_minutes([1500.0] * 15), 800.0, 1800.0) == 1.0
+
+
+def test_nowcast_weight_follows_inverse_variance_under_passing_clouds():
+    """A measurement swinging between cloud and sun says less about the next
+    quarter hour than Solcast's band, so the forecast weighs more."""
+
+    measured = _minutes([500.0, 1700.0] * 7 + [500.0])
+    var_forecast = ((1800.0 - 800.0) / (2 * stats.norm.ppf(0.9))) ** 2
+    var_measured = measured.std() ** 2
+
+    weight = nowcast_weight(measured, 800.0, 1800.0)
+
+    assert weight == pytest.approx(var_forecast / (var_forecast + var_measured))
+    assert weight < 0.5

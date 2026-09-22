@@ -13,9 +13,11 @@ from domain.time import local_day_start, to_local_time
 from features.building import BuildingLumpedIdentifier, BuildingThermalIdentifier
 from features.dataset import DatasetBuilder, DatasetLoader
 from features.solar import (
+    NOWCAST_SPREAD_WINDOW,
     PREDICT_STEP_MINUTES,
     SolarBiasIdentifier,
     nowcast_solar,
+    nowcast_weight,
     predict_solar,
     predict_solar_band,
 )
@@ -70,7 +72,16 @@ class StateManager:
 
         state = self._map(df, self.load(), config=config)
 
-        self._predict_solar(state, now)
+        recent_solar = self.loader.load(
+            DatasetBuilder()
+            .timeseries("pv_production", config.solar, aggregation="mean")
+            .build(),
+            now - NOWCAST_SPREAD_WINDOW,
+            now,
+        )
+        self._predict_solar(
+            state, now, recent_solar.set_index("time")["pv_production"]
+        )
         self._simulate_building(state, config, now)
 
         self.state_repository.save(state)
@@ -187,7 +198,9 @@ class StateManager:
 
         return results[0], results[1]
 
-    def _predict_solar(self, state: State, now: datetime) -> None:
+    def _predict_solar(
+        self, state: State, now: datetime, recent_solar: pd.Series
+    ) -> None:
         """Builds state.predictions.solar and its calibrated p10/p90 band from
         the live Solcast forecast curves and whatever SolarBiasIdentifier last
         calibrated, so the MPC optimizer and the dashboard chart always see a
@@ -211,26 +224,13 @@ class StateManager:
         step = timedelta(minutes=PREDICT_STEP_MINUTES)
         nowcast = self._current_quarter_nowcast(state.measurements.solar, now)
 
-        def from_now(series: pd.Series) -> pd.Series:
-            # Only quarter hours that haven't ended. The running one - the step
-            # the optimizer acts on - takes the measurement-based estimate where
-            # there is one, in all three solar scenarios alike: its spread over
-            # the next few minutes is not calibrated.
-            series = series[series.index > now - step]
-
-            if nowcast is not None and nowcast[0] in series.index:
-                series = series.copy()
-                series[nowcast[0]] = nowcast[1]
-
-            return series
-
         p50 = predict_solar(
             identifier.model,
             self._future_series(forecast.p50, now),
             self.latitude,
             self.longitude,
         )
-        state.predictions.solar = self._series_points(from_now(p50))
+        p10 = p90 = None
 
         if forecast.p10 and forecast.p90:
             p10, p90 = predict_solar_band(
@@ -239,6 +239,37 @@ class StateManager:
                 self._future_series(forecast.p90, now),
                 now,
             )
+
+        # Without a calibrated band there is no forecast variance to weigh the
+        # measurement against, so it stands alone.
+        weight = 1.0
+
+        if (
+            nowcast is not None
+            and p10 is not None
+            and p90 is not None
+            and nowcast[0] in p10.index
+            and nowcast[0] in p90.index
+        ):
+            weight = nowcast_weight(recent_solar, p10[nowcast[0]], p90[nowcast[0]])
+
+        def from_now(series: pd.Series) -> pd.Series:
+            # Only quarter hours that haven't ended. The running one - the step
+            # the optimizer acts on - combines the measurement-based estimate
+            # with each scenario's own forecast (see nowcast_weight).
+            series = series[series.index > now - step]
+
+            if nowcast is not None and nowcast[0] in series.index:
+                series = series.copy()
+                series[nowcast[0]] = (
+                    weight * nowcast[1] + (1 - weight) * series[nowcast[0]]
+                )
+
+            return series
+
+        state.predictions.solar = self._series_points(from_now(p50))
+
+        if p10 is not None and p90 is not None:
             state.predictions.solar_p10 = self._series_points(from_now(p10))
             state.predictions.solar_p90 = self._series_points(from_now(p90))
         else:
