@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from domain.config import HeatPumpStates
 from domain.models import HeatPumpCOPModel
 from domain.physics import CP_WATER_J_PER_KG_K, RHO_WATER_KG_PER_L
 from features.cop import HeatPumpCOPIdentifier
@@ -73,7 +74,7 @@ def test_calibrate_recovers_known_parameters_and_ignores_other_modes():
 
     df = pd.concat([sww_df, heating_df], ignore_index=True)
 
-    identifier = HeatPumpCOPIdentifier(mode=SWW_STATE, key="dhw")
+    identifier = HeatPumpCOPIdentifier(key="dhw")
     model = identifier.calibrate(df)
 
     assert model.eta_carnot == pytest.approx(TRUE_ETA_CARNOT, rel=0.1)
@@ -116,7 +117,7 @@ def test_q_th_line_fit_recovers_a_known_linear_thermal_output():
     T_supply = np.linspace(35.0, 60.0, 50)
     df = _power_rows(T_supply, 7000.0 - 20.0 * (T_supply - 35.0))
 
-    identifier = HeatPumpCOPIdentifier(mode=SWW_STATE, key="dhw")
+    identifier = HeatPumpCOPIdentifier(key="dhw")
     low, high = identifier._fit_q_th_line(df, TRUE_COP_MODEL)
 
     assert low == pytest.approx(7100.0)
@@ -132,7 +133,7 @@ def test_q_th_line_fit_ignores_compressor_start_up_readings():
     start_up = _power_rows(np.linspace(20.0, 34.0, 30), 2000.0)
     df = pd.concat([start_up, running], ignore_index=True)
 
-    identifier = HeatPumpCOPIdentifier(mode=SWW_STATE, key="dhw")
+    identifier = HeatPumpCOPIdentifier(key="dhw")
     low, high = identifier._fit_q_th_line(df, TRUE_COP_MODEL)
 
     assert low == pytest.approx(6500.0)
@@ -142,11 +143,19 @@ def test_q_th_line_fit_ignores_compressor_start_up_readings():
 def test_q_th_line_fit_is_flat_when_supply_temperature_does_not_vary():
     df = _power_rows(np.full(20, 50.0), 6000.0)
 
-    identifier = HeatPumpCOPIdentifier(mode=SWW_STATE, key="dhw")
+    identifier = HeatPumpCOPIdentifier(key="dhw")
     low, high = identifier._fit_q_th_line(df, TRUE_COP_MODEL)
 
     assert low == pytest.approx(6000.0)
     assert high == pytest.approx(6000.0)
+
+
+def _after_start_up(df: pd.DataFrame) -> pd.DataFrame:
+    """df with the same mode entered STARTUP before its first row."""
+
+    entry = df.iloc[[0]].assign(time=df["time"].iloc[0] - HeatPumpCOPIdentifier.STARTUP)
+
+    return pd.concat([entry, df], ignore_index=True)
 
 
 def test_prepare_excludes_rows_where_the_booster_heater_is_active():
@@ -157,21 +166,24 @@ def test_prepare_excludes_rows_where_the_booster_heater_is_active():
     otherwise looks.
     """
 
-    times = pd.date_range("2026-01-01T10:00:00Z", periods=2, freq="5min")
-    df = pd.DataFrame(
-        {
-            "time": times,
-            "T_outdoor": [10.0, 10.0],
-            "T_supply": [45.0, 45.0],
-            "T_return": [40.0, 40.0],
-            "flow_lpm": [12.0, 12.0],
-            "P_el": [1500.0, 1500.0],
-            "state": [SWW_STATE, SWW_STATE],
-            "booster": ["off", "on"],
-        }
+    # Past the compressor's start-up (see STARTUP), which prepare() drops.
+    times = pd.date_range("2026-01-01T10:15:00Z", periods=2, freq="5min")
+    df = _after_start_up(
+        pd.DataFrame(
+            {
+                "time": times,
+                "T_outdoor": [10.0, 10.0],
+                "T_supply": [45.0, 45.0],
+                "T_return": [40.0, 40.0],
+                "flow_lpm": [12.0, 12.0],
+                "P_el": [1500.0, 1500.0],
+                "state": [SWW_STATE, SWW_STATE],
+                "booster": ["off", "on"],
+            }
+        )
     )
 
-    identifier = HeatPumpCOPIdentifier(mode=SWW_STATE, key="dhw")
+    identifier = HeatPumpCOPIdentifier(key="dhw")
     prepared = identifier.prepare(df)
 
     assert len(prepared) == 1
@@ -184,24 +196,49 @@ def test_prepare_does_not_filter_on_booster_when_not_configured():
     rows filtered on this basis.
     """
 
-    times = pd.date_range("2026-01-01T10:00:00Z", periods=2, freq="5min")
-    df = pd.DataFrame(
-        {
-            "time": times,
-            "T_outdoor": [10.0, 10.0],
-            "T_supply": [45.0, 45.0],
-            "T_return": [40.0, 40.0],
-            "flow_lpm": [12.0, 12.0],
-            "P_el": [1500.0, 1500.0],
-            "state": [SWW_STATE, SWW_STATE],
-        }
+    times = pd.date_range("2026-01-01T10:15:00Z", periods=2, freq="5min")
+    df = _after_start_up(
+        pd.DataFrame(
+            {
+                "time": times,
+                "T_outdoor": [10.0, 10.0],
+                "T_supply": [45.0, 45.0],
+                "T_return": [40.0, 40.0],
+                "flow_lpm": [12.0, 12.0],
+                "P_el": [1500.0, 1500.0],
+                "state": [SWW_STATE, SWW_STATE],
+            }
+        )
     )
 
-    identifier = HeatPumpCOPIdentifier(mode=SWW_STATE, key="dhw")
+    identifier = HeatPumpCOPIdentifier(key="dhw")
     prepared = identifier.prepare(df)
 
     assert len(prepared) == 2
 
+
+def test_prepare_drops_the_compressor_start_up_and_unknown_outdoor_readings():
+    """The COP formula describes steady operation, so the first STARTUP after
+    entering the mode is left out - again after every new entry. So is a
+    reading with no outdoor temperature yet: back-filling one invented it
+    (real data: 45 days at the first value ever recorded)."""
+
+    times = pd.date_range("2026-01-01T10:00:00Z", periods=10, freq="5min")
+    df = pd.DataFrame(
+        {
+            "time": times,
+            "temperature": [np.nan] + [10.0] * 9,
+            "T_supply": [45.0] * 10,
+            "T_return": [40.0] * 10,
+            "flow_lpm": [12.0] * 10,
+            "P_el": [1500.0] * 10,
+            "state": [SWW_STATE] * 5 + ["Uit"] + [SWW_STATE] * 4,
+        }
+    )
+
+    prepared = HeatPumpCOPIdentifier(key="dhw").prepare(df)
+
+    assert prepared["time"].tolist() == [times[3], times[4], times[9]]
 
 
 def test_prepare_filters_to_the_configured_mode_only():
@@ -211,11 +248,28 @@ def test_prepare_filters_to_the_configured_mode_only():
     heating_df = _simulate(rng, HEATING_STATE, t_supply=35.0)
     df = pd.concat([sww_df, heating_df], ignore_index=True)
 
-    identifier = HeatPumpCOPIdentifier(mode=SWW_STATE, key="dhw")
+    identifier = HeatPumpCOPIdentifier(key="dhw")
     prepared = identifier.prepare(df)
 
     assert (prepared["state"] == SWW_STATE).all()
     assert len(prepared) <= len(sww_df)
+
+
+def test_prepare_uses_the_configured_state_labels():
+    """Another installation reports its modes in its own words."""
+
+    rng = np.random.default_rng(5)
+    df = pd.concat(
+        [_simulate(rng, "DHW", t_supply=50.0), _simulate(rng, "Heat", t_supply=35.0)],
+        ignore_index=True,
+    )
+
+    identifier = HeatPumpCOPIdentifier(key="heating")
+    identifier.states = HeatPumpStates(dhw="DHW", heating="Heat")
+    prepared = identifier.prepare(df)
+
+    assert not prepared.empty
+    assert (prepared["state"] == "Heat").all()
 
 
 def test_prepare_bridges_a_brief_reporting_gap_while_active_but_zeroes_when_idle():
@@ -251,7 +305,7 @@ def test_prepare_bridges_a_brief_reporting_gap_while_active_but_zeroes_when_idle
     # full prepare(): the idle row's resolved value is exactly 0, which
     # prepare()'s own validity filter (flow_lpm/P_el must be > 0) would
     # otherwise strip before it could be inspected.
-    identifier = HeatPumpCOPIdentifier(mode=SWW_STATE, key="dhw")
+    identifier = HeatPumpCOPIdentifier(key="dhw")
     bridged = identifier._bridge_reporting_gaps(df)
 
     active_gap = bridged[bridged["time"] == times[1]].iloc[0]
@@ -268,7 +322,7 @@ def test_validate_reports_low_error_on_matching_synthetic_data():
 
     df = _simulate(rng, SWW_STATE, t_supply=50.0)
 
-    identifier = HeatPumpCOPIdentifier(mode=SWW_STATE, key="dhw")
+    identifier = HeatPumpCOPIdentifier(key="dhw")
     identifier.calibrate(df)
     metrics = identifier.validate(df)
 
@@ -321,7 +375,7 @@ def test_validate_scores_the_planning_power_line_against_measured_power():
         }
     )
 
-    identifier = HeatPumpCOPIdentifier(mode=SWW_STATE, key="dhw")
+    identifier = HeatPumpCOPIdentifier(key="dhw")
     identifier.calibrate(df)
     result = identifier.validate(df)
 
@@ -342,7 +396,7 @@ def test_validate_flags_delta_t_pinned_at_bound(caplog):
     rng = np.random.default_rng(11)
     df = _simulate(rng, SWW_STATE, t_supply=50.0)
 
-    identifier = HeatPumpCOPIdentifier(mode=SWW_STATE, key="dhw")
+    identifier = HeatPumpCOPIdentifier(key="dhw")
     identifier.calibrate(df)
 
     # Force the exact pinned-at-bound condition directly, rather than
@@ -369,7 +423,7 @@ def test_validate_does_not_flag_delta_t_away_from_bounds():
     rng = np.random.default_rng(11)
     df = _simulate(rng, SWW_STATE, t_supply=50.0)
 
-    identifier = HeatPumpCOPIdentifier(mode=SWW_STATE, key="dhw")
+    identifier = HeatPumpCOPIdentifier(key="dhw")
     identifier.calibrate(df)
     result = identifier.validate(df)
 
@@ -379,8 +433,8 @@ def test_validate_does_not_flag_delta_t_away_from_bounds():
 
 
 def test_name_and_label_are_key_specific():
-    sww = HeatPumpCOPIdentifier(mode=SWW_STATE, key="dhw")
-    heating = HeatPumpCOPIdentifier(mode=HEATING_STATE, key="heating")
+    sww = HeatPumpCOPIdentifier(key="dhw")
+    heating = HeatPumpCOPIdentifier(key="heating")
 
     assert sww.name != heating.name
     assert sww.label != heating.label

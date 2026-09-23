@@ -2,12 +2,11 @@ import pandas as pd
 
 from domain.models import BoilerThermalModel
 from domain.mpc import MPCConfig, MPCInput
-from domain.physics import CP_WATER_J_PER_KG_K, RHO_WATER_KG_PER_L
 from features.boiler import BoilerThermalIdentifier, booster_active
 from features.cop import HeatPumpCOPIdentifier
 from features.optimizer import MPCOptimizer
 
-SWW = BoilerThermalIdentifier.DHW_ACTIVE_STATE
+SWW = "SWW"
 
 
 def _run(frequency: list[float], flow: list[float]) -> pd.DataFrame:
@@ -86,24 +85,25 @@ def test_heat_pump_limit_and_booster_heat_are_identified_from_booster_runs():
 
 
 def test_cop_fit_excludes_booster_rows_recognised_without_a_sensor():
-    times = pd.date_range("2026-01-01T10:00:00Z", periods=3, freq="5min")
+    # The first three readings are the compressor's start-up, which prepare()
+    # drops on its own (see HeatPumpCOPIdentifier.STARTUP).
+    times = pd.date_range("2026-01-01T10:00:00Z", periods=6, freq="5min")
     df = pd.DataFrame(
         {
             "time": times,
-            "T_outdoor": [10.0] * 3,
-            "T_supply": [58.0] * 3,
-            "T_return": [53.0] * 3,
-            "flow_lpm": [18.5] * 3,
-            "P_el": [2000.0] * 3,
-            "state": [SWW] * 3,
-            "compressor_frequency": [40.0, 0.0, 30.0],
+            "T_outdoor": [10.0] * 6,
+            "T_supply": [58.0] * 6,
+            "T_return": [53.0] * 6,
+            "flow_lpm": [18.5] * 6,
+            "P_el": [2000.0] * 6,
+            "state": [SWW] * 6,
+            "compressor_frequency": [40.0] * 4 + [0.0, 30.0],
         }
     )
 
-    prepared = HeatPumpCOPIdentifier(mode=SWW, key="dhw").prepare(df)
+    prepared = HeatPumpCOPIdentifier(key="dhw").prepare(df)
 
-    assert times[1] not in set(prepared["time"])
-    assert len(prepared) == 2
+    assert prepared["time"].tolist() == [times[3], times[5]]
 
 
 BOOSTER_MODEL = BoilerThermalModel(
@@ -122,7 +122,9 @@ HORIZON = 24
 
 def test_booster_heats_above_the_heat_pump_limit_and_only_there():
     target = [10.0] * HORIZON
-    target[20] = 60.0
+    # Below the maximum, as a real legionella target is: a target at the
+    # thermostat's own cut-out could only be met at the moment it cuts out.
+    target[20] = 59.0
     data = MPCInput(
         solar_forecast_w=[0.0] * HORIZON,
         ambient_temperature=20.0,
@@ -132,23 +134,19 @@ def test_booster_heats_above_the_heat_pump_limit_and_only_there():
         target_temperature_top=tuple(target),
     )
 
-    config = MPCConfig()
-    result = MPCOptimizer(BOOSTER_MODEL, config).solve(data)
+    result = MPCOptimizer(BOOSTER_MODEL, MPCConfig()).solve(data)
     temperatures = result.temperatures
     # Only the booster can have raised the tank above the heat pump's own limit.
     above_the_limit = [t for t in temperatures if t > 55.0 + 1e-6]
-    # It cannot modulate, so the step it is cut out in may overshoot by its own
-    # full heat input.
-    booster_step_k = (
-        BOOSTER_MODEL.booster_heat_w
-        * config.step_hours
-        * 3600.0
-        / (RHO_WATER_KG_PER_L * BOOSTER_MODEL.volume_l * CP_WATER_J_PER_KG_K)
-    )
+    heated = [i for i, heat_w in enumerate(result.heat_w) if heat_w > 0.0]
 
-    assert temperatures[20] >= 60.0 - 1e-6
+    assert temperatures[20] >= 59.0 - 1e-6
     assert above_the_limit
-    assert max(temperatures) <= BOOSTER_MODEL.max_tank_temperature_c + booster_step_k
+    # The thermostat cuts the booster out at the maximum, and it takes over in
+    # the very step the heat pump reaches its limit: one run, no idle step
+    # between the two.
+    assert max(temperatures) <= BOOSTER_MODEL.max_tank_temperature_c + 1e-6
+    assert heated == list(range(heated[0], heated[-1] + 1))
 
 
 def test_the_booster_cannot_start_a_run_by_itself():

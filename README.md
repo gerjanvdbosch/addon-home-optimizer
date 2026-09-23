@@ -202,6 +202,12 @@ actions:
                 ["19:00", 10.0]
               ]
             }
+            "states": {
+              "off": "Uit", 
+              "dhw": "SWW", 
+              "heating": "Verwarmen", 
+              "cooling": "Koelen"
+            },
           },
           "building": {
             "thermostat": {

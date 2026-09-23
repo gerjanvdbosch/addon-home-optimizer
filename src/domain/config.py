@@ -56,6 +56,25 @@ class BoilerConfig(BaseModel):
     target_temperature: float | list[tuple[time, float]] = Field()
 
 
+class HeatPumpStates(BaseModel):
+    """The values heat_pump.state reports for each operating mode, which differ
+    per brand and language. The defaults are this Ecodan's Dutch labels.
+
+    Each is matched exactly, as a whitelist: supply, return and flow are shared
+    by the tank and the floor circuit, so a mode that is not recognised must
+    count as neither rather than be taken for one of them.
+    """
+
+    # The only value trusted as "compressor definitely off", where a stale
+    # flow or power reading is reset to 0.
+    off: str = Field(default="Uit")
+    # Heat goes to the hot water tank.
+    dhw: str = Field(default="SWW")
+    # Heat goes to (or, cooling, is taken from) the floor circuit.
+    heating: str = Field(default="Verwarmen")
+    cooling: str = Field(default="Koelen")
+
+
 class HeatPumpConfig(BaseModel):
     state: SensorReference = Field()
     power: SensorReference = Field()
@@ -81,6 +100,7 @@ class HeatPumpConfig(BaseModel):
     # planning has to use for the future in any case.
     outdoor_temperature: SensorReference | None = Field(default=None)
     boiler: BoilerConfig = Field()
+    states: HeatPumpStates = Field(default_factory=HeatPumpStates)
 
 
 class SouthGlazing(BaseModel):

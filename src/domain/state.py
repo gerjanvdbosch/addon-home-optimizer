@@ -9,7 +9,7 @@ from typing import Generic, TypeVar
 
 from pydantic import BaseModel, Field
 
-from domain.models import ForecasterType, HeatPumpMode
+from domain.models import ForecasterType
 
 P = TypeVar("P")
 
@@ -26,7 +26,6 @@ class BoilerMeasurement(BaseModel):
 
 
 class HeatPumpMeasurement(BaseModel):
-    mode: HeatPumpMode = "heat"
     state: list[SeriesPoint[str]] = Field(default_factory=list)
     power: list[SeriesPoint[float]] = Field(default_factory=list)
     supply_temperature: list[SeriesPoint[float]] = Field(default_factory=list)

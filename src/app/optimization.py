@@ -92,15 +92,14 @@ class Optimization:
         # None if cop_dhw hasn't been calibrated yet (load() warns and leaves
         # it unset rather than raising) - MPCOptimizer falls back to the flat
         # boiler_electrical_power_w assumption in that case.
-        cop_identifier = HeatPumpCOPIdentifier(
-            mode=BoilerThermalIdentifier.DHW_ACTIVE_STATE, key="dhw"
-        )
+        cop_identifier = HeatPumpCOPIdentifier(key="dhw")
         cop_identifier.load(path=self.models_path)
         cop_model = cop_identifier.model
 
+        dhw_state = config.heat_pump.states.dhw
         heat_pump_state = state.measurements.heat_pump.state
         boiler_on_current = bool(heat_pump_state) and (
-            heat_pump_state[-1].value == BoilerThermalIdentifier.DHW_ACTIVE_STATE
+            heat_pump_state[-1].value == dhw_state
         )
 
         # From the first quarter hour of the trailing run of COMPRESSOR
@@ -121,7 +120,7 @@ class Optimization:
         }
 
         def compressor_running(point) -> bool:
-            if point.value != BoilerThermalIdentifier.DHW_ACTIVE_STATE:
+            if point.value != dhw_state:
                 return False
 
             # Without a frequency reading the state is all there is, and
@@ -152,7 +151,7 @@ class Optimization:
             idle_start = heat_pump_state[-1].time if heat_pump_state else None
 
             for point in reversed(heat_pump_state):
-                if point.value == BoilerThermalIdentifier.DHW_ACTIVE_STATE:
+                if point.value == dhw_state:
                     break
                 idle_start = point.time
 

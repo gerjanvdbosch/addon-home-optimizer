@@ -152,7 +152,18 @@ class AttributeSeriesLoader(DataLoader):
         start: datetime,
         end: datetime,
     ) -> pd.DataFrame:
-        sensors = self.resolver.resolve_attributes(definition.sensor)
+        # Only the attributes asked for: each is a query of its own, and the
+        # state asks for one of Open-Meteo's twelve.
+        attributes = dict(definition.sensor.attributes.items())
+        sensors = {
+            name: self.resolver.resolve(
+                SensorReference(
+                    entity_id=definition.sensor.entity_id,
+                    attribute=attributes[name],
+                )
+            )
+            for name in definition.attributes
+        }
 
         time_sensor = self.resolver.resolve(
             SensorReference(

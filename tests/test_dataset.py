@@ -37,13 +37,9 @@ class _Influx:
 
 class _Resolver:
     def resolve(self, sensor):
-        return InfluxSensor(measurement="°C", entity_id="forecast", field="time")
-
-    def resolve_attributes(self, sensor):
-        return {
-            name: InfluxSensor(measurement="°C", entity_id="forecast", field=name)
-            for name in sensor.attributes
-        }
+        return InfluxSensor(
+            measurement="°C", entity_id="forecast", field=sensor.attribute
+        )
 
 
 def _load(influx) -> list[tuple[datetime, float]]:

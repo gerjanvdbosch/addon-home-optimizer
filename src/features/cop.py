@@ -1,4 +1,5 @@
 import logging
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -9,7 +10,7 @@ from sklearn.metrics import (
     r2_score,
 )
 
-from domain.config import Config
+from domain.config import Config, HeatPumpStates
 from domain.dataset import DatasetDefinition
 from domain.models import HeatPumpCOPModel
 from domain.physics import CP_WATER_J_PER_KG_K, RHO_WATER_KG_PER_L
@@ -34,8 +35,9 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
     differences relevant to the optimizer's costing - hence one instance per
     mode rather than one shared model.
 
-    HEATING MODES ONLY ("SWW", "Verwarmen"). This does not describe cooling,
-    and instantiating it with mode="Koelen" was tried and removed. Two
+    HEATING MODES ONLY (HeatPumpStates.dhw and .heating). This does not
+    describe cooling, and an instance for the cooling mode was tried and
+    removed. Two
     independent reasons: prepare() requires delta_t_water = T_supply - T_return
     to be positive, which it never is while cooling (the supply is the colder
     side), so every genuine cooling row is discarded and only transitional
@@ -49,13 +51,6 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
     """
 
     TRAIN_RATIO = 0.80
-
-    # Whitelist, not a blacklist of "anything that isn't self.mode" (same
-    # principle as BoilerThermalIdentifier.DHW_ACTIVE_STATE): the only state
-    # confirmed_idle below may trust as "compressor definitely off" - a
-    # different active mode should not be forced to 0 here even though this
-    # instance's own mode filter excludes it anyway.
-    HEAT_PUMP_OFF_STATE = "Uit"
 
     MIN_FLOW_LPM = 0.0
     # Watts, not kW - matches the rest of this codebase's convention (e.g.
@@ -109,7 +104,10 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
     # a physical sanity check only; validate()'s pinned-at-bound warning is
     # the correct, permanent way to surface that delta_t_evap (and by
     # extension eta_carnot) is not reliably identified from this data, not
-    # something to be tuned away.
+    # something to be tuned away. The chase itself came from the data, not
+    # the model: start-up readings (see STARTUP) and a back-filled outdoor
+    # temperature (see prepare()). Without them the same 90 days settle at
+    # 16 +/- 1.5 K, well inside the bound.
     MIN_DELTA_T_EVAP = 0.5
     MAX_DELTA_T_EVAP = 20.0
     INITIAL_DELTA_T_EVAP = 5.0
@@ -137,18 +135,31 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
     # interval, so more than two missing readings in a row means the
     # compressor stopped in between.
     RUN_GAP = pd.Timedelta(minutes=15)
+    # The COP formula describes a compressor in steady operation. For the first
+    # quarter hour after entering a mode it is not: the compressor ramps up
+    # and the water circuit warms, so Q_th is still climbing (real DHW data,
+    # median per 5 minutes since entering SWW: 2.1, 4.5 and 5.8 kW, then a
+    # steady 6.6-7.0 kW - the boiler's own identified ramp is ~13 minutes).
+    # Left in, those readings pulled delta_t_evap onto its upper bound; left
+    # out from 15 minutes on, it settles at 12-14 K whether the cut is at 15,
+    # 20 or 25 minutes.
+    STARTUP = pd.Timedelta(minutes=15)
 
-    def __init__(self, mode: str, key: str) -> None:
+    def __init__(self, key: Literal["dhw", "heating"]) -> None:
         super().__init__()
-        # The heat_pump.state value this instance's data is filtered to (e.g.
-        # BoilerThermalIdentifier.DHW_ACTIVE_STATE for SWW) - see prepare().
-        self.mode = mode
-        # Short, stable identifier slug (e.g. "dhw") independent of the raw HA
-        # state string - name()/label() derive from this, not from `mode`
-        # directly, so the identifier's own name doesn't change if the HA
-        # entity's state string ever does.
+        # Which HeatPumpStates mode this instance fits, and its stable name
+        # (see name()): independent of the raw state label, so a model keeps
+        # its name when that label is configured differently.
         self.key = key
+        # The configured state labels; overwritten by dataset().
+        self.states = HeatPumpStates()
         self.parameter_std_errors: dict[str, float] | None = None
+
+    @property
+    def mode(self) -> str:
+        """The heat_pump.state value this instance's data is filtered to."""
+
+        return getattr(self.states, self.key)
 
     @property
     def name(self) -> str:
@@ -175,7 +186,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         """
 
         df = df.copy()
-        is_off = df["state"] == self.HEAT_PUMP_OFF_STATE
+        is_off = df["state"] == self.states.off
 
         for column in ["P_el", "flow_lpm"]:
             df[column] = df[column].ffill()
@@ -200,14 +211,18 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         # target times, so it matches at most 1 in 12 of these 5-minute rows
         # exactly - forward-filling holds that hourly value for the following
         # readings, a reasonable approximation since outdoor air temperature
-        # changes slowly relative to an hour. A duplicate 5-minute reading can
+        # changes slowly relative to an hour. Only forward: readings from before
+        # the first outdoor temperature have none and are dropped below.
+        # Back-filling gave them the first value ever recorded - on real data
+        # half of all DHW readings, 45 days of them, at one and the same
+        # 22.6 degC. A duplicate 5-minute reading can
         # still occur if the outdoor-temperature source reported more than one
         # overlapping forecast for the same hour (a real possibility - see
         # AttributeTimeSeriesLoader, which returns the full snapshot history,
         # not just the latest); reduce back to one row per reading first.
         if "temperature" in df.columns:
             df = df.sort_values("time").drop_duplicates(subset="time", keep="last")
-            df["temperature"] = df["temperature"].ffill().bfill()
+            df["temperature"] = df["temperature"].ffill()
 
         df = df.rename(columns={"temperature": "T_outdoor"})
 
@@ -242,6 +257,11 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             )
 
         df = self._bridge_reporting_gaps(df)
+
+        # Before any reading is dropped, so a run's start is its real start.
+        running = df["state"] == self.mode
+        entered = df["time"].where(running & ~running.shift(fill_value=False))
+        start_up = running & (df["time"] - entered.ffill() < self.STARTUP)
 
         df = df.dropna(subset=numeric_columns).copy()
 
@@ -280,6 +300,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         valid = (
             in_mode
             & ~booster
+            & ~start_up
             & (df["flow_lpm"] > self.MIN_FLOW_LPM)
             & (df["P_el"] > self.MIN_ELECTRICAL_POWER_W)
             & (df["delta_t_water"] > 0.0)
@@ -289,16 +310,18 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
 
         invalid_count = int((~valid).sum())
         booster_count = int((in_mode & booster).sum())
+        start_up_count = int((start_up & ~booster).sum())
 
         df = df.loc[valid].copy()
 
         logger.info(
             "Heat pump COP preparation (%s): %d valid points, %d points removed "
-            "(%d of them booster heater)",
+            "(%d of them booster heater, %d compressor start-up)",
             self.mode,
             len(df),
             invalid_count,
             booster_count,
+            start_up_count,
         )
 
         if df.empty:
@@ -784,6 +807,8 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         self,
         config: Config,
     ) -> DatasetDefinition:
+        self.states = config.heat_pump.states
+
         # Outdoor air temperature, not the boiler's own room-ambient sensor
         # (features/boiler.py's T_ambient, a different physical quantity): for
         # an air-water heat pump, the evaporator draws heat from outdoor air.

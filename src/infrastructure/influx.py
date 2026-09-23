@@ -99,14 +99,11 @@ class InfluxSensorResolver:
         if self.schema_loaded:
             return
 
-        measurements = self.db.query("SHOW MEASUREMENTS")
-
-        for measurement in measurements.get_points():
-            name = measurement["name"]
-
-            fields = self.db.query(f'SHOW FIELD KEYS FROM "{name}"')
-
-            for field in fields.get_points():
+        # One query for every measurement's fields: a job runs in a fresh
+        # process, so this runs once per job, and asking per measurement cost
+        # a query for each of this database's ~90.
+        for (name, _), fields in self.db.query("SHOW FIELD KEYS").items():
+            for field in fields:
                 self.schema.append(
                     InfluxSensor(
                         measurement=name,
@@ -150,10 +147,23 @@ class InfluxSensorResolver:
             return self.cache[cache_key]
 
         candidates = self._candidate_fields(attribute)
+        # Only the measurements this entity has series in, found from the index
+        # in one query. Trying every measurement with a matching field instead
+        # took one query each - ~70 for a plain "value" sensor, half a second
+        # per sensor and most of a state update's time.
+        measurements = {
+            point["name"]
+            for point in self.db.query(
+                f"SHOW MEASUREMENTS WHERE \"entity_id\" = '{entity_id}'"
+            ).get_points()
+        }
 
         for field_name in candidates:
             for influx_sensor in self.schema:
-                if influx_sensor.field != field_name:
+                if (
+                    influx_sensor.field != field_name
+                    or influx_sensor.measurement not in measurements
+                ):
                     continue
 
                 query = f"""

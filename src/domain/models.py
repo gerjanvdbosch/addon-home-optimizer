@@ -11,8 +11,6 @@ from typing import ClassVar, Literal
 
 import numpy as np
 
-HeatPumpMode = Literal["heat", "cool"]
-
 ForecasterType = Literal["baseload", "tap"]
 IdentificationType = Literal[
     "boiler",

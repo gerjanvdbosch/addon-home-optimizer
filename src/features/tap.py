@@ -7,7 +7,7 @@ from skforecast.preprocessing import CalendarFeatures
 from skforecast.recursive import ForecasterRecursive
 from sklearn.ensemble import HistGradientBoostingRegressor
 
-from domain.config import Config
+from domain.config import Config, HeatPumpStates
 from domain.dataset import DatasetDefinition
 from domain.jobs import ForecasterType
 from features.boiler import BoilerThermalIdentifier
@@ -49,6 +49,9 @@ class TapForecaster(SkforecastForecaster):
 
     def __init__(self, models_path: Path) -> None:
         self.models_path = models_path
+        # The configured state labels, handed to the boiler identifier this
+        # trains on; overwritten by dataset().
+        self.states = HeatPumpStates()
         super().__init__()
 
     @property
@@ -151,6 +154,7 @@ class TapForecaster(SkforecastForecaster):
 
     def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
         identifier = BoilerThermalIdentifier()
+        identifier.states = self.states
         identifier.load(self.models_path)
 
         if identifier.model is None:
@@ -195,6 +199,7 @@ class TapForecaster(SkforecastForecaster):
         return super().prepare(merged)
 
     def dataset(self, config: Config) -> DatasetDefinition:
+        self.states = config.heat_pump.states
         builder = (
             DatasetBuilder()
             .timeseries(

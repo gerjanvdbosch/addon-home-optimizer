@@ -17,8 +17,6 @@ from domain.models import (
 )
 from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.physics import (
-    CP_WATER_J_PER_KG_K,
-    RHO_WATER_KG_PER_L,
     lumped_tank_state_space,
     zone_observation,
     zone_state_space,
@@ -335,22 +333,11 @@ class MPCOptimizer:
         )
 
         # The tank cannot get hotter than whichever source can heat it: the
-        # boiler's maximum plus the single booster step it may be cut out in
-        # (it cannot modulate), or the heat pump's own limit without it - nor
-        # colder at the start than it already is.
-        # Over the longest step, not the shortest: beyond fine_horizon_hours a
-        # step spans a whole coarse block, and a bound that only fits a 15-minute
-        # booster step would rule the booster out there entirely - a far-away
-        # legionella target then looked unreachable and the plan pre-heated a day
-        # early instead.
-        booster_step_k = (
-            (booster_heat_w or 0.0)
-            * max(plan.dt_hours)
-            * 3600.0
-            / (RHO_WATER_KG_PER_L * self.thermal_model.volume_l * CP_WATER_J_PER_KG_K)
-        )
+        # boiler's maximum, where the tank's thermostat cuts the booster out, or
+        # the heat pump's own limit without it - nor colder at the start than it
+        # already is.
         if booster_possible:
-            reachable_c = max_tank_c + booster_step_k
+            reachable_c = max_tank_c
         elif heat_pump_max_c is not None:
             reachable_c = min(heat_pump_max_c, max_tank_c)
         else:
@@ -386,13 +373,24 @@ class MPCOptimizer:
         # the tank reaches its setpoint (published per run - see
         # app.optimization), or modulates down near its tank limit (real data:
         # ~7 kW at 36-47 degC, ~3 kW at 55 degC).
-        model.q_heat_pump_w = pyo.Var(
-            model.K, bounds=(0.0, self._heat_w)
-        )
+        model.q_heat_pump_w = pyo.Var(model.K, bounds=(0.0, self._heat_w))
 
-        # The booster heater is a resistive element: it cannot modulate, so it is
-        # all-or-nothing at its identified rating.
+        # The booster heater is a resistive element: it cannot modulate, so while
+        # it runs it heats at its identified rating. Its heat per step is still
+        # continuous, for the same reason as the heat pump's: the tank's
+        # thermostat cuts it out at the boiler's maximum partway through a step,
+        # and it takes over from the heat pump partway through one (see
+        # heat_source_constraints). As a whole-step decision it could do
+        # neither: a 1-hour look-ahead block overshot the maximum by 7 K, and a
+        # heat pump reaching its limit early in a step left the rest of that
+        # step empty before the booster started - a gap the real run never has.
         model.booster_on = pyo.Var(model.K, domain=pyo.Binary)
+        model.q_booster_w = pyo.Var(model.K, bounds=(0.0, booster_heat_w or 0.0))
+
+        # Whether anything heats the tank in a step, 0 or 1 even in a step both
+        # sources share: the bounds below leave no other value once boiler_on
+        # and booster_on are decided, so it needs no integrality of its own.
+        model.tank_heating = pyo.Var(model.K, bounds=(0.0, 1.0))
 
         model.slack = pyo.Var(model.K, domain=pyo.NonNegativeReals)
 
@@ -485,7 +483,20 @@ class MPCOptimizer:
         # all (see the continuation rule in heat_source_constraints), so nothing
         # is lost by no longer pricing it.
         def heating(m: pyo.ConcreteModel, k: int):
-            return m.boiler_on[k] + m.booster_on[k]
+            return m.tank_heating[k]
+
+        model.tank_heating_constraint = pyo.ConstraintList()
+
+        for k in range(num_steps):
+            model.tank_heating_constraint.add(
+                model.tank_heating[k] >= model.boiler_on[k]
+            )
+            model.tank_heating_constraint.add(
+                model.tank_heating[k] >= model.booster_on[k]
+            )
+            model.tank_heating_constraint.add(
+                model.tank_heating[k] <= model.boiler_on[k] + model.booster_on[k]
+            )
 
         def compressor(m: pyo.ConcreteModel, k: int):
             return m.boiler_on[k] + m.space_on[k]
@@ -613,7 +624,7 @@ class MPCOptimizer:
                 == a_d[0, 0] * model.T[k]
                 + b_d[0, 0] * float(data.ambient_temperature)
                 + b_d[0, 1] * model.q_heat_pump_w[k]
-                + b_d[0, 1] * (booster_heat_w or 0.0) * model.booster_on[k]
+                + b_d[0, 1] * model.q_booster_w[k]
                 + b_d[0, 2] * float(tap_w[k])
             )
 
@@ -639,7 +650,6 @@ class MPCOptimizer:
         # against a real optimum of 0.45 EUR, and a booster day took half a
         # minute to prove - the booster decisions being the hard part.
         model.heat_pump_temperature = pyo.Var(model.K)
-        model.booster_temperature = pyo.Var(model.K)
 
         def add_product(running_c, decision, k: int) -> None:
             for bound in (
@@ -649,6 +659,19 @@ class MPCOptimizer:
                 running_c >= model.T[k] - t_ceiling[k] * (1 - decision),
             ):
                 model.heat_source_constraints.add(bound)
+
+        def busy(k: int):
+            """The part of step k the tank's sources run. A heat pump starting
+            in it runs longer than its heat alone says: the ramp's shortfall
+            (see _ramp_fraction) is time, not heat. Only used where the booster
+            may run."""
+
+            return (
+                model.q_heat_pump_w[k] / self._heat_w
+                + (1.0 - self._ramp_fraction(plan.dt_hours[k]))
+                * model.compressor_start[k]
+                + model.q_booster_w[k] / booster_heat_w
+            )
 
         for k in range(num_steps):
             on = model.boiler_on[k]
@@ -692,37 +715,71 @@ class MPCOptimizer:
                 )
 
             # Fixed, not merely bounded to zero: a variable the solver can
-            # presolve away comes back without a value at all. Also where this
-            # step's ceiling shows the tank cannot be above the heat pump's limit
-            # yet - the booster could not run there in any plan.
+            # presolve away comes back without a value at all. Also where the
+            # ceiling at the step's end shows the tank cannot pass the heat
+            # pump's limit by then - the booster could not run there in any plan.
+            last = k + 1 == num_steps
             if (
                 not booster_possible
                 or heat_pump_max_c is None
-                or t_ceiling[k] < heat_pump_max_c
+                or t_ceiling[k if last else k + 1] < heat_pump_max_c
             ):
                 model.booster_on[k].fix(0)
-                model.booster_temperature[k].fix(0.0)
+                model.q_booster_w[k].fix(0.0)
                 continue
 
             booster = model.booster_on[k]
-            model.heat_source_constraints.add(on + booster <= 1)
-            # The booster only runs above the heat pump's limit and below the
-            # boiler's maximum, where the tank's thermostat cuts it out. Being
-            # all-or-nothing, it may overshoot within the step it is cut out in.
-            add_product(model.booster_temperature[k], booster, k)
             model.heat_source_constraints.add(
-                model.booster_temperature[k] >= heat_pump_max_c * booster
+                model.q_booster_w[k] <= booster_heat_w * booster
             )
+            # One tank, one source at a time: a step the two share is a
+            # handover, the heat pump for the part up to its limit and the
+            # booster for the rest.
+            model.heat_source_constraints.add(busy(k) <= 1)
+            # The booster only heats above the heat pump's limit: on its own, a
+            # step starts there; sharing one, the heat pump's part reaches it.
+            # Each slack is exactly the room between this step's own bound and
+            # that edge, so a rule says nothing unless the case it covers holds.
             model.heat_source_constraints.add(
-                model.booster_temperature[k] <= max_tank_c * booster
+                model.T[k]
+                >= heat_pump_max_c
+                - max(heat_pump_max_c - t_floor[k], 0.0) * (1 - booster + on)
             )
+
             # And only as the continuation of a run already heating: the booster
             # takes over from a compressor that cannot lift the tank any further,
             # it never starts a DHW run by itself.
             previous = (
                 float(data.boiler_on_current) if k == 0 else heating(model, k - 1)
             )
-            model.heat_source_constraints.add(booster <= previous)
+            model.heat_source_constraints.add(booster <= previous + on)
+
+            # Both sources heat until their setpoint, so a step the booster runs
+            # in on its own follows one with no idle time left - the run is one
+            # piece, as it really is.
+            if k > 0:
+                model.heat_source_constraints.add(busy(k - 1) >= booster - on)
+
+            if last:
+                continue
+
+            a_d, b_d = discretized(plan.dt_hours[k])
+            passive = b_d[0, 0] * ambient_c + b_d[0, 2] * float(tap_w[k])
+            model.heat_source_constraints.add(
+                a_d[0, 0] * model.heat_pump_temperature[k]
+                + passive * on
+                + b_d[0, 1] * model.q_heat_pump_w[k]
+                >= heat_pump_limit_c * on
+                - max(heat_pump_limit_c - a_d[0, 0] * t_floor[k] - passive, 0.0)
+                * (1 - booster)
+            )
+            # The tank's thermostat cuts the booster out at the boiler's maximum.
+            model.heat_source_constraints.add(
+                model.T[k + 1]
+                <= max_tank_c + max(t_ceiling[k + 1] - max_tank_c, 0.0) * (1 - booster)
+            )
+            # Once it has taken over, the compressor run is over.
+            model.heat_source_constraints.add(model.boiler_on[k + 1] + booster <= 1)
 
         # active_power_w[k, s] is the grid draw at step k if solar scenario s
         # comes true: max(0, electrical power - solar). One schedule is shared by
@@ -754,10 +811,7 @@ class MPCOptimizer:
 
         for k in range(num_steps):
             alpha, beta = power_lines[k]
-            unused = (
-                model.boiler_on[k]
-                - model.q_heat_pump_w[k] / self._heat_w
-            )
+            unused = model.boiler_on[k] - model.q_heat_pump_w[k] / self._heat_w
             heat_pump_power_w = (
                 alpha * model.boiler_on[k]
                 + beta * model.heat_pump_temperature[k]
@@ -780,13 +834,10 @@ class MPCOptimizer:
             # source against the whole sun separately let a few percent of both
             # run on it for free there, and the relaxation's bound stayed so far
             # below any real plan that a booster day took up to a minute.
-            electrical_w = (
-                heat_pump_power_w + (booster_heat_w or 0.0) * model.booster_on[k]
-            )
-            running = (
-                model.q_heat_pump_w[k] / self._heat_w
-                + model.booster_on[k]
-            )
+            electrical_w = heat_pump_power_w + model.q_booster_w[k]
+            running = model.q_heat_pump_w[k] / self._heat_w
+            if booster_heat_w:
+                running = running + model.q_booster_w[k] / booster_heat_w
 
             # Space heating draws through the same compressor. Its efficiency
             # is a per-step constant rather than a line in the zone's
@@ -796,9 +847,7 @@ class MPCOptimizer:
             # would need the heating COP model a heating season has to produce.
             if hasattr(model, "q_space_w"):
                 electrical_w = electrical_w + model.q_space_w[k] / model.space_cop[k]
-                running = (
-                    running + model.q_space_w[k] / self._heat_w
-                )
+                running = running + model.q_space_w[k] / self._heat_w
 
             for s, (_, solar_w) in enumerate(solar_scenarios):
                 solar_available_w = max(0.0, float(solar_w[k]))
@@ -974,9 +1023,7 @@ class MPCOptimizer:
         if self.cop_model is None or outdoor_c is None:
             # Same fallback the tank uses: a flat electrical assumption over
             # its nominal heat output.
-            return self._heat_w / max(
-                self.config.boiler_electrical_power_w, 1.0
-            )
+            return self._heat_w / max(self.config.boiler_electrical_power_w, 1.0)
 
         return float(self.cop_model.clamped_cop(outdoor_c, self.SPACE_HEATING_SUPPLY_C))
 
@@ -1220,19 +1267,14 @@ class MPCOptimizer:
         objective_value = float(pyo.value(model.objective))
 
         booster_heat_w = self.thermal_model.booster_heat_w or 0.0
-        booster_on_model = [
-            round(float(pyo.value(model.booster_on[k]))) for k in range(plan.num_steps)
+        # "On" whenever the boiler is actually heated, which for a coarse block
+        # is the part of it the run uses rather than the whole block (see
+        # fine_heat_w below). Reported any other way, the run would end where
+        # the block does and the setpoint published for it would be the tank's
+        # temperature at a moment the heat pump has long since stopped.
+        planned_on = [
+            round(float(pyo.value(model.tank_heating[m]))) for m in plan.fine_to_model
         ]
-        heat_w_model = [
-            float(pyo.value(model.q_heat_pump_w[k]))
-            + booster_heat_w * booster_on_model[k]
-            for k in range(plan.num_steps)
-        ]
-        # "On" whenever the boiler is heated, by either source.
-        schedule = tuple(
-            max(round(float(pyo.value(model.boiler_on[m]))), booster_on_model[m])
-            for m in plan.fine_to_model
-        )
 
         # Replayed at the input's own fine resolution using the
         # *un-aggregated* ambient/tap data - only the on/off decision is
@@ -1249,16 +1291,94 @@ class MPCOptimizer:
         initial_temperature = (data.current_temp_top + data.current_temp_bottom) / 2.0
         temperatures = [float(initial_temperature)]
 
-        for i in range(horizon - 1):
-            t = temperatures[-1]
+        # A coarse block the plan only partly uses is a run that stops inside
+        # it, not an hour at half power: each source runs at its own output
+        # until its setpoint and then stops (the heat pump's 6.6 kW or nothing),
+        # the heat pump first and the booster after it. Spreading the block's
+        # energy evenly instead reported a heat and an electrical draw the
+        # machine cannot produce, and gave the tank a slow drift where it really
+        # has a rise and then a coast. The energy over the block is the same
+        # either way - only where it lands inside it changes. Laid from the
+        # block's start, a run stays one piece: a block a run continues after is
+        # full (see heat_source_constraints). A single fine step keeps its
+        # average: there the part-used step IS the run's last step, which is how
+        # it was identified.
+        # The booster's thermostat also acts inside the block: a tap later in
+        # it is met by the booster switching on again, not by heat that was
+        # already put in before the tap and overshot the maximum.
+        identified_max_c = self.thermal_model.max_tank_temperature_c
+        max_tank_c = (
+            identified_max_c
+            if identified_max_c is not None
+            else DEFAULT_MAX_TANK_TEMPERATURE_C
+        )
+        heat_pump_w = [0.0] * horizon
+        booster_w = [0.0] * horizon
 
-            next_t = (
-                a_d[0, 0] * t
-                + b_d[0, 0] * float(data.ambient_temperature)
-                + b_d[0, 1] * heat_w_model[plan.fine_to_model[i]]
-                + b_d[0, 2] * float(tap_forecast_w[i])
+        for m in range(plan.num_steps):
+            slots = [i for i in range(horizon) if plan.fine_to_model[i] == m]
+            heat_pump_wh = float(pyo.value(model.q_heat_pump_w[m])) * plan.dt_hours[m]
+            booster_wh = float(pyo.value(model.q_booster_w[m])) * plan.dt_hours[m]
+            starts = round(float(pyo.value(model.compressor_start[m])))
+
+            for n, i in enumerate(slots):
+                passive = (
+                    a_d[0, 0] * temperatures[i]
+                    + b_d[0, 0] * float(data.ambient_temperature)
+                    + b_d[0, 2] * float(tap_forecast_w[i])
+                )
+
+                if len(slots) == 1:
+                    heat_pump_w[i] = heat_pump_wh / plan.dt_hours[m]
+                    booster_w[i] = booster_wh / plan.dt_hours[m]
+                else:
+                    # A block the compressor starts in loses its ramp where the
+                    # ramp happens, in the run's first quarter hour - the same
+                    # energy the block's own step lost to it (see
+                    # _ramp_fraction).
+                    rate_w = self._heat_w * (
+                        self._ramp_fraction(self.config.step_hours)
+                        if starts and n == 0
+                        else 1.0
+                    )
+                    hours = min(self.config.step_hours, heat_pump_wh / rate_w)
+                    heat_pump_w[i] = rate_w * hours / self.config.step_hours
+                    heat_pump_wh -= rate_w * hours
+
+                    booster_w[i] = (
+                        min(
+                            booster_heat_w * (self.config.step_hours - hours),
+                            booster_wh,
+                            max(max_tank_c - passive - b_d[0, 1] * heat_pump_w[i], 0.0)
+                            / b_d[0, 1]
+                            * self.config.step_hours,
+                        )
+                        / self.config.step_hours
+                    )
+                    booster_wh -= booster_w[i] * self.config.step_hours
+
+                if i + 1 < horizon:
+                    temperatures.append(
+                        float(passive + b_d[0, 1] * (heat_pump_w[i] + booster_w[i]))
+                    )
+
+        fine_heat_w = [hp + bo for hp, bo in zip(heat_pump_w, booster_w, strict=True)]
+
+        # Only inside a coarse block: there the plan's own step spans hours and
+        # the run stops inside it. A fine step is already the resolution the
+        # decision was made at, and its last one may legitimately carry no heat
+        # at all (the heat pump reached its setpoint), which is still part of
+        # the run the minimum runtime counts.
+        schedule = tuple(
+            int(
+                on
+                and (
+                    fine_heat_w[i] > 0.0
+                    or plan.dt_hours[plan.fine_to_model[i]] <= self.config.step_hours
+                )
             )
-            temperatures.append(float(next_t))
+            for i, on in enumerate(planned_on)
+        )
 
         temperatures = tuple(temperatures)
 
@@ -1271,11 +1391,6 @@ class MPCOptimizer:
         electrical_power_w = []
 
         for i in range(horizon):
-            if booster_on_model[plan.fine_to_model[i]]:
-                # Resistive element: electrical power equals its heat (COP 1).
-                electrical_power_w.append(booster_heat_w)
-                continue
-
             T_outdoor = (
                 data.outdoor_temperature_forecast[i]
                 if data.outdoor_temperature_forecast
@@ -1283,10 +1398,11 @@ class MPCOptimizer:
             )
             alpha, beta = self._power_line_coefficients(T_outdoor, overall_target_max)
             # For the part of the step the heat pump runs (see active_power_w).
-            used = (
-                heat_w_model[plan.fine_to_model[i]] / self._heat_w
+            # The booster is resistive: electrical power equals its heat (COP 1).
+            used = heat_pump_w[i] / self._heat_w
+            electrical_power_w.append(
+                (alpha + beta * temperatures[i]) * used + booster_w[i]
             )
-            electrical_power_w.append((alpha + beta * temperatures[i]) * used)
 
         # Empty when no space heating was planned, so a caller can tell "the
         # zone was left alone" from "the zone was planned to coast".
@@ -1305,8 +1421,7 @@ class MPCOptimizer:
             # What the thermostats would read, which is what comfort was
             # judged on (see zone_observation).
             zone_model = [
-                float(pyo.value(model.zone_measured(k)))
-                for k in range(plan.num_steps)
+                float(pyo.value(model.zone_measured(k))) for k in range(plan.num_steps)
             ]
 
             space_schedule = tuple(space_on_model[m] for m in plan.fine_to_model)
@@ -1317,7 +1432,7 @@ class MPCOptimizer:
             schedule=schedule,
             temperatures=temperatures,
             electrical_power_w=tuple(electrical_power_w),
-            heat_w=tuple(heat_w_model[m] for m in plan.fine_to_model),
+            heat_w=tuple(fine_heat_w),
             objective_value=objective_value,
             solver_status=str(termination_condition),
             termination_condition=str(termination_condition),

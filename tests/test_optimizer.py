@@ -1274,3 +1274,41 @@ def test_without_an_identified_ramp_every_step_is_a_full_one():
     assert result.heat_w[heating[0]] == pytest.approx(
         THERMAL_MODEL.q_in_nominal_w, rel=0.02
     )
+
+
+def test_a_coarse_block_reports_a_real_run_not_an_averaged_one():
+    """Inside an hour-long look-ahead block the heat pump still runs the way it
+    does: at its own output until it stops, not for an hour at a fraction of
+    it. The block's energy is the same either way - only where it lands inside
+    the block changes, and with it the tank's shape and the power reported.
+    """
+
+    horizon = 192
+    target = [10.0] * horizon
+    target[168] = 45.0
+
+    data = _make_input(
+        solar_forecast_w=[0.0] * horizon,
+        target_temperature_top=tuple(target),
+        current_temp_top=20.0,
+        current_temp_bottom=20.0,
+    )
+
+    optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig(), cop_model=COP_MODEL)
+    result = optimizer.solve(data)
+
+    coarse_on = [
+        k
+        for k, on in enumerate(result.schedule)
+        if on and k >= MPCConfig().fine_horizon_hours / MPCConfig().step_hours
+    ]
+    assert coarse_on, "expected the plan to heat in the coarse region"
+
+    heats = [result.heat_w[k] for k in coarse_on]
+    # Its own output, until the run's last step which carries what is left.
+    assert heats[0] == pytest.approx(THERMAL_MODEL.q_in_nominal_w, rel=0.01)
+    assert all(
+        earlier >= later - 1e-6
+        for earlier, later in zip(heats, heats[1:], strict=False)
+    )
+    assert all(heat > 0.0 for heat in heats)

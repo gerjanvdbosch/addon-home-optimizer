@@ -23,9 +23,8 @@ import numpy as np
 import pandas as pd
 from pvlib import irradiance, solarposition
 from scipy.optimize import least_squares
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-from domain.config import Config
+from domain.config import Config, HeatPumpStates
 from domain.dataset import DatasetDefinition
 from domain.dynamics import discretize_zoh, kalman_states
 from domain.models import BuildingLumpedModel, BuildingThermalModel
@@ -155,20 +154,6 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     the envelope loss. The fit needs both, and validate() reports each regime
     separately so one cannot hide a poor result in the other.
     """
-
-    # Whitelist, not a blacklist of "anything that isn't Uit": during "SWW" and
-    # "Legionellapreventie" the three-way valve sends the same measured flow to
-    # the DHW tank, not to the floor circuit, so those states must read as zero
-    # heat into the building. Only states that actually drive the floor belong
-    # here. "Verwarmen" is listed although this installation has not logged it
-    # yet - the model is the same either way, and a heating run must not be
-    # silently dropped once one occurs.
-    SPACE_ACTIVE_STATES = ("Koelen", "Verwarmen")
-
-    # The only state prepare()'s flow-gap bridging may trust as "compressor
-    # definitely off" - same principle and same value as
-    # BoilerThermalIdentifier.HEAT_PUMP_OFF_STATE.
-    HEAT_PUMP_OFF_STATE = "Uit"
 
     # A flow reading must be strictly positive to mean anything physically.
     MIN_FLOW_LPM = 0.0
@@ -310,6 +295,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         self.room_areas_m2: list[float] = []
         self.shutter_columns: list[str] = []
         self.presence_columns: list[str] = []
+        self.states = HeatPumpStates()
         self.parameter_std_errors: dict[str, float] | None = None
 
     @property
@@ -579,14 +565,12 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # a gap means - identical reasoning to
         # BoilerThermalIdentifier._bridge_flow_reporting_gaps.
         flow = df["flow_lpm"].ffill()
-        df["flow_lpm"] = flow.where(
-            df["state"] != self.HEAT_PUMP_OFF_STATE, 0.0
-        ).fillna(0.0)
+        df["flow_lpm"] = flow.where(df["state"] != self.states.off, 0.0).fillna(0.0)
 
         # Heat only reaches the floor circuit while the heat pump is actually
         # serving the space; during SWW the same flow goes to the tank instead.
         measurable = (
-            df["state"].isin(self.SPACE_ACTIVE_STATES)
+            df["state"].isin((self.states.heating, self.states.cooling))
             & (df["flow_lpm"] > self.MIN_FLOW_LPM)
             & df["T_supply"].notna()
             & df["T_return"].notna()
@@ -1005,6 +989,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     ) -> float:
         """How much of persistence's error the model removes, 0 = no better."""
 
+        from sklearn.metrics import mean_absolute_error
+
         baseline = float(mean_absolute_error(measured, persistence))
 
         if baseline <= 0.0:
@@ -1020,6 +1006,11 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         how well the data determined it, and is reported here too, but it is
         never evidence that the model is physically right.
         """
+
+        # Imported here, not at the top: the state update loads this module
+        # every few minutes for estimate() and forecast() alone, and sklearn
+        # was a third of its import time.
+        from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
         model = self.get_model()
 
@@ -1424,6 +1415,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
     def dataset(self, config: Config) -> DatasetDefinition:
         self.room_areas_m2 = [room.area_m2 for room in config.building.rooms]
+        self.states = config.heat_pump.states
         # Derived, not configured: the same areas already drive the weighting.
         self.volume_m3 = sum(self.room_areas_m2) * config.building.ceiling_height
         self.glazing_areas_m2 = [

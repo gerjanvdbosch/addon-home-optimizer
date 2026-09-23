@@ -10,7 +10,7 @@ from sklearn.metrics import (
     r2_score,
 )
 
-from domain.config import Config
+from domain.config import Config, HeatPumpStates
 from domain.dataset import DatasetDefinition
 from domain.dynamics import discretize_zoh
 from domain.models import BoilerThermalModel
@@ -208,23 +208,9 @@ def _rollout(
 
 
 class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
-    # "SWW" (sanitair warm water) is the only DHW-active value observed in this
-    # installation's state sensor; T_supply/T_return/flow_lpm are shared with the
-    # space-heating circuit, so boiler_on must whitelist this value rather than
-    # blacklist "Uit" - a hypothetical space-heating state string must NOT be read as
-    # boiler heat input.
-    DHW_ACTIVE_STATE = "SWW"
-
     # A flow reading must be strictly positive to mean anything physically (a real
     # minimum, not a fitted threshold).
     MIN_FLOW_LPM = 0.0
-
-    # Whitelist, not a blacklist of "anything that isn't SWW" (same principle
-    # as DHW_ACTIVE_STATE above): the only state prepare()'s flow-gap bridging
-    # may trust as "compressor definitely off" - a hypothetical space-heating
-    # state must not be forced to 0 here either, even though this identifier's
-    # own calorimetric override is separately gated on boiler_on regardless.
-    HEAT_PUMP_OFF_STATE = "Uit"
 
     TRAIN_RATIO = 0.80
 
@@ -283,7 +269,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
     # Home Assistant device_tracker convention: only an explicit "not_home" state or
     # (as InfluxDB actually exports these specific trackers) a numeric 0.0 is
     # trusted as confirmed away - whitelist, not blacklist, the same principle as
-    # DHW_ACTIVE_STATE. A custom zone name could reflect a GPS-accuracy artifact
+    # HeatPumpStates. A custom zone name could reflect a GPS-accuracy artifact
     # while someone is still actually home, and anything else (including
     # "unknown"/"unavailable" or a missing/NaN reading) means the tracker itself is
     # unreliable right now - none of those may be read as "away", since this
@@ -349,6 +335,9 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         # overwritten by dataset() once available. Empty means no trackers
         # configured, or prepare()/calibrate() called directly without dataset().
         self.presence_columns: list[str] = []
+        # The configured state labels (see HeatPumpStates); overwritten by
+        # dataset() like the volume above.
+        self.states = HeatPumpStates()
         # Set by calibrate() whenever a calorimetric mean anchors
         # q_in_nominal_w's bounds (see MIN_CALORIMETRIC_Q_IN_SAMPLES); checked
         # by validate() to report whether the fit is pinned at that boundary.
@@ -380,7 +369,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
         df = df.copy()
         df["flow_lpm"] = pd.to_numeric(df["flow_lpm"], errors="coerce")
-        is_off = df["state"] == self.HEAT_PUMP_OFF_STATE
+        is_off = df["state"] == self.states.off
 
         df["flow_lpm"] = df["flow_lpm"].ffill()
         df["flow_lpm"] = df["flow_lpm"].where(~is_off, 0.0)
@@ -417,7 +406,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
         df = df[df["dt_seconds"] > 0].copy()
 
-        df["boiler_on"] = df["state"] == self.DHW_ACTIVE_STATE
+        df["boiler_on"] = df["state"] == self.states.dhw
 
         if "flow_lpm" in df.columns:
             df = self._bridge_flow_reporting_gaps(df)
@@ -425,7 +414,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         # Booster heat still reaches the tank through the coil (it heats the
         # primary water), so the calorimetric override below covers it - this
         # only tells the two heat sources apart (see _identify_booster).
-        df["booster_on"] = booster_active(df, self.DHW_ACTIVE_STATE)
+        df["booster_on"] = booster_active(df, self.states.dhw)
 
         # Calorimetric heat input: Q = (rho*cp/60) * flow_lpm * max(T_supply -
         # T_return, 0) replaces the fitted constant Q_in_nominal_w wherever
@@ -465,8 +454,10 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             valid = df["boiler_on"] & (flow_lpm > self.MIN_FLOW_LPM)
 
             q_calorimetric_w = (
-                (RHO_WATER_KG_PER_L / 60.0) * CP_WATER_J_PER_KG_K
-            ) * flow_lpm * delta_t_water
+                ((RHO_WATER_KG_PER_L / 60.0) * CP_WATER_J_PER_KG_K)
+                * flow_lpm
+                * delta_t_water
+            )
 
             df["q_in_override_w"] = q_calorimetric_w.where(valid)
         else:
@@ -589,9 +580,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         boiler_on = train_df["boiler_on"].to_numpy(dtype=bool)
         dt_seconds = train_df["dt_seconds"].to_numpy(dtype=float)
         q_in_override = train_df["q_in_override_w"].to_numpy(dtype=float)
-        confirmed_away_settled = train_df["confirmed_away_settled"].to_numpy(
-            dtype=bool
-        )
+        confirmed_away_settled = train_df["confirmed_away_settled"].to_numpy(dtype=bool)
 
         # q_in_nominal_w is only ever USED (see _resolve_q_in) on heating
         # timesteps lacking a valid calorimetric override - wherever the
@@ -1766,6 +1755,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
     def dataset(self, config: Config) -> DatasetDefinition:
         self.volume_l = float(config.heat_pump.boiler.volume)
+        self.states = config.heat_pump.states
         self.presence_columns = [f"presence_{i}" for i in range(len(config.presence))]
 
         builder = (
