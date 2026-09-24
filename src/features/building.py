@@ -27,13 +27,12 @@ from scipy.optimize import least_squares
 from domain.config import Config, HeatPumpStates
 from domain.dataset import DatasetDefinition
 from domain.dynamics import discretize_zoh, kalman_states
-from domain.models import BuildingLumpedModel, BuildingThermalModel
+from domain.models import BuildingThermalModel
 from domain.physics import (
     CP_AIR_J_PER_KG_K,
     RHO_AIR_KG_PER_M3,
     floor_heat_w,
     internal_gain_w,
-    lumped_zone_state_space,
     solar_gain_w,
     two_node_zone_state_space,
     zone_observation,
@@ -202,9 +201,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # that argument possible at all. It also has to be large relative to the
     # 0.03 K sensor noise, because the model is demonstrably the less reliable
     # of the two: below roughly 1 kW the filter starts trusting the model over
-    # the thermometer and both structures get worse. Above it the two-node
-    # result is flat across two orders of magnitude, so nothing here hinges on
-    # the exact number - the tests check that.
+    # the thermometer and the result gets worse. Above it the result is flat
+    # across two orders of magnitude, so nothing here hinges on the exact
+    # number - the tests check that.
     PROCESS_NOISE_W = 3000.0
 
     # Standard MAD-to-std conversion for a normal distribution, used to set the
@@ -382,9 +381,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
     @staticmethod
     def _state_space(model) -> tuple[np.ndarray, np.ndarray]:
-        """The structure this identifier fits. Overridden by the single-node
-        variant; everything else in this class is shared between the two.
-        """
+        """The structure this identifier fits."""
 
         return two_node_zone_state_space(model)
 
@@ -621,8 +618,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         Rebuilt per fit iteration because two of the four depend on identified
         parameters (the effective aperture and the in-zone baseload fraction).
-        Takes the model rather than the raw parameter vector, so both the
-        two-node and the single-node structure feed it the same way.
+        Takes the model rather than the raw parameter vector.
         """
 
         q_solar = solar_gain_w(
@@ -1347,6 +1343,34 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         wrong problem.
         """
 
+        zone, last = self._trajectory(df, now, baseload_w)
+
+        return zone.iloc[last:]
+
+    def trajectory(
+        self,
+        df: pd.DataFrame,
+        now: datetime,
+        baseload_w: pd.Series | None = None,
+    ) -> pd.DataFrame:
+        """The zone over the whole frame, indexed by time: the filter's estimate
+        of every state up to now, then the free-running forecast from there (see
+        forecast()), with the measured zone temperature and the gains beside
+        them. One filter pass serves both halves - what a plan starts from and
+        is driven by, and the history it is drawn against.
+        """
+
+        zone, _ = self._trajectory(df, now, baseload_w)
+
+        return zone
+
+    def _trajectory(
+        self,
+        df: pd.DataFrame,
+        now: datetime,
+        baseload_w: pd.Series | None,
+    ) -> tuple[pd.DataFrame, int]:
+
         model = self.get_model()
         prepared = self.prepare(df)
 
@@ -1398,20 +1422,30 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             dt_seconds=dt_seconds[last:],
         )
 
-        names = ["air", "mass"][: simulated.shape[1]]
+        # The rollout starts from the filter's last estimate, so the two join
+        # without a seam.
+        states = np.vstack([estimates[:last], simulated])
+        names = ["air", "mass"][: states.shape[1]]
 
-        forecast = pd.DataFrame(
-            simulated[:, : len(names)],
+        zone = pd.DataFrame(
+            states[:, : len(names)],
             columns=names,
-            index=prepared["time"].to_numpy()[last:],
+            index=prepared["time"].to_numpy(),
         )
 
         # What a thermostat would read of it, which is the only column that
         # can be drawn against - or scored on - the measurement (see
-        # zone_observation). For one node that is the node itself.
-        forecast["reading"] = simulated @ zone_observation(model)
+        # zone_observation).
+        zone["reading"] = states @ zone_observation(model)
+        zone["measured"] = np.where(
+            known, prepared["T_air"].to_numpy(dtype=float), np.nan
+        )
+        # The heat no decision changes, split by where it lands, for a plan to
+        # start from: the same gains the rollout was driven by.
+        zone["internal_gain_w"] = inputs[:, 1]
+        zone["solar_gain_w"] = inputs[:, 2]
 
-        return forecast
+        return zone, last
 
     def dataset(self, config: Config) -> DatasetDefinition:
         self.room_areas_m2 = [room.area_m2 for room in config.building.rooms]
@@ -1541,111 +1575,3 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             )
 
         return builder.build()
-
-
-class BuildingLumpedIdentifier(BuildingThermalIdentifier):
-    """Identifies the single-node form of the same zone.
-
-    Deliberately a subclass: the dataset, the input assembly, the rollout
-    windowing and every diagnostic are identical, and only the structure and
-    its parameters differ. Running both against the same data is the point -
-    `skill_vs_persistence` and `implausible_aperture` then say which structure
-    the data actually supports, rather than the choice being an assumption.
-
-    On cooling-season data this one wins clearly: 0.11 K against 0.36 K over
-    six-hour rollouts, positive skill against persistence where the two-node
-    model scores -1.24, and an effective aperture of 50% of the glass area
-    where the two-node model reports a physically impossible 6%. That is not
-    evidence the two-node structure is wrong - floor heating really does lag -
-    but that this data, with the floor circuit active in 2.4% of quarter hours,
-    cannot identify it.
-    """
-
-    # No hidden state to settle: the single node IS the measured temperature,
-    # so a rollout can be anchored on it directly. The two-node model needs a
-    # day of lead-in for its unmeasured mass node; this one needs none, which
-    # also makes far shorter gap-free stretches usable.
-    MASS_WARMUP_HOURS = 0.0
-
-    PARAMETER_NAMES = (
-        "ua_w_per_k",
-        "c_j_per_k",
-        "a_eff_m2",
-        "internal_gain_fraction",
-    )
-
-    # One node has to hold everything that stores heat, so its capacity spans
-    # the two-node model's air and mass bounds combined: from a light structure
-    # to a heavy one. The lower bound is the zone's own air, derived from the
-    # configured volume as before, and never asserted in Joules.
-    # One node, so an unmodelled flow has only one place to go, whichever
-    # channel it arrives through.
-    DISTURBANCE_INPUTS = (1,)
-
-    MIN_C_J_PER_K = 2.0e6
-    MAX_C_J_PER_K = 60.0e6
-    INITIAL_C_J_PER_K = 20.0e6
-
-    @property
-    def name(self) -> str:
-        return "building_lumped"
-
-    @property
-    def label(self) -> str:
-        return "Room temperature (single node)"
-
-    @staticmethod
-    def _state_space(model) -> tuple[np.ndarray, np.ndarray]:
-        return lumped_zone_state_space(model)
-
-    @staticmethod
-    def _parameters(model: BuildingLumpedModel) -> np.ndarray:
-        return np.array(
-            [
-                model.ua_w_per_k,
-                model.c_j_per_k,
-                model.a_eff_m2,
-                model.internal_gain_fraction,
-            ]
-        )
-
-    def _model_from_parameters(self, x: np.ndarray) -> BuildingLumpedModel:
-        return BuildingLumpedModel(
-            ua_w_per_k=float(x[0]),
-            c_j_per_k=float(x[1]),
-            a_eff_m2=float(x[2]),
-            internal_gain_fraction=float(x[3]),
-        )
-
-    def _bounds(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if self.volume_m3 <= 0.0:
-            raise ValueError(
-                "building.ceiling_height and building.rooms "
-                "areas must be configured: the node's heat capacity bounds are "
-                "derived from the zone's air volume, not assumed."
-            )
-
-        air_capacity = RHO_AIR_KG_PER_M3 * self.volume_m3 * CP_AIR_J_PER_KG_K
-        max_aperture = max(sum(self.glazing_areas_m2), self.MIN_F_SCALE)
-
-        lower = np.array(
-            [
-                self.MIN_UA_ENVELOPE_W_PER_K,
-                max(self.MIN_C_J_PER_K, air_capacity),
-                0.0,
-                0.0,
-            ]
-        )
-        upper = np.array(
-            [self.MAX_UA_ENVELOPE_W_PER_K, self.MAX_C_J_PER_K, max_aperture, 1.0]
-        )
-        initial = np.array(
-            [
-                self.INITIAL_UA_ENVELOPE_W_PER_K,
-                self.INITIAL_C_J_PER_K,
-                self.INITIAL_APERTURE_FRACTION * max_aperture,
-                self.INITIAL_INTERNAL_GAIN_FRACTION,
-            ]
-        )
-
-        return lower, np.clip(initial, lower, upper), upper

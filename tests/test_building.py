@@ -1,4 +1,4 @@
-import dataclasses
+import functools
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
@@ -8,19 +8,17 @@ import pytest
 
 from domain.config import Config
 from domain.dynamics import discretize_zoh, kalman_states
-from domain.models import BuildingLumpedModel, BuildingThermalModel
+from domain.models import BuildingThermalModel
 from domain.physics import (
     CP_AIR_J_PER_KG_K,
     Q_PERSON_SENSIBLE_W,
     RHO_AIR_KG_PER_M3,
     floor_heat_w,
-    lumped_zone_state_space,
     solar_gain_w,
     two_node_zone_state_space,
     zone_observation,
-    zone_state_space,
 )
-from features.building import BuildingLumpedIdentifier, BuildingThermalIdentifier
+from features.building import BuildingThermalIdentifier
 
 TRUE_VOLUME_M3 = 120.0
 TRUE_ZONE_AREA_M2 = 46.0
@@ -218,6 +216,35 @@ def _simulate(rng: np.random.Generator) -> pd.DataFrame:
     raw["T_air"] = np.round(noisy / SENSOR_RESOLUTION_C) * SENSOR_RESOLUTION_C
 
     return raw
+
+
+@functools.cache
+def _fitted(with_future: bool):
+    """One fit, shared by every test that only needs a calibrated model: the
+    fit is the slow part, and nothing these tests check depends on it being
+    their own."""
+
+    if with_future:
+        df, now = _frame_with_future(np.random.default_rng(22))
+    else:
+        df, now = _simulate(np.random.default_rng(14)), None
+
+    identifier = _identifier()
+    identifier.calibrate(df)
+
+    return df, now, identifier.model, identifier.parameter_std_errors
+
+
+def _calibrated(with_future: bool = False):
+    """A calibrated identifier of its own - the model is copied, so a test may
+    break it - with the frame it was fitted on and, with_future, where now is."""
+
+    df, now, model, std_errors = _fitted(with_future)
+    identifier = _identifier()
+    identifier.model = replace(model)
+    identifier.parameter_std_errors = dict(std_errors or {})
+
+    return identifier, df.copy(), now
 
 
 def test_calibrate_recovers_known_parameters():
@@ -493,152 +520,6 @@ def test_validate_reports_positive_skill_for_the_calibrated_model():
     assert metrics["skill_vs_persistence"] > 0.0
 
 
-TRUE_LUMPED = BuildingLumpedModel(
-    ua_w_per_k=150.0,
-    c_j_per_k=20.0e6,
-    a_eff_m2=6.0,
-    internal_gain_fraction=0.6,
-)
-
-
-def _lumped_identifier() -> BuildingLumpedIdentifier:
-    identifier = BuildingLumpedIdentifier(latitude=52.39, longitude=5.79)
-    identifier.room_areas_m2 = [TRUE_ZONE_AREA_M2]
-    identifier.volume_m3 = TRUE_VOLUME_M3
-    identifier.glazing_areas_m2 = [TRUE_SOUTH_GLASS_M2]
-    identifier.shutter_areas_m2 = [TRUE_SOUTH_GLASS_M2]
-    identifier.shutter_columns = ["shutter_0"]
-    identifier.presence_columns = ["presence_0"]
-    return identifier
-
-
-def _simulate_lumped(rng: np.random.Generator) -> pd.DataFrame:
-    identifier = _lumped_identifier()
-    prepared = identifier.prepare(_raw_frame())
-    inputs = identifier._inputs(TRUE_LUMPED, prepared)
-
-    a_d, b_d = discretize_zoh(*lumped_zone_state_space(TRUE_LUMPED), DT_SECONDS)
-
-    state = np.array([21.0])
-    room = np.empty(len(prepared))
-
-    for i in range(len(prepared)):
-        room[i] = state[0]
-        state = a_d @ state + b_d @ inputs[i]
-
-    noisy = room + rng.normal(0.0, MEASUREMENT_NOISE_STD_C, len(room))
-
-    raw = _raw_frame()
-    raw["T_air"] = np.round(noisy / SENSOR_RESOLUTION_C) * SENSOR_RESOLUTION_C
-
-    return raw
-
-
-def test_lumped_calibrate_recovers_known_parameters():
-    identifier = _lumped_identifier()
-
-    model = identifier.calibrate(_simulate_lumped(np.random.default_rng(10)))
-
-    assert model.ua_w_per_k == pytest.approx(TRUE_LUMPED.ua_w_per_k, rel=0.15)
-    assert model.c_j_per_k == pytest.approx(TRUE_LUMPED.c_j_per_k, rel=0.20)
-    assert model.a_eff_m2 == pytest.approx(TRUE_LUMPED.a_eff_m2, rel=0.15)
-    assert model.internal_gain_fraction == pytest.approx(
-        TRUE_LUMPED.internal_gain_fraction, abs=0.2
-    )
-
-
-def test_lumped_has_no_hidden_state_to_infer():
-    """The single state is the measured one, so the filter has nothing to infer.
-
-    That is the whole reason this structure exists: the two-node model's mass
-    node is never measured. Here a window starts from the filter's estimate of
-    the one state, which is the measurement with its quantisation noise partly
-    removed - close to it, but deliberately not identical.
-    """
-
-    identifier = _lumped_identifier()
-    df = _simulate_lumped(np.random.default_rng(11))
-    identifier.calibrate(df)
-
-    prepared = identifier.prepare(df)
-    plan = identifier._rollout_plan(prepared, float(prepared["dt_seconds"].median()))
-    predicted, measured, _, _ = identifier._simulate_windows(
-        identifier._parameters(identifier.model), prepared, plan
-    )
-
-    _, _, horizon = plan
-    anchors = np.arange(0, len(predicted), horizon)
-
-    # Within the sensor's own reporting step of what it measured - the filter
-    # smooths, it does not wander.
-    assert np.abs(predicted[anchors] - measured[anchors]).max() < (
-        identifier.SENSOR_RESOLUTION_K
-    )
-    # And the state space really is one-dimensional, so there is nothing else
-    # for the filter to estimate.
-    a, _ = identifier._state_space(identifier.model)
-    assert a.shape == (1, 1)
-
-
-def test_lumped_beats_persistence_on_its_own_dynamics():
-    identifier = _lumped_identifier()
-    df = _simulate_lumped(np.random.default_rng(12))
-    identifier.calibrate(df)
-
-    metrics = identifier.validate(df)
-
-    assert metrics["skill_vs_persistence"] > 0.0
-    assert metrics["implausible_aperture"] == 0.0
-
-
-def test_both_structures_share_one_dataset_definition():
-    """The two identifiers must request identical data, or their metrics would
-    not be comparable and the choice between them would mean nothing.
-    """
-
-    config = _config()
-
-    two_node = BuildingThermalIdentifier(latitude=52.39, longitude=5.79)
-    one_node = BuildingLumpedIdentifier(latitude=52.39, longitude=5.79)
-
-    assert [d.name for d in two_node.dataset(config).definitions] == [
-        d.name for d in one_node.dataset(config).definitions
-    ]
-    assert two_node.name != one_node.name
-
-
-def test_lumped_scores_from_the_very_first_window():
-    """No hidden state means no lead-in to discard.
-
-    The two-node model drops a day of windows while its unmeasured mass node
-    settles. Carrying that cost over to a structure whose only state is the
-    measurement would throw away usable data for nothing, and would keep short
-    gap-free stretches unusable.
-    """
-
-    two_node = _identifier()
-    one_node = _lumped_identifier()
-
-    assert two_node.MASS_WARMUP_HOURS > 0.0
-    assert one_node.MASS_WARMUP_HOURS == 0.0
-
-    df = _simulate_lumped(np.random.default_rng(13))
-    one_node.calibrate(df)
-
-    prepared = one_node.prepare(df)
-    median_dt = float(prepared["dt_seconds"].median())
-    runs, warmup, horizon = one_node._rollout_plan(prepared, median_dt)
-
-    assert warmup == 0
-
-    predicted, _, _, positions = one_node._simulate_windows(
-        one_node._parameters(one_node.model), prepared, (runs, warmup, horizon)
-    )
-
-    # Scoring starts at the first row of the first run, not a day later.
-    assert positions[0] == runs[0][0]
-
-
 def test_validate_splits_skill_by_regime():
     """An overall skill averages over two regimes with very different counts.
 
@@ -647,9 +528,7 @@ def test_validate_splits_skill_by_regime():
     there still reports a healthy headline figure.
     """
 
-    identifier = _lumped_identifier()
-    df = _simulate_lumped(np.random.default_rng(14))
-    identifier.calibrate(df)
+    identifier, df, _ = _calibrated()
 
     metrics = identifier.validate(df)
 
@@ -673,9 +552,7 @@ def test_validate_reports_too_few_active_windows_as_untested(caplog):
     "this model has not been tried".
     """
 
-    identifier = _lumped_identifier()
-    df = _simulate_lumped(np.random.default_rng(15))
-    identifier.calibrate(df)
+    identifier, df, _ = _calibrated()
 
     identifier.MIN_ACTIVE_WINDOWS = 10_000
 
@@ -689,14 +566,12 @@ def test_validate_reports_too_few_active_windows_as_untested(caplog):
 
 
 def test_validate_flags_a_model_that_cannot_predict_the_forced_response(caplog):
-    identifier = _lumped_identifier()
-    df = _simulate_lumped(np.random.default_rng(16))
-    identifier.calibrate(df)
+    identifier, df, _ = _calibrated()
 
     identifier.MIN_ACTIVE_WINDOWS = 1
     # Break only the coupling to delivered heat: free drift stays fine, the
     # response to the floor circuit does not.
-    identifier.model.c_j_per_k = identifier.MIN_C_J_PER_K
+    identifier.model.c_mass_j_per_k = identifier.MIN_C_MASS_J_PER_K
 
     with caplog.at_level("WARNING"):
         metrics = identifier.validate(df)
@@ -714,7 +589,7 @@ def test_zone_temperature_is_weighted_by_floor_area():
     the mean is weighted by the area each sensor stands for.
     """
 
-    identifier = _lumped_identifier()
+    identifier = _identifier()
     identifier.room_temperature_columns = ["room_temperature_0", "room_temperature_1"]
     identifier.room_areas_m2 = [36.0, 4.0]
 
@@ -729,7 +604,7 @@ def test_zone_temperature_is_weighted_by_floor_area():
 
 
 def test_a_dropped_out_sensor_drops_its_weight_too():
-    identifier = _lumped_identifier()
+    identifier = _identifier()
     identifier.room_temperature_columns = ["room_temperature_0", "room_temperature_1"]
     identifier.room_areas_m2 = [36.0, 4.0]
 
@@ -749,7 +624,7 @@ def test_volume_is_derived_from_the_zone_areas_and_ceiling_height():
     """
 
     config = _config()
-    identifier = BuildingLumpedIdentifier(latitude=52.39, longitude=5.79)
+    identifier = BuildingThermalIdentifier(latitude=52.39, longitude=5.79)
     identifier.dataset(config)
 
     expected = sum(room.area_m2 for room in config.building.rooms) * (
@@ -867,9 +742,7 @@ def test_envelope_trend_ignores_sunlit_windows():
     isolate the envelope.
     """
 
-    identifier = _lumped_identifier()
-    df = _simulate_lumped(np.random.default_rng(21))
-    identifier.calibrate(df)
+    identifier, df, _ = _calibrated()
 
     metrics = identifier.validate(df)
 
@@ -888,7 +761,7 @@ def test_envelope_trend_ignores_sunlit_windows():
 def _frame_with_future(rng: np.random.Generator) -> tuple[pd.DataFrame, datetime]:
     """A frame reaching past `now`, as the loader returns when asked for it."""
 
-    df = _simulate_lumped(rng)
+    df = _simulate(rng)
     # Every sensor column carries its last reading forward there, which is
     # exactly what the loader's fill="previous" produces.
     now = df["target_time"].iloc[len(df) * 3 // 4]
@@ -897,9 +770,7 @@ def _frame_with_future(rng: np.random.Generator) -> tuple[pd.DataFrame, datetime
 
 
 def test_forecast_starts_where_the_measurements_stop():
-    identifier = _lumped_identifier()
-    df, now = _frame_with_future(np.random.default_rng(22))
-    identifier.calibrate(df)
+    identifier, df, now = _calibrated(with_future=True)
 
     forecast = identifier.forecast(df, now)
 
@@ -908,17 +779,31 @@ def test_forecast_starts_where_the_measurements_stop():
     # It picks up from the filter, so the first value is what the filter had.
     estimated = identifier.estimate(df[df["target_time"] <= now])
     assert forecast["air"].iloc[0] == pytest.approx(estimated["air"].iloc[-1], abs=1e-6)
-    # One node, so what the thermostat reads is that node itself.
-    assert forecast["reading"].equals(forecast["air"])
+
+
+def test_trajectory_is_the_filter_until_now_and_the_forecast_after():
+    """One filter pass for both halves: what a plan starts from, and the
+    history the dashboard draws it against."""
+
+    identifier, df, now = _calibrated(with_future=True)
+
+    trajectory = identifier.trajectory(df, now)
+    forecast = identifier.forecast(df, now)
+    past = trajectory.index < forecast.index.min()
+
+    assert trajectory.loc[~past, "mass"].to_numpy() == pytest.approx(
+        forecast["mass"].to_numpy()
+    )
+    assert trajectory.loc[past, "measured"].notna().any()
+    assert trajectory.loc[trajectory.index > now, "measured"].isna().all()
 
 
 def test_two_node_forecast_carries_the_thermostat_reading():
     """The curve drawn against the measurement has to be the same quantity:
     with two nodes the thermostat reads part of the mass as well."""
 
-    identifier = _identifier()
-    df, now = _frame_with_future(np.random.default_rng(22))
-    identifier.model = replace(identifier.calibrate(df), sensor_mass_fraction=0.4)
+    identifier, df, now = _calibrated(with_future=True)
+    identifier.model = replace(identifier.model, sensor_mass_fraction=0.4)
 
     forecast = identifier.forecast(df, now)
 
@@ -933,9 +818,7 @@ def test_forecast_delivers_no_heat_to_the_zone():
     There is no decision in it, which is why it does not live in the optimizer.
     """
 
-    identifier = _lumped_identifier()
-    df, now = _frame_with_future(np.random.default_rng(23))
-    identifier.calibrate(df)
+    identifier, df, now = _calibrated(with_future=True)
 
     # Cooling runs in the synthetic frame, so a forecast that used them would
     # visibly pull the zone down.
@@ -952,9 +835,7 @@ def test_forecast_delivers_no_heat_to_the_zone():
 
 
 def test_forecast_needs_both_a_past_and_a_future():
-    identifier = _lumped_identifier()
-    df, _ = _frame_with_future(np.random.default_rng(24))
-    identifier.calibrate(df)
+    identifier, df, _ = _calibrated(with_future=True)
 
     with pytest.raises(ValueError, match="No future rows"):
         identifier.forecast(df, df["target_time"].max())
@@ -966,9 +847,7 @@ def test_forecast_needs_both_a_past_and_a_future():
 def test_forecast_uses_a_supplied_baseload_curve():
     """The baseload forecaster's own curve beats carrying one reading forward."""
 
-    identifier = _lumped_identifier()
-    df, now = _frame_with_future(np.random.default_rng(25))
-    identifier.calibrate(df)
+    identifier, df, now = _calibrated(with_future=True)
 
     prepared = identifier.prepare(df)
     high = pd.Series(5000.0, index=prepared["time"])
@@ -980,62 +859,8 @@ def test_forecast_uses_a_supplied_baseload_curve():
     assert boosted["air"].iloc[-1] > plain["air"].iloc[-1]
 
 
-def test_zone_state_space_serves_both_structures():
-    """One entry point, so a filter, a rollout or the MPC can drive whichever
-    structure was identified without knowing which one it holds.
-    """
-
-    lumped = BuildingLumpedModel(
-        ua_w_per_k=140.0,
-        c_j_per_k=20.0e6,
-        a_eff_m2=6.0,
-        internal_gain_fraction=0.6,
-    )
-
-    two_node_a, two_node_b = zone_state_space(TRUE_MODEL)
-    lumped_a, lumped_b = zone_state_space(lumped)
-
-    assert two_node_a.shape == (2, 2)
-    assert lumped_a.shape == (1, 1)
-    # Same input vector for both, which is what makes them interchangeable.
-    assert two_node_b.shape[1] == lumped_b.shape[1] == 4
-
-
-def test_a_perfectly_coupled_two_node_zone_is_the_single_node_one():
-    """The two-node structure contains the single-node one as a limit.
-
-    With the air and the mass locked together, the pair holds one temperature
-    and one combined capacity, and must then move exactly as a single node of
-    that capacity does. It is the check that the coupling was written into the
-    balance rather than added to it.
-    """
-
-    locked = dataclasses.replace(TRUE_MODEL, ua_air_mass_w_per_k=1.0e7)
-    combined = BuildingLumpedModel(
-        ua_w_per_k=TRUE_MODEL.ua_envelope_w_per_k,
-        c_j_per_k=TRUE_MODEL.c_air_j_per_k + TRUE_MODEL.c_mass_j_per_k,
-        a_eff_m2=TRUE_MODEL.a_eff_m2,
-        internal_gain_fraction=TRUE_MODEL.internal_gain_fraction,
-    )
-
-    two_node = discretize_zoh(*zone_state_space(locked), DT_SECONDS)
-    single = discretize_zoh(*zone_state_space(combined), DT_SECONDS)
-
-    inputs = np.array([5.0, 300.0, 400.0, 2000.0])
-    pair = np.array([20.0, 20.0])
-    one = np.array([20.0])
-
-    for _ in range(SAMPLES_PER_DAY):
-        pair = two_node[0] @ pair + two_node[1] @ inputs
-        one = single[0] @ one + single[1] @ inputs
-
-    assert pair[0] == pytest.approx(one[0], abs=1e-3)
-    assert pair[1] == pytest.approx(one[0], abs=1e-3)
-
-
 def test_observation_is_air_alone_without_a_radiant_share():
     assert zone_observation(TRUE_MODEL).tolist() == [1.0, 0.0]
-    assert zone_observation(TRUE_LUMPED).tolist() == [1.0]
 
 
 def test_observation_weighs_air_against_mass():

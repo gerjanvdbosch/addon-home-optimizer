@@ -11,9 +11,9 @@ from pyomo.contrib.appsi.solvers.highs import Highs
 from domain.dynamics import discretize_zoh
 from domain.models import (
     BoilerThermalModel,
-    BuildingLumpedModel,
     BuildingThermalModel,
     HeatPumpCOPModel,
+    SpaceHeatingModel,
 )
 from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.physics import (
@@ -72,7 +72,9 @@ class MPCOptimizer:
         thermal_model: BoilerThermalModel,
         config: MPCConfig,
         cop_model: HeatPumpCOPModel | None = None,
-        building_model: BuildingThermalModel | BuildingLumpedModel | None = None,
+        building_model: BuildingThermalModel | None = None,
+        space_heating_model: SpaceHeatingModel | None = None,
+        heating_cop_model: HeatPumpCOPModel | None = None,
     ) -> None:
         self.thermal_model = thermal_model
         self.config = config
@@ -83,12 +85,23 @@ class MPCOptimizer:
         # model that cannot predict their effect would be worse than not
         # planning them.
         self.building_model = building_model
+        # None until heating runs have shown how the heat pump runs the floor
+        # by itself (see features.space_heating). Until then a plan may put any
+        # heat up to the compressor's into the zone, in runs of any length.
+        self.space_heating_model = space_heating_model
+        # The COP fitted on the heat pump's own heating runs (cop_heating),
+        # None until there are any; space heating falls back to cop_model -
+        # the same Carnot model, fitted on hot water runs - until then.
+        self.heating_cop_model = heating_cop_model
         # None until a cop_dhw model has actually been calibrated (see
         # HeatPumpCOPIdentifier) - _power_line_coefficients() falls back to
         # the flat boiler_electrical_power_w assumption until then.
         self.cop_model = cop_model
 
     def solve(self, data: MPCInput) -> MPCResult:
+        """The optimal plan, or the best one found within
+        MPCConfig.solve_time_limit_s."""
+
         self._validate_input(data)
 
         model = self._build_model(data)
@@ -98,12 +111,33 @@ class MPCOptimizer:
             "mip_abs_gap": MIP_ABSOLUTE_GAP_EUR,
             "mip_rel_gap": 0.0,
         }
+        time_limit_s = self.config.solve_time_limit_s
+        solver.config.time_limit = time_limit_s
+        solver.config.load_solution = False
         results = solver.solve(model)
+        stopped_early = (
+            results.termination_condition == TerminationCondition.maxTimeLimit
+            and results.best_feasible_objective is not None
+        )
 
-        if results.termination_condition != TerminationCondition.optimal:
+        if (
+            results.termination_condition != TerminationCondition.optimal
+            and not stopped_early
+        ):
             raise RuntimeError(
                 "MPC optimization failed. Termination condition: "
                 f"{results.termination_condition}"
+            )
+
+        results.solution_loader.load_vars()
+
+        if stopped_early:
+            logger.info(
+                "MPC stopped at its %.0f s time limit: best plan %.3f EUR, at most "
+                "%.3f EUR from optimal",
+                time_limit_s,
+                results.best_feasible_objective,
+                results.best_feasible_objective - results.best_objective_bound,
             )
 
         return self._extract_result(model, data, results.termination_condition)
@@ -452,7 +486,9 @@ class MPCOptimizer:
             rule=end_temperature_rule,
         )
 
-        initial_boiler_on = int(data.boiler_on_current)
+        # The compressor runs now if it serves either demand: a plan that goes
+        # on heating the zone it is heating already makes no start.
+        initial_compressor_on = int(data.boiler_on_current or data.space_on_current)
 
         # Inequality, not equality: compressor_start must be 1 on a real 0->1
         # transition (RHS=1, forcing compressor_start[k]>=1), but on a 1->0 stop the
@@ -505,7 +541,9 @@ class MPCOptimizer:
 
         def startup_rule(m: pyo.ConcreteModel, k: int):
             if k == 0:
-                return m.compressor_start[k] >= (compressor(m, k) - initial_boiler_on)
+                return m.compressor_start[k] >= (
+                    compressor(m, k) - initial_compressor_on
+                )
 
             return m.compressor_start[k] >= (compressor(m, k) - compressor(m, k - 1))
 
@@ -522,7 +560,7 @@ class MPCOptimizer:
         model.start_exact = pyo.ConstraintList()
 
         for k in range(num_steps):
-            previous = initial_boiler_on if k == 0 else compressor(model, k - 1)
+            previous = initial_compressor_on if k == 0 else compressor(model, k - 1)
             model.start_exact.add(model.compressor_start[k] <= compressor(model, k))
             model.start_exact.add(model.compressor_start[k] <= 1 - previous)
 
@@ -1039,12 +1077,21 @@ class MPCOptimizer:
     def _space_cop(self, outdoor_c: float | None) -> float:
         """Coefficient of performance for space heating at one step."""
 
-        if self.cop_model is None or outdoor_c is None:
+        cop_model = self.heating_cop_model or self.cop_model
+
+        if cop_model is None or outdoor_c is None:
             # Same fallback the tank uses: a flat electrical assumption over
             # its nominal heat output.
             return self._heat_w / max(self.config.boiler_electrical_power_w, 1.0)
 
-        return float(self.cop_model.clamped_cop(outdoor_c, self.SPACE_HEATING_SUPPLY_C))
+        # At the supply the heat pump's own heating curve runs at, once known.
+        supply_c = (
+            self.space_heating_model.supply_c(outdoor_c)
+            if self.space_heating_model is not None
+            else self.SPACE_HEATING_SUPPLY_C
+        )
+
+        return float(cop_model.clamped_cop(outdoor_c, supply_c))
 
     def _add_space_heating(
         self,
@@ -1073,12 +1120,11 @@ class MPCOptimizer:
         # Missing it means the filter has not run, which is not something to
         # paper over with a guess - the zone is simply not planned, exactly as
         # when no model has been calibrated.
-        needs_mass = isinstance(building, BuildingThermalModel)
         planned = (
             building is not None
             and data.zone_temperature is not None
             and bool(data.zone_target_temperature)
-            and (not needs_mass or data.zone_mass_temperature is not None)
+            and data.zone_mass_temperature is not None
         )
 
         if not planned:
@@ -1087,10 +1133,14 @@ class MPCOptimizer:
 
             return
 
-        def compressor_of(m: pyo.ConcreteModel, k: int):
-            return m.boiler_on[k] + m.space_on[k]
-
         target_c = self._aggregate(data.zone_target_temperature, plan, max)
+        # min, the mirror of the target's max: a ceiling anywhere within a
+        # coarse block must hold for the whole block.
+        maximum_c = (
+            self._aggregate(data.zone_maximum_temperature, plan, min)
+            if data.zone_maximum_temperature
+            else None
+        )
 
         def gains(series: Sequence[float]) -> list[float]:
             # mean, not max: a gain is a rate, so a coarse block carries the
@@ -1114,25 +1164,21 @@ class MPCOptimizer:
         observation = zone_observation(building)
         num_states = a.shape[0]
 
-        # State 0 is the air temperature the thermostats measure and comfort is
-        # judged on, in both structures; any further state is the thermal mass,
-        # which only the two-node one has. Carrying the zone as a vector is
-        # what lets the MPC plan against whichever structure the data supports
-        # without a second copy of this block.
+        # State 0 is the air, state 1 the thermal mass - screed and internal
+        # walls - that the floor's heat lands in.
         model.ZONE_STATES = pyo.RangeSet(0, num_states - 1)
         model.zone_state = pyo.Var(model.K, model.ZONE_STATES)
         model.q_space_w = pyo.Var(model.K, bounds=(0.0, max_heat_w))
         model.zone_slack = pyo.Var(model.K, domain=pyo.NonNegativeReals)
+        model.zone_excess = pyo.Var(model.K, domain=pyo.NonNegativeReals)
 
         model.zone_constraints = pyo.ConstraintList()
         model.zone_constraints.add(
             model.zone_state[0, 0] == float(data.zone_temperature)
         )
-
-        if needs_mass:
-            model.zone_constraints.add(
-                model.zone_state[0, 1] == float(data.zone_mass_temperature)
-            )
+        model.zone_constraints.add(
+            model.zone_state[0, 1] == float(data.zone_mass_temperature)
+        )
 
         # Evaluated at a representative floor-circuit supply temperature and
         # the outdoor temperature of each step, so a cold day costs what a cold
@@ -1144,39 +1190,32 @@ class MPCOptimizer:
         ]
 
         discretized: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+        zone_outdoor_c = [
+            float(outdoor_c[k]) if outdoor_c else float(data.ambient_temperature)
+            for k in range(num_steps)
+        ]
 
-        # At most one tank block per compressor run. The three-way valve may
-        # hand over to the zone and back within a run, but once the tank stops
-        # being heated it is because it reached its target, so it will not need
-        # heating again before the compressor stops. Without this the plan
+        # A tank block only ever opens a compressor run; it never follows the
+        # zone within one. The three-way valve may hand over from the tank to
+        # the zone - the loop is then hotter than the floor needs, and that heat
+        # flows on into it - but not back: the loop would first have to be
+        # reheated from floor temperature to above the tank's, an estimated
+        # 0.4-0.5 kWh before the tank gains at all (see
+        # MPCConfig.heat_pump_min_off_steps). Without a rule here the plan
         # flapped the valve - five steps of tank, six of zone, then a single
-        # step of tank - which delivers almost nothing: a DHW start spends an
-        # estimated 0.4-0.5 kWh reheating the loop and coil before the tank
-        # gains at all (see MPCConfig.heat_pump_min_off_steps).
+        # step of tank.
         #
-        # dhw_done[k] latches once the tank stops and is only released when the
-        # compressor does.
-        model.dhw_done = pyo.Var(model.K, domain=pyo.Binary)
-        model.dhw_done[0].fix(0)
+        # It follows that every tank block is a compressor start, and that is
+        # stated too: in the solver's relaxation a fraction of a tank block
+        # otherwise came without one. Latching "the tank has had its turn"
+        # instead took a binary per step and a minute to prove a plan the solver
+        # had found in seconds; this proves the same plan in one.
+        model.zone_constraints.add(model.boiler_on[0] <= 1 - int(data.space_on_current))
 
         for k in range(1, num_steps):
-            # Set when the tank stops being heated.
+            model.zone_constraints.add(model.boiler_on[k] <= 1 - model.space_on[k - 1])
             model.zone_constraints.add(
-                model.dhw_done[k] >= model.boiler_on[k - 1] - model.boiler_on[k]
-            )
-            # Carried while the compressor keeps running.
-            model.zone_constraints.add(
-                model.dhw_done[k] >= model.dhw_done[k - 1] + compressor_of(model, k) - 1
-            )
-            # And it cannot be set for no reason, which would otherwise be a
-            # free way to rule the tank out of a run entirely.
-            model.zone_constraints.add(
-                model.dhw_done[k] <= model.dhw_done[k - 1] + model.boiler_on[k - 1]
-            )
-            # Having had its turn, the tank does not get a second one.
-            model.zone_constraints.add(
-                model.boiler_on[k]
-                <= 1 - model.dhw_done[k - 1] + (1 - compressor_of(model, k - 1))
+                model.compressor_start[k] >= model.boiler_on[k] - model.boiler_on[k - 1]
             )
 
         for k in range(num_steps):
@@ -1198,12 +1237,10 @@ class MPCOptimizer:
                 discretized[dt_hours] = discretize_zoh(a, b, dt_hours * 3600.0)
 
             a_d, b_d = discretized[dt_hours]
-            outdoor = (
-                float(outdoor_c[k]) if outdoor_c else float(data.ambient_temperature)
-            )
+            outdoor = zone_outdoor_c[k]
 
             # u = [T_outdoor, Q_internal, Q_solar, Q_floor], the same input
-            # vector both structures are identified with. Each state advances
+            # vector the zone is identified with. Each state advances
             # by its own row of the discrete matrices, so where a gain lands -
             # the air node or the mass node - is the model's to decide, not
             # this block's.
@@ -1219,8 +1256,8 @@ class MPCOptimizer:
                     + b_d[i, 3] * model.q_space_w[k]
                 )
 
-        # What a thermostat reads of the plan: the air alone for one node, an
-        # operative temperature for two (see zone_observation). Comfort is
+        # What a thermostat reads of the plan: an operative temperature, part
+        # air and part mass (see zone_observation). Comfort is
         # judged on it because that is the quantity the setpoint is set in and
         # the occupant feels, and because it is what the model was identified
         # against.
@@ -1232,18 +1269,147 @@ class MPCOptimizer:
 
         model.zone_measured = measured
 
+        # What a thermostat would read with the zone heated flat out every step,
+        # and with it left alone. A target above the first cannot be met by any
+        # plan, and sun alone may carry the zone past a ceiling below the
+        # second; those parts are the same whatever is decided, so they are left
+        # out and the slacks measure only what planning can still change - as
+        # for the tank's target. Priced at weight_temperature_slack, an
+        # unavoidable shortfall of a few hundredths of a degree had the solver
+        # proving plans to a millionth of one: over a minute for a plan it had
+        # found in seconds.
+        initial = np.array(
+            [float(data.zone_temperature), float(data.zone_mass_temperature)]
+        )
+
+        def states_with(heat_w: float) -> list[np.ndarray]:
+            state = initial
+            states = [state]
+
+            for k in range(num_steps - 1):
+                a_d, b_d = discretized[plan.dt_hours[k]]
+                inputs = np.array(
+                    [
+                        zone_outdoor_c[k],
+                        float(internal_gain_w[k]),
+                        float(solar_gain_w[k]),
+                        heat_w,
+                    ]
+                )
+                state = a_d @ state + b_d @ inputs
+                states.append(state)
+
+            return states
+
+        heated = states_with(max_heat_w)
+        unheated = states_with(0.0)
+        reachable_c = [float(observation @ state) for state in heated]
+        unheated_c = [float(observation @ state) for state in unheated]
+        tolerance_c = float(data.zone_comfort_tolerance_c)
+
         # Comfort at both ends of a step, for the same reason the tank's target
         # is checked at both: T[k] is the value at a step's START, and a coarse
         # look-ahead block is an hour long.
         for k in range(num_steps):
             model.zone_constraints.add(
-                measured(k) + model.zone_slack[k] >= float(target_c[k])
+                measured(k) + model.zone_slack[k]
+                >= min(float(target_c[k]) - tolerance_c, reachable_c[k])
             )
 
             if k + 1 < num_steps:
                 model.zone_constraints.add(
-                    measured(k + 1) + model.zone_slack[k] >= float(target_c[k])
+                    measured(k + 1) + model.zone_slack[k]
+                    >= min(float(target_c[k]) - tolerance_c, reachable_c[k + 1])
                 )
+
+            # The ceiling, soft like the target: sun alone can push the zone
+            # past it, and a plan must still exist then. Only heat the plan
+            # adds is its to answer for, and the excess is priced as dearly as
+            # a shortfall.
+            if maximum_c is None:
+                continue
+
+            model.zone_constraints.add(
+                measured(k) - model.zone_excess[k]
+                <= max(float(maximum_c[k]), unheated_c[k])
+            )
+
+            if k + 1 < num_steps:
+                model.zone_constraints.add(
+                    measured(k + 1) - model.zone_excess[k]
+                    <= max(float(maximum_c[k]), unheated_c[k + 1])
+                )
+
+        # How the heat pump runs the floor by itself, once heating runs have
+        # shown it (see features.space_heating). It picks its supply temperature
+        # from its own curve, so the heat a run delivers is not the plan's to
+        # choose: Q = G * (supply - T_mass), with T_mass the node the floor's
+        # heat lands in. The plan decides when; the physics decides how much -
+        # and a quarter hour at full power into a floor at room temperature is
+        # no longer on offer. Needs an outdoor forecast, which the curve is a
+        # function of.
+        operating = self.space_heating_model if outdoor_c else None
+
+        if operating is None:
+            return
+
+        sink = num_states - 1
+        # The product T_sink * space_on, exact for a binary decision within the
+        # sink's range, which the unheated and flat-out rollouts bound.
+        model.space_sink_on = pyo.Var(model.K)
+        conductance = operating.conductance_w_per_k
+
+        for k in range(num_steps):
+            low = float(unheated[k][sink])
+            high = float(heated[k][sink])
+            on = model.space_on[k]
+            sink_on = model.space_sink_on[k]
+
+            for bound in (
+                sink_on <= high * on,
+                sink_on >= low * on,
+                sink_on <= model.zone_state[k, sink] - low * (1 - on),
+                sink_on >= model.zone_state[k, sink] - high * (1 - on),
+            ):
+                model.zone_constraints.add(bound)
+
+            floor_w = conductance * (
+                operating.supply_c(zone_outdoor_c[k]) * on - sink_on
+            )
+            model.zone_constraints.add(model.q_space_w[k] <= floor_w)
+
+            # Held to exactly that wherever it is within the compressor's own
+            # output. Where it may not be - a curve extrapolated to a colder day
+            # than its runs covered - the heat pump gives what it can, and the
+            # floor's uptake only caps it.
+            supply = operating.supply_c(zone_outdoor_c[k])
+            if conductance * (supply - low) <= max_heat_w:
+                model.zone_constraints.add(model.q_space_w[k] >= floor_w)
+
+        # And for as long as it runs by itself at the least: a run begun is
+        # held that long (the standard minimum-up form, a start within the last
+        # min_runtime steps keeps it on). Only in the fine region, like the
+        # compressor's own minimum runtime; a coarse block already spans it.
+        min_run_steps = math.ceil(
+            operating.min_runtime_hours / self.config.step_hours - 1e-9
+        )
+        fine_steps = sum(1 for dt in plan.dt_hours if dt <= self.config.step_hours)
+        model.space_start = pyo.Var(model.K, bounds=(0.0, 1.0))
+
+        for k in range(num_steps):
+            previous = int(data.space_on_current) if k == 0 else model.space_on[k - 1]
+            model.zone_constraints.add(
+                model.space_start[k] >= model.space_on[k] - previous
+            )
+
+        for k in range(fine_steps):
+            model.zone_constraints.add(
+                sum(
+                    model.space_start[j]
+                    for j in range(max(0, k - min_run_steps + 1), k + 1)
+                )
+                <= model.space_on[k]
+            )
 
     def _build_objective(
         self,
@@ -1270,7 +1436,9 @@ class MPCOptimizer:
             # both are promises the plan made, and neither is worth trading for
             # a few cents of electricity.
             if hasattr(model, "zone_slack"):
-                objective += self.config.weight_temperature_slack * model.zone_slack[k]
+                objective += self.config.weight_temperature_slack * (
+                    model.zone_slack[k] + model.zone_excess[k]
+                )
 
         return objective
 

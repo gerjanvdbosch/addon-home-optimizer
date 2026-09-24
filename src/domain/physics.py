@@ -10,7 +10,7 @@ that estimates their states and to the planner that acts on them.
 
 import numpy as np
 
-from domain.models import BuildingLumpedModel, BuildingThermalModel
+from domain.models import BuildingThermalModel
 
 # Physical constants (water), not fit parameters.
 RHO_WATER_KG_PER_L = 1.0
@@ -150,63 +150,28 @@ def two_node_zone_state_space(
     return a, b
 
 
-def lumped_zone_state_space(
-    model: BuildingLumpedModel,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Continuous state-space for the single-node model.
-
-    x = [T], u = [T_outdoor, Q_internal, Q_solar, Q_floor]:
-
-        C dT/dt = UA (T_out - T) + Q_int + Q_sol + Q_floor
-
-    All three heat inputs enter the one node, because there is only one. Where
-    they physically land - air or screed - is exactly the distinction this
-    model gives up, and the reason the two-node form still exists.
-    """
-
-    ua = model.ua_w_per_k
-    c = model.c_j_per_k
-
-    a = np.array([[-ua / c]])
-    b = np.array([[ua / c, 1.0 / c, 1.0 / c, 1.0 / c]])
-
-    return a, b
-
-
 def zone_state_space(
-    model: BuildingThermalModel | BuildingLumpedModel,
+    model: BuildingThermalModel,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Continuous state-space of whichever zone structure was identified.
-
-    Both forms share the same input vector u = [T_outdoor, Q_internal, Q_solar,
-    Q_floor] and the same first state (the air temperature the thermostats
-    measure), so anything driving the zone - the Kalman filter, a rollout, the
-    MPC - can work from this without knowing which structure it was handed.
-    They differ only in how many states there are and where the heat lands.
-    """
-
-    if isinstance(model, BuildingLumpedModel):
-        return lumped_zone_state_space(model)
+    """Continuous state-space of the zone, with the input vector u =
+    [T_outdoor, Q_internal, Q_solar, Q_floor] and the air temperature as its
+    first state - what the Kalman filter, a rollout and the MPC all drive."""
 
     return two_node_zone_state_space(model)
 
 
 def zone_observation(
-    model: BuildingThermalModel | BuildingLumpedModel,
+    model: BuildingThermalModel,
 ) -> np.ndarray:
     """Row vector h with T_measured = h x: what a thermostat reads from the
     zone's states.
 
-    A single node leaves nothing to weigh. Two make the reading an operative
-    temperature: a wall-mounted sensor exchanges longwave radiation with the
-    surfaces around it, so it follows the mass node as well as the air (see
-    BuildingThermalModel.sensor_mass_fraction). This is a measurement
+    An operative temperature: a wall-mounted sensor exchanges longwave
+    radiation with the surfaces around it, so it follows the mass node as well
+    as the air (see BuildingThermalModel.sensor_mass_fraction). This is a measurement
     equation, not a heat balance - it moves no energy, and dropping it would
     only mean claiming the sensor reads pure air.
     """
-
-    if isinstance(model, BuildingLumpedModel):
-        return np.array([1.0])
 
     fraction = model.sensor_mass_fraction
 

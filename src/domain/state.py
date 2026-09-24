@@ -101,13 +101,6 @@ class Predictions(BaseModel):
     baseload: list[SeriesPoint[float]] = Field(default_factory=list)
     tap: list[SeriesPoint[float]] = Field(default_factory=list)
     boiler: list[SeriesPoint[float]] = Field(default_factory=list)
-    # Where the zone temperature goes if nothing is done to it, from each of
-    # the two building structures. Both are kept on purpose: they disagree
-    # mainly about how much sun gets in, and a forecast is the one test that
-    # can settle that without waiting for a heating season - the measurement
-    # catches up to them a day later and says which was right.
-    zone_forecast_lumped: list[SeriesPoint[float]] = Field(default_factory=list)
-    zone_forecast_two_node: list[SeriesPoint[float]] = Field(default_factory=list)
     # The filter's estimate of the building's thermal mass - screed and
     # internal walls - which no sensor measures. Continuous by construction,
     # because the filter corrects every step rather than restarting each
@@ -128,6 +121,10 @@ class HeatPumpSchedule(BaseModel):
 
 class BuildingSchedule(BaseModel):
     target_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
+    # The shadow plan: space heating as it would be planned, for comparison
+    # with what the thermostats do - never acted on (see Optimization).
+    heat: list[SeriesPoint[float]] = Field(default_factory=list)
+    temperatures: list[SeriesPoint[float]] = Field(default_factory=list)
 
 
 class Schedule(BaseModel):

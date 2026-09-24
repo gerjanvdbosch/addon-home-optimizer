@@ -7,9 +7,9 @@ import pytest
 from domain.dynamics import discretize_zoh
 from domain.models import (
     BoilerThermalModel,
-    BuildingLumpedModel,
     BuildingThermalModel,
     HeatPumpCOPModel,
+    SpaceHeatingModel,
 )
 from domain.mpc import MPCConfig, MPCInput
 from domain.physics import (
@@ -880,10 +880,16 @@ def test_target_holds_through_a_coarse_look_ahead_block():
     assert not shortfall, f"plan dips up to {max(shortfall):.3f} K below target"
 
 
-BUILDING_MODEL = BuildingLumpedModel(
-    ua_w_per_k=130.0,
-    c_j_per_k=40.0e6,
+# The air and, behind it, the screed and internal walls the floor heats.
+BUILDING_MODEL = BuildingThermalModel(
+    ua_envelope_w_per_k=130.0,
+    ua_air_mass_w_per_k=500.0,
+    c_air_j_per_k=2.5e6,
+    c_mass_j_per_k=37.5e6,
     a_eff_m2=9.0,
+    # A pure air sensor, so the plans these tests check are judged on the air
+    # node exactly; the operative reading has its own test.
+    sensor_mass_fraction=0.0,
     internal_gain_fraction=1.0,
 )
 
@@ -898,6 +904,7 @@ def _zone_input(**overrides) -> MPCInput:
 
     defaults = dict(
         zone_temperature=19.5,
+        zone_mass_temperature=19.5,
         zone_target_temperature=tuple(target),
         zone_internal_gain_w=(0.0,) * len(SOLAR_FORECAST_W),
     )
@@ -1066,23 +1073,6 @@ def test_the_zone_may_still_be_served_before_and_after_the_tank():
     assert _blocks(result.space_schedule) >= 1
 
 
-# The same zone as BUILDING_MODEL, split into the air it holds and the screed
-# and internal walls behind it: the capacities sum to the single node's, so the
-# two structures store the same energy and only differ in how fast the store
-# reaches the air.
-TWO_NODE_BUILDING_MODEL = BuildingThermalModel(
-    ua_envelope_w_per_k=130.0,
-    ua_air_mass_w_per_k=500.0,
-    c_air_j_per_k=2.5e6,
-    c_mass_j_per_k=37.5e6,
-    a_eff_m2=9.0,
-    # A pure air sensor, so the plans these tests check are judged on the air
-    # node exactly as before; the operative reading has its own test.
-    sensor_mass_fraction=0.0,
-    internal_gain_fraction=1.0,
-)
-
-
 def test_the_two_node_zone_is_brought_to_its_target():
     """The MPC plans against whichever structure it was handed.
 
@@ -1099,7 +1089,7 @@ def test_the_two_node_zone_is_brought_to_its_target():
         THERMAL_MODEL,
         MPCConfig(),
         cop_model=COP_MODEL,
-        building_model=TWO_NODE_BUILDING_MODEL,
+        building_model=BUILDING_MODEL,
     ).solve(data)
 
     assert any(result.space_schedule), "expected the zone to be heated"
@@ -1115,34 +1105,6 @@ def test_the_two_node_zone_is_brought_to_its_target():
     assert result.zone_temperatures[-1] >= data.zone_target_temperature[-1] - 1e-6
 
 
-def test_reaching_the_air_through_the_screed_costs_more_heat():
-    """Why the structure is worth the extra state.
-
-    Both zones store the same energy per kelvin and lose it through the same
-    envelope; they differ only in that the two-node one has to raise the screed
-    before the air follows. Holding the same comfort target therefore takes
-    more heat and a longer run - which is exactly the cost a plan must know
-    about before it starts a floor run.
-    """
-
-    two_node = MPCOptimizer(
-        THERMAL_MODEL,
-        MPCConfig(),
-        cop_model=COP_MODEL,
-        building_model=TWO_NODE_BUILDING_MODEL,
-    ).solve(_zone_input(zone_mass_temperature=19.5))
-
-    single_node = MPCOptimizer(
-        THERMAL_MODEL,
-        MPCConfig(),
-        cop_model=COP_MODEL,
-        building_model=BUILDING_MODEL,
-    ).solve(_zone_input())
-
-    assert sum(two_node.space_heat_w) > sum(single_node.space_heat_w)
-    assert sum(two_node.space_schedule) >= sum(single_node.space_schedule)
-
-
 def test_a_two_node_zone_is_not_planned_without_its_mass_temperature():
     """Nothing measures the screed, so a plan that needs it must be given the
     filter's estimate. Guessing it would silently decide whether the floor is
@@ -1153,8 +1115,8 @@ def test_a_two_node_zone_is_not_planned_without_its_mass_temperature():
         THERMAL_MODEL,
         MPCConfig(),
         cop_model=COP_MODEL,
-        building_model=TWO_NODE_BUILDING_MODEL,
-    ).solve(_zone_input())
+        building_model=BUILDING_MODEL,
+    ).solve(_zone_input(zone_mass_temperature=None))
 
     assert result.space_schedule == ()
     assert result.zone_temperatures == ()
@@ -1164,15 +1126,13 @@ def test_a_charged_screed_needs_less_heating_than_a_cold_one():
     """The effect the second state exists for.
 
     Same air temperature, same comfort target, same weather - only the heat
-    already stored in the floor differs. A single-node zone cannot express
-    this at all: its one temperature is the air's.
-    """
+    already stored in the floor differs."""
 
     optimizer = MPCOptimizer(
         THERMAL_MODEL,
         MPCConfig(),
         cop_model=COP_MODEL,
-        building_model=TWO_NODE_BUILDING_MODEL,
+        building_model=BUILDING_MODEL,
     )
 
     cold = optimizer.solve(_zone_input(zone_mass_temperature=18.0))
@@ -1191,7 +1151,7 @@ def test_solar_gain_warms_the_two_node_zone_through_its_mass():
         THERMAL_MODEL,
         MPCConfig(),
         cop_model=COP_MODEL,
-        building_model=TWO_NODE_BUILDING_MODEL,
+        building_model=BUILDING_MODEL,
     )
 
     steps = len(SOLAR_FORECAST_W)
@@ -1226,8 +1186,8 @@ def test_comfort_is_judged_on_what_the_thermostat_reads():
             building_model=building,
         ).solve(data)
 
-    air_only = solve(TWO_NODE_BUILDING_MODEL)
-    operative = solve(replace(TWO_NODE_BUILDING_MODEL, sensor_mass_fraction=0.5))
+    air_only = solve(BUILDING_MODEL)
+    operative = solve(replace(BUILDING_MODEL, sensor_mass_fraction=0.5))
 
     # Half air, half mass against the air node alone.
     assert air_only.zone_temperatures[0] == pytest.approx(22.0)
@@ -1314,3 +1274,148 @@ def test_a_coarse_block_reports_a_real_run_not_an_averaged_one():
         for earlier, later in zip(heats, heats[1:], strict=False)
     )
     assert all(heat > 0.0 for heat in heats)
+
+
+def test_a_higher_ceiling_buffers_the_sun_in_the_floor_and_the_ceiling_holds():
+    """Room above the target is what a floor buffer is charged into: with it the
+    plan moves heat into the sunny hours, and never past the ceiling."""
+
+    steps = 96
+    hour = (np.arange(steps) * 0.25 + 6.0) % 24.0
+    sun = np.clip(4000.0 * np.sin(np.pi * (hour - 8.0) / 9.0), 0.0, None)
+    sun[(hour < 8.0) | (hour > 17.0)] = 0.0
+    sunny = sun > 500.0
+    model = BuildingThermalModel(
+        ua_envelope_w_per_k=80.0,
+        ua_air_mass_w_per_k=650.0,
+        c_air_j_per_k=2.6e6,
+        c_mass_j_per_k=35.0e6,
+        a_eff_m2=3.0,
+        sensor_mass_fraction=0.5,
+        internal_gain_fraction=0.6,
+    )
+    data = _make_input(
+        solar_forecast_w=list(sun),
+        target_temperature_top=(10.0,) * steps,
+        outdoor_temperature_forecast=(5.0,) * steps,
+        zone_temperature=20.1,
+        zone_mass_temperature=20.4,
+        zone_target_temperature=tuple(np.where(hour < 22.0, 20.0, 18.0)),
+        zone_internal_gain_w=(150.0,) * steps,
+    )
+    optimizer = MPCOptimizer(
+        THERMAL_MODEL, MPCConfig(), cop_model=COP_MODEL, building_model=model
+    )
+
+    def sunny_heat(ceiling_c: float):
+        result = optimizer.solve(
+            replace(data, zone_maximum_temperature=(ceiling_c,) * steps)
+        )
+        assert max(result.zone_temperatures) <= ceiling_c + 1e-6
+
+        return float(np.asarray(result.space_heat_w)[sunny].sum())
+
+    assert sunny_heat(22.0) > 1.5 * sunny_heat(20.3)
+
+
+def _cold_day(**overrides):
+    steps = 96
+    hour = (np.arange(steps) * 0.25 + 6.0) % 24.0
+    defaults = dict(
+        solar_forecast_w=[0.0] * steps,
+        target_temperature_top=(10.0,) * steps,
+        outdoor_temperature_forecast=(5.0,) * steps,
+        zone_temperature=20.1,
+        zone_mass_temperature=20.2,
+        zone_target_temperature=tuple(np.where(hour < 22.0, 20.0, 18.0)),
+        zone_maximum_temperature=(21.5,) * steps,
+        zone_internal_gain_w=(150.0,) * steps,
+    )
+    defaults.update(overrides)
+
+    return _make_input(**defaults)
+
+
+TWO_NODE = BuildingThermalModel(
+    ua_envelope_w_per_k=80.0,
+    ua_air_mass_w_per_k=650.0,
+    c_air_j_per_k=2.6e6,
+    c_mass_j_per_k=35.0e6,
+    a_eff_m2=3.0,
+    sensor_mass_fraction=0.5,
+    internal_gain_fraction=0.6,
+)
+
+
+def test_space_runs_are_as_long_and_as_strong_as_the_heat_pump_makes_them():
+    """Once its heating runs are known, the plan decides when the zone is heated
+    but not how much: the heat follows from the curve and the floor, and a run
+    lasts at least as long as the heat pump's own shortest ones."""
+
+    space = SpaceHeatingModel(
+        supply_at_zero_outdoor_c=28.0,
+        supply_per_outdoor_k=-0.4,
+        conductance_w_per_k=400.0,
+        min_runtime_hours=1.5,
+    )
+    result = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE,
+        space_heating_model=space,
+    ).solve(_cold_day())
+
+    fine_steps = int(MPCConfig().fine_horizon_hours / MPCConfig().step_hours)
+    on = list(result.space_schedule[:fine_steps])
+    heat = np.asarray(result.space_heat_w[:fine_steps])
+
+    assert any(on), "expected the zone to be heated"
+    # What a floor near room temperature takes from the curve's 26 degC water
+    # (400 W/K over about 6 K), not the compressor's full output.
+    assert heat.max() < 400.0 * (26.0 - 19.5)
+    assert heat.max() < THERMAL_MODEL.q_in_nominal_w
+
+    runs = []
+    for k, value in enumerate(on):
+        if value and (k == 0 or not on[k - 1]):
+            runs.append(1)
+        elif value:
+            runs[-1] += 1
+
+    # A run cut off by the end of the fine region may be shorter.
+    assert all(length >= 6 for length in runs[:-1])
+
+
+def test_a_comfort_tolerance_lets_small_predicted_dips_go():
+    optimizer = MPCOptimizer(
+        THERMAL_MODEL, MPCConfig(), cop_model=COP_MODEL, building_model=TWO_NODE
+    )
+
+    exact = optimizer.solve(_cold_day())
+    tolerant = optimizer.solve(_cold_day(zone_comfort_tolerance_c=0.3))
+
+    assert sum(tolerant.space_heat_w) < sum(exact.space_heat_w)
+
+
+def test_space_heating_is_costed_with_the_heating_cop_once_there_is_one():
+    """The heat pump's own heating runs, not its hot water ones, say what a
+    floor run costs - but the hot water fit stands in until there are any."""
+
+    heating_cop = replace(COP_MODEL, eta_carnot=COP_MODEL.eta_carnot / 2.0)
+
+    def space_cop(**models):
+        optimizer = MPCOptimizer(
+            THERMAL_MODEL,
+            MPCConfig(),
+            cop_model=COP_MODEL,
+            building_model=TWO_NODE,
+            **models,
+        )
+
+        return optimizer._space_cop(5.0)
+
+    assert space_cop(heating_cop_model=heating_cop) < space_cop()
+    assert space_cop() == pytest.approx(
+        COP_MODEL.clamped_cop(5.0, MPCOptimizer.SPACE_HEATING_SUPPLY_C)
+    )

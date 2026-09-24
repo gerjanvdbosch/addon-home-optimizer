@@ -10,7 +10,6 @@ from domain.config import Config
 from domain.dataset import DatasetDefinition
 from domain.state import SeriesPoint, State
 from domain.time import local_day_start, to_local_time
-from features.building import BuildingLumpedIdentifier, BuildingThermalIdentifier
 from features.dataset import DatasetBuilder, DatasetLoader
 from features.solar import (
     NOWCAST_SPREAD_WINDOW,
@@ -24,11 +23,6 @@ from features.solar import (
 from infrastructure.repositories import ConfigRepository, StateRepository
 
 logger = logging.getLogger(__name__)
-
-# How far past the present the zone forecast reaches. Open-Meteo's own
-# horizon on this installation is about 38 hours, so asking for two days takes
-# whatever it has without ever being the binding limit.
-FORECAST_HORIZON = timedelta(days=2)
 
 
 class StateManager:
@@ -82,126 +76,8 @@ class StateManager:
         self._predict_solar(
             state, now, recent_solar.set_index("time")["pv_production"]
         )
-        self._simulate_building(state, config, now)
 
         self.state_repository.save(state)
-
-    def _simulate_building(self, state: State, config: Config, now: datetime) -> None:
-        """Reconstructs the zone temperature the calibrated building model
-        implies, so the dashboard can show it against the measurement.
-
-        Draws the filter's running state estimate rather than a sequence of
-        fixed-horizon rollouts. The filter corrects every step, so its output
-        is continuous instead of jumping back to the measurement every horizon
-        - those jumps are the model's own forecast error, which belongs in
-        validate()'s metrics, not in a line that is supposed to be read as a
-        temperature.
-
-        That needs the two-node structure, even though the single-node one
-        currently scores better: only this one HAS a thermal mass, and its
-        temperature is the interesting quantity here because nothing measures
-        it. The air estimate alone would just retrace the sensors.
-
-        Loads its own window because the building model needs inputs the state
-        dataset does not carry - irradiance components, shutter positions.
-
-        Leaves an existing curve untouched whenever the model is not calibrated
-        yet or the window has no gap-free stretch long enough to simulate,
-        rather than replacing a real curve with an empty one.
-        """
-
-        identifier = BuildingThermalIdentifier(self.latitude, self.longitude)
-        identifier.load(self.models_path)
-
-        if identifier.model is None:
-            return
-
-        dataset = identifier.dataset(config)
-
-        warmup = timedelta(hours=identifier.MASS_WARMUP_HOURS)
-        start = local_day_start(now, days=-1).astimezone(timezone.utc) - warmup
-
-        try:
-            loaded = self.loader.load(dataset, start, now)
-            estimated = identifier.estimate(loaded)
-            measured = identifier.prepare(loaded).set_index("time")["T_air"]
-        except ValueError:
-            return
-
-        # The air estimate is not stored: with the process noise set from the
-        # model's own unreliability the filter gain is essentially one, so it
-        # reproduces the measurement exactly and a second identical line says
-        # nothing. How far the model's own forecast drifts belongs in
-        # validate()'s metrics, not in a line read as a temperature.
-        state.measurements.building.zone_temperature = self._series_points(measured)
-
-        # The mass line runs straight on into the forecast: the filter's last
-        # estimate is what the rollout starts from, so there is no seam.
-        mass = estimated["mass"]
-
-        forecasts = self._forecast_zone(dataset, start, now)
-
-        if forecasts is not None:
-            two_node, lumped = forecasts
-            mass = pd.concat([mass, two_node["mass"].iloc[1:]])
-            # The reading, not the air node: what these curves are drawn
-            # against is the measurement, and with a two-node structure the
-            # thermostat reads part of the mass too (see zone_observation).
-            state.predictions.zone_forecast_two_node = self._series_points(
-                two_node["reading"]
-            )
-            state.predictions.zone_forecast_lumped = self._series_points(
-                lumped["reading"]
-            )
-
-        state.predictions.thermal_mass = self._series_points(mass)
-
-    def _forecast_zone(
-        self,
-        dataset: DatasetDefinition,
-        start: datetime,
-        now: datetime,
-    ) -> tuple[pd.DataFrame, pd.DataFrame] | None:
-        """Both structures rolled forward, or None if either cannot be.
-
-        Loaded past the present so the weather forecast's own rows come along -
-        that is where the irradiance and outdoor temperature a forecast needs
-        actually live.
-        """
-
-        loaded = self.loader.load(dataset, start, now + FORECAST_HORIZON)
-
-        state = self.load()
-        baseload = pd.Series(
-            {point.time: point.value for point in state.predictions.baseload}
-        )
-
-        results = []
-
-        for cls in (BuildingThermalIdentifier, BuildingLumpedIdentifier):
-            identifier = cls(self.latitude, self.longitude)
-            identifier.load(self.models_path)
-
-            if identifier.model is None:
-                return None
-
-            identifier.dataset(self.config_repository.load())
-
-            try:
-                results.append(
-                    identifier.forecast(
-                        loaded, now, baseload if not baseload.empty else None
-                    )
-                )
-            except ValueError as error:
-                # Normal before the weather sensor's horizon reaches past now,
-                # or right after a restart with no measurements yet. Logged
-                # rather than swallowed: a silent None here once hid a plain
-                # coding mistake for a whole run.
-                logger.warning("No zone forecast from %s: %s", identifier.name, error)
-                return None
-
-        return results[0], results[1]
 
     def _predict_solar(
         self, state: State, now: datetime, recent_solar: pd.Series
@@ -415,6 +291,37 @@ class StateManager:
 
         self.state_repository.save(state)
 
+    def update_zone(self, temperature: pd.Series, thermal_mass: pd.Series) -> None:
+        """The zone as the optimization job estimates it (see
+        Optimization._plan_space_heating): its measured temperature, and the
+        thermal mass no sensor measures."""
+
+        state = self.load()
+
+        state.measurements.building.zone_temperature = self._series_points(temperature)
+        state.predictions.thermal_mass = self._series_points(thermal_mass)
+
+        self.state_repository.save(state)
+
+    def update_building_schedule(
+        self,
+        heat_w: Sequence[float],
+        temperatures: Sequence[float],
+        times: list[datetime],
+    ) -> None:
+        state = self.load()
+
+        state.schedule.building.heat = [
+            SeriesPoint(time=t, value=float(value))
+            for t, value in zip(times, heat_w, strict=False)
+        ]
+        state.schedule.building.temperatures = [
+            SeriesPoint(time=t, value=float(value))
+            for t, value in zip(times, temperatures, strict=False)
+        ]
+
+        self.state_repository.save(state)
+
     def _map(
         self,
         df: pd.DataFrame,
@@ -426,6 +333,11 @@ class StateManager:
         if existing is not None:
             state.predictions = existing.predictions
             state.schedule = existing.schedule
+            # Measured, but by the optimization job, which averages the rooms
+            # as the building model does (see update_zone).
+            state.measurements.building.zone_temperature = (
+                existing.measurements.building.zone_temperature
+            )
 
         state.measurements.solar = self._parse_series(df, "pv_production")
         state.measurements.baseload = self._parse_series(df, "baseload")

@@ -12,13 +12,15 @@ from typing import ClassVar, Literal
 import numpy as np
 
 ForecasterType = Literal["baseload", "tap"]
+# In the order they are calibrated (see app.bootstrap): space_heating is
+# fitted against the building model's estimate of the floor's mass.
 IdentificationType = Literal[
     "boiler",
     "cop_dhw",
     "cop_heating",
-    "solar",
     "building",
-    "building_lumped",
+    "solar",
+    "space_heating",
 ]
 
 
@@ -100,40 +102,34 @@ class BuildingThermalModel:
     internal_gain_fraction: float
 
 
-@dataclass
-class BuildingLumpedModel:
-    """Single-node (1R1C) model of the same zone: C dT/dt = UA (T_out - T) +
-    Q_internal + Q_solar + Q_floor.
-
-    One capacity covering everything that stores heat - air, furnishings,
-    screed, internal walls together - and one conductance to outdoors. Its
-    parameters are NOT a reduction of BuildingThermalModel's: both are fitted
-    to the same data and land on genuinely different values, because a single
-    node has to account for the whole response with one time constant.
-
-    It exists because the two-node model's mass node is never measured, and on
-    cooling-season data that hidden state was the largest single error source:
-    dropping it took the six-hour rollout error from 0.36 K to 0.11 K and
-    turned an effective solar aperture of 6% of the glass area - which no
-    glazing can have - into a perfectly ordinary 50%. Here the state IS the
-    measurement, so nothing has to be inferred.
-
-    The cost is real and physical: this cannot represent the floor being warmer
-    than the air, so it cannot describe charging the screed as thermal storage.
-    That is what the two-node model is for, once data with daily floor-circuit
-    transitions can actually identify it - see BuildingLumpedIdentifier.
-    """
-
-    ua_w_per_k: float
-    c_j_per_k: float
-    a_eff_m2: float
-    internal_gain_fraction: float
-
-
 # Exact by definition of the Kelvin scale (0 degC = 273.15 K) - used
 # wherever a Celsius temperature must enter a formula (like COP) that is
 # only valid on an absolute temperature scale.
 KELVIN_OFFSET_C = 273.15
+
+
+@dataclass
+class SpaceHeatingModel:
+    """How the heat pump runs the floor circuit by itself (see
+    features.space_heating): the supply temperature it chooses, the heat that
+    brings into the floor, and how long it runs."""
+
+    # Its heating curve, supply = a + b * T_outdoor (deg C, K per K).
+    supply_at_zero_outdoor_c: float
+    supply_per_outdoor_k: float
+    # From the supply water to the building's thermal mass (W/K), both the
+    # screed's uptake and the water cooling through the loop.
+    conductance_w_per_k: float
+    # The shortest runs it makes (hours).
+    min_runtime_hours: float
+
+    def supply_c(self, outdoor_c):
+        return self.supply_at_zero_outdoor_c + self.supply_per_outdoor_k * outdoor_c
+
+    def heat_w(self, outdoor_c, mass_c):
+        """The heat a run delivers into the floor (W)."""
+
+        return self.conductance_w_per_k * (self.supply_c(outdoor_c) - mass_c)
 
 
 @dataclass

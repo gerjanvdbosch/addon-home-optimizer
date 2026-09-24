@@ -60,12 +60,10 @@ class Container:
     def identification(self) -> "Identification":
         from app.identification import Identification
         from features.boiler import BoilerThermalIdentifier
-        from features.building import (
-            BuildingLumpedIdentifier,
-            BuildingThermalIdentifier,
-        )
+        from features.building import BuildingThermalIdentifier
         from features.cop import HeatPumpCOPIdentifier
         from features.solar import SolarBiasIdentifier
+        from features.space_heating import SpaceHeatingIdentifier
 
         latitude, longitude = self.settings.latitude, self.settings.longitude
 
@@ -88,12 +86,14 @@ class Container:
                 # class docstring).
                 HeatPumpCOPIdentifier(key="heating"),
                 BuildingThermalIdentifier(latitude=latitude, longitude=longitude),
-                # Both building structures are calibrated against the same data
-                # on purpose: their own skill_vs_persistence and
-                # implausible_aperture metrics then decide which one the data
-                # supports, instead of the choice being an untested assumption.
-                BuildingLumpedIdentifier(latitude=latitude, longitude=longitude),
                 SolarBiasIdentifier(latitude=latitude, longitude=longitude),
+                # After the building: it fits against that model's estimate of
+                # the floor's mass.
+                SpaceHeatingIdentifier(
+                    latitude=latitude,
+                    longitude=longitude,
+                    models_path=self.models_path,
+                ),
             ],
         )
 
@@ -103,6 +103,7 @@ class Container:
         from infrastructure.home_assistant import HomeAssistant
 
         return Optimization(
+            loader=self.dataset_loader,
             state_manager=self.state_manager,
             config_repository=self.config_repository,
             models_path=self.models_path,

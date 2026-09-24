@@ -39,6 +39,10 @@ class MPCConfig:
     # solves.
     fine_horizon_hours: float = 24.0
     coarse_step_hours: float = 1.0
+    # A fallback, not the usual case (s): on real data a plan is proven optimal
+    # in 1-8 s. Should a harder one come up, the best plan found by then is
+    # used - better than a plan that never comes.
+    solve_time_limit_s: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -95,19 +99,21 @@ class MPCInput:
     # The zone's own temperature now, which the plan starts from.
     zone_temperature: float | None = None
     # The thermal mass's temperature now (deg C). Nothing measures it, so it
-    # comes from the Kalman filter's estimate (see building.kalman_states); it
-    # stays None for a single-node zone, which has no such state. A two-node
+    # comes from the Kalman filter's estimate (see building.kalman_states). A
     # plan needs it: starting the screed at the air temperature would claim a
     # cold floor is as ready to heat as a charged one.
     zone_mass_temperature: float | None = None
     # Comfort floor per step, as a schedule rather than one number.
     zone_target_temperature: tuple[float, ...] = ()
+    # Comfort ceiling per step: how warm buffering heat may make the zone.
+    # Empty means none.
+    zone_maximum_temperature: tuple[float, ...] = ()
+    # How far below the target the zone may dip before it counts (K).
+    zone_comfort_tolerance_c: float = 0.0
     # Heat entering the zone that no decision can change (W), split by where it
     # physically lands: appliances, lighting and people warm the air directly,
-    # while shortwave through the glazing is absorbed by floor and furnishings.
-    # A single-node zone gives both the same coefficient and the distinction
-    # costs nothing there; a two-node one does not, so the split has to be
-    # carried rather than summed away.
+    # while shortwave through the glazing is absorbed by floor and furnishings,
+    # so the split has to be carried rather than summed away.
     zone_internal_gain_w: tuple[float, ...] = ()
     zone_solar_gain_w: tuple[float, ...] = ()
     # Whether the heat pump is serving the zone right now, the space-heating

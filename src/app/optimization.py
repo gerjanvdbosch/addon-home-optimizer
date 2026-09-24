@@ -1,14 +1,23 @@
+import dataclasses
 import logging
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pandas as pd
+
 from app.state import StateManager
+from domain.config import Config
 from domain.jobs import OptimizeConfig
 from domain.mpc import MPCConfig, MPCInput, MPCResult
+from domain.state import State
+from domain.time import local_day_start
 from features.boiler import BoilerThermalIdentifier
+from features.building import BuildingThermalIdentifier
 from features.cop import HeatPumpCOPIdentifier
+from features.dataset import DatasetLoader
 from features.optimizer import MPCOptimizer
+from features.space_heating import SpaceHeatingIdentifier
 from infrastructure.home_assistant import HomeAssistant
 from infrastructure.repositories import ConfigRepository
 
@@ -25,11 +34,13 @@ class Optimization:
 
     def __init__(
         self,
+        loader: DatasetLoader,
         state_manager: StateManager,
         config_repository: ConfigRepository,
         models_path: Path,
         home_assistant: HomeAssistant,
     ) -> None:
+        self.loader = loader
         self.state_manager = state_manager
         self.config_repository = config_repository
         self.models_path = models_path
@@ -237,6 +248,143 @@ class Optimization:
         )
 
         self.publish_dhw(result, forecast_times)
+        self._plan_space_heating(optimizer, data, state, config, forecast_times)
+
+    def _plan_space_heating(
+        self,
+        optimizer: MPCOptimizer,
+        data: MPCInput,
+        state: State,
+        config: Config,
+        times: list[datetime],
+    ) -> None:
+        """The building's side of a plan: the zone's state, and a second plan
+        with the zone as a second demand on the compressor.
+
+        The zone is estimated here, where it is planned, rather than on every
+        state update: one load and one filter pass give both the state a plan
+        starts from and the measured temperature and thermal mass the dashboard
+        draws. Two-node, because only that structure has the thermal mass a
+        floor buffer is made of.
+
+        The plan itself is a shadow: stored for the dashboard and never acted
+        on. Before a plan may drive the thermostats it has to be seen to make
+        sense against what they actually do, over a heating season. It is
+        solved apart from the hot water plan acted on above, so that plan stays
+        exactly what it was - sharing the compressor, the zone would otherwise
+        move it. Only planned with a comfort ceiling configured.
+        """
+
+        identifier = BuildingThermalIdentifier(
+            self.state_manager.latitude, self.state_manager.longitude
+        )
+        identifier.load(self.models_path)
+
+        if identifier.model is None:
+            return
+
+        now = datetime.now(timezone.utc)
+        # From the previous local midnight, so the dashboard has yesterday
+        # beside today, and before that the filter's own warm-up.
+        start = local_day_start(now, days=-1).astimezone(timezone.utc) - timedelta(
+            hours=identifier.MASS_WARMUP_HOURS
+        )
+        end = times[-1] + timedelta(hours=optimizer.config.step_hours)
+        baseload = pd.Series(
+            {point.time: point.value for point in state.predictions.baseload}
+        )
+
+        try:
+            zone = identifier.trajectory(
+                self.loader.load(identifier.dataset(config), start, end),
+                now,
+                baseload if not baseload.empty else None,
+            )
+        except ValueError as error:
+            # Normal right after a restart with no measurements yet, or before
+            # the weather forecast reaches past now.
+            logger.warning("No zone estimate: %s", error)
+            return
+
+        zone.index = pd.to_datetime(zone.index, utc=True)
+        self.state_manager.update_zone(
+            temperature=zone["measured"].dropna(), thermal_mass=zone["mass"]
+        )
+
+        maximum = config.building.maximum_temperature
+
+        if maximum is None:
+            return
+
+        # The plan starts where the filter's estimate of the whole zone state
+        # stands at its first step: the air node, and the mass.
+        planned = zone.reindex(pd.DatetimeIndex(times))
+
+        if planned[["air", "mass"]].iloc[0].isna().any():
+            logger.info(
+                "Shadow space-heating plan skipped: no zone estimate at %s", times[0]
+            )
+            return
+
+        heat_pump_state = state.measurements.heat_pump.state
+
+        zone_data = dataclasses.replace(
+            data,
+            zone_temperature=float(planned["air"].iloc[0]),
+            zone_mass_temperature=float(planned["mass"].iloc[0]),
+            zone_target_temperature=tuple(
+                point.value
+                for point in self.state_manager.resolve_schedule(
+                    config.building.target_temperature, times
+                )
+            ),
+            zone_maximum_temperature=tuple(
+                point.value
+                for point in self.state_manager.resolve_schedule(maximum, times)
+            ),
+            zone_comfort_tolerance_c=config.building.comfort_tolerance,
+            # No gain assumed where the estimate does not reach - the same
+            # "assume none" align_predictions makes for any missing forecast.
+            zone_internal_gain_w=tuple(planned["internal_gain_w"].fillna(0.0)),
+            zone_solar_gain_w=tuple(planned["solar_gain_w"].fillna(0.0)),
+            space_on_current=bool(heat_pump_state)
+            and heat_pump_state[-1].value == config.heat_pump.states.heating,
+        )
+
+        # How the heat pump runs the floor by itself - None until heating runs
+        # have shown it, and the plan may then choose the zone's heat freely.
+        space_heating = SpaceHeatingIdentifier(
+            self.state_manager.latitude, self.state_manager.longitude, self.models_path
+        )
+        space_heating.load(self.models_path)
+        heating_cop = HeatPumpCOPIdentifier(key="heating")
+        heating_cop.load(path=self.models_path)
+
+        try:
+            result = MPCOptimizer(
+                thermal_model=optimizer.thermal_model,
+                config=optimizer.config,
+                cop_model=optimizer.cop_model,
+                building_model=identifier.model,
+                space_heating_model=space_heating.model,
+                heating_cop_model=heating_cop.model,
+            ).solve(zone_data)
+        except RuntimeError as error:
+            # Nothing acts on this plan, so a failure here must not take the
+            # hot water plan above down with it.
+            logger.warning("Shadow space-heating plan failed: %s", error)
+            return
+
+        logger.info(
+            "Shadow space-heating plan: %.1f kWh into the zone over the horizon",
+            sum(result.space_heat_w) * optimizer.config.step_hours / 1000.0,
+        )
+
+        self.state_manager.update_building_schedule(
+            heat_w=result.space_heat_w,
+            temperatures=result.zone_temperatures,
+            times=times,
+        )
 
     def publish_dhw(self, result: MPCResult, times: list[datetime]) -> None:
         """Writes the plan's hot water decision to Home Assistant: on/off for the

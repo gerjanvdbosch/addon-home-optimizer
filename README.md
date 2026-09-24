@@ -218,6 +218,8 @@ actions:
               ["18:00", 20.0],
               ["22:00", 19.0]
             ],
+            "maximum_temperature": 21.5,
+            "comfort_tolerance": 0.2,
             "rooms": [
               [6.0, "sensor.danfoss_0_temperature"],
               [10.0, "sensor.danfoss_1_temperature"],

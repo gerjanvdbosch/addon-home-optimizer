@@ -7,8 +7,9 @@ simply a negative heat input and nothing here describes the heat pump. Mode-depe
 belongs in the COP model and in the condensation limit on floor cooling, not in this
 heat balance.
 
-Calibrate with `"target": "building"` and `"target": "building_lumped"` (see the
-Calibrate API in the [README](../README.md)).
+Calibrate with `"target": "building"` (see the Calibrate API in the
+[README](../README.md)), and once there are heating runs, `"target": "space_heating"`
+after it - that model is fitted against this one's estimate of the floor's mass.
 
 ## Configuration
 
@@ -34,9 +35,7 @@ correlates 0.65 with outdoor temperature, so it tracks the weather rather than t
 Net floor-to-ceiling height. The zone's air volume is derived from this and the areas
 above rather than configured separately, so the same geometry is stated once. It covers
 only rooms that have a sensor, slightly undercounting hall and landing - which is fine,
-because the volume only bounds a heat capacity, and for `building_lumped` it does not
-bind at all (air capacity stays far below that model's own floor for any dwelling-sized
-zone).
+because the volume only bounds a heat capacity.
 
 ### `south_glazing`
 
@@ -70,26 +69,22 @@ unit really stands outdoors: here it sits in a shed and reads 1.8 K warm on aver
 a strongly diurnal bias (+2.8 K at night against +0.9 K at midday), so it is
 deliberately left unset.
 
-## Two structures, calibrated side by side
+## Two nodes
 
-The same configuration feeds two models, and both are calibrated against the same data
-on purpose.
+**`building`** has two nodes: room air and thermal mass (screed, internal walls),
+coupled to each other, with solar and floor heat entering the mass. Floor heating
+really does reach the room with a lag, and only a mass node can describe charging the
+screed as storage - which is what planning it as a buffer needs. Its mass temperature
+is never measured directly, but the thermostats see part of it, which is what
+`sensor_mass_fraction` below is about.
 
-- **`building`** - two nodes: room air and thermal mass (screed, internal walls),
-  coupled to each other, with solar and floor heat entering the mass. Physically the
-  more faithful of the two, because floor heating really does reach the room with a lag,
-  and the only one that can describe charging the screed as storage. Its mass
-  temperature is never measured directly - but the thermostats see part of it, which is
-  what `sensor_mass_fraction` below is about.
-- **`building_lumped`** - one node: a single capacity covering everything that stores
-  heat, and one conductance to outdoors. Cruder - it cannot represent the floor being
-  warmer than the air - but its state *is* the measurement, so nothing has to be
-  inferred.
+A single-node model - one capacity for everything that stores heat, its state the
+measurement itself - used to be calibrated beside it for comparison, and has been
+removed: it cannot represent the floor being warmer than the air, so it cannot plan the
+screed as storage whatever it scores. On this installation's cooling-season data (43
+days, both recalibrated on it) the comparison stood at:
 
-Which one to trust is a measurement, not an assumption. On this installation's
-cooling-season data (43 days, both recalibrated on it):
-
-|                        | `building`      | `building_lumped` |
+|                        | two nodes       | one node          |
 |------------------------|-----------------|-------------------|
 | MAE over 6 h rollouts  | 0.134 K         | **0.128 K**       |
 | persistence baseline   | 0.153 K         | 0.160 K           |
@@ -165,7 +160,7 @@ difference - in both directions, so the two halves cancel in any average.
 Fitted over **dark windows only**. Solar gain and the outdoor difference both peak in
 the afternoon and correlate about +0.4 here, so a trend fitted over every window
 measures the net of two errors and can read clean while both are large: over all windows
-`building_lumped` slopes +0.0009 K/K, but after dark it slopes -0.0328, its oversized
+the single-node model slopes +0.0009 K/K, but after dark it slopes -0.0328, its oversized
 solar term cancelling its own envelope error.
 
 Judged against its own standard error rather than a fixed threshold, since how well a
@@ -176,15 +171,13 @@ slope is determined depends on how spread out the conditions happened to be.
 Everything below needs a heating season. The floor circuit ran in 2.4% of quarter hours
 over the cooling season, giving three to four scored windows with any floor activity.
 
-**Which structure to keep.** What separates one node from two is the transient after a
-step in floor heat, and there is almost none of it here. Both models currently report
-`ua_air_mass` at its upper bound and `c_air` at its ceiling, which is the data asking for
-them to be merged.
+**How the mass couples to the air.** What a second node adds is the transient after a
+step in floor heat, and there is almost none of it here: `c_air` sits at its ceiling.
 
-**The envelope conductance.** Both slope negative after dark (-0.018 and -0.033 K/K),
-so both respond too weakly, and three independent estimates put the true time constant
-near 90 h against the ~120 h both models hold. Neither slope clears two standard errors
-on 45-49 windows, so it is suggestive, not established. In summer the indoor-outdoor
+**The envelope conductance.** The model slopes negative after dark (-0.018 K/K), so it
+responds too weakly, and three independent estimates put the true time constant near
+90 h against the ~120 h it holds. The slope does not clear two standard errors on 45-49
+windows, so it is suggestive, not established. In summer the indoor-outdoor
 difference is 2-5 K and a window's decay signal sits under the sensor resolution; in
 winter it is 20-30 K.
 
@@ -193,8 +186,7 @@ on this data, and releasing that ceiling keeps improving the fit until the readi
 almost entirely the mass - at which point the solar aperture falls below what any glass
 can have and the active bias grows, the signature of a fit rather than a physical
 value. What it does say is that these thermostats follow the structure at least as
-closely as they follow the air, which is also why `c_air` sits at its ceiling in both
-structures. A heating season, where the floor drives the mass hard, is what can settle
+closely as they follow the air, which is also why `c_air` sits at its ceiling. A heating season, where the floor drives the mass hard, is what can settle
 the split.
 
 **Whether the floor coupling is mode-dependent.** A warm floor drives a buoyant plume
@@ -203,9 +195,8 @@ is roughly 11 W/m2K heating against 7 cooling. `ua_air_mass` is currently one pa
 for both modes - the first thing in this model that may genuinely need splitting, and
 for a physical reason rather than a better fit.
 
-**Whether delivered heat is overstated.** Both structures run cold during floor
-operation by almost pure bias (93% and 99% of their active error), worth 13% and 33% of
-the measured cooling. The heat pump stands in a shed, so part of the measured
+**Whether delivered heat is overstated.** The model runs cold during floor operation by
+almost pure bias (93% of its active error), worth 13% of the measured cooling. The heat pump stands in a shed, so part of the measured
 supply-to-return difference happens in the pipe run rather than in the screed. Heating
 flips the sign of that test: a positive `bias_active_k` of the same order would confirm
 it, and the fix would be one efficiency factor on the delivered heat.
@@ -220,5 +211,5 @@ After the first weeks of heating, recalibrate and check, in this order:
 3. `implausible_aperture` == 0 - the solar aperture is one a real window could have.
 4. `envelope_bias_slope_k_per_k` within two standard errors of zero.
 
-If `building` passes and `building_lumped` does not, the mass node has earned its place
-back - and only then can the screed be planned as thermal storage.
+If it passes, the mass node is identified from real heating - and only then can the
+screed be planned as thermal storage rather than in the shadow plan alone.

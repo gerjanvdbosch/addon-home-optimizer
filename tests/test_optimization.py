@@ -20,6 +20,7 @@ class _RecordingHomeAssistant:
 def _published(schedule: tuple[int, ...]) -> dict[str, str]:
     home_assistant = _RecordingHomeAssistant()
     optimization = Optimization(
+        loader=None,  # type: ignore[arg-type]
         state_manager=None,  # type: ignore[arg-type]
         config_repository=None,  # type: ignore[arg-type]
         models_path=Path("."),

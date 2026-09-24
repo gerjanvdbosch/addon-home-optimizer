@@ -177,6 +177,15 @@ class Thermostat(BaseModel):
 class BuildingConfig(BaseModel):
     thermostat: Thermostat = Field()
     target_temperature: float | list[tuple[time, float]] = Field()
+    # The warmest the zone may be heated to (deg C), a schedule like the target.
+    # Buffering heat in the floor means heating above the target while heat is
+    # cheap, and this is the ceiling of that: without one, cheap heat would be
+    # stored without limit. None plans no space heating at all.
+    maximum_temperature: float | list[tuple[time, float]] | None = Field(default=None)
+    # How far below the target the zone may dip without counting as a shortfall
+    # (K). A comfort choice, not physics: 0 holds the target exactly, down to a
+    # predicted dip of hundredths of a degree that no one would notice.
+    comfort_tolerance: float = Field(default=0.0, ge=0.0)
     # Every room that belongs to the modelled zone. The building model averages
     # their sensors into one representative zone temperature, which is what a
     # whole-dwelling energy balance needs: the delivered heat and the baseload
@@ -195,9 +204,7 @@ class BuildingConfig(BaseModel):
     # volume would be a second place for the same fact to be wrong. It covers
     # only the rooms that have a sensor, so it slightly undercounts hall,
     # landing and stairwell - acceptable because the volume only sets bounds on
-    # a heat capacity (and for the single-node model does not bind at all,
-    # since air capacity stays far below MIN_C_J_PER_K for any dwelling-sized
-    # zone).
+    # a heat capacity.
     ceiling_height: float = Field(default=2.6)
     # The zone's south-facing glazing, window group by window group. Not the
     # solar gain itself: the total area is the physical upper bound on the
