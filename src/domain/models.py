@@ -152,7 +152,9 @@ class HeatPumpCOPModel:
     # MPCOptimizer._power_line_coefficients) - the normal active-heating
     # operating range for a DHW cycle on this installation. They belong with
     # the model because q_th_at_power_fit_low_w/high_w below are defined AT
-    # them: the fields have no meaning without these two numbers.
+    # them: the fields have no meaning without these two numbers. DHW only: a
+    # heating model leaves these fields at their defaults (see
+    # HeatPumpCOPIdentifier.calibrate()).
     POWER_FIT_T_LOW_C: ClassVar[float] = 30.0
     POWER_FIT_T_HIGH_C: ClassVar[float] = 60.0
 

@@ -26,12 +26,9 @@ logger = logging.getLogger(__name__)
 
 
 class SpaceHeatingIdentifier(SystemIdentifier[SpaceHeatingModel]):
-    # Chronological split, as for every other identifier here.
+    # Chronological split, as for every other identifier here - but by whole
+    # runs: half a run in each split would validate a run on itself.
     TRAIN_RATIO = 0.80
-
-    # Two curve parameters and one conductance: below this many runs a fit
-    # follows the particular runs rather than the heat pump.
-    MIN_RUNS = 5
 
     # The shortest runs the heat pump makes by itself, not its typical one: a
     # plan may not ask for shorter runs than it ever runs, but it may well ask
@@ -101,6 +98,10 @@ class SpaceHeatingIdentifier(SystemIdentifier[SpaceHeatingModel]):
         """The model from heating-run readings (see runs()).
 
         The heating curve: supply = a + b * T_outdoor, over settled readings.
+        Flat at their mean supply when the runs do not show the slope - a
+        supply rising with the outdoor temperature, or a slope within its own
+        standard error, says the outdoor range was too narrow, not that the
+        curve is shaped that way.
         The floor: Q = G * (supply - T_mass), a conductance from the supply
         water to the mass. It covers both the water warming the screed and the
         water cooling on its way through the loop - G = 1 / (1 / UA_floor +
@@ -108,47 +109,65 @@ class SpaceHeatingIdentifier(SystemIdentifier[SpaceHeatingModel]):
         flows at no temperature difference.
 
         The run length from complete runs only: one cut off by the edge of the
-        data says nothing about how long it would have lasted.
+        data says nothing about how long it would have lasted, and one that
+        never settled is a start-up that failed, not a run the heat pump
+        chose.
         """
 
         settled = rows[rows["settled"] & (rows["Q_floor_w"] > 0.0)]
 
-        if settled["run"].nunique() < self.MIN_RUNS:
-            raise ValueError(
-                f"Space heating needs at least {self.MIN_RUNS} heating runs, "
-                f"found {settled['run'].nunique()}."
+        if settled.empty:
+            raise ValueError("Space heating needs at least one settled heating run.")
+
+        slope, intercept = 0.0, float(settled["T_supply"].mean())
+
+        if len(settled) > 3 and settled["T_out"].nunique() > 1:
+            (fit_slope, fit_intercept), covariance = np.polyfit(
+                settled["T_out"], settled["T_supply"], 1, cov=True
             )
 
-        slope, intercept = np.polyfit(settled["T_out"], settled["T_supply"], 1)
+            if 0.0 >= fit_slope and np.sqrt(covariance[0, 0]) < -fit_slope:
+                slope, intercept = float(fit_slope), float(fit_intercept)
+            else:
+                logger.warning(
+                    "Space heating: supply slope %.2f K/K not shown by these "
+                    "runs - a flat curve at their mean supply %.1f degC.",
+                    fit_slope,
+                    intercept,
+                )
 
         lift = (settled["T_supply"] - settled["T_mass"]).to_numpy(dtype=float)
         heat = settled["Q_floor_w"].to_numpy(dtype=float)
         conductance = float(np.dot(lift, heat) / np.dot(lift, lift))
 
-        lengths = rows.groupby("run").size() * dt_hours
+        lengths = (
+            rows[rows["run"].isin(settled["run"])].groupby("run").size() * dt_hours
+        )
         complete = lengths.iloc[1:-1] if len(lengths) > 2 else lengths
         min_runtime_hours = float(
             math.floor(complete.quantile(self.MIN_RUNTIME_QUANTILE) / dt_hours)
             * dt_hours
         )
 
-        if slope > 0.0:
-            logger.warning(
-                "Space heating: the supply rises with the outdoor temperature "
-                "(%.2f K/K) - not a heating curve, check the runs it came from.",
-                slope,
-            )
-
         return SpaceHeatingModel(
-            supply_at_zero_outdoor_c=float(intercept),
-            supply_per_outdoor_k=float(slope),
+            supply_at_zero_outdoor_c=intercept,
+            supply_per_outdoor_k=slope,
             conductance_w_per_k=conductance,
             min_runtime_hours=max(min_runtime_hours, dt_hours),
         )
 
+    def _in_test(self, rows: pd.DataFrame) -> pd.Series:
+        """Whether each reading belongs to the runs held out for validation:
+        the last fifth of those that settled, but never the only one."""
+
+        runs = rows.loc[rows["settled"], "run"].unique()
+        train_runs = max(1, int(len(runs) * self.TRAIN_RATIO))
+
+        return rows["run"].isin(runs[train_runs:])
+
     def calibrate(self, df: pd.DataFrame) -> SpaceHeatingModel:
         rows = self.runs(df)
-        train = rows[rows["time"] <= rows["time"].quantile(self.TRAIN_RATIO)]
+        train = rows[~self._in_test(rows)]
         dt_hours = float(rows["dt_seconds"].median()) / 3600.0
 
         self.model = self.fit(train, dt_hours)
@@ -170,14 +189,13 @@ class SpaceHeatingIdentifier(SystemIdentifier[SpaceHeatingModel]):
 
         model = self.get_model()
         rows = self.runs(df)
-        test = rows[
-            (rows["time"] > rows["time"].quantile(self.TRAIN_RATIO))
-            & rows["settled"]
-            & (rows["Q_floor_w"] > 0.0)
-        ]
+        test = rows[self._in_test(rows) & rows["settled"] & (rows["Q_floor_w"] > 0.0)]
 
         if test.empty:
-            raise ValueError("No settled heating readings to validate on.")
+            raise ValueError(
+                "No settled heating run held out to validate on - the model is "
+                "fitted on every run there is."
+            )
 
         predicted = model.heat_w(
             test["T_out"].to_numpy(dtype=float), test["T_mass"].to_numpy(dtype=float)

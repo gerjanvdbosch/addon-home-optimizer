@@ -84,7 +84,7 @@ class Container:
                 # remembers. Cooling is deliberately absent: there the water is
                 # the COLD side and this model does not describe it (see the
                 # class docstring).
-                HeatPumpCOPIdentifier(key="heating"),
+                HeatPumpCOPIdentifier(key="heating", models_path=self.models_path),
                 BuildingThermalIdentifier(latitude=latitude, longitude=longitude),
                 SolarBiasIdentifier(latitude=latitude, longitude=longitude),
                 # After the building: it fits against that model's estimate of

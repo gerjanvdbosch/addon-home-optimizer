@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -145,12 +146,17 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
     # 20 or 25 minutes.
     STARTUP = pd.Timedelta(minutes=15)
 
-    def __init__(self, key: Literal["dhw", "heating"]) -> None:
+    def __init__(
+        self, key: Literal["dhw", "heating"], models_path: Path | None = None
+    ) -> None:
         super().__init__()
         # Which HeatPumpStates mode this instance fits, and its stable name
         # (see name()): independent of the raw state label, so a model keeps
         # its name when that label is configured differently.
         self.key = key
+        # Where the DHW model is found, whose evaporator approach a heating fit
+        # falls back on (see _shared_delta_t_evap).
+        self.models_path = models_path
         # The configured state labels; overwritten by dataset().
         self.states = HeatPumpStates()
         self.parameter_std_errors: dict[str, float] | None = None
@@ -476,6 +482,29 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             zip(parameter_names, std_errors.tolist(), strict=True)
         )
 
+        shared = self._shared_delta_t_evap(delta_t_evap, float(std_errors[1]))
+
+        if shared is not None:
+            # With the approach fixed the COP is eta_carnot times the Carnot
+            # COP, so eta_carnot is a least-squares solve through the origin.
+            delta_t_evap = shared
+            carnot = HeatPumpCOPModel(
+                eta_carnot=1.0,
+                delta_t_cond=self.FIXED_DELTA_T_COND,
+                delta_t_evap=delta_t_evap,
+            ).cop(T_outdoor, T_supply)
+            eta_carnot = float(np.dot(carnot, COP_measured) / np.dot(carnot, carnot))
+            residual = COP_measured - eta_carnot * carnot
+            eta_std_error = float(
+                np.sqrt(
+                    np.dot(residual, residual)
+                    / max(len(residual) - 1, 1)
+                    / np.dot(carnot, carnot)
+                )
+            )
+            std_errors = np.array([eta_std_error, 0.0])
+            self.parameter_std_errors = {"eta_carnot": eta_std_error}
+
         logger.info(
             "Heat pump COP parameters calibrated (%s): "
             "eta_carnot=%.4f±%.4f, "
@@ -501,41 +530,82 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         # "how hot does this specific installation's heat pump actually run
         # a full SWW cycle", without inventing an unmeasured tank-to-supply
         # approach parameter.
-        reference_supply_temperature_c = float(df["T_supply"].quantile(0.95))
+        self.model = HeatPumpCOPModel(
+            eta_carnot=eta_carnot,
+            delta_t_cond=self.FIXED_DELTA_T_COND,
+            delta_t_evap=delta_t_evap,
+        )
 
+        # The reference supply and the Q_th line are what DHW planning costs a
+        # tank charge with, at 30-60 degC supply. Space heating is costed at
+        # its heating curve's own supply with cop() alone (see
+        # MPCOptimizer._space_cop), so a heating fit has no use for them - and
+        # a line fitted at ~25-30 degC floor supply extrapolated to 60 degC
+        # would mean nothing.
+        if self.key != "dhw":
+            return self.model
+
+        self.model.reference_supply_temperature_c = float(df["T_supply"].quantile(0.95))
         # See the class docstring on POWER_FIT_T_LOW_C/HIGH_C and
         # POWER_FIT_MIN_SUPPLY_C. Fitted on the training split only, like the
         # COP parameters, so validate() scores it on data it never saw.
-        q_th_at_power_fit_low_w, q_th_at_power_fit_high_w = self._fit_q_th_line(
-            train_df,
-            HeatPumpCOPModel(
-                eta_carnot=eta_carnot,
-                delta_t_cond=self.FIXED_DELTA_T_COND,
-                delta_t_evap=delta_t_evap,
-            ),
-        )
+        (
+            self.model.q_th_at_power_fit_low_w,
+            self.model.q_th_at_power_fit_high_w,
+        ) = self._fit_q_th_line(train_df, self.model)
 
         logger.info(
             "Heat pump COP calibration (%s): reference_supply_temperature_c="
             "%.2f degC, Q_th at %.0f/%.0f degC = %.1f/%.1f W",
             self.mode,
-            reference_supply_temperature_c,
+            self.model.reference_supply_temperature_c,
             HeatPumpCOPModel.POWER_FIT_T_LOW_C,
             HeatPumpCOPModel.POWER_FIT_T_HIGH_C,
-            q_th_at_power_fit_low_w,
-            q_th_at_power_fit_high_w,
-        )
-
-        self.model = HeatPumpCOPModel(
-            eta_carnot=eta_carnot,
-            delta_t_cond=self.FIXED_DELTA_T_COND,
-            delta_t_evap=delta_t_evap,
-            reference_supply_temperature_c=reference_supply_temperature_c,
-            q_th_at_power_fit_low_w=q_th_at_power_fit_low_w,
-            q_th_at_power_fit_high_w=q_th_at_power_fit_high_w,
+            self.model.q_th_at_power_fit_low_w,
+            self.model.q_th_at_power_fit_high_w,
         )
 
         return self.model
+
+    def _shared_delta_t_evap(
+        self, delta_t_evap: float, std_error: float
+    ) -> float | None:
+        """The DHW model's evaporator approach, for a heating fit that cannot
+        pin down its own.
+
+        Both modes draw heat through the same outdoor evaporator, so its
+        approach is one physical quantity; what differs between them is the
+        supply temperature, which eta_carnot and the condenser side carry.
+        Separating the approach from eta_carnot takes a spread in lift, which
+        a few heating runs at one floor supply do not have - there the DHW
+        fit, over a far wider lift range, is the better estimate. None when
+        the heating fit's own approach is identified, or when there is no DHW
+        model to take it from.
+        """
+
+        if self.key == "dhw" or self.models_path is None:
+            return None
+
+        if np.isfinite(std_error) and std_error <= abs(delta_t_evap):
+            return None
+
+        dhw = HeatPumpCOPIdentifier(key="dhw")
+        dhw.load(self.models_path)
+
+        if dhw.model is None:
+            return None
+
+        logger.info(
+            "Heat pump COP calibration (%s): delta_t_evap=%.2f+/-%.2f K is not "
+            "identified here - using the DHW fit's %.2f K (same evaporator) "
+            "and fitting eta_carnot alone.",
+            self.mode,
+            delta_t_evap,
+            std_error,
+            dhw.model.delta_t_evap,
+        )
+
+        return float(dhw.model.delta_t_evap)
 
     def _fit_q_th_line(
         self, df: pd.DataFrame, cop_model: HeatPumpCOPModel
@@ -730,11 +800,14 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         # optimizer costs with a straight power line through two Q_th
         # reference values (see _fit_q_th_line()), so that line is scored here
         # against measured power, in the supply range planning evaluates it in.
-        planned_power_w = self._planned_power_w(test_df)
-        measured_power_w = test_df["P_el"].to_numpy(dtype=float)
-        in_planning_range = T_supply >= self.POWER_FIT_MIN_SUPPLY_C
+        # Only DHW planning has such a line (see calibrate()).
+        in_planning_range = (T_supply >= self.POWER_FIT_MIN_SUPPLY_C) & (
+            self.key == "dhw"
+        )
 
         if in_planning_range.any():
+            planned_power_w = self._planned_power_w(test_df)
+            measured_power_w = test_df["P_el"].to_numpy(dtype=float)
             error_w = (planned_power_w - measured_power_w)[in_planning_range]
             power_bias_w = float(np.mean(error_w))
             power_mae_w = float(np.mean(np.abs(error_w)))
@@ -775,6 +848,8 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             )
         else:
             power_bias_w = power_mae_w = run_peak_ratio = float("nan")
+
+        if self.key == "dhw" and not in_planning_range.any():
             logger.warning(
                 "Heat pump COP validation (%s): no test readings at or above "
                 "%.0f degC supply - planned power not scored.",

@@ -148,6 +148,11 @@ class MPCOptimizer:
         if horizon < 2:
             raise ValueError("MPC horizon must contain at least 2 steps.")
 
+        if self.config.feed_in_price_eur_per_kwh > self.config.price_eur_per_kwh:
+            raise ValueError(
+                "feed_in_price_eur_per_kwh may not exceed price_eur_per_kwh."
+            )
+
         if len(data.target_temperature_top) != horizon:
             raise ValueError(
                 "target_temperature_top must have the same length as "
@@ -861,6 +866,12 @@ class MPCOptimizer:
             for k in range(num_steps)
         ]
 
+        # The heat pump's whole draw per step, sun or grid - see _build_objective.
+        # Never below zero: the power line is a linear fit, and on inputs far
+        # outside what it was fitted on it can dip below zero at a cold tank,
+        # which no compressor does.
+        model.draw_w = pyo.Var(model.K, domain=pyo.NonNegativeReals)
+
         for k in range(num_steps):
             alpha, beta = power_lines[k]
             share = model.q_heat_pump_w[k] / self._heat_w
@@ -906,6 +917,8 @@ class MPCOptimizer:
                 electrical_w = electrical_w + model.q_space_w[k] / model.space_cop[k]
                 running = running + model.q_space_w[k] / self._heat_w
 
+            model.active_power_constraint.add(model.draw_w[k] >= electrical_w)
+
             for s, (_, solar_w) in enumerate(solar_scenarios):
                 solar_available_w = max(0.0, float(solar_w[k]))
 
@@ -921,7 +934,7 @@ class MPCOptimizer:
         # 46 degC ahead of a 45 degC target) - while this household's runs
         # mostly have sun, so later heat is rarely pure grid heat. Heat needed
         # after tomorrow's targets is planned once it comes within the horizon;
-        # free surplus sun is not stored for demand beyond it.
+        # surplus sun is not stored for demand beyond it.
         model.objective = pyo.Objective(
             expr=self._build_objective(
                 model, plan, [weight for weight, _ in solar_scenarios]
@@ -1425,8 +1438,15 @@ class MPCOptimizer:
                 for s, weight in enumerate(scenario_weights)
             )
             grid_energy_kwh = expected_grid_power_w * plan.dt_hours[k] / 1000.0
+            energy_kwh = model.draw_w[k] * plan.dt_hours[k] / 1000.0
 
-            objective += self.config.price_eur_per_kwh * grid_energy_kwh
+            # What the house pays for the heat pump against not running it at
+            # all: the grid energy at the price, and the own solar it uses at
+            # the export that solar would otherwise have earned.
+            feed_in = self.config.feed_in_price_eur_per_kwh
+            objective += (
+                self.config.price_eur_per_kwh - feed_in
+            ) * grid_energy_kwh + feed_in * energy_kwh
 
             objective += self.config.weight_switching * model.compressor_start[k]
 

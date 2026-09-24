@@ -78,25 +78,39 @@ class Identification:
                     break
 
     def validate(self, config: ValidateConfig) -> None:
-        identifier, df = self._prepare(config.target, config.days, end=config.end)
+        # Without a target every model, as calibrate() does - and as a batch
+        # too: one model that cannot be validated (never calibrated, no runs in
+        # the window) is reported and the rest still run.
+        for identifier in self.identifiers:
+            if config.target and identifier.name != config.target:
+                continue
 
-        result = identifier.validate(df)
+            try:
+                identifier, df = self._prepare(identifier, config.days, end=config.end)
+                result = identifier.validate(df)
+            except Exception as error:
+                if config.target:
+                    raise
 
-        logger.info(
-            "Validate finished (%s): %s",
-            identifier.name,
-            " ".join(f"{key}={value:.4g}" for key, value in result.items()),
-        )
+                logger.error(
+                    "Validating %s failed, continuing with the rest: %s",
+                    identifier.name,
+                    error,
+                )
+                continue
+
+            logger.info(
+                "Validate finished (%s): %s",
+                identifier.name,
+                " ".join(f"{key}={value:.4g}" for key, value in result.items()),
+            )
 
     def _prepare(
         self,
-        identifier: str | SystemIdentifier,
+        identifier: SystemIdentifier,
         days: int,
         end: datetime | None = None,
     ) -> tuple[SystemIdentifier, Any]:
-        if isinstance(identifier, str):
-            identifier = self._get_identifier(identifier)
-
         identifier.load(self.path)
 
         config = self.config_repository.load()
@@ -108,10 +122,3 @@ class Identification:
         df = self.loader.load(dataset, start, end)
 
         return identifier, df
-
-    def _get_identifier(self, name: str) -> SystemIdentifier:
-        for identifier in self.identifiers:
-            if identifier.name == name:
-                return identifier
-
-        raise ValueError(f"Unknown system identifier: {name}")

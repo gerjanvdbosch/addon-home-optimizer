@@ -39,6 +39,11 @@ COP_MODEL = HeatPumpCOPModel(
 
 # Solar rising to a midday peak then falling, 24 steps of 15 minutes (6 hours).
 _SOLAR_MIDDAY_W = [500, 1000, 2000, 3000, 3500, 3000, 2000, 1000, 500, 0.0]
+# Own sun is only cheaper than the grid where exporting it earns less than
+# importing costs; the tests about following the sun are about that case.
+NO_FEED_IN = MPCConfig(feed_in_price_eur_per_kwh=0.0)
+
+
 SOLAR_FORECAST_W = [0.0] * 8 + _SOLAR_MIDDAY_W + [0.0] * 6
 
 
@@ -348,7 +353,7 @@ def test_uncertain_solar_window_loses_to_a_certain_one_with_less_p50():
     target = [10.0] * horizon
     target[20] = 45.0
 
-    optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig())
+    optimizer = MPCOptimizer(THERMAL_MODEL, NO_FEED_IN)
     common = dict(solar_forecast_w=p50, target_temperature_top=tuple(target))
 
     on_p50 = optimizer.solve(_make_input(**common))
@@ -1304,7 +1309,7 @@ def test_a_higher_ceiling_buffers_the_sun_in_the_floor_and_the_ceiling_holds():
         zone_internal_gain_w=(150.0,) * steps,
     )
     optimizer = MPCOptimizer(
-        THERMAL_MODEL, MPCConfig(), cop_model=COP_MODEL, building_model=model
+        THERMAL_MODEL, NO_FEED_IN, cop_model=COP_MODEL, building_model=model
     )
 
     def sunny_heat(ceiling_c: float):
@@ -1419,3 +1424,30 @@ def test_space_heating_is_costed_with_the_heating_cop_once_there_is_one():
     assert space_cop() == pytest.approx(
         COP_MODEL.clamped_cop(5.0, MPCOptimizer.SPACE_HEATING_SUPPLY_C)
     )
+
+
+def test_net_metering_does_not_heat_today_for_a_cloudy_tomorrow():
+    """Under net metering own sun earns what grid power costs, so heat stored
+    today for a cloudier tomorrow is paid in full today and partly lost by
+    tomorrow. Priced as free, the sun made exactly that worth doing."""
+
+    steps = 192
+    hour = np.arange(steps) * 0.25
+    sun = np.clip(2500.0 * np.sin(np.pi * ((hour % 24.0) - 7.0) / 12.0), 0.0, None)
+    sun[hour >= 24.0] *= 0.3
+    target = [10.0] * steps
+    for day in (0, 24):
+        target[int((18.0 + day) * 4)] = 45.0
+
+    def run_end(config: MPCConfig) -> float:
+        result = MPCOptimizer(THERMAL_MODEL, config, cop_model=COP_MODEL).solve(
+            _make_input(
+                solar_forecast_w=list(sun),
+                target_temperature_top=tuple(target),
+                outdoor_temperature_forecast=(15.0,) * steps,
+            )
+        )
+        on = [k for k, value in enumerate(result.schedule[:96]) if value]
+        return result.temperatures[on[-1] + 1]
+
+    assert run_end(MPCConfig()) < run_end(NO_FEED_IN) - 0.5

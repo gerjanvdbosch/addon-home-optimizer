@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 
 from app.identification import Identification
-from domain.jobs import CalibrateConfig
+from domain.jobs import CalibrateConfig, ValidateConfig
 
 
 class _Identifier:
@@ -16,6 +16,7 @@ class _Identifier:
         self._error = error
         self.calibrated = False
         self.saved = False
+        self.validated = False
         self.attempts = 0
 
     @property
@@ -37,6 +38,14 @@ class _Identifier:
 
     def save(self, path: Path) -> None:
         self.saved = True
+
+    def validate(self, df: pd.DataFrame) -> dict[str, float]:
+        if self._error is not None:
+            raise self._error
+
+        self.validated = True
+
+        return {"mae": 0.1}
 
 
 class _Loader:
@@ -134,3 +143,29 @@ def test_a_stale_saved_model_is_dropped_and_refitted(tmp_path, caplog):
     assert identifier.attempts == 2
     assert identifier.calibrated and identifier.saved
     assert "dropping it and fitting from scratch" in caplog.text
+
+
+def test_validate_without_a_target_validates_every_model(tmp_path, caplog):
+    """Without a target it once crashed on None instead of running a batch,
+    as calibrate does: every model, one failure reported and the rest run."""
+
+    first = _Identifier("boiler")
+    broken = _Identifier("space_heating", ValueError("no run held out"))
+    last = _Identifier("solar")
+
+    with caplog.at_level(logging.ERROR):
+        _identification([first, broken, last], tmp_path).validate(
+            ValidateConfig(days=60)
+        )
+
+    assert first.validated and last.validated
+    assert "space_heating" in caplog.text
+
+
+def test_validate_by_name_fails_loudly(tmp_path):
+    broken = _Identifier("space_heating", ValueError("no run held out"))
+
+    with pytest.raises(ValueError, match="no run held out"):
+        _identification([_Identifier("boiler"), broken], tmp_path).validate(
+            ValidateConfig(target="space_heating", days=60)
+        )

@@ -439,3 +439,26 @@ def test_name_and_label_are_key_specific():
     assert sww.name != heating.name
     assert sww.label != heating.label
     assert sww.name == "cop_dhw"
+
+
+def test_heating_fit_takes_the_evaporator_approach_from_dhw(tmp_path):
+    """Heating runs at one floor supply and one outdoor temperature cannot
+    separate the approach from eta_carnot; the DHW fit's approach (same
+    evaporator) is used instead. And no Q_th line: that is DHW planning's."""
+
+    dhw = HeatPumpCOPIdentifier(key="dhw")
+    dhw.model = TRUE_COP_MODEL
+    dhw.save(tmp_path)
+
+    df = _simulate(np.random.default_rng(7), HEATING_STATE, t_supply=28.0)
+    # The same heat, now drawn at one outdoor temperature.
+    df["P_el"] *= TRUE_COP_MODEL.cop(df["T_outdoor"], 28.0) / TRUE_COP_MODEL.cop(
+        15.0, 28.0
+    )
+    df["T_outdoor"] = 15.0
+
+    model = HeatPumpCOPIdentifier(key="heating", models_path=tmp_path).calibrate(df)
+
+    assert model.delta_t_evap == TRUE_DELTA_T_EVAP
+    assert model.eta_carnot == pytest.approx(TRUE_ETA_CARNOT, rel=0.05)
+    assert model.q_th_at_power_fit_high_w == 0.0

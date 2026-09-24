@@ -94,6 +94,9 @@ def _config() -> Config:
 
 
 DT_SECONDS = 900.0
+# Air leaking through a closed envelope in wind: ~0.1 air changes per hour per
+# m/s through TRUE_VOLUME_M3 (rho * c_p ~ 1200 J/m3K).
+INFILTRATION_W_PER_K_M_S = 4.0
 SAMPLES_PER_DAY = int(24 * 3600 / DT_SECONDS)
 N_DAYS = 20
 
@@ -185,16 +188,26 @@ def _true_parameters() -> np.ndarray:
     )
 
 
-def _simulate(rng: np.random.Generator) -> pd.DataFrame:
+def _simulate(
+    rng: np.random.Generator, wind_kmh: np.ndarray | None = None
+) -> pd.DataFrame:
     """Generate a room-temperature trajectory from the known ODE parameters.
 
     The forcing is taken from prepare() itself, so the test exercises the real
     irradiance transposition, shutter handling and calorimetry rather than a
     second, parallel implementation of them.
+
+    With wind, the zone also loses INFILTRATION_W_PER_K_M_S per K of
+    indoor-outdoor difference per m/s of it - physics TRUE_MODEL lacks.
     """
 
     identifier = _identifier()
-    prepared = identifier.prepare(_raw_frame())
+    raw = _raw_frame()
+
+    if wind_kmh is not None:
+        raw["wind_speed"] = wind_kmh
+
+    prepared = identifier.prepare(raw)
 
     inputs = identifier._inputs(TRUE_MODEL, prepared)
 
@@ -204,15 +217,19 @@ def _simulate(rng: np.random.Generator) -> pd.DataFrame:
     state = np.array([21.0, 21.0])
     air = np.empty(len(prepared))
 
+    wind = prepared.get("wind_m_per_s", pd.Series(0.0, index=prepared.index))
+
     for i in range(len(prepared)):
         # What the thermostat reads of the state, which for TRUE_MODEL is the
         # air node alone.
         air[i] = observation @ state
-        state = a_d @ state + b_d @ inputs[i]
+        forcing = inputs[i].copy()
+        # Into the air node, like the other internal flows (index 1).
+        forcing[1] -= INFILTRATION_W_PER_K_M_S * wind.iloc[i] * (state[0] - forcing[0])
+        state = a_d @ state + b_d @ forcing
 
     noisy = air + rng.normal(0.0, MEASUREMENT_NOISE_STD_C, len(air))
 
-    raw = _raw_frame()
     raw["T_air"] = np.round(noisy / SENSOR_RESOLUTION_C) * SENSOR_RESOLUTION_C
 
     return raw
@@ -730,6 +747,41 @@ def test_envelope_trend_ignores_sunlit_windows():
     assert metrics["dark_windows"] < metrics["scored_samples"] / (
         identifier.ROLLOUT_HORIZON_HOURS * 4
     )
+
+
+def _windy_days() -> np.ndarray:
+    """Wind (km/h), steady within a day and random between days: independent
+    of the daily indoor-outdoor cycle, and of this module's own day-periodic
+    cooling and shutter patterns, which a periodic wind would line up with."""
+
+    day = np.arange(N_DAYS * SAMPLES_PER_DAY) // SAMPLES_PER_DAY
+
+    return np.random.default_rng(1).uniform(0.0, 40.0, N_DAYS)[day]
+
+
+def test_validate_flags_heat_lost_to_wind_the_model_lacks(caplog):
+    identifier, _, _ = _calibrated()
+    windy = _simulate(np.random.default_rng(14), wind_kmh=_windy_days())
+
+    with caplog.at_level("WARNING"):
+        metrics = identifier.validate(windy)
+
+    assert metrics["wind_bias_slope_k_per_k_m_s"] < 0.0
+    assert "loses more heat with the wind" in caplog.text
+
+
+def test_validate_reports_no_wind_trend_where_wind_changes_nothing(caplog):
+    identifier, df, _ = _calibrated()
+    # The same trajectory, now with wind the zone never felt.
+    df["wind_speed"] = _windy_days()
+
+    with caplog.at_level("WARNING"):
+        metrics = identifier.validate(df)
+
+    assert abs(metrics["wind_bias_slope_k_per_k_m_s"]) <= (
+        identifier.SIGNIFICANT_SLOPE_STD_ERRORS * metrics["wind_bias_slope_std_error"]
+    )
+    assert "with the wind" not in caplog.text
 
 
 def _frame_with_future(rng: np.random.Generator) -> tuple[pd.DataFrame, datetime]:

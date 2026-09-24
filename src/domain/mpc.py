@@ -22,6 +22,16 @@ class MPCConfig:
     heat_pump_min_off_steps: int = 2
     # Flat price for now - will become a per-installation config option later.
     price_eur_per_kwh: float = 0.23
+    # What an exported kWh brings in (EUR/kWh), and so what the heat pump's own
+    # solar really costs: the export it forgoes. Equal to the price under net
+    # metering (salderen, in the Netherlands until 2027), which credits an
+    # exported kWh at the price of an imported one - own sun is then no cheaper
+    # than the grid. Priced at nothing instead, sun looked free, and a sunny
+    # day ahead of a cloudy one had the plan heat the tank for tomorrow today:
+    # 48 instead of 47 degC for a 45 degC target, with a fifth of the stored
+    # heat lost by the next day. At most the price: exporting cannot pay more
+    # than importing costs, or the plan would import to earn.
+    feed_in_price_eur_per_kwh: float = 0.07
     weight_switching: float = 0.1
     weight_temperature_slack: float = 1000.0
     # Decisions within this many hours of now keep the full step_hours

@@ -369,6 +369,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # the fitted slope rather than to a single measurement.
     SIGNIFICANT_SLOPE_STD_ERRORS = 2.0
 
+    # Open-Meteo reports wind speed in km/h unless asked otherwise; exact by
+    # definition of both units.
+    KMH_PER_M_PER_S = 3.6
+
     PARAMETER_NAMES = (
         "ua_envelope_w_per_k",
         "ua_air_mass_w_per_k",
@@ -610,6 +614,11 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         df["shutter_open_fraction"] = self._shutter_open_fraction(df)
         df["occupants"] = self._occupants(df)
         df["baseload_w"] = df["baseload_w"].fillna(0.0)
+
+        if "wind_speed" in df.columns:
+            df["wind_m_per_s"] = (
+                pd.to_numeric(df["wind_speed"], errors="coerce") / self.KMH_PER_M_PER_S
+            )
 
         return df
 
@@ -994,6 +1003,19 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         return 1.0 - float(mean_absolute_error(measured, predicted)) / baseline
 
+    @staticmethod
+    def _trend(error: np.ndarray, *drives: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Least-squares slopes of error on the drives, fitted together with an
+        intercept, and their standard errors from the scatter around the fit."""
+
+        design = np.column_stack([np.ones(len(error)), *drives])
+        coefficients = np.linalg.lstsq(design, error, rcond=None)[0]
+        residual = error - design @ coefficients
+        variance = float(residual @ residual) / max(len(error) - design.shape[1], 1)
+        covariance = variance * np.linalg.pinv(design.T @ design)
+
+        return coefficients[1:], np.sqrt(np.diag(covariance))[1:]
+
     def validate(self, df: pd.DataFrame) -> dict[str, float]:
         """Forward-simulation accuracy over independent rollout windows.
 
@@ -1179,7 +1201,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         ):
             window_drive = window_drive[dark]
             window_error = window_error[dark]
-            slope = float(np.polyfit(window_drive, window_error, 1)[0])
+            (slope,), (standard_error,) = self._trend(window_error, window_drive)
             span = float(
                 np.quantile(window_drive, 0.95) - np.quantile(window_drive, 0.05)
             )
@@ -1192,14 +1214,6 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             # honest yardstick here - a fixed threshold in kelvin would either
             # fire on noise or hide a real trend depending on how spread out the
             # conditions happened to be.
-            fitted = slope * window_drive + np.polyfit(window_drive, window_error, 1)[1]
-            degrees_of_freedom = max(len(window_drive) - 2, 1)
-            variance = float(np.sum((window_error - fitted) ** 2)) / (
-                degrees_of_freedom
-            )
-            spread = float(np.sum((window_drive - window_drive.mean()) ** 2))
-            standard_error = float(np.sqrt(variance / spread)) if spread > 0 else 0.0
-
             metrics["envelope_bias_slope_std_error"] = standard_error
 
             significant = standard_error > 0.0 and abs(slope) > (
@@ -1220,6 +1234,59 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                     metrics["envelope_bias_span_k"],
                     "weak" if slope < 0.0 else "strong",
                 )
+
+            # Wind drives air through the envelope, and the heat that carries
+            # scales with wind speed times the indoor-outdoor difference. The
+            # model has no such term: its envelope conductance holds the mean
+            # infiltration. Were that too little, the error would slope with
+            # wind x drive beyond what the drive alone explains - so both are
+            # fitted together, and only the wind's own slope is judged.
+            #
+            # A diagnostic, not a reason to add a term: on summer data the one
+            # found was ~0.34 air changes per hour per m/s, several times what
+            # a closed envelope of this quality leaks - windows opened on windy
+            # days, not infiltration. Only data with the windows shut (the
+            # heating season) can show an infiltration term.
+            if "wind_m_per_s" in df.columns:
+                wind_drive = (
+                    (df["wind_m_per_s"].to_numpy(dtype=float)[positions] * drive)
+                    .reshape(windows, horizon_samples)
+                    .mean(axis=1)[dark]
+                )
+                known = np.isfinite(wind_drive)
+
+                if (
+                    known.sum() >= self.MIN_WINDOWS_FOR_A_TREND
+                    and np.std(wind_drive[known]) > 0
+                ):
+                    (_, wind_slope), (_, wind_error) = self._trend(
+                        window_error[known], window_drive[known], wind_drive[known]
+                    )
+                    wind_span = abs(wind_slope) * float(
+                        np.quantile(wind_drive[known], 0.95)
+                        - np.quantile(wind_drive[known], 0.05)
+                    )
+
+                    # K of window error per K of drive per m/s of wind.
+                    metrics["wind_bias_slope_k_per_k_m_s"] = float(wind_slope)
+                    metrics["wind_bias_slope_std_error"] = float(wind_error)
+                    metrics["wind_bias_span_k"] = wind_span
+
+                    if (
+                        abs(wind_slope) > self.SIGNIFICANT_SLOPE_STD_ERRORS * wind_error
+                        and wind_span > self.SENSOR_RESOLUTION_K
+                    ):
+                        logger.warning(
+                            "Building thermal validation: beyond the envelope "
+                            "slope, the window error slopes %+.4f K per K of "
+                            "indoor-outdoor difference per m/s of wind, worth "
+                            "%.2f K after dark - the zone %s heat with the "
+                            "wind than the model. Infiltration only if the "
+                            "windows were shut; otherwise opened windows.",
+                            wind_slope,
+                            wind_span,
+                            "loses more" if wind_slope < 0.0 else "loses less",
+                        )
 
         if self.parameter_std_errors is not None:
             weakly_identified = 0
@@ -1487,6 +1554,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 "diffuse_radiation",
                 "direct_normal_irradiance",
                 "temperature",
+                # Instantaneous like temperature, so not shifted either. Read
+                # by validate()'s wind diagnostic only - the model has no
+                # infiltration term (see there).
+                "wind_speed",
             ],
             interval="1h",
             aggregation="last",
