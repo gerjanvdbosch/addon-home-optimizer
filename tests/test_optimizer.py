@@ -617,7 +617,9 @@ def test_reported_electrical_power_rises_as_tank_heats_through_a_run():
     assert len(on_steps) >= 2
     assert on_steps == list(range(on_steps[0], on_steps[-1] + 1))  # one contiguous run
 
-    on_steps_power = [result.electrical_power_w[k] for k in on_steps]
+    # The full steps only: the run's last one is used for just the part the
+    # target needs, and draws for that part alone.
+    on_steps_power = [result.electrical_power_w[k] for k in on_steps[:-1]]
     # Strictly increasing across the run: later steps have a hotter tank
     # (T[k] rises monotonically while heating), hence a lower COP and higher
     # reported electrical draw.

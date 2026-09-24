@@ -29,12 +29,14 @@ logger = logging.getLogger(__name__)
 # domestic hot water tank, chosen for this installation.
 DEFAULT_MAX_TANK_TEMPERATURE_C = 65.0
 
-# How close to optimal a plan must be proven (EUR): one cent, the precision the
-# price itself is given in. The solver's default tolerance is relative to the
-# objective instead, which an unavoidable temperature shortfall inflates into the
-# thousands - at 0.01% of that, a plan was accepted on real data that kept the
-# heat pump 'on' without heating for 1.5 hours.
-MIP_ABSOLUTE_GAP_EUR = 0.01
+# How close to optimal a plan must be proven (EUR). The solver's default
+# tolerance is relative to the objective instead, which an unavoidable
+# temperature shortfall inflates into the thousands - at 0.01% of that, a plan was
+# accepted on real data that kept the heat pump 'on' without heating for 1.5
+# hours. A tenth of a cent, not a whole one: heat the sun almost covers costs
+# less than a cent, so at one cent a plan with two needless full steps - the
+# tank to 57 instead of 45 degC - counted as optimal.
+MIP_ABSOLUTE_GAP_EUR = 0.001
 
 # Swanson's rule: the standard three-point weights for a distribution's
 # expectation from its P10/P50/P90 (exact for a symmetric distribution, close
@@ -787,16 +789,28 @@ class MPCOptimizer:
         # every step corrects course once it does), and only the cost differs
         # between them.
         #
-        # A full heat pump step draws alpha * on + beta * T * on (see
-        # _power_line_coefficients), with T * on the exact product
-        # heat_pump_temperature (see heat_source_constraints) - so a heat pump
-        # at a fraction of 'on' in the solver's relaxation also draws its share.
-        # A partly used step draws for the part it runs, (alpha + beta * T) *
-        # q / q_in_nominal_w, which is not linear. The unused part is instead
-        # subtracted at the step's floor temperature, which never overstates the
-        # saving: exact for a full step, a little too dear for a partial one.
-        # Costed at full power instead, a step once on made the rest of its heat
-        # free, so the plan heated past the target on grid power as well.
+        # The heat pump draws alpha + beta * T (see _power_line_coefficients)
+        # for the share u = q / q_in_nominal_w of the step it runs, so a step
+        # draws alpha * u + beta * T * u. T * u is not linear, and is replaced
+        # by its McCormick lower envelope over the step's range of T while the
+        # heat pump runs - from its floor to its ceiling, at most the heat
+        # pump's own limit: the larger of T_floor * u and
+        # T * on - T_upper * (on - u), with T * on the exact product
+        # heat_pump_temperature. Exact for a full step (u = on) and an idle one
+        # (u = 0). For the partial last step of a run it never books more than
+        # the step really draws, and prices the heat that fills it at no better
+        # COP than it has - so the plan fills it only as far as a target needs.
+        #
+        # Subtracting the unused part at the floor temperature instead - an
+        # upper envelope - priced that heat at the COP of the cold tank the step
+        # could have started from: filling the last step looked cheap, and a
+        # run from 24 degC was planned to 51.5 degC for a 45 degC target. The
+        # T_floor * u half is what keeps the solver quick: without it, a heat
+        # pump at a fraction of 'on' in the relaxation could book a negative
+        # draw, and proving a plan took 17-25 s instead of 3-6 s.
+        model.heat_pump_temperature_share = pyo.Var(model.K)
+        model.heat_pump_power_constraint = pyo.ConstraintList()
+
         model.S = pyo.RangeSet(0, len(solar_scenarios) - 1)
         model.active_power_w = pyo.Var(model.K, model.S, domain=pyo.NonNegativeReals)
 
@@ -811,12 +825,17 @@ class MPCOptimizer:
 
         for k in range(num_steps):
             alpha, beta = power_lines[k]
-            unused = model.boiler_on[k] - model.q_heat_pump_w[k] / self._heat_w
-            heat_pump_power_w = (
-                alpha * model.boiler_on[k]
-                + beta * model.heat_pump_temperature[k]
-                - (alpha + beta * t_floor[k]) * unused
+            share = model.q_heat_pump_w[k] / self._heat_w
+            temperature_share = model.heat_pump_temperature_share[k]
+            model.heat_pump_power_constraint.add(
+                temperature_share >= t_floor[k] * share
             )
+            model.heat_pump_power_constraint.add(
+                temperature_share
+                >= model.heat_pump_temperature[k]
+                - min(t_ceiling[k], heat_pump_limit_c) * (model.boiler_on[k] - share)
+            )
+            heat_pump_power_w = alpha * share + beta * temperature_share
 
             # The booster is a resistive element: its electrical power equals its
             # heat (COP 1 - real data: 1.37 kWh heat for 1.38 kWh electrical).
