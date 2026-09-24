@@ -73,9 +73,7 @@ class StateManager:
             now - NOWCAST_SPREAD_WINDOW,
             now,
         )
-        self._predict_solar(
-            state, now, recent_solar.set_index("time")["pv_production"]
-        )
+        self._predict_solar(state, now, recent_solar.set_index("time")["pv_production"])
 
         self.state_repository.save(state)
 

@@ -30,11 +30,18 @@ jobs:
       - name: Ruff (lint)
         run: ruff check src tests
 
-      #      - name: Black (format check)
-      #        run: black --check src tests
+      - name: Ruff (format check)
+        run: ruff format --check src tests
 
       #      - name: Pyright (type check)
       #        run: pyright
 
+      # One thread per library in each test worker: pytest-xdist already runs a
+      # worker per core, and BLAS or OpenMP pools inside every one of them
+      # (numpy, scipy, sklearn, HiGHS) oversubscribe the runner's cores.
       - name: Pytest
-        run: python -m pytest
+        env:
+          OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+        run: python -m pytest --durations=15

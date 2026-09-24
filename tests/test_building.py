@@ -248,9 +248,8 @@ def _calibrated(with_future: bool = False):
 
 
 def test_calibrate_recovers_known_parameters():
-    identifier = _identifier()
-
-    model = identifier.calibrate(_simulate(np.random.default_rng(0)))
+    identifier, _, _ = _calibrated()
+    model = identifier.model
 
     # The two conductances and the solar aperture set the zone's steady-state
     # energy balance, which is what planning depends on.
@@ -270,10 +269,7 @@ def test_calibrate_recovers_known_parameters():
 
 
 def test_validate_reports_forward_simulation_accuracy():
-    identifier = _identifier()
-    df = _simulate(np.random.default_rng(1))
-
-    identifier.calibrate(df)
+    identifier, df, _ = _calibrated()
     metrics = identifier.validate(df)
 
     assert metrics["scored_samples"] > 0
@@ -353,9 +349,7 @@ def test_validate_flags_a_physically_impossible_aperture(caplog):
     has. Validation has to say so rather than report the fit as a result.
     """
 
-    identifier = _identifier()
-    df = _simulate(np.random.default_rng(3))
-    identifier.calibrate(df)
+    identifier, df, _ = _calibrated()
 
     identifier.model.a_eff_m2 = 0.05 * TRUE_SOUTH_GLASS_M2
 
@@ -368,9 +362,7 @@ def test_validate_flags_a_physically_impossible_aperture(caplog):
 
 
 def test_validate_accepts_a_realistic_aperture():
-    identifier = _identifier()
-    df = _simulate(np.random.default_rng(4))
-    identifier.calibrate(df)
+    identifier, df, _ = _calibrated()
 
     # The synthetic truth is 6 of 14 m2, a g-value times frame factor of 0.43 -
     # an ordinary double-glazed window.
@@ -420,9 +412,7 @@ def test_simulate_returns_one_prediction_per_scored_sample():
     invisible to validate(), because that only consumes the values.
     """
 
-    identifier = _identifier()
-    df = _simulate(np.random.default_rng(5))
-    identifier.calibrate(df)
+    identifier, df, _ = _calibrated()
 
     simulated = identifier.simulate(df)["predicted"]
     prepared = identifier.prepare(df)
@@ -440,9 +430,7 @@ def test_simulate_returns_one_prediction_per_scored_sample():
 
 
 def test_simulate_tracks_the_measured_temperature():
-    identifier = _identifier()
-    df = _simulate(np.random.default_rng(6))
-    identifier.calibrate(df)
+    identifier, df, _ = _calibrated()
 
     simulated = identifier.simulate(df)["predicted"]
     measured = identifier.prepare(df).set_index("time")["T_air"]
@@ -461,9 +449,7 @@ def test_simulate_runs_up_to_the_last_measurement():
     the measurement.
     """
 
-    identifier = _identifier()
-    df = _simulate(np.random.default_rng(7))
-    identifier.calibrate(df)
+    identifier, df, _ = _calibrated()
 
     # Trim to a length that is NOT a whole number of windows, so there really
     # is a remainder to drop - 20 whole days divides exactly and would make
@@ -494,9 +480,7 @@ def test_validate_flags_a_model_that_loses_to_persistence(caplog):
     MAE next to the 0.1 K sensor resolution can otherwise hide.
     """
 
-    identifier = _identifier()
-    df = _simulate(np.random.default_rng(8))
-    identifier.calibrate(df)
+    identifier, df, _ = _calibrated()
 
     # A badly wrong envelope makes the dynamics drift away from every anchor.
     identifier.model.ua_envelope_w_per_k = identifier.MAX_UA_ENVELOPE_W_PER_K
@@ -509,9 +493,7 @@ def test_validate_flags_a_model_that_loses_to_persistence(caplog):
 
 
 def test_validate_reports_positive_skill_for_the_calibrated_model():
-    identifier = _identifier()
-    df = _simulate(np.random.default_rng(9))
-    identifier.calibrate(df)
+    identifier, df, _ = _calibrated()
 
     metrics = identifier.validate(df)
 
@@ -644,9 +626,7 @@ def test_filter_infers_the_unmeasured_mass_node():
     something the measured air temperature supports.
     """
 
-    identifier = _identifier()
-    df = _simulate(np.random.default_rng(17))
-    identifier.calibrate(df)
+    identifier, df, _ = _calibrated()
 
     prepared = identifier.prepare(df)
     model = identifier.model
@@ -678,9 +658,7 @@ def test_filter_result_does_not_hinge_on_the_process_noise():
     the two structures a matter of tuning rather than of evidence.
     """
 
-    identifier = _identifier()
-    df = _simulate(np.random.default_rng(18))
-    identifier.calibrate(df)
+    identifier, df, _ = _calibrated()
 
     scores = []
 
@@ -700,9 +678,7 @@ def test_validate_flags_an_envelope_that_reacts_too_weakly(caplog):
     conductance is exactly that failure.
     """
 
-    identifier = _identifier()
-    df = _simulate(np.random.default_rng(19))
-    identifier.calibrate(df)
+    identifier, df, _ = _calibrated()
 
     identifier.model.ua_envelope_w_per_k *= 0.5
 
@@ -715,9 +691,7 @@ def test_validate_flags_an_envelope_that_reacts_too_weakly(caplog):
 
 
 def test_validate_reports_no_envelope_trend_for_the_calibrated_model(caplog):
-    identifier = _identifier()
-    df = _simulate(np.random.default_rng(20))
-    identifier.calibrate(df)
+    identifier, df, _ = _calibrated()
 
     with caplog.at_level("WARNING"):
         metrics = identifier.validate(df)

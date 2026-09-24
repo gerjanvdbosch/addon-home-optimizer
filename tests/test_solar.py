@@ -519,9 +519,7 @@ def test_validate_pools_windows_weighted_by_sample_size():
     total_n = sum(r["n"] for r in kept)
     expected_baseline = sum(r["baseline_mae"] * r["n"] for r in kept) / total_n
     expected_mae = sum(r["mae"] * r["n"] for r in kept) / total_n
-    expected_improvement = (
-        100 * (expected_baseline - expected_mae) / expected_baseline
-    )
+    expected_improvement = 100 * (expected_baseline - expected_mae) / expected_baseline
 
     assert result["windows"] == pytest.approx(3.0)
     assert result["n"] == pytest.approx(total_n)

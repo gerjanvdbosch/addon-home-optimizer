@@ -32,7 +32,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "black>=24.0",
     "pyflakes>=3.2",
     "pyright>=1.1,<2.0",
     "pytest>=8.0",
@@ -59,10 +58,6 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "B"]
 
 [tool.ruff.lint.per-file-ignores]
-
-[tool.black]
-line-length = 88
-target-version = ["py311"]
 
 [tool.pyright]
 include = ["src", "tests"]

@@ -195,9 +195,7 @@ def _prepare(df: pd.DataFrame, latitude: float, longitude: float) -> pd.DataFram
 
     df = _mask_outages(df)
 
-    df["lead_time_hours"] = (
-        df["target_time"] - df["time"]
-    ).dt.total_seconds() / 3600.0
+    df["lead_time_hours"] = (df["target_time"] - df["time"]).dt.total_seconds() / 3600.0
     df["solar_elevation"] = _solar_elevation(df["target_time"], latitude, longitude)
 
     return df.sort_values(["time", "target_time"])
@@ -213,9 +211,7 @@ def _arguments(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
 
     df = df.dropna(subset=[TARGET_COLUMN, "p50", *EXOG_COLUMNS]).copy()
 
-    df = df[
-        (df["p50"] >= MIN_SOLAR_IRRADIANCE) & (df["lead_time_hours"] >= 0.5)
-    ].copy()
+    df = df[(df["p50"] >= MIN_SOLAR_IRRADIANCE) & (df["lead_time_hours"] >= 0.5)].copy()
 
     y_target = df[TARGET_COLUMN] / df["p50"]
 
@@ -745,8 +741,7 @@ class SolarBiasIdentifier(SystemIdentifier[_ElevationBiasModel]):
             ", ".join(f"{v:+.1f}%" for v in per_window_improvement),
         )
         logger.info(
-            "One-sample t-test (H0: mean per-window improvement = 0): "
-            "t=%.2f, p=%.3f%s",
+            "One-sample t-test (H0: mean per-window improvement = 0): t=%.2f, p=%.3f%s",
             ttest.statistic,
             ttest.pvalue,
             " (not significant at p<0.05 - few windows, low power)"
