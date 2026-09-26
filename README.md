@@ -200,7 +200,11 @@ actions:
               "target_temperature": [
                 ["18:00", 45.0],
                 ["19:00", 10.0]
-              ]
+              ],
+              "legionella": {
+                "temperature": 60.0,
+                "interval": 14
+              }
             }
             "states": {
               "off": "Uit", 

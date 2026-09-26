@@ -17,6 +17,8 @@ from domain.models import (
 )
 from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.physics import (
+    CP_WATER_J_PER_KG_K,
+    RHO_WATER_KG_PER_L,
     lumped_tank_state_space,
     zone_observation,
     zone_state_space,
@@ -335,12 +337,13 @@ class MPCOptimizer:
 
         ambient_c = float(data.ambient_temperature)
 
-        def unheated(start_c: float) -> list[float]:
-            """The tank temperature at each step with no heating from start_c on."""
+        def unheated(start_c: float, first: int = 0) -> list[float]:
+            """The tank temperature at each step from `first` on with no heating
+            from start_c on."""
 
             temperatures = [start_c]
 
-            for k in range(num_steps - 1):
+            for k in range(first, num_steps - 1):
                 a_d, b_d = discretized(plan.dt_hours[k])
                 passive = b_d[0, 0] * ambient_c + b_d[0, 2] * float(tap_w[k])
                 temperatures.append(float(a_d[0, 0] * temperatures[-1] + passive))
@@ -372,6 +375,46 @@ class MPCOptimizer:
                 )
             )
         )
+
+        # And only in the steps it can serve such a target from: where a tank at
+        # the heat pump's limit would have cooled below it by then, but one at
+        # the boiler's maximum not yet - and the steps before, that the booster
+        # needs to lift the tank from the one to the other. Earlier, whatever it
+        # heats is lost again before the target; after it, the tank only cools.
+        # A 60 degC disinfection target otherwise gave the booster a decision in
+        # every step of the horizon and doubled the solve time. A tank already
+        # above the limit keeps it everywhere: a booster run may be under way.
+        booster_useful = [False] * num_steps
+
+        if booster_possible and heat_pump_max_c is not None:
+            if initial_temperature > heat_pump_max_c:
+                booster_useful = [True] * num_steps
+            else:
+                holds = []
+
+                for k in range(num_steps):
+                    from_limit = unheated(heat_pump_max_c, k)
+                    from_maximum = unheated(max_tank_c, k)
+                    holds.append(
+                        any(
+                            from_limit[j - k] < float(target_c[j])
+                            and (j == k + 1 or from_maximum[j - k] >= target_c[j])
+                            for j in range(k + 1, num_steps)
+                        )
+                    )
+
+                lift_j = (
+                    self.thermal_model.volume_l
+                    * RHO_WATER_KG_PER_L
+                    * CP_WATER_J_PER_KG_K
+                    * max(max_tank_c - heat_pump_max_c, 0.0)
+                )
+                lift_steps = math.ceil(
+                    lift_j / (booster_heat_w * self.config.step_hours * 3600.0)
+                )
+                booster_useful = [
+                    any(holds[k : k + lift_steps + 1]) for k in range(num_steps)
+                ]
 
         # The tank cannot get hotter than whichever source can heat it: the
         # boiler's maximum, where the tank's thermostat cuts the booster out, or
@@ -765,7 +808,7 @@ class MPCOptimizer:
             # pump's limit by then - the booster could not run there in any plan.
             last = k + 1 == num_steps
             if (
-                not booster_possible
+                not booster_useful[k]
                 or heat_pump_max_c is None
                 or t_ceiling[k if last else k + 1] < heat_pump_max_c
             ):

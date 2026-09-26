@@ -47,6 +47,19 @@ class Settings(BaseModel):
     longitude: float = Field(description="Installation longitude (degrees)")
 
 
+class LegionellaConfig(BaseModel):
+    """A periodic disinfection run: the whole tank at `temperature` at least
+    once every `interval`. When and how is the plan's choice: on the day before
+    the interval ends, where the sun covers the run best - the heat pump up to
+    its own limit, the booster above it."""
+
+    # 60 degC: the temperature Dutch legionella guidance (ISSO 55.1) requires
+    # the stored water to reach periodically.
+    temperature: float = Field(default=60.0)
+    # Days.
+    interval: int = Field(default=7, ge=1)
+
+
 class BoilerConfig(BaseModel):
     setpoint: SensorReference = Field()
     top_temperature: SensorReference = Field()
@@ -54,6 +67,8 @@ class BoilerConfig(BaseModel):
     ambient_temperature: SensorReference = Field()
     volume: int = Field(default=200)
     target_temperature: float | list[tuple[time, float]] = Field()
+    # None plans no disinfection run.
+    legionella: LegionellaConfig | None = Field(default=None)
 
 
 class HeatPumpStates(BaseModel):
