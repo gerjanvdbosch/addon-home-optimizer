@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from app.state import StateManager
@@ -65,6 +66,60 @@ def test_no_estimate_from_a_stale_measurement():
     measured = [SeriesPoint(time=NOW - timedelta(hours=1), value=800.0)]
 
     assert _state_manager()._current_quarter_nowcast(measured, NOW) is None
+
+
+def test_measurement_moves_the_running_quarter_band_without_narrowing_it(
+    monkeypatch,
+):
+    """The nowcast says where the output is now, not how much the sky will
+    still change: the running quarter hour's p10-p90 band keeps its width."""
+
+    quarter = datetime(2026, 6, 21, 10, 30, tzinfo=UTC)
+    grid = pd.date_range(quarter, periods=2, freq="15min")
+
+    class Identifier:
+        model = object()
+
+        def __init__(self, *args) -> None:
+            pass
+
+        def load(self, path) -> None:
+            pass
+
+    monkeypatch.setattr("app.state.SolarBiasIdentifier", Identifier)
+    monkeypatch.setattr(
+        "app.state.predict_solar", lambda *args: pd.Series([1000.0] * 2, grid)
+    )
+    monkeypatch.setattr(
+        "app.state.predict_solar_band",
+        lambda *args: (pd.Series([600.0] * 2, grid), pd.Series([1300.0] * 2, grid)),
+    )
+    state = State(updated=NOW)
+    point = [SeriesPoint(time=quarter, value=1.0)]
+    state.forecast.solcast.p10 = state.forecast.solcast.p50 = point
+    state.forecast.solcast.p90 = point
+    state.measurements.solar = [SeriesPoint(time=quarter, value=400.0)]
+    # A steady sky: the measurement carries all the weight.
+    recent = pd.Series(
+        [400.0] * 15, index=pd.date_range(end=NOW, periods=15, freq="1min")
+    )
+
+    _state_manager()._predict_solar(state, NOW, recent)
+
+    p10, p50, p90 = (
+        series[0].value
+        for series in (
+            state.predictions.solar_p10,
+            state.predictions.solar,
+            state.predictions.solar_p90,
+        )
+    )
+    nowcast = _state_manager()._current_quarter_nowcast(state.measurements.solar, NOW)
+    assert p50 == pytest.approx(nowcast[1])
+    assert p50 - p10 == pytest.approx(400.0)
+    assert p90 - p50 == pytest.approx(300.0)
+    # The next quarter hour is the forecast's alone.
+    assert state.predictions.solar[1].value == 1000.0
 
 
 QUARTER = datetime(2026, 6, 21, 10, 30, tzinfo=UTC)

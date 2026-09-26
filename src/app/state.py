@@ -132,17 +132,30 @@ class StateManager:
         ):
             weight = nowcast_weight(recent_solar, p10[nowcast[0]], p90[nowcast[0]])
 
+        # The running quarter hour - the step the optimizer acts on - combines
+        # the measurement-based estimate with the forecast (see
+        # nowcast_weight). The measurement moves the whole band, not its width:
+        # it says where the output is now, not how much the sky will still
+        # change within the quarter hour. Blending each scenario with the one
+        # measurement instead shrank the band by (1 - weight): on 24 days the
+        # calibration had not seen, 73% of the rest of the quarter hour fell
+        # outside p10-p90 (median width 49 W) - the plan took a run's first
+        # step as all but certain sun. Shifted, 34% did (220 W), and the p10/p90
+        # pinball loss fell from 79.9 to 64.4 W. A run's expected grid import
+        # over its minimum runtime was already close to what it really drew,
+        # and stayed so (within 0.01 kWh either way).
+        shift = 0.0
+
+        if nowcast is not None and nowcast[0] in p50.index:
+            shift = weight * (nowcast[1] - p50[nowcast[0]])
+
         def from_now(series: pd.Series) -> pd.Series:
-            # Only quarter hours that haven't ended. The running one - the step
-            # the optimizer acts on - combines the measurement-based estimate
-            # with each scenario's own forecast (see nowcast_weight).
+            # Only quarter hours that haven't ended.
             series = series[series.index > now - step]
 
-            if nowcast is not None and nowcast[0] in series.index:
+            if shift and nowcast[0] in series.index:
                 series = series.copy()
-                series[nowcast[0]] = (
-                    weight * nowcast[1] + (1 - weight) * series[nowcast[0]]
-                )
+                series[nowcast[0]] = max(series[nowcast[0]] + shift, 0.0)
 
             return series
 

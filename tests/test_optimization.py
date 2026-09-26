@@ -63,8 +63,9 @@ def test_no_planned_run_leaves_the_start_and_setpoint_unknown():
     }
 
 
-def test_the_setpoint_is_the_planned_end_temperature_rounded_up():
-    """The tank is at 48.2 degC after the run's last step - rounded up to the
-    heat pump's half degrees."""
+def test_the_setpoint_is_the_planned_end_temperature_rounded_to_the_nearest():
+    """The tank is at 48.2 degC after the run's last step, 48.3 degC after a
+    one-step run - each to the heat pump's nearest half degree."""
 
-    assert _published((0, 1, 1, 0))[Optimization.DHW_SETPOINT_ENTITY] == "48.5"
+    assert _published((0, 1, 1, 0))[Optimization.DHW_SETPOINT_ENTITY] == "48.0"
+    assert _published((0, 1, 0, 0))[Optimization.DHW_SETPOINT_ENTITY] == "48.5"

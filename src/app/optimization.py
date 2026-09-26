@@ -393,13 +393,16 @@ class Optimization:
         any).
 
         The heat pump heats until its setpoint and stops by itself, so the
-        setpoint is the run's planned end temperature, rounded up to the heat
-        pump's half degree. The heat left in the coil and loop then still flows
-        into the tank, which settles above the setpoint (real data: 0.9-2.8 K,
-        median 1.75 K). That is deliberately not subtracted: it is the margin
-        that absorbs a tap or loss forecast that turns out worse, where
+        setpoint is the run's planned end temperature, rounded to the heat
+        pump's nearest half degree. The heat left in the coil and loop then
+        still flows into the tank, which settles above the setpoint (real data:
+        0.9-2.8 K, median 1.75 K). That is deliberately not subtracted: it is the
+        margin that absorbs a tap or loss forecast that turns out worse, where
         planning the run to end exactly on target made every replan that saw a
-        fraction of a degree short start another run.
+        fraction of a degree short start another run. Rounding up on top of it
+        only added up to half a degree more; rounded to the nearest, the setpoint
+        is at most a quarter degree below the plan, well inside that margin
+        (replayed on 14 real runs, 12-26 September 2026: no afternoon top-up).
         """
 
         schedule = result.schedule
@@ -415,7 +418,7 @@ class Optimization:
 
             end_temperature = result.temperatures[min(end + 1, len(schedule) - 1)]
             next_start = times[start].isoformat()
-            setpoint = str(math.ceil(round(2 * end_temperature, 2)) / 2)
+            setpoint = str(math.floor(round(2 * end_temperature, 2) + 0.5) / 2)
 
         self.home_assistant.set_state(
             self.DHW_STATUS_ENTITY,
