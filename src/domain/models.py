@@ -42,6 +42,12 @@ class BoilerThermalModel:
     heat_pump_max_tank_temperature_c: float | None = None
     max_tank_temperature_c: float | None = None
     booster_heat_w: float | None = None
+    # How far the settled tank ends above the SWW setpoint of a heat pump run
+    # that stopped by itself on it (K; see
+    # BoilerThermalIdentifier._identify_setpoint_overshoot): the heat the run
+    # still puts in beyond its setpoint, which planning counts. None until such
+    # a run has been observed.
+    setpoint_overshoot_k: float | None = None
     # The heat the compressor puts into the tank once it is up to speed (W),
     # and how long it takes to get there after a start (s). Measured
     # calorimetrically rather than fitted to the temperature trajectory (see
@@ -52,6 +58,44 @@ class BoilerThermalModel:
     # input is missing. None until runs have shown them.
     q_in_steady_w: float | None = None
     q_in_ramp_seconds: float | None = None
+    # How much hotter the heat pump's supply runs than the tank it charges, at
+    # the tank's energy temperature, once past a run's first step (K; see
+    # BoilerThermalIdentifier._identify_supply_margin). None until runs with a
+    # supply temperature have been observed.
+    supply_margin_k: float | None = None
+    # The layer the two sensors do not show (see
+    # BoilerThermalIdentifier._identify_cold_layer): after tapping, cold water
+    # fills the tank from the bottom, so two point sensors in the stratified
+    # tank misstate its mean. Its share of the volume, its temperature (deg C,
+    # an effective one: the cold water warms against the tank above it), and
+    # the stratification (top minus bottom sensor, K) at which it is full.
+    # None until runs have shown it; the sensors' average then stands for the
+    # tank.
+    cold_layer_fraction: float | None = None
+    cold_water_temperature_c: float | None = None
+    cold_layer_spread_k: float | None = None
+
+    def mixed_temperature(self, top_c, bottom_c):
+        """The tank's mean temperature (deg C): what mixing it gives, and so
+        what a plan starts from. The layer counts in proportion to the
+        stratification the sensors show, up to full at cold_layer_spread_k: a
+        tank mixed by a run has none until it is tapped again. Scalars or
+        arrays."""
+
+        average = (top_c + bottom_c) / 2.0
+
+        if (
+            self.cold_layer_fraction is None
+            or self.cold_water_temperature_c is None
+            or not self.cold_layer_spread_k
+        ):
+            return average
+
+        share = np.clip((top_c - bottom_c) / self.cold_layer_spread_k, 0.0, 1.0)
+
+        return average - self.cold_layer_fraction * share * (
+            average - self.cold_water_temperature_c
+        )
 
 
 @dataclass
@@ -179,8 +223,42 @@ class HeatPumpCOPModel:
     # *trajectory*, a different purpose) understated real electrical draw
     # through the middle of a cycle. Not read by cop() itself (default 0.0
     # is harmless there, e.g. for a trial fit's parameter vector).
+    #
+    # At 0 degC outdoor, rising by q_th_per_outdoor_w_per_k per K warmer: a
+    # compressor at a fixed speed moves a fixed volume of refrigerant vapour,
+    # and warmer outdoor air evaporates it at a higher pressure, so denser -
+    # more refrigerant, more heat (real data at 57 Hz: 6.45 kW at 15-18 degC
+    # outdoor, 7.1 kW above 21 degC). Left out, a line fitted on summer runs
+    # planned autumn runs 5% too high at their real supply temperature.
     q_th_at_power_fit_low_w: float = 0.0
     q_th_at_power_fit_high_w: float = 0.0
+    q_th_per_outdoor_w_per_k: float = 0.0
+    # The heat a DHW run puts into the tank once past its start-up (W), at
+    # 0 degC outdoor and per K warmer: measured calorimetrically over every such
+    # reading, modulation included (see HeatPumpCOPIdentifier._fit_heat_input),
+    # rather than fitted through the electrical power like the line above - it
+    # sets how fast the tank heats, so how long a run lasts. It rises with the
+    # outdoor temperature for the same reason as that line (real data: 6.3 kW at
+    # 17 degC, +55 W per K); a summer median of 6.6 kW planned autumn runs
+    # minutes too short. 0.0 until calibrated: planning then uses the boiler's
+    # own q_in_steady_w.
+    q_in_at_zero_outdoor_w: float = 0.0
+    q_in_per_outdoor_w_per_k: float = 0.0
+    # The electrical power over a DHW run's first planning step (W), measured
+    # (see HeatPumpCOPIdentifier._start_up): the compressor comes up
+    # to speed and the loop warms, so the heat lags the power, and the steady
+    # COP above does not hold there (real data: 0.75 kW for 3.0 kW of heat, a
+    # COP of 4 where the steady model gave 5.3). 0.0 until calibrated: planning
+    # then costs that step on the power line too.
+    start_step_power_w: float = 0.0
+    # How long the compressor takes to reach that heat after a DHW run starts
+    # (s), read off the energy the start-up leaves short (see
+    # BoilerThermalIdentifier._identify_heat_input_ramp) - from minute
+    # readings, timed from the run's own start. The boiler's own estimate from
+    # 5-minute readings timed runs up to 5 minutes early, from the start of the
+    # interval they switched on in (real data: 1005 s against 790-830 s per
+    # minute). 0.0 until calibrated: planning then uses the boiler's.
+    start_ramp_seconds: float = 0.0
 
     def cop(self, T_outdoor: float, T_supply: float) -> float:
         """Carnot COP scaled by eta_carnot - see
@@ -216,9 +294,11 @@ class HeatPumpCOPModel:
         line planning costs with. Scalars or arrays.
         """
 
+        outdoor_w = self.q_th_per_outdoor_w_per_k * T_outdoor
+
         return (
-            self.q_th_at_power_fit_low_w
+            (self.q_th_at_power_fit_low_w + outdoor_w)
             / self.clamped_cop(T_outdoor, self.POWER_FIT_T_LOW_C),
-            self.q_th_at_power_fit_high_w
+            (self.q_th_at_power_fit_high_w + outdoor_w)
             / self.clamped_cop(T_outdoor, self.POWER_FIT_T_HIGH_C),
         )

@@ -1059,9 +1059,11 @@ def test_calorimetric_q_in_ignores_stale_flow_after_shutoff():
     assert np.allclose(q_in_override[1:4], expected)
     assert np.all(np.diff(q_in_override[1:4]) > 0)  # genuinely time-varying
 
-    # Input rows 5-6 (state="Uit" but flow stale at 14 L/min, deltaT stale at 11 K -
-    # the exact real-world artifact) -> prepared indices 4-5: must NOT be used.
-    assert np.isnan(q_in_override[4])
+    # Input rows 5-6 (state="Uit" but flow stale at 14 L/min - the exact
+    # real-world artifact) -> prepared indices 4-5: the interval the run stopped
+    # in counts its own heat, which with no temperature difference left is none;
+    # the idle interval after it is not used at all.
+    assert q_in_override[4] == 0.0
     assert np.isnan(q_in_override[5])
 
     # Input row 7 (idle, flow finally reset to 0) -> prepared index 6: no override.
@@ -1357,22 +1359,25 @@ def _ramp_frame(
     runs: int, steady_w: float, ramp_seconds: float, run_minutes: int = 40
 ) -> pd.DataFrame:
     """Runs whose calorimetric heat rises linearly to `steady_w` over
-    `ramp_seconds`, the way a modulating compressor comes up to speed."""
+    `ramp_seconds`, the way a modulating compressor comes up to speed, as the
+    dataset holds it: each reading the mean over its 5 minutes."""
 
     rows = []
     time = pd.Timestamp("2026-01-01", tz="UTC")
 
     for _ in range(runs):
-        for minute in range(run_minutes + 30):
+        for minute in range(0, run_minutes + 30, 5):
             on = minute < run_minutes
-            since = minute * 60.0
+            seconds = minute * 60.0 + np.arange(300)
             rows.append(
                 {
                     "time": time + pd.Timedelta(minutes=minute),
                     "boiler_on": on,
                     "booster_on": False,
                     "q_in_override_w": (
-                        steady_w * min(1.0, since / ramp_seconds) if on else np.nan
+                        steady_w * float(np.minimum(1.0, seconds / ramp_seconds).mean())
+                        if on
+                        else np.nan
                     ),
                 }
             )
@@ -1384,16 +1389,17 @@ def _ramp_frame(
 
 def test_identify_heat_input_ramp_recovers_a_known_ramp():
     """The ramp is read off the energy it costs, so a linear rise to full
-    output is recovered from the shortfall it leaves behind."""
+    output is recovered from the shortfall it leaves behind - from readings
+    that are means over their interval, summed as such."""
 
     identifier = BoilerThermalIdentifier()
 
     steady_w, ramp_seconds = identifier._identify_heat_input_ramp(
-        _ramp_frame(runs=12, steady_w=6000.0, ramp_seconds=600.0)
+        _ramp_frame(runs=12, steady_w=6000.0, ramp_seconds=800.0)
     )
 
-    assert steady_w == pytest.approx(6000.0, rel=0.02)
-    assert ramp_seconds == pytest.approx(600.0, rel=0.1)
+    assert steady_w == pytest.approx(6000.0, rel=0.01)
+    assert ramp_seconds == pytest.approx(800.0, rel=0.02)
 
 
 def test_identify_heat_input_ramp_needs_enough_runs():

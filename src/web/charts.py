@@ -4,8 +4,9 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from domain.models import BoilerThermalModel
 from domain.mpc import MPCConfig
-from domain.state import BacktestResult, SeriesPoint, State
+from domain.state import BacktestResult, BoilerMeasurement, SeriesPoint, State
 from domain.time import local_day_start, to_local_series, to_local_time
 
 
@@ -43,7 +44,44 @@ def add_series(
     )
 
 
-def dashboard_chart(state: State) -> str:
+def continued(measured: list, planned: list) -> list:
+    """The planned points from where the measured ones end, starting at the
+    last measurement: a plan starts from the state it was made in, which the
+    measurements have moved on from since, so drawn whole it overlaps them with
+    a line of its own instead of running on from what really happened."""
+
+    if not measured:
+        return planned
+
+    last = measured[-1]
+
+    return [last] + [point for point in planned if point.time > last.time]
+
+
+def mixed_tank(
+    boiler: BoilerMeasurement, model: BoilerThermalModel | None
+) -> list[SeriesPoint]:
+    """The measured tank as the optimizer plans with it: mixed (see
+    BoilerThermalModel.mixed_temperature), or the two sensors' average without
+    a calibrated model."""
+
+    bottom_by_time = {p.time: p.value for p in boiler.bottom_temperature}
+
+    return [
+        SeriesPoint(
+            time=p.time,
+            value=model.mixed_temperature(p.value, bottom_by_time[p.time])
+            if model is not None
+            else (p.value + bottom_by_time[p.time]) / 2.0,
+        )
+        for p in boiler.top_temperature
+        if p.time in bottom_by_time
+    ]
+
+
+def dashboard_chart(
+    state: State, boiler_model: BoilerThermalModel | None = None
+) -> str:
     fig = make_subplots(
         rows=3,
         cols=1,
@@ -125,7 +163,7 @@ def dashboard_chart(state: State) -> str:
 
     series(
         "Solar",
-        state.predictions.solar,
+        continued(state.measurements.solar, state.predictions.solar),
         line=dict(width=1.5, color="#FFA15A", shape="spline"),
         legendgroup="solar",
         unit="W",
@@ -163,7 +201,7 @@ def dashboard_chart(state: State) -> str:
 
     series(
         "Baseload",
-        state.predictions.baseload,
+        continued(state.measurements.baseload, state.predictions.baseload),
         line=dict(width=1, color="rgba(239, 85, 59, 0.5)", shape="spline"),
         legendgroup="baseload",
         showlegend=False,
@@ -185,7 +223,7 @@ def dashboard_chart(state: State) -> str:
 
     series(
         "Heat pump",
-        state.schedule.heat_pump.power,
+        continued(state.measurements.heat_pump.power, state.schedule.heat_pump.power),
         unit="W",
         row=1,
         col=1,
@@ -256,7 +294,10 @@ def dashboard_chart(state: State) -> str:
     # plan heats nothing. Nothing acts on it yet.
     series(
         "Zone plan (shadow)",
-        state.schedule.building.temperatures,
+        continued(
+            state.measurements.building.zone_temperature,
+            state.schedule.building.temperatures,
+        ),
         row=2,
         col=1,
         line=dict(width=1, color="#EF553B", shape="spline", dash="dot"),
@@ -275,9 +316,34 @@ def dashboard_chart(state: State) -> str:
         decimal=1,
     )
 
+    # The tank mixed - the temperature the optimizer plans from (see
+    # BoilerThermalModel.mixed_temperature) - so the measured line continues
+    # straight into the planned "Boiler temperature" line. The sensors' own
+    # average without a calibrated model, which then is the same thing. The two
+    # sensors are drawn beside it: their stratification is what the mixed
+    # temperature is read from.
+    boiler = state.measurements.heat_pump.boiler
+    measured_average = mixed_tank(boiler, boiler_model)
+
+    for name, points in (
+        ("Boiler top", boiler.top_temperature),
+        ("Boiler bottom", boiler.bottom_temperature),
+    ):
+        series(
+            name,
+            points,
+            row=3,
+            col=1,
+            line=dict(width=1, color="#636EFA", dash="dot"),
+            legendgroup="boiler_temperature",
+            showlegend=False,
+            unit="°C",
+            decimal=1,
+        )
+
     series(
         "Boiler temperature",
-        state.schedule.heat_pump.boiler.temperatures,
+        continued(measured_average, state.schedule.heat_pump.boiler.temperatures),
         row=3,
         col=1,
         line=dict(width=2, color="#19D3F3", shape="spline"),
@@ -295,16 +361,6 @@ def dashboard_chart(state: State) -> str:
         unit="°C",
         decimal=1,
     )
-
-    # The same single-node tank average the optimizer plans with, so the measured
-    # line continues straight into the planned "Boiler temperature" line.
-    boiler = state.measurements.heat_pump.boiler
-    bottom_by_time = {p.time: p.value for p in boiler.bottom_temperature}
-    measured_average = [
-        SeriesPoint(time=p.time, value=(p.value + bottom_by_time[p.time]) / 2.0)
-        for p in boiler.top_temperature
-        if p.time in bottom_by_time
-    ]
 
     series(
         "Boiler temperature",

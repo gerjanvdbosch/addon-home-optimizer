@@ -1451,3 +1451,160 @@ def test_net_metering_does_not_heat_today_for_a_cloudy_tomorrow():
         return result.temperatures[on[-1] + 1]
 
     assert run_end(MPCConfig()) < run_end(NO_FEED_IN) - 0.5
+
+
+def test_a_measured_supply_margin_does_not_depend_on_the_targets():
+    """A 60 degC legionella target in the horizon must not change what a normal
+    run costs: how much hotter the supply runs than the tank is the coil's
+    property, not the target's."""
+
+    optimizer = MPCOptimizer(
+        replace(THERMAL_MODEL, supply_margin_k=8.0), MPCConfig(), cop_model=COP_MODEL
+    )
+
+    assert optimizer._power_line_coefficients(
+        10.0, 45.0
+    ) == optimizer._power_line_coefficients(10.0, 60.0)
+
+
+def test_the_solver_log_stays_out_of_info(caplog):
+    """HiGHS's progress lines are for debugging: at INFO only the plan's own
+    lines should show."""
+
+    with caplog.at_level("INFO"):
+        MPCOptimizer(THERMAL_MODEL, MPCConfig()).solve(_make_input())
+
+    assert not [r for r in caplog.records if r.name.startswith("pyomo")]
+
+
+# A compressor ramping up over its first minutes (see _ramp_fraction).
+STARTING_MODEL = replace(THERMAL_MODEL, q_in_ramp_seconds=420.0, supply_margin_k=9.6)
+# The electrical power it draws meanwhile, measured (see
+# HeatPumpCOPModel.start_step_power_w).
+STARTING_COP_MODEL = replace(COP_MODEL, start_step_power_w=750.0)
+
+
+@pytest.mark.parametrize(
+    ("thermal_model", "cop_model"),
+    [(THERMAL_MODEL, COP_MODEL), (STARTING_MODEL, STARTING_COP_MODEL)],
+)
+def test_the_reported_energy_is_what_the_objective_priced(thermal_model, cop_model):
+    """The electricity and its grid part a result reports cost exactly the
+    objective, less its starts: a plan log built on them ranks plans the way the
+    optimizer does. Also with a start step drawing its measured power."""
+
+    config = MPCConfig()
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[18] = 45.0
+    result = MPCOptimizer(thermal_model, config, cop_model=cop_model).solve(
+        _make_input(
+            target_temperature_top=tuple(target),
+            outdoor_temperature_forecast=(5.0,) * len(SOLAR_FORECAST_W),
+        )
+    )
+    starts = sum(
+        1
+        for k, on in enumerate(result.schedule)
+        if on and (k == 0 or not result.schedule[k - 1])
+    )
+    energy_eur = (
+        config.price_eur_per_kwh - config.feed_in_price_eur_per_kwh
+    ) * result.grid_kwh + config.feed_in_price_eur_per_kwh * result.electricity_kwh
+
+    assert result.electricity_kwh > 0.0
+    assert energy_eur + config.weight_switching * starts == pytest.approx(
+        result.objective_value, abs=1e-6
+    )
+
+
+def test_a_runs_first_step_draws_its_measured_power():
+    """The start step draws what runs were measured to draw there, not the
+    power line over the ramp's heat; the step after it the power line again."""
+
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[18] = 45.0
+    optimizer = MPCOptimizer(STARTING_MODEL, MPCConfig(), cop_model=STARTING_COP_MODEL)
+    result = optimizer.solve(
+        _make_input(
+            target_temperature_top=tuple(target),
+            outdoor_temperature_forecast=(5.0,) * len(SOLAR_FORECAST_W),
+        )
+    )
+    alpha, beta = optimizer._power_line_coefficients(5.0, max(target))
+    first = result.schedule.index(1)
+    second_w = (alpha + beta * result.temperatures[first + 1]) * (
+        result.heat_w[first + 1] / optimizer._heat_w
+    )
+
+    assert result.electrical_power_w[first] == pytest.approx(750.0)
+    assert result.electrical_power_w[first + 1] == pytest.approx(second_w)
+
+
+OVERSHOOT_MODEL = replace(THERMAL_MODEL, setpoint_overshoot_k=1.75)
+
+
+def _run_end(result) -> float:
+    """The tank after the first planned run."""
+
+    first = result.schedule.index(1)
+    end = first + result.schedule[first:].index(0)
+
+    return result.temperatures[end]
+
+
+def test_a_planned_run_ends_its_setpoint_overshoot_above_what_the_target_needs():
+    """The heat pump stops on its setpoint and the tank settles above it: a run
+    planned for a 45 degC target ends that much higher, as it really does."""
+
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[18] = 45.0
+    data = _make_input(target_temperature_top=tuple(target))
+
+    without = MPCOptimizer(THERMAL_MODEL, MPCConfig()).solve(data)
+    with_overshoot = MPCOptimizer(OVERSHOOT_MODEL, MPCConfig()).solve(data)
+
+    assert with_overshoot.temperatures[18] >= 45.0 + 1.75 - 1e-6
+    assert _run_end(with_overshoot) == pytest.approx(_run_end(without) + 1.75, abs=0.3)
+
+
+def test_heat_already_in_the_tank_counts_in_full():
+    """A tank that holds its target with less than the overshoot to spare is
+    not topped up: the overshoot only applies to the end of a run the plan
+    makes."""
+
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[6] = 45.0
+    data = _make_input(
+        target_temperature_top=tuple(target),
+        current_temp_top=45.6,
+        current_temp_bottom=45.6,
+    )
+
+    result = MPCOptimizer(OVERSHOOT_MODEL, MPCConfig()).solve(data)
+
+    assert not any(result.schedule)
+
+
+def test_a_colder_day_heats_the_tank_slower():
+    """The heat pump gives less heat the colder the outdoor air, so the same
+    target takes more of the plan's run on a cold day."""
+
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[18] = 45.0
+    cop_model = replace(
+        COP_MODEL, q_in_at_zero_outdoor_w=3000.0, q_in_per_outdoor_w_per_k=60.0
+    )
+
+    def run_steps(outdoor_c: float) -> int:
+        return sum(
+            MPCOptimizer(THERMAL_MODEL, MPCConfig(), cop_model=cop_model)
+            .solve(
+                _make_input(
+                    target_temperature_top=tuple(target),
+                    outdoor_temperature_forecast=(outdoor_c,) * len(SOLAR_FORECAST_W),
+                )
+            )
+            .schedule
+        )
+
+    assert run_steps(0.0) > run_steps(20.0)

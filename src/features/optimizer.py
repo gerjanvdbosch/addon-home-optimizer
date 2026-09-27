@@ -116,6 +116,9 @@ class MPCOptimizer:
         time_limit_s = self.config.solve_time_limit_s
         solver.config.time_limit = time_limit_s
         solver.config.load_solution = False
+        # HiGHS's own progress log, at INFO by default, buried the plan's own
+        # lines under dozens per solve: kept, but for debugging.
+        solver.config.log_level = logging.DEBUG
         results = solver.solve(model)
         stopped_early = (
             results.termination_condition == TerminationCondition.maxTimeLimit
@@ -297,6 +300,9 @@ class MPCOptimizer:
             if data.outdoor_temperature_forecast
             else []
         )
+        heat_w = [
+            self._heat_at(outdoor_c[k] if outdoor_c else None) for k in range(num_steps)
+        ]
         # max, not mean: a real requirement anywhere within a coarse block
         # must not be silently relaxed by averaging it with a quieter
         # neighboring step.
@@ -315,7 +321,9 @@ class MPCOptimizer:
 
         model.K = pyo.RangeSet(0, num_steps - 1)
 
-        initial_temperature = (data.current_temp_top + data.current_temp_bottom) / 2.0
+        initial_temperature = self.thermal_model.mixed_temperature(
+            data.current_temp_top, data.current_temp_bottom
+        )
 
         # Exact zero-order-hold dynamics for the lumped tank node. Unlike the
         # two-node calibration model, this simplified model has no on/off
@@ -436,7 +444,7 @@ class MPCOptimizer:
         # the big-M constraints below are built from them: with one loose range
         # for every step, the solver's relaxation could run the booster at a
         # fraction everywhere and had to branch on nearly every step of it.
-        max_heat_w = max(self._heat_w, booster_heat_w or 0.0)
+        max_heat_w = max(max(heat_w), booster_heat_w or 0.0)
         t_floor = unheated(initial_temperature)
         t_ceiling = [initial_temperature]
 
@@ -457,7 +465,7 @@ class MPCOptimizer:
         # the tank reaches its setpoint (published per run - see
         # app.optimization), or modulates down near its tank limit (real data:
         # ~7 kW at 36-47 degC, ~3 kW at 55 degC).
-        model.q_heat_pump_w = pyo.Var(model.K, bounds=(0.0, self._heat_w))
+        model.q_heat_pump_w = pyo.Var(model.K, bounds=lambda m, k: (0.0, heat_w[k]))
 
         # The booster heater is a resistive element: it cannot modulate, so while
         # it runs it heats at its identified rating. Its heat per step is still
@@ -484,10 +492,11 @@ class MPCOptimizer:
         # without a value at all.
         model.space_on = pyo.Var(model.K, domain=pyo.Binary)
 
-        # initial_temperature (above) rests on the equal-volume-node assumption,
-        # same as the calibrated identification model: the average of the two
-        # measured sensors approximates the tank's current total stored thermal
-        # energy per unit mass.
+        # initial_temperature (above) is the tank mixed: the heat it holds, cold
+        # layer below the sensors included (see
+        # BoilerThermalModel.mixed_temperature). The sensors' plain average
+        # overstated it by up to 11 K after tapping, and runs were planned
+        # accordingly short - half the real electricity on a warm tank.
         model.initial_temperature = pyo.Constraint(
             expr=model.T[0] == float(initial_temperature)
         )
@@ -498,8 +507,36 @@ class MPCOptimizer:
         # optimum is the same plan - but an unreachable legionella target had
         # inflated the objective into the thousands, and proving a plan to the
         # cent against that took the solver half a minute.
+        # A heat pump run does not end where the plan stops it: it stops on its
+        # setpoint and then settles setpoint_overshoot_k above it (see
+        # BoilerThermalModel), and that heat is part of what the run costs and
+        # how long it takes. So a target after a planned run is met with that
+        # much to spare - the setpoint published is the run's planned end less
+        # it (see app.optimization) - while heat already in the tank counts in
+        # full: a later replan that finds the tank a fraction of a degree
+        # warmer than needed sees a buffer, not a reason for another run. ran[k]
+        # is whether the heat pump heats the tank at or before step k's start:
+        # the bounds leave it 0 or 1 once the runs are decided. Not where the
+        # booster finishes the tank: its thermostat, not a setpoint, ends it.
+        overshoot_k = self.thermal_model.setpoint_overshoot_k or 0.0
+        model.ran = pyo.Var(model.K, bounds=(0.0, 1.0))
+        model.ran_constraint = pyo.ConstraintList()
+        model.ran_constraint.add(model.ran[0] >= int(data.boiler_on_current))
+
+        for k in range(1, num_steps):
+            model.ran_constraint.add(model.ran[k] >= model.ran[k - 1])
+            model.ran_constraint.add(model.ran[k] >= model.boiler_on[k - 1])
+
+        def required(m: pyo.ConcreteModel, k: int):
+            target = min(float(target_c[k]), t_ceiling[k])
+
+            if target + overshoot_k > min(t_ceiling[k], heat_pump_max_c or math.inf):
+                return target
+
+            return target + overshoot_k * m.ran[k]
+
         def temperature_rule(m: pyo.ConcreteModel, k: int):
-            return m.T[k] + m.slack[k] >= min(float(target_c[k]), t_ceiling[k])
+            return m.T[k] + m.slack[k] >= required(m, k)
 
         model.temperature_constraint = pyo.Constraint(
             model.K,
@@ -527,7 +564,7 @@ class MPCOptimizer:
             if k + 1 > max(m.K):
                 return pyo.Constraint.Skip
 
-            return m.T[k + 1] + m.slack[k] >= min(float(target_c[k]), t_ceiling[k])
+            return m.T[k + 1] + m.slack[k] >= required(m, k)
 
         model.end_temperature_constraint = pyo.Constraint(
             model.K,
@@ -755,7 +792,7 @@ class MPCOptimizer:
             may run."""
 
             return (
-                model.q_heat_pump_w[k] / self._heat_w
+                model.q_heat_pump_w[k] / heat_w[k]
                 + (1.0 - self._ramp_fraction(plan.dt_hours[k]))
                 * model.compressor_start[k]
                 + model.q_booster_w[k] / booster_heat_w
@@ -767,7 +804,7 @@ class MPCOptimizer:
             # What this step can deliver: full output, less the part of it the
             # compressor spends coming up to speed if it starts here (see
             # _ramp_fraction).
-            available = self._heat_w * (
+            available = heat_w[k] * (
                 on
                 - (1.0 - self._ramp_fraction(plan.dt_hours[k]))
                 * model.compressor_start[k]
@@ -785,7 +822,7 @@ class MPCOptimizer:
             if k + 1 < num_steps:
                 model.heat_source_constraints.add(
                     model.q_heat_pump_w[k]
-                    >= available - self._heat_w * (1 - model.boiler_on[k + 1])
+                    >= available - heat_w[k] * (1 - model.boiler_on[k + 1])
                 )
 
             # The heat pump modulates, so it stops exactly at its limit: the tank
@@ -915,9 +952,11 @@ class MPCOptimizer:
         # which no compressor does.
         model.draw_w = pyo.Var(model.K, domain=pyo.NonNegativeReals)
 
+        start_power_w = self.cop_model.start_step_power_w if self.cop_model else 0.0
+
         for k in range(num_steps):
             alpha, beta = power_lines[k]
-            share = model.q_heat_pump_w[k] / self._heat_w
+            share = model.q_heat_pump_w[k] / heat_w[k]
             temperature_share = model.heat_pump_temperature_share[k]
             model.heat_pump_power_constraint.add(
                 temperature_share >= t_floor[k] * share
@@ -928,6 +967,21 @@ class MPCOptimizer:
                 - min(t_ceiling[k], heat_pump_limit_c) * (model.boiler_on[k] - share)
             )
             heat_pump_power_w = alpha * share + beta * temperature_share
+
+            # A run's first fine step draws its measured power (see
+            # HeatPumpCOPModel.start_step_power_w) in place of the power line
+            # over the heat it delivers. That heat is the ramp's share of the
+            # step, at the tank it starts from - taken as the tank without
+            # heating, exact for the horizon's first run and close for a later
+            # one, so the objective stays linear.
+            if start_power_w:
+                ramp = self._ramp_fraction(self.config.step_hours)
+                heat_pump_power_w += (
+                    (start_power_w - ramp * (alpha + beta * t_floor[k]))
+                    * self.config.step_hours
+                    / plan.dt_hours[k]
+                    * model.compressor_start[k]
+                )
 
             # The booster is a resistive element: its electrical power equals its
             # heat (COP 1 - real data: 1.37 kWh heat for 1.38 kWh electrical).
@@ -946,7 +1000,7 @@ class MPCOptimizer:
             # run on it for free there, and the relaxation's bound stayed so far
             # below any real plan that a booster day took up to a minute.
             electrical_w = heat_pump_power_w + model.q_booster_w[k]
-            running = model.q_heat_pump_w[k] / self._heat_w
+            running = model.q_heat_pump_w[k] / heat_w[k]
             if booster_heat_w:
                 running = running + model.q_booster_w[k] / booster_heat_w
 
@@ -986,6 +1040,7 @@ class MPCOptimizer:
         )
 
         model.mpc_step_plan = plan
+        model.mpc_scenario_weights = [weight for weight, _ in solar_scenarios]
 
         return model
 
@@ -999,6 +1054,19 @@ class MPCOptimizer:
 
         return self.thermal_model.q_in_steady_w or self.thermal_model.q_in_nominal_w
 
+    def _heat_at(self, outdoor_c: float | None) -> float:
+        """The heat a running compressor puts into the tank at this outdoor
+        temperature (W): the calorimetric line of the COP model (see
+        HeatPumpCOPModel.q_in_at_zero_outdoor_w), or _heat_w without it or
+        without a forecast."""
+
+        cop = self.cop_model
+
+        if cop is None or outdoor_c is None or not cop.q_in_at_zero_outdoor_w:
+            return self._heat_w
+
+        return cop.q_in_at_zero_outdoor_w + cop.q_in_per_outdoor_w_per_k * outdoor_c
+
     def _ramp_fraction(self, dt_hours: float) -> float:
         """Share of _heat_w a step delivers when the compressor starts in it.
 
@@ -1009,7 +1077,11 @@ class MPCOptimizer:
         replaced.
         """
 
-        ramp_seconds = self.thermal_model.q_in_ramp_seconds
+        # Timed from the run's own start where the COP model has it (see
+        # HeatPumpCOPModel.start_ramp_seconds).
+        ramp_seconds = (
+            self.cop_model and self.cop_model.start_ramp_seconds
+        ) or self.thermal_model.q_in_ramp_seconds
 
         if not ramp_seconds:
             return 1.0
@@ -1064,13 +1136,8 @@ class MPCOptimizer:
         charging (it must stay hotter to keep pushing heat in), which is
         exactly what T[k] represents, already decision-consistent with the
         rest of the model. The margin between T[k] and the real supply
-        temperature is not directly measured (cop_dhw has no
-        tank-temperature column to calibrate it against), so it is
-        approximated as reference_supply_temperature_c's own margin above
-        the highest configured target - the same "how much hotter does
-        supply run than the target it's aiming for" gap already implied by
-        that calibrated value, floored at 0 so supply is never modelled as
-        colder than the tank it is heating. POWER_FIT_T_LOW_C/HIGH_C are
+        temperature is the coil's approach measured on the boiler's own runs
+        (see _supply_margin_c). POWER_FIT_T_LOW_C/HIGH_C are
         real T_supply values (q_th_at_power_fit_low_w/high_w are that fitted
         line evaluated at those *real* T_supply values - see
         HeatPumpCOPIdentifier._fit_q_th_line()), so COP is evaluated directly at
@@ -1089,7 +1156,7 @@ class MPCOptimizer:
         if self.cop_model is None or T_outdoor is None:
             return self.config.boiler_electrical_power_w, 0.0
 
-        margin = self._supply_margin_c(overall_target_max)
+        margin = self._supply_margin_c(overall_target_max) + self._half_step_rise_k
 
         power_low, power_high = map(
             float, self.cop_model.planned_power_at_reference_points(T_outdoor)
@@ -1111,12 +1178,49 @@ class MPCOptimizer:
 
         return alpha, beta
 
+    @property
+    def _half_step_rise_k(self) -> float:
+        """Half the rise of the tank over a fine step the heat pump runs through
+        (K). T[k] is the tank at the start of the step, but the supply follows
+        the tank as it warms, so the step draws as at its middle - the point
+        the supply margin is measured against (see
+        BoilerThermalIdentifier._identify_supply_margin). The fine step also
+        for a coarse block: that one is run as fine steps too (see
+        _extract_result). 0 without a measured margin: the fallback margin is
+        not measured against the tank's middle."""
+
+        if self.thermal_model.supply_margin_k is None:
+            return 0.0
+
+        return (
+            self._heat_w
+            * self.config.step_hours
+            * 3600.0
+            / (
+                2.0
+                * RHO_WATER_KG_PER_L
+                * self.thermal_model.volume_l
+                * CP_WATER_J_PER_KG_K
+            )
+        )
+
     def _supply_margin_c(self, overall_target_max: float) -> float:
         """How much hotter the heat pump's supply runs than the tank it charges
-        (see _power_line_coefficients); 0 without a calibrated COP model."""
+        (see _power_line_coefficients); 0 without a calibrated COP model.
+
+        The coil's measured approach (BoilerThermalModel.supply_margin_k) where
+        calibrated: a property of the coil, whatever the targets are. A model
+        calibrated before it existed falls back to the reference supply's margin
+        above the highest target until its next calibration - which a target
+        near that supply, such as a legionella run, drove to 0, costing every
+        run in the horizon as if the supply were no hotter than the tank.
+        """
 
         if self.cop_model is None:
             return 0.0
+
+        if self.thermal_model.supply_margin_k is not None:
+            return self.thermal_model.supply_margin_k
 
         return max(
             self.cop_model.reference_supply_temperature_c - overall_target_max, 0.0
@@ -1538,7 +1642,9 @@ class MPCOptimizer:
         a_d, b_d = discretize_zoh(a, b, self.config.step_hours * 3600.0)
         tap_forecast_w = data.tap_forecast_w or (0.0,) * horizon
 
-        initial_temperature = (data.current_temp_top + data.current_temp_bottom) / 2.0
+        initial_temperature = self.thermal_model.mixed_temperature(
+            data.current_temp_top, data.current_temp_bottom
+        )
         temperatures = [float(initial_temperature)]
 
         # A coarse block the plan only partly uses is a run that stops inside
@@ -1563,13 +1669,22 @@ class MPCOptimizer:
             else DEFAULT_MAX_TANK_TEMPERATURE_C
         )
         heat_pump_w = [0.0] * horizon
+
+        def outdoor_at(i: int) -> float | None:
+            forecast = data.outdoor_temperature_forecast
+            return forecast[i] if forecast else None
+
         booster_w = [0.0] * horizon
+        # The fine steps a run starts in (see HeatPumpCOPModel.start_step_power_w).
+        start_slots: set[int] = set()
 
         for m in range(plan.num_steps):
             slots = [i for i in range(horizon) if plan.fine_to_model[i] == m]
             heat_pump_wh = float(pyo.value(model.q_heat_pump_w[m])) * plan.dt_hours[m]
             booster_wh = float(pyo.value(model.q_booster_w[m])) * plan.dt_hours[m]
             starts = round(float(pyo.value(model.compressor_start[m])))
+            if starts:
+                start_slots.add(slots[0])
 
             for n, i in enumerate(slots):
                 passive = (
@@ -1586,7 +1701,7 @@ class MPCOptimizer:
                     # ramp happens, in the run's first quarter hour - the same
                     # energy the block's own step lost to it (see
                     # _ramp_fraction).
-                    rate_w = self._heat_w * (
+                    rate_w = self._heat_at(outdoor_at(i)) * (
                         self._ramp_fraction(self.config.step_hours)
                         if starts and n == 0
                         else 1.0
@@ -1641,18 +1756,18 @@ class MPCOptimizer:
         electrical_power_w = []
 
         for i in range(horizon):
-            T_outdoor = (
-                data.outdoor_temperature_forecast[i]
-                if data.outdoor_temperature_forecast
-                else None
-            )
+            T_outdoor = outdoor_at(i)
             alpha, beta = self._power_line_coefficients(T_outdoor, overall_target_max)
             # For the part of the step the heat pump runs (see active_power_w).
             # The booster is resistive: electrical power equals its heat (COP 1).
-            used = heat_pump_w[i] / self._heat_w
-            electrical_power_w.append(
-                (alpha + beta * temperatures[i]) * used + booster_w[i]
+            used = heat_pump_w[i] / self._heat_at(T_outdoor)
+            start_power_w = self.cop_model.start_step_power_w if self.cop_model else 0.0
+            heat_pump_power_w = (
+                start_power_w
+                if i in start_slots and used and start_power_w
+                else (alpha + beta * temperatures[i]) * used
             )
+            electrical_power_w.append(heat_pump_power_w + booster_w[i])
 
         # Empty when no space heating was planned, so a caller can tell "the
         # zone was left alone" from "the zone was planned to coast".
@@ -1678,6 +1793,20 @@ class MPCOptimizer:
             space_heat_w = tuple(space_heat_model[m] for m in plan.fine_to_model)
             zone_temperatures = tuple(zone_model[m] for m in plan.fine_to_model)
 
+        # The objective's own energy terms (see _build_objective), so what is
+        # reported of a plan's cost is what the plan was chosen on.
+        electricity_kwh = (
+            sum(pyo.value(model.draw_w[k]) * plan.dt_hours[k] for k in model.K) / 1000.0
+        )
+        grid_kwh = (
+            sum(
+                weight * pyo.value(model.active_power_w[k, s]) * plan.dt_hours[k]
+                for k in model.K
+                for s, weight in enumerate(model.mpc_scenario_weights)
+            )
+            / 1000.0
+        )
+
         return MPCResult(
             schedule=schedule,
             temperatures=temperatures,
@@ -1689,4 +1818,6 @@ class MPCOptimizer:
             space_schedule=space_schedule,
             space_heat_w=space_heat_w,
             zone_temperatures=zone_temperatures,
+            electricity_kwh=electricity_kwh,
+            grid_kwh=grid_kwh,
         )

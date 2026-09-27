@@ -14,8 +14,9 @@ from sklearn.metrics import (
 from domain.config import Config, HeatPumpStates
 from domain.dataset import DatasetDefinition
 from domain.models import HeatPumpCOPModel
+from domain.mpc import MPCConfig
 from domain.physics import CP_WATER_J_PER_KG_K, RHO_WATER_KG_PER_L
-from features.boiler import booster_active
+from features.boiler import BoilerThermalIdentifier, booster_active
 from features.dataset import DatasetBuilder
 from features.identifier import SystemIdentifier
 
@@ -121,16 +122,23 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
     # output, validated for the tank's temperature *trajectory*, a different
     # purpose) understated real electrical draw by up to ~40% through the
     # middle of a cycle.
-    # Rows below this supply temperature are left out of that Q_th fit: the
-    # compressor is still ramping up there (real data: ~600 W electrical and
-    # ~2.8 kW thermal at 20-30 degC supply, against ~6.5 kW thermal once
-    # running), a start-up transient the planning line is never evaluated in -
-    # MPCOptimizer maps tank temperature plus the reference margin to supply
-    # temperature, in practice 45 degC and up. Estimating Q_th at the reference
-    # points as local medians instead (+/-5 degC windows at 30 and 60 degC) was
-    # dragged down by exactly those start-up rows and by the modulating-down
-    # tail, and planned DHW power ~20% below real in every one of 20 runs.
-    POWER_FIT_MIN_SUPPLY_C = 35.0
+    # That Q_th fit uses only readings where the compressor runs at its usual
+    # speed: below it, it is still ramping up or already modulating down near
+    # its limit (real data: 56-60 Hz running, 44-50 Hz in both), regimes the
+    # plan covers with its start ramp and by stopping at the limit (see
+    # MPCOptimizer), not through this line. Fitted with them, one straight line
+    # came out too flat - 6-7% below real power at the 40-50 degC tanks a DHW
+    # run ends in - and local medians at the reference points instead planned
+    # DHW power ~20% below real in every one of 20 runs. Usual means no more
+    # than this many robust standard deviations (the median absolute deviation
+    # times 1.4826, its ratio to the standard deviation of a normal
+    # distribution) below the median frequency: the ramp and the modulating
+    # tail lie that far below it, the running speed's own spread does not.
+    # Filtered on speed rather than on fixed supply temperatures (35-55 degC
+    # before), it does not depend on the setpoint the runs used; on 12 runs it
+    # was not fitted on, it planned them as closely as those bounds did.
+    USUAL_SPEED_ROBUST_STD = 3.0
+    MAD_TO_STD = 1.4826
     # validate() treats readings further apart than this as separate compressor
     # runs: prepare() keeps only active readings at the dataset's 5-minute
     # interval, so more than two missing readings in a row means the
@@ -213,11 +221,12 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         # the other way around, unlike SolarBiasIdentifier - that identifier needs
         # the full forecast-snapshot history to learn how forecasts evolve
         # with lead time; COP only needs the best-known outdoor temperature at
-        # each reading). The outdoor-temperature attribute only reports hourly
-        # target times, so it matches at most 1 in 12 of these 5-minute rows
-        # exactly - forward-filling holds that hourly value for the following
-        # readings, a reasonable approximation since outdoor air temperature
-        # changes slowly relative to an hour. Only forward: readings from before
+        # each reading). The outdoor-temperature attribute reports 15-minute
+        # target times, so it matches at most 1 in 3 of these 5-minute rows
+        # exactly - forward-filling holds that value for the following
+        # readings, which changes nothing measurable: interpolating between the
+        # values instead fitted the Q_th line identically (real data). Only
+        # forward: readings from before
         # the first outdoor temperature have none and are dropped below.
         # Back-filling gave them the first value ever recorded - on real data
         # half of all DHW readings, 45 days of them, at one and the same
@@ -399,6 +408,8 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         self,
         df: pd.DataFrame,
     ) -> HeatPumpCOPModel:
+        # From the raw readings: prepare() leaves the start-up out.
+        start_ramp_seconds, start_step_power_w = self._start_up(df)
         df = self.prepare(df)
 
         if len(df) < 10:
@@ -547,22 +558,41 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
 
         self.model.reference_supply_temperature_c = float(df["T_supply"].quantile(0.95))
         # See the class docstring on POWER_FIT_T_LOW_C/HIGH_C and
-        # POWER_FIT_MIN_SUPPLY_C. Fitted on the training split only, like the
+        # USUAL_SPEED_ROBUST_STD. Fitted on the training split only, like the
         # COP parameters, so validate() scores it on data it never saw.
         (
             self.model.q_th_at_power_fit_low_w,
             self.model.q_th_at_power_fit_high_w,
+            self.model.q_th_per_outdoor_w_per_k,
         ) = self._fit_q_th_line(train_df, self.model)
+        (
+            self.model.q_in_at_zero_outdoor_w,
+            self.model.q_in_per_outdoor_w_per_k,
+        ) = self._fit_heat_input(train_df)
+        self.model.start_step_power_w = start_step_power_w
+        self.model.start_ramp_seconds = start_ramp_seconds
 
         logger.info(
             "Heat pump COP calibration (%s): reference_supply_temperature_c="
-            "%.2f degC, Q_th at %.0f/%.0f degC = %.1f/%.1f W",
+            "%.2f degC, Q_th at %.0f/%.0f degC supply and 0 degC outdoor = "
+            "%.1f/%.1f W, %+.1f W per K outdoor",
             self.mode,
             self.model.reference_supply_temperature_c,
             HeatPumpCOPModel.POWER_FIT_T_LOW_C,
             HeatPumpCOPModel.POWER_FIT_T_HIGH_C,
             self.model.q_th_at_power_fit_low_w,
             self.model.q_th_at_power_fit_high_w,
+            self.model.q_th_per_outdoor_w_per_k,
+        )
+        logger.info(
+            "Heat pump COP calibration (%s): heat into the tank after the "
+            "start-up %.1f W at 0 degC outdoor, %+.1f W per K outdoor; a "
+            "%.0f s ramp and %.0f W electrical over a run's first step",
+            self.mode,
+            self.model.q_in_at_zero_outdoor_w,
+            self.model.q_in_per_outdoor_w_per_k,
+            self.model.start_ramp_seconds,
+            self.model.start_step_power_w,
         )
 
         return self.model
@@ -609,26 +639,35 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
 
     def _fit_q_th_line(
         self, df: pd.DataFrame, cop_model: HeatPumpCOPModel
-    ) -> tuple[float, float]:
-        """Q_th at POWER_FIT_T_LOW_C/HIGH_C from a line
-        Q_th = q_0 + q_slope * T_supply, chosen so that Q_th / COP reproduces
-        measured P_el as closely as possible - electrical power is what
-        planning costs, so that is the error to minimize, not the Q_th error
-        itself. Linear in (q_0, q_slope), so an ordinary least-squares solve.
-        Uses only rows at or above POWER_FIT_MIN_SUPPLY_C (see its class
-        docstring). Falls back to a flat Q_th when supply temperature barely
-        varies (the slope is then not identifiable), and to all rows, with a
-        warning, when fewer than two lie in the operating range.
+    ) -> tuple[float, float, float]:
+        """Q_th at POWER_FIT_T_LOW_C/HIGH_C and 0 degC outdoor, and its rise
+        per K outdoor (see HeatPumpCOPModel.q_th_per_outdoor_w_per_k), from a
+        plane Q_th = q_0 + q_slope * T_supply + q_outdoor * T_outdoor chosen so
+        that Q_th / COP reproduces measured P_el as closely as possible -
+        electrical power is what planning costs, so that is the error to
+        minimize, not the Q_th error itself. Linear in its coefficients, so an
+        ordinary least-squares solve. Uses only rows with the compressor at its
+        usual speed (see USUAL_SPEED_ROBUST_STD). A temperature that barely
+        varies leaves its slope unidentifiable: the outdoor one is dropped
+        first, then the supply one, down to a flat Q_th. All rows, with a
+        warning, without a compressor frequency to tell them by.
         """
 
-        rows = df[df["T_supply"] >= self.POWER_FIT_MIN_SUPPLY_C]
+        frequency = pd.to_numeric(
+            df.get("compressor_frequency", pd.Series(np.nan, index=df.index)),
+            errors="coerce",
+        )
 
-        if len(rows) < 2:
+        if frequency.notna().sum() >= 2:
+            median = frequency.median()
+            spread = self.MAD_TO_STD * (frequency - median).abs().median()
+            rows = df[frequency >= median - self.USUAL_SPEED_ROBUST_STD * spread]
+        else:
             logger.warning(
-                "Heat pump COP calibration (%s): fewer than 2 readings at or "
-                "above %.1f degC supply - fitting Q_th on all readings instead.",
+                "Heat pump COP calibration (%s): no compressor frequency - "
+                "fitting Q_th on all readings, the ramp and the modulating "
+                "tail included.",
                 self.mode,
-                self.POWER_FIT_MIN_SUPPLY_C,
             )
             rows = df
 
@@ -638,17 +677,115 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             rows["T_outdoor"].to_numpy(dtype=float), T_supply
         )
 
-        design = np.column_stack([inverse_cop, T_supply * inverse_cop])
-        (q_0, q_slope), _, rank, _ = np.linalg.lstsq(design, P_el, rcond=None)
+        design = np.column_stack(
+            [
+                inverse_cop,
+                T_supply * inverse_cop,
+                rows["T_outdoor"].to_numpy(dtype=float) * inverse_cop,
+            ]
+        )
 
-        if rank < 2:
-            q_0 = float(np.dot(inverse_cop, P_el) / np.dot(inverse_cop, inverse_cop))
-            q_slope = 0.0
+        for terms in (3, 2, 1):
+            coefficients, _, rank, _ = np.linalg.lstsq(
+                design[:, :terms], P_el, rcond=None
+            )
+            if rank == terms:
+                break
+
+        q_0, q_slope, q_outdoor = np.r_[coefficients, np.zeros(3 - terms)]
 
         return (
             float(q_0 + q_slope * HeatPumpCOPModel.POWER_FIT_T_LOW_C),
             float(q_0 + q_slope * HeatPumpCOPModel.POWER_FIT_T_HIGH_C),
+            float(q_outdoor),
         )
+
+    def _start_up(self, df: pd.DataFrame) -> tuple[float, float]:
+        """(ramp s, electrical power over the first planning step W) of runs in
+        this mode, from the readings as loaded - minute readings, so a run
+        starts within a minute of when it really did, and prepare() has not yet
+        left the start-up out. The ramp as the boiler reads it (see
+        BoilerThermalIdentifier._identify_heat_input_ramp), from the
+        calorimetric heat; the power the median, over runs that lasted past
+        their first step (MPCConfig.step_hours) without the booster, of their
+        mean power over it. 0.0 for either without such runs."""
+
+        df = self._bridge_reporting_gaps(
+            df.sort_values("time")
+            .drop_duplicates(subset="time", keep="last")
+            .reset_index(drop=True)
+            .assign(
+                P_el=lambda d: pd.to_numeric(d["P_el"], errors="coerce"),
+                flow_lpm=lambda d: pd.to_numeric(d["flow_lpm"], errors="coerce"),
+            )
+        )
+        running = (df["state"] == self.mode).to_numpy(dtype=bool)
+        booster = booster_active(df, self.mode).to_numpy(dtype=bool)
+        heat_w = (
+            (RHO_WATER_KG_PER_L / 60.0)
+            * CP_WATER_J_PER_KG_K
+            * df["flow_lpm"]
+            * (
+                pd.to_numeric(df["T_supply"], errors="coerce")
+                - pd.to_numeric(df["T_return"], errors="coerce")
+            ).clip(lower=0.0)
+        )
+        _, ramp_seconds = BoilerThermalIdentifier()._identify_heat_input_ramp(
+            pd.DataFrame(
+                {
+                    "time": df["time"],
+                    "boiler_on": running,
+                    "booster_on": booster,
+                    "q_in_override_w": heat_w.where(running),
+                }
+            )
+        )
+
+        power_w = df["P_el"].to_numpy(dtype=float)
+        seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
+        step_s = MPCConfig().step_hours * 3600.0
+        powers = []
+
+        for start in np.flatnonzero(running & ~np.r_[False, running[:-1]]):
+            end = start
+
+            while end + 1 < len(df) and running[end + 1]:
+                end += 1
+
+            since = seconds[start : end + 1] - seconds[start]
+            first = np.arange(start, end + 1)[since < step_s]
+
+            if (
+                since[-1] < step_s
+                or booster[start : end + 1].any()
+                or np.isnan(power_w[first]).any()
+            ):
+                continue
+
+            powers.append(float(power_w[first].mean()))
+
+        return (
+            ramp_seconds or 0.0,
+            float(np.median(powers)) if powers else 0.0,
+        )
+
+    @staticmethod
+    def _fit_heat_input(df: pd.DataFrame) -> tuple[float, float]:
+        """(heat at 0 degC outdoor W, its rise per K outdoor) from a line fitted
+        by least squares to the calorimetric heat of every reading after the
+        start-up (see STARTUP), so a run's full steps as the plan meets them,
+        modulation included. Flat, at the mean, where the outdoor temperature
+        barely varies: the slope is then not identifiable."""
+
+        heat_w = df["Q_th"].to_numpy(dtype=float)
+        outdoor_c = df["T_outdoor"].to_numpy(dtype=float)
+        design = np.column_stack([np.ones_like(outdoor_c), outdoor_c])
+        (at_zero_w, per_k_w), _, rank, _ = np.linalg.lstsq(design, heat_w, rcond=None)
+
+        if rank < 2:
+            return float(np.mean(heat_w)), 0.0
+
+        return float(at_zero_w), float(per_k_w)
 
     def _planned_power_w(self, df: pd.DataFrame) -> np.ndarray:
         """The electrical power MPCOptimizer plans with at each row's real
@@ -799,16 +936,13 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         # An accurate COP fit does not guarantee accurate planning: the
         # optimizer costs with a straight power line through two Q_th
         # reference values (see _fit_q_th_line()), so that line is scored here
-        # against measured power, in the supply range planning evaluates it in.
-        # Only DHW planning has such a line (see calibrate()).
-        in_planning_range = (T_supply >= self.POWER_FIT_MIN_SUPPLY_C) & (
-            self.key == "dhw"
-        )
-
-        if in_planning_range.any():
+        # against measured power over whole runs (less their start-up, see
+        # STARTUP), as planning evaluates it. Only DHW planning has such a line
+        # (see calibrate()).
+        if self.key == "dhw":
             planned_power_w = self._planned_power_w(test_df)
             measured_power_w = test_df["P_el"].to_numpy(dtype=float)
-            error_w = (planned_power_w - measured_power_w)[in_planning_range]
+            error_w = planned_power_w - measured_power_w
             power_bias_w = float(np.mean(error_w))
             power_mae_w = float(np.mean(np.abs(error_w)))
 
@@ -825,7 +959,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             run_peak_ratio = float((peaks["planned"] / peaks["measured"]).median())
 
             supply_bins = np.arange(
-                self.POWER_FIT_MIN_SUPPLY_C,
+                HeatPumpCOPModel.POWER_FIT_T_LOW_C,
                 HeatPumpCOPModel.POWER_FIT_T_HIGH_C + 5.0,
                 5.0,
             )
@@ -835,11 +969,10 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             )[["planned", "measured"]].median()
 
             logger.info(
-                "Heat pump COP validation (%s): planned vs measured power at "
-                ">= %.0f degC supply: bias=%+.0f W, MAE=%.0f W, median run "
-                "peak planned/measured=%.3f (%d runs); median per supply bin:\n%s",
+                "Heat pump COP validation (%s): planned vs measured power: "
+                "bias=%+.0f W, MAE=%.0f W, median run peak planned/measured="
+                "%.3f (%d runs); median per supply bin:\n%s",
                 self.mode,
-                self.POWER_FIT_MIN_SUPPLY_C,
                 power_bias_w,
                 power_mae_w,
                 run_peak_ratio,
@@ -848,14 +981,6 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             )
         else:
             power_bias_w = power_mae_w = run_peak_ratio = float("nan")
-
-        if self.key == "dhw" and not in_planning_range.any():
-            logger.warning(
-                "Heat pump COP validation (%s): no test readings at or above "
-                "%.0f degC supply - planned power not scored.",
-                self.mode,
-                self.POWER_FIT_MIN_SUPPLY_C,
-            )
 
         result = {
             "r2": r2,
@@ -914,14 +1039,14 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             .timeseries(
                 "T_supply",
                 config.heat_pump.supply_temperature,
-                interval="5m",
+                interval="1m",
                 aggregation="mean",
                 fill="previous",
             )
             .timeseries(
                 "T_return",
                 config.heat_pump.return_temperature,
-                interval="5m",
+                interval="1m",
                 aggregation="mean",
                 fill="previous",
             )
@@ -943,7 +1068,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             .timeseries(
                 "P_el",
                 config.heat_pump.power,
-                interval="5m",
+                interval="1m",
                 aggregation="mean",
                 fill="none",
             )
@@ -954,7 +1079,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             .timeseries(
                 "flow_lpm",
                 config.heat_pump.flow,
-                interval="5m",
+                interval="1m",
                 aggregation="mean",
                 fill="none",
             )
@@ -965,7 +1090,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             .timeseries(
                 "state",
                 config.heat_pump.state,
-                interval="5m",
+                interval="1m",
                 aggregation="last",
                 fill="previous",
             )
@@ -1018,7 +1143,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         builder = builder.timeseries(
             "compressor_frequency",
             config.heat_pump.compressor_frequency,
-            interval="5m",
+            interval="1m",
             aggregation="mean",
             fill="previous",
         ).join(
@@ -1035,7 +1160,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             builder = builder.timeseries(
                 "booster",
                 config.heat_pump.booster,
-                interval="5m",
+                interval="1m",
                 aggregation="last",
                 fill="previous",
             ).join(

@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from domain.config import BoilerConfig, LegionellaConfig
 from domain.models import BoilerThermalModel
 from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.time import local_day_start
+from features.optimizer import MPCOptimizer
 
 START = datetime(2026, 9, 17, 10, 0, tzinfo=UTC)
 TIMES = [START + timedelta(minutes=15 * i) for i in range(4)]
@@ -22,7 +24,9 @@ class _RecordingHomeAssistant:
         self.states[entity_id] = (state, attributes)
 
 
-def _published(schedule: tuple[int, ...]) -> dict[str, str]:
+def _published(
+    schedule: tuple[int, ...], thermal_model: BoilerThermalModel | None = None
+) -> dict[str, str]:
     home_assistant = _RecordingHomeAssistant()
     optimization = Optimization(
         loader=None,  # type: ignore[arg-type]
@@ -41,7 +45,7 @@ def _published(schedule: tuple[int, ...]) -> dict[str, str]:
         termination_condition="optimal",
     )
 
-    optimization.publish_dhw(result, TIMES)
+    optimization.publish_dhw(result, TIMES, thermal_model)
 
     return {entity: state for entity, (state, _) in home_assistant.states.items()}
 
@@ -74,6 +78,30 @@ def test_the_setpoint_is_the_planned_end_temperature_rounded_to_the_nearest():
 
     assert _published((0, 1, 1, 0))[Optimization.DHW_SETPOINT_ENTITY] == "48.0"
     assert _published((0, 1, 0, 0))[Optimization.DHW_SETPOINT_ENTITY] == "48.5"
+
+
+def test_the_setpoint_leaves_the_overshoot_the_plan_counts():
+    """A run planned to end at 48.2 degC with 1.7 K of overshoot is set to
+    stop at 46.5; one ending above the heat pump's own limit ends on the
+    booster's thermostat and keeps its end as setpoint."""
+
+    model = BoilerThermalModel(
+        volume_l=200.0,
+        ua_top_w_per_k=1.0,
+        ua_bottom_w_per_k=1.0,
+        ua_mix_idle_w_per_k=0.1,
+        ua_mix_active_w_per_k=500.0,
+        q_in_nominal_w=6000.0,
+        setpoint_overshoot_k=1.7,
+    )
+
+    assert _published((0, 1, 1, 0), model)[Optimization.DHW_SETPOINT_ENTITY] == "46.5"
+    assert (
+        _published((0, 1, 1, 0), replace(model, heat_pump_max_tank_temperature_c=48.0))[
+            Optimization.DHW_SETPOINT_ENTITY
+        ]
+        == "48.0"
+    )
 
 
 LEGIONELLA = LegionellaConfig(temperature=60.0, interval=7)
@@ -193,3 +221,50 @@ def test_an_interval_ending_beyond_the_plan_plans_nothing_yet():
 
 def test_one_sensor_at_temperature_does_not_count_as_disinfected():
     assert 60.0 in _targets_with_legionella(1, 61.0, 58.0)
+
+
+def test_the_plan_log_reports_the_objective_s_own_energy(caplog):
+    """1.00 kWh of which 0.50 from the grid, as the optimizer counted them:
+    the import at the price, the sun at the export it forgoes."""
+
+    result = MPCResult(
+        schedule=(0, 1, 1, 0),
+        temperatures=TEMPERATURES,
+        electrical_power_w=(0.0, 2000.0, 2000.0, 0.0),
+        heat_w=(0.0,) * 4,
+        objective_value=0.0,
+        solver_status="optimal",
+        termination_condition="optimal",
+        electricity_kwh=1.0,
+        grid_kwh=0.5,
+    )
+
+    with caplog.at_level("INFO", logger="app.optimization"):
+        Optimization.log_dhw_plan(result, TIMES, MPCConfig())
+
+    assert "to 48.2 degC | 1.00 kWh, of which sun 0.50 and grid 0.50" in caplog.text
+    assert "EUR 0.150" in caplog.text
+
+
+def test_explain_logs_the_plan_beside_earlier_finishes(caplog):
+    """A 45 degC target at the end of six hours with sun only in the last
+    hour and a half: the plan heats in it, and each earlier finish is solved and
+    logged beside it."""
+
+    steps = 24
+    data = MPCInput(
+        solar_forecast_w=[0.0] * (steps - 6) + [3000.0] * 6,
+        ambient_temperature=20.0,
+        current_temp_top=40.0,
+        current_temp_bottom=40.0,
+        boiler_on_current=False,
+        target_temperature_top=(10.0,) * (steps - 1) + (45.0,),
+    )
+    times = [NOW + timedelta(minutes=15 * i) for i in range(steps)]
+    optimizer = MPCOptimizer(TANK, MPCConfig())
+
+    with caplog.at_level("INFO", logger="app.optimization"):
+        Optimization.explain_dhw_plan(optimizer, data, optimizer.solve(data), times)
+
+    for line in ("plan:", "0.5 h earlier:", "1 h earlier:", "2 h earlier:"):
+        assert line in caplog.text

@@ -14,7 +14,7 @@ from domain.models import BoilerThermalModel
 from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.physics import CP_WATER_J_PER_KG_K, RHO_WATER_KG_PER_L
 from domain.state import State
-from domain.time import local_day_start
+from domain.time import local_day_start, to_local_time
 from features.boiler import BoilerThermalIdentifier
 from features.building import BuildingThermalIdentifier
 from features.cop import HeatPumpCOPIdentifier
@@ -253,8 +253,129 @@ class Optimization:
             times=forecast_times,
         )
 
-        self.publish_dhw(result, forecast_times)
+        self.publish_dhw(result, forecast_times, thermal_model)
+        self.log_dhw_plan(result, forecast_times, mpc_config)
+
+        if optimize_config.explain:
+            self.explain_dhw_plan(optimizer, data, result, forecast_times)
+
         self._plan_space_heating(optimizer, data, state, config, forecast_times)
+
+    @staticmethod
+    def dhw_runs(schedule: tuple[int, ...]) -> list[tuple[int, int]]:
+        """(first, last) step of each planned run."""
+
+        runs: list[list[int]] = []
+
+        for k, on in enumerate(schedule):
+            if on and runs and runs[-1][1] == k - 1:
+                runs[-1][1] = k
+            elif on:
+                runs.append([k, k])
+
+        return [(first, last) for first, last in runs]
+
+    @classmethod
+    def dhw_summary(
+        cls,
+        result: MPCResult,
+        times: list[datetime],
+        mpc_config: MPCConfig,
+    ) -> str:
+        """What a hot water plan does and what it expects that to cost: each
+        run's time and end temperature, its electricity and how much of it is
+        expected from the grid, as the plan's own objective counts them (see
+        MPCResult.electricity_kwh) - so the cheaper of two plans here is the one
+        the optimizer would choose. The cost is the import at the price and the
+        own sun at the export it forgoes; not the whole objective, which also
+        prices starts and shortfalls and so is no amount of money."""
+
+        runs = cls.dhw_runs(result.schedule)
+
+        if not runs:
+            return "no run within the horizon"
+
+        solar_kwh = result.electricity_kwh - result.grid_kwh
+        cost_eur = (
+            result.grid_kwh * mpc_config.price_eur_per_kwh
+            + solar_kwh * mpc_config.feed_in_price_eur_per_kwh
+        )
+        step = timedelta(hours=mpc_config.step_hours)
+        last = len(result.temperatures) - 1
+        runs_text = ", ".join(
+            f"{to_local_time(times[first]):%a %H:%M}-"
+            f"{to_local_time(times[end] + step):%H:%M} "
+            f"to {result.temperatures[min(end + 1, last)]:.1f} degC"
+            for first, end in runs
+        )
+
+        return (
+            f"{runs_text} | {result.electricity_kwh:.2f} kWh, of which sun "
+            f"{solar_kwh:.2f} and grid {result.grid_kwh:.2f} (expected) "
+            f"| EUR {cost_eur:.3f}"
+        )
+
+    @classmethod
+    def log_dhw_plan(
+        cls,
+        result: MPCResult,
+        times: list[datetime],
+        mpc_config: MPCConfig,
+    ) -> None:
+        logger.info("DHW plan: %s", cls.dhw_summary(result, times, mpc_config))
+
+    # How much earlier explain_dhw_plan has the first run finish (hours): the
+    # question a plan usually raises is why it does not run earlier, in more sun.
+    # Half an hour first: a run lasts about an hour, and the sunnier slot a plan
+    # passes over is often just before it; then on to where the morning starts.
+    EXPLAIN_EARLIER_HOURS = (0.5, 1, 2, 3)
+
+    @classmethod
+    def explain_dhw_plan(
+        cls,
+        optimizer: MPCOptimizer,
+        data: MPCInput,
+        result: MPCResult,
+        times: list[datetime],
+    ) -> None:
+        """Logs the plan beside the same plan with its first run finished
+        earlier, at the temperature the plan ends it at: solved again with that
+        temperature as a target, so each alternative is costed with its own
+        losses, COP and end temperature, not the plan's run moved in time. One
+        more solve per alternative, so only on request (OptimizeConfig.explain).
+        """
+
+        runs = cls.dhw_runs(result.schedule)
+
+        if not runs:
+            return
+
+        mpc_config = optimizer.config
+        finish = runs[0][1] + 1
+        end_c = result.temperatures[min(finish, len(result.temperatures) - 1)]
+        lines = [f"  {'plan:':<16}{cls.dhw_summary(result, times, mpc_config)}"]
+
+        run_steps = runs[0][1] - runs[0][0] + 1
+
+        for hours in cls.EXPLAIN_EARLIER_HOURS:
+            k = finish - round(hours / mpc_config.step_hours)
+
+            # The run would have to start before now: no plan can reach it, and
+            # the solver would only return the nearest one it can - an earlier
+            # line again.
+            if k - run_steps < 0:
+                continue
+
+            targets = list(data.target_temperature_top)
+            targets[k] = max(targets[k], end_c)
+            forced = dataclasses.replace(data, target_temperature_top=tuple(targets))
+            summary = cls.dhw_summary(optimizer.solve(forced), times, mpc_config)
+            lines.append(f"  {f'{hours:g} h earlier:':<16}{summary}")
+
+        if len(lines) == 1:
+            lines.append("  no earlier finish left: the run would start before now")
+
+        logger.info("DHW plan alternatives:\n%s", "\n".join(lines))
 
     def _with_legionella(
         self,
@@ -349,7 +470,9 @@ class Optimization:
         heat_capacity_j_per_k = (
             thermal_model.volume_l * RHO_WATER_KG_PER_L * CP_WATER_J_PER_KG_K
         )
-        start_c = (data.current_temp_top + data.current_temp_bottom) / 2.0
+        start_c = thermal_model.mixed_temperature(
+            data.current_temp_top, data.current_temp_bottom
+        )
         limit_c = thermal_model.heat_pump_max_tank_temperature_c or temperature
         seconds = (
             heat_capacity_j_per_k
@@ -522,23 +645,30 @@ class Optimization:
             times=times,
         )
 
-    def publish_dhw(self, result: MPCResult, times: list[datetime]) -> None:
+    def publish_dhw(
+        self,
+        result: MPCResult,
+        times: list[datetime],
+        thermal_model: BoilerThermalModel | None = None,
+    ) -> None:
         """Writes the plan's hot water decision to Home Assistant: on/off for the
         quarter hour running now, and the start and SWW setpoint of the next
         planned run (the current one if it is heating now, 'unknown' without
         any).
 
-        The heat pump heats until its setpoint and stops by itself, so the
-        setpoint is the run's planned end temperature, rounded to the heat
-        pump's nearest half degree. The heat left in the coil and loop then
-        still flows into the tank, which settles above the setpoint (real data:
-        0.9-2.8 K, median 1.75 K). That is deliberately not subtracted: it is the
-        margin that absorbs a tap or loss forecast that turns out worse, where
-        planning the run to end exactly on target made every replan that saw a
-        fraction of a degree short start another run. Rounding up on top of it
-        only added up to half a degree more; rounded to the nearest, the setpoint
-        is at most a quarter degree below the plan, well inside that margin
-        (replayed on 14 real runs, 12-26 September 2026: no afternoon top-up).
+        The heat pump heats until its setpoint and stops by itself; the heat
+        left around the coil and in the loop then still mixes through, and the
+        tank settles setpoint_overshoot_k above the setpoint (real data: median
+        1.75 K). The plan counts that heat - a run it plans ends that much above
+        what its targets need (see MPCOptimizer) - so the setpoint is the run's
+        planned end less it: the setpoint its targets need, and the tank ends
+        where the plan has it. That margin above the need stays on purpose: it
+        absorbs a tap or loss forecast that turns out worse, where planning the
+        run to end exactly on target made every replan that saw a fraction of a
+        degree short start another run. Rounded to the heat pump's nearest half
+        degree, at most a quarter degree below the need (replayed on 14 real
+        runs, 12-26 September 2026: no afternoon top-up). Not below the heat
+        pump's own limit: a run the booster finishes ends on its thermostat.
         """
 
         schedule = result.schedule
@@ -553,6 +683,12 @@ class Optimization:
                 end += 1
 
             end_temperature = result.temperatures[min(end + 1, len(schedule) - 1)]
+            overshoot_k = thermal_model and thermal_model.setpoint_overshoot_k
+            limit_c = thermal_model and thermal_model.heat_pump_max_tank_temperature_c
+
+            if overshoot_k and (limit_c is None or end_temperature <= limit_c):
+                end_temperature -= overshoot_k
+
             next_start = times[start].isoformat()
             setpoint = str(math.floor(round(2 * end_temperature, 2) + 0.5) / 2)
 

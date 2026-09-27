@@ -2,6 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import joblib
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse
@@ -24,6 +25,7 @@ from domain.jobs import (
     UpdateConfig,
     ValidateConfig,
 )
+from domain.models import BoilerThermalModel
 from web.charts import backtest_chart, dashboard_chart
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -38,6 +40,7 @@ async def lifespan(app: FastAPI):
     configure_logger(settings.log_level)
 
     app.state.repositories = create_repositories(settings)
+    app.state.models_path = settings.data_path / "models"
 
     app.state.worker = Worker()
 
@@ -73,6 +76,16 @@ async def validation_exception_handler(request: Request, error: RequestValidatio
     )
 
 
+def boiler_model(models_path: Path) -> BoilerThermalModel | None:
+    """The calibrated boiler model the dashboard draws the tank with, None until
+    it is calibrated. Read as saved, without the identifier that made it: that
+    would import the modelling libraries this process stays free of."""
+
+    path = models_path / "boiler.joblib"
+
+    return joblib.load(path) if path.exists() else None
+
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     repositories = request.app.state.repositories
@@ -89,7 +102,9 @@ async def dashboard(request: Request):
         request=request,
         name="dashboard.html",
         context={
-            "dashboard_chart": dashboard_chart(state),
+            "dashboard_chart": dashboard_chart(
+                state, boiler_model(request.app.state.models_path)
+            ),
             "backtest_chart": backtest_chart(backtest),
         },
     )

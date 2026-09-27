@@ -81,6 +81,10 @@ class OptimizeConfig(BaseModel):
     # than incidentally following however many points the last solar
     # prediction happened to produce.
     steps: int = Field(default=192)
+    # Also log the plan beside alternatives that finish its first run earlier
+    # (see Optimization.explain_dhw_plan) - a few more solves, so off unless
+    # asked for.
+    explain: bool = Field(default=False)
 
 
 @dataclass

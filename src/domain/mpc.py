@@ -158,3 +158,8 @@ class MPCResult:
     space_schedule: tuple[int, ...] = ()
     space_heat_w: tuple[float, ...] = ()
     zone_temperatures: tuple[float, ...] = ()
+    # The plan's electricity over the horizon exactly as its objective prices
+    # it (kWh): the whole draw, and the part expected from the grid over the
+    # solar scenarios. The rest is own sun.
+    electricity_kwh: float = 0.0
+    grid_kwh: float = 0.0

@@ -100,16 +100,26 @@ TRUE_COP_MODEL = HeatPumpCOPModel(
 )
 
 
-def _power_rows(T_supply, q_th_w, T_outdoor: float = 10.0) -> pd.DataFrame:
+def _power_rows(
+    T_supply, q_th_w, T_outdoor: float = 10.0, frequency_hz: float = 58.0
+) -> pd.DataFrame:
     """Readings whose electrical power is exactly q_th_w / COP at each supply
-    temperature - the relationship _fit_q_th_line() inverts."""
+    temperature - the relationship _fit_q_th_line() inverts - with the
+    compressor at frequency_hz."""
 
     T_supply = np.asarray(T_supply, dtype=float)
     q_th_w = np.broadcast_to(np.asarray(q_th_w, dtype=float), T_supply.shape)
     cop = TRUE_COP_MODEL.clamped_cop(T_outdoor, T_supply)
 
     return pd.DataFrame(
-        {"T_supply": T_supply, "T_outdoor": T_outdoor, "P_el": q_th_w / cop}
+        {
+            "T_supply": T_supply,
+            "T_outdoor": T_outdoor,
+            "P_el": q_th_w / cop,
+            # A running compressor's own spread around its usual speed.
+            "compressor_frequency": frequency_hz
+            + np.resize([-1.0, 0.0, 1.0], len(T_supply)),
+        }
     )
 
 
@@ -118,23 +128,77 @@ def test_q_th_line_fit_recovers_a_known_linear_thermal_output():
     df = _power_rows(T_supply, 7000.0 - 20.0 * (T_supply - 35.0))
 
     identifier = HeatPumpCOPIdentifier(key="dhw")
-    low, high = identifier._fit_q_th_line(df, TRUE_COP_MODEL)
+    low, high, per_outdoor = identifier._fit_q_th_line(df, TRUE_COP_MODEL)
 
     assert low == pytest.approx(7100.0)
     assert high == pytest.approx(6500.0)
 
 
+def test_q_th_fit_recovers_the_rise_with_outdoor_temperature():
+    """At a fixed speed a compressor gives more heat the warmer the outdoor
+    air it evaporates from: 140 W per K here, on top of the supply line."""
+
+    T_supply = np.linspace(35.0, 60.0, 20)
+    df = pd.concat(
+        [
+            _power_rows(
+                T_supply,
+                5000.0 - 20.0 * (T_supply - 35.0) + 140.0 * outdoor,
+                T_outdoor=outdoor,
+            )
+            for outdoor in (10.0, 16.0, 22.0)
+        ],
+        ignore_index=True,
+    )
+
+    low, high, per_outdoor = HeatPumpCOPIdentifier(key="dhw")._fit_q_th_line(
+        df, TRUE_COP_MODEL
+    )
+
+    assert low == pytest.approx(5100.0)
+    assert high == pytest.approx(4500.0)
+    assert per_outdoor == pytest.approx(140.0)
+
+
 def test_q_th_line_fit_ignores_compressor_start_up_readings():
-    """Regression test for the real finding behind POWER_FIT_MIN_SUPPLY_C:
-    low start-up readings (compressor still ramping up) dragged the planned
-    Q_th down and planned DHW power ~20% below real."""
+    """Regression test for a real finding: low start-up readings (compressor
+    still ramping up) dragged the planned Q_th down and planned DHW power ~20%
+    below real."""
 
     running = _power_rows(np.linspace(35.0, 60.0, 50), 6500.0)
-    start_up = _power_rows(np.linspace(20.0, 34.0, 30), 2000.0)
+    start_up = _power_rows(np.linspace(20.0, 34.0, 30), 2000.0, frequency_hz=45.0)
     df = pd.concat([start_up, running], ignore_index=True)
 
     identifier = HeatPumpCOPIdentifier(key="dhw")
-    low, high = identifier._fit_q_th_line(df, TRUE_COP_MODEL)
+    low, high, per_outdoor = identifier._fit_q_th_line(df, TRUE_COP_MODEL)
+
+    assert low == pytest.approx(6500.0)
+    assert high == pytest.approx(6500.0)
+
+
+def test_q_th_line_fit_ignores_the_compressor_modulating_down_near_its_limit():
+    """Near its limit the compressor slows down and gives less heat; those
+    readings must not flatten the line the plan uses below, whatever supply
+    temperature the limit lies at."""
+
+    running = _power_rows(np.linspace(35.0, 51.0, 40), 6500.0)
+    modulating = _power_rows(np.linspace(52.0, 57.0, 20), 3000.0, frequency_hz=47.0)
+    df = pd.concat([running, modulating], ignore_index=True)
+
+    identifier = HeatPumpCOPIdentifier(key="dhw")
+    low, high, per_outdoor = identifier._fit_q_th_line(df, TRUE_COP_MODEL)
+
+    assert low == pytest.approx(6500.0)
+    assert high == pytest.approx(6500.0)
+
+
+def test_q_th_line_fit_uses_all_readings_without_a_compressor_frequency():
+    df = _power_rows(np.linspace(35.0, 60.0, 50), 6500.0).drop(
+        columns="compressor_frequency"
+    )
+
+    identifier = HeatPumpCOPIdentifier(key="dhw")
+    low, high, per_outdoor = identifier._fit_q_th_line(df, TRUE_COP_MODEL)
 
     assert low == pytest.approx(6500.0)
     assert high == pytest.approx(6500.0)
@@ -144,7 +208,7 @@ def test_q_th_line_fit_is_flat_when_supply_temperature_does_not_vary():
     df = _power_rows(np.full(20, 50.0), 6000.0)
 
     identifier = HeatPumpCOPIdentifier(key="dhw")
-    low, high = identifier._fit_q_th_line(df, TRUE_COP_MODEL)
+    low, high, per_outdoor = identifier._fit_q_th_line(df, TRUE_COP_MODEL)
 
     assert low == pytest.approx(6000.0)
     assert high == pytest.approx(6000.0)
@@ -462,3 +526,51 @@ def test_heating_fit_takes_the_evaporator_approach_from_dhw(tmp_path):
     assert model.delta_t_evap == TRUE_DELTA_T_EVAP
     assert model.eta_carnot == pytest.approx(TRUE_ETA_CARNOT, rel=0.05)
     assert model.q_th_at_power_fit_high_w == 0.0
+
+
+def test_heat_input_is_a_line_in_the_outdoor_temperature():
+    df = pd.DataFrame({"T_outdoor": [5.0, 10.0, 15.0, 20.0]})
+    df["Q_th"] = 5400.0 + 55.0 * df["T_outdoor"]
+
+    assert HeatPumpCOPIdentifier._fit_heat_input(df) == pytest.approx((5400.0, 55.0))
+
+
+def test_heat_input_is_flat_when_the_outdoor_temperature_does_not_vary():
+    df = pd.DataFrame({"T_outdoor": [12.0] * 3, "Q_th": [6000.0, 6200.0, 6400.0]})
+
+    assert HeatPumpCOPIdentifier._fit_heat_input(df) == pytest.approx((6200.0, 0.0))
+
+
+def test_the_start_up_is_read_from_the_readings_as_loaded():
+    """Twelve 40-minute DHW runs at minute readings, their heat rising linearly
+    to 6 kW over 800 s and their power to 2 kW over the same time: the ramp is
+    recovered, and the first 15 minutes draw (2 kW over 800 s at half, then
+    full) 2000 * (1 - 400 / 900) = 1111 W."""
+
+    rows = []
+    time = pd.Timestamp("2026-09-20 10:00", tz="UTC")
+    water_w_per_k = (RHO_WATER_KG_PER_L / 60.0) * CP_WATER_J_PER_KG_K * FLOW_LPM
+
+    for _ in range(12):
+        for minute in range(70):
+            on = minute < 40
+            # The minute's mean of a linear rise.
+            rise = float(
+                np.minimum(1.0, (minute * 60.0 + np.arange(60)) / 800.0).mean()
+            )
+            rows.append(
+                dict(
+                    time=time,
+                    state=SWW_STATE if on else "Uit",
+                    P_el=2000.0 * rise if on else 0.0,
+                    flow_lpm=FLOW_LPM if on else 0.0,
+                    T_supply=45.0 + (6000.0 * rise / water_w_per_k if on else 0.0),
+                    T_return=45.0,
+                )
+            )
+            time += pd.Timedelta(minutes=1)
+
+    ramp_s, power_w = HeatPumpCOPIdentifier(key="dhw")._start_up(pd.DataFrame(rows))
+
+    assert ramp_s == pytest.approx(800.0, rel=0.02)
+    assert power_w == pytest.approx(2000.0 * (1.0 - 400.0 / 900.0), rel=0.01)
