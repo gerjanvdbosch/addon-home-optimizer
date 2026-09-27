@@ -58,6 +58,32 @@ def continued(measured: list, planned: list) -> list:
     return [last] + [point for point in planned if point.time > last.time]
 
 
+def read_at(points: list[SeriesPoint], updated: datetime) -> list[SeriesPoint]:
+    """A quarter's last reading at the time it was read: the quarter's end, or
+    the state's update in the quarter still running. InfluxDB labels the
+    quarter at its start (see StateManager._dataset), where a heating tank was
+    drawn a quarter early - flat through the running quarter, and then jumping
+    to the plan."""
+
+    quarter = timedelta(hours=MPCConfig().step_hours)
+
+    return [
+        SeriesPoint(time=min(p.time + quarter, updated), value=p.value) for p in points
+    ]
+
+
+def ended(points: list[SeriesPoint], updated: datetime) -> list[SeriesPoint]:
+    """Only the quarters that had ended at the update. The running quarter's
+    mean covers only its first minutes, and a power sensor that has not
+    reported yet in it is filled with 0 (see StateManager._dataset): a run
+    that had just started was drawn at 0 W for that quarter, in place of the
+    plan, which does cover it."""
+
+    quarter = timedelta(hours=MPCConfig().step_hours)
+
+    return [p for p in points if p.time + quarter <= updated]
+
+
 def mixed_tank(
     boiler: BoilerMeasurement, model: BoilerThermalModel | None
 ) -> list[SeriesPoint]:
@@ -210,9 +236,11 @@ def dashboard_chart(
         col=1,
     )
 
+    heat_pump_power = ended(state.measurements.heat_pump.power, state.updated)
+
     series(
         "Heat pump",
-        state.measurements.heat_pump.power,
+        heat_pump_power,
         unit="W",
         row=1,
         col=1,
@@ -223,7 +251,7 @@ def dashboard_chart(
 
     series(
         "Heat pump",
-        continued(state.measurements.heat_pump.power, state.schedule.heat_pump.power),
+        continued(heat_pump_power, state.schedule.heat_pump.power),
         unit="W",
         row=1,
         col=1,
@@ -254,7 +282,7 @@ def dashboard_chart(
 
     series(
         "Climate temp",
-        state.measurements.building.temperature,
+        read_at(state.measurements.building.temperature, state.updated),
         row=2,
         col=1,
         line=dict(width=1.5, color="#FECB52", shape="spline"),
@@ -322,7 +350,11 @@ def dashboard_chart(
     # average without a calibrated model, which then is the same thing. The two
     # sensors are drawn beside it: their stratification is what the mixed
     # temperature is read from.
-    boiler = state.measurements.heat_pump.boiler
+    measured = state.measurements.heat_pump.boiler
+    boiler = BoilerMeasurement(
+        top_temperature=read_at(measured.top_temperature, state.updated),
+        bottom_temperature=read_at(measured.bottom_temperature, state.updated),
+    )
     measured_average = mixed_tank(boiler, boiler_model)
 
     for name, points in (
@@ -447,7 +479,8 @@ def dashboard_chart(
     # ending the axis there makes it equal to the data's own extent, so plotly's
     # double-click autosize lands on exactly the same view.
     fig.update_xaxes(
-        range=[window_start, window_end - timedelta(hours=MPCConfig().step_hours)]
+        range=[window_start, window_end - timedelta(hours=MPCConfig().step_hours)],
+        hoverformat="%b %-d, %Y, %H:%M",
     )
 
     fig.add_vline(

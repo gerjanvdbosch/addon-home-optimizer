@@ -1431,13 +1431,24 @@ def test_net_metering_does_not_heat_today_for_a_cloudy_tomorrow():
     today for a cloudier tomorrow is paid in full today and partly lost by
     tomorrow. Priced as free, the sun made exactly that worth doing."""
 
-    steps = 192
+    # Today and tomorrow morning: longer only slowed the solve.
+    steps = 144
     hour = np.arange(steps) * 0.25
     sun = np.clip(2500.0 * np.sin(np.pi * ((hour % 24.0) - 7.0) / 12.0), 0.0, None)
-    sun[hour >= 24.0] *= 0.3
+    # Too little sun tomorrow to heat on: with 30% of today's, it still
+    # covered tomorrow's run too, heating on either day was free, and which of
+    # the two equal plans came out was up to the solver.
+    sun[hour >= 24.0] *= 0.05
     target = [10.0] * steps
-    for day in (0, 24):
-        target[int((18.0 + day) * 4)] = 45.0
+    target[18 * 4] = 45.0
+    target[34 * 4] = 45.0
+    # 5 kWh drawn tomorrow at 7:00, more than even a full tank holds above
+    # tomorrow's target: tomorrow runs either way, so heat stored today saves
+    # no start, only grid power. Without it, today's tank held tomorrow's
+    # target by itself, storing more saved nothing, and which of the two equal
+    # plans came out was up to the solver's version (it differed on CI).
+    tap = [0.0] * steps
+    tap[31 * 4 : 32 * 4] = [5000.0] * 4
 
     def run_end(config: MPCConfig) -> float:
         result = MPCOptimizer(THERMAL_MODEL, config, cop_model=COP_MODEL).solve(
@@ -1445,6 +1456,7 @@ def test_net_metering_does_not_heat_today_for_a_cloudy_tomorrow():
                 solar_forecast_w=list(sun),
                 target_temperature_top=tuple(target),
                 outdoor_temperature_forecast=(15.0,) * steps,
+                tap_forecast_w=tuple(tap),
             )
         )
         on = [k for k, value in enumerate(result.schedule[:96]) if value]
@@ -1608,3 +1620,36 @@ def test_a_colder_day_heats_the_tank_slower():
         )
 
     assert run_steps(0.0) > run_steps(20.0)
+
+
+def test_a_run_under_way_starts_from_the_heat_it_has_put_in():
+    """Half an hour into a run the sensors lag the tank: the plan starts from
+    the tank mixed before the run plus the run's own heat since, ramp and
+    standing loss included - not from the sensors."""
+
+    model = replace(STARTING_MODEL, heat_pump_max_tank_temperature_c=55.0)
+    optimizer = MPCOptimizer(model, MPCConfig())
+    data = _make_input(
+        current_temp_top=42.0,
+        current_temp_bottom=41.5,
+        boiler_on_current=True,
+        compressor_elapsed_hours=0.5,
+        run_start_temp_top=34.0,
+        run_start_temp_bottom=34.0,
+    )
+    a_d, b_d = discretize_zoh(
+        *lumped_tank_state_space(
+            model.volume_l, model.ua_top_w_per_k + model.ua_bottom_w_per_k
+        ),
+        1800.0,
+    )
+    heat_w = model.q_in_nominal_w * (1.0 - 420.0 / (2.0 * 1800.0))
+    expected_c = a_d[0, 0] * 34.0 + b_d[0, 0] * 20.0 + b_d[0, 1] * heat_w
+
+    assert optimizer._initial_temperature(data) == pytest.approx(expected_c)
+    assert optimizer._initial_temperature(
+        replace(data, run_start_temp_top=None, run_start_temp_bottom=None)
+    ) == pytest.approx(41.75)
+    assert optimizer._initial_temperature(
+        replace(data, compressor_elapsed_hours=5.0)
+    ) == pytest.approx(55.0)

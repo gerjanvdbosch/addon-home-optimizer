@@ -13,7 +13,7 @@ from sklearn.metrics import (
 from domain.config import Config, HeatPumpStates
 from domain.dataset import DatasetDefinition
 from domain.dynamics import discretize_zoh
-from domain.models import BoilerThermalModel
+from domain.models import TANK_SENSOR_RESOLUTION_K, BoilerThermalModel
 from domain.mpc import MPCConfig
 from domain.physics import (
     CP_WATER_J_PER_KG_K,
@@ -1409,12 +1409,14 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
         top_c, bottom_c, mean_c = map(np.asarray, zip(*starts, strict=True))
         average_c = (top_c + bottom_c) / 2.0
-        spread_k = float(np.median(top_c - bottom_c))
+        # Beyond one sensor step, as BoilerThermalModel.mixed_temperature reads it.
+        stratification_k = top_c - bottom_c - TANK_SENSOR_RESOLUTION_K
+        spread_k = float(np.median(stratification_k))
 
         if spread_k <= self.MIXED_SPREAD_K:
             return None, None, None
 
-        share = np.clip((top_c - bottom_c) / spread_k, 0.0, 1.0)
+        share = np.clip(stratification_k / spread_k, 0.0, 1.0)
         # mean - average = -fraction * share * (average - layer), linear in
         # (fraction, fraction * layer).
         (fraction, fraction_layer), *_ = np.linalg.lstsq(
@@ -1434,15 +1436,15 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
         # The stratification at which the layer is full is learned with the
         # rest, from that start: the median stratification only set a scale,
-        # and the layer fills well before it (real data: 3.6 K against 8 K;
-        # the tank's mean before a run within 0.85 K instead of 1.2 K on runs
+        # and the layer fills well before it (real data: 2.65 K against 7.5 K;
+        # the tank's mean before a run within 0.86 K instead of 1.2 K on runs
         # left out of the fit).
         def residuals(p: np.ndarray) -> np.ndarray:
             f, layer, spread = p
-            share = np.clip((top_c - bottom_c) / spread, 0.0, 1.0)
+            share = np.clip(stratification_k / spread, 0.0, 1.0)
             return average_c - f * share * (average_c - layer) - mean_c
 
-        max_spread_k = float((top_c - bottom_c).max())
+        max_spread_k = float(stratification_k.max())
         fit = least_squares(
             residuals,
             [fraction, layer_c, min(spread_k, max_spread_k)],

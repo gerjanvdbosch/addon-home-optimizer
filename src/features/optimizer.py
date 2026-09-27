@@ -321,9 +321,7 @@ class MPCOptimizer:
 
         model.K = pyo.RangeSet(0, num_steps - 1)
 
-        initial_temperature = self.thermal_model.mixed_temperature(
-            data.current_temp_top, data.current_temp_bottom
-        )
+        initial_temperature = self._initial_temperature(data)
 
         # Exact zero-order-hold dynamics for the lumped tank node. Unlike the
         # two-node calibration model, this simplified model has no on/off
@@ -906,6 +904,61 @@ class MPCOptimizer:
             # Once it has taken over, the compressor run is over.
             model.heat_source_constraints.add(model.boiler_on[k + 1] + booster <= 1)
 
+        # Heat above the heat pump's limit can only come from the booster: the
+        # tank's excess over that limit at any step is at most what it held at
+        # the start plus the booster heat put in since - losses and taps only
+        # lower it. Every real plan meets this already; it is here for the
+        # solver's relaxation, where a heat pump at a small fraction of 'on' in
+        # every step could otherwise heat past its limit a little at a time
+        # and never need the booster at all (real data: a lower bound of 0.39
+        # EUR against a 0.81 EUR legionella plan, and 30 s without proving it).
+        if booster_possible:
+            heat_capacity_j_per_k = (
+                self.thermal_model.volume_l * RHO_WATER_KG_PER_L * CP_WATER_J_PER_KG_K
+            )
+            booster_j = 0.0
+
+            for k in range(num_steps - 1):
+                booster_j = booster_j + model.q_booster_w[k] * plan.dt_hours[k] * 3600.0
+
+                if t_ceiling[k + 1] > heat_pump_limit_c:
+                    model.heat_source_constraints.add(
+                        heat_capacity_j_per_k * (model.T[k + 1] - heat_pump_limit_c)
+                        <= heat_capacity_j_per_k
+                        * max(initial_temperature - heat_pump_limit_c, 0.0)
+                        + booster_j
+                    )
+
+        # A target the tank cannot hold without heating needs a run: if even the
+        # hottest the tank can be at step m, left unheated, has cooled below
+        # the target by step k, something heats in between - a source already
+        # running at m, or a compressor starting after it. Stated for the
+        # latest such m, the strongest. Every real plan meets this already; in
+        # the solver's relaxation a heat pump a little 'on' in every step
+        # otherwise heated without ever paying for a start (real data: 0.25
+        # starts against the 2 a legionella plan really makes).
+        model.run_needed = pyo.ConstraintList()
+
+        for k in range(1, num_steps):
+            target = min(float(target_c[k]), t_ceiling[k])
+
+            if target <= t_floor[k]:
+                continue
+
+            for m in range(k - 1, -1, -1):
+                cooled_c = unheated(t_ceiling[m], m)[k - m]
+
+                if cooled_c < target:
+                    # Or the plan misses the target: unheated, by at least this.
+                    model.run_needed.add(
+                        sum(model.compressor_start[j] for j in range(m + 1, k))
+                        + model.tank_heating[m]
+                        + model.space_on[m]
+                        + model.slack[k] / (target - cooled_c)
+                        >= 1
+                    )
+                    break
+
         # active_power_w[k, s] is the grid draw at step k if solar scenario s
         # comes true: max(0, electrical power - solar). One schedule is shared by
         # all scenarios (the plan cannot know which one will happen; replanning
@@ -954,6 +1007,19 @@ class MPCOptimizer:
 
         start_power_w = self.cop_model.start_step_power_w if self.cop_model else 0.0
 
+        # The top of the range a run's partly used last step starts in, the
+        # same for every step: the highest the plan needs the tank, a run
+        # ending its overshoot above it (see required), at most the heat pump's
+        # limit. The step's ceiling instead was low for steps close to now and
+        # at the limit an hour on, so the same run's last step came out up to
+        # 0.05 kWh cheaper a quarter later - and every replan put the start a
+        # quarter later again (real data: 28 Sep, 12:15 to 13:30 and on). A
+        # plan heating further than it needs prices that step a little high.
+        partial_upper_c = min(
+            heat_pump_limit_c,
+            max(overall_target_max + overshoot_k, initial_temperature),
+        )
+
         for k in range(num_steps):
             alpha, beta = power_lines[k]
             share = model.q_heat_pump_w[k] / heat_w[k]
@@ -964,7 +1030,7 @@ class MPCOptimizer:
             model.heat_pump_power_constraint.add(
                 temperature_share
                 >= model.heat_pump_temperature[k]
-                - min(t_ceiling[k], heat_pump_limit_c) * (model.boiler_on[k] - share)
+                - partial_upper_c * (model.boiler_on[k] - share)
             )
             heat_pump_power_w = alpha * share + beta * temperature_share
 
@@ -1066,6 +1132,59 @@ class MPCOptimizer:
             return self._heat_w
 
         return cop.q_in_at_zero_outdoor_w + cop.q_in_per_outdoor_w_per_k * outdoor_c
+
+    def _initial_temperature(self, data: MPCInput) -> float:
+        """The tank the plan starts from (deg C): mixed from its sensors (see
+        BoilerThermalModel.mixed_temperature), or while a DHW run is under way
+        the tank mixed just before it began plus the heat the run has put in
+        since, less the standing loss - the same ramp and heat input the plan
+        runs on. The sensors lag that heat while the tank is heating (real
+        data, 28 Sep: 42.0/41.5 degC half an hour into a run, 41.0 mixed,
+        against 44 degC by the run's own heat balance), and a plan started
+        from them saw the run go on a quarter hour longer than it did. Taps
+        during the run are not known and left out. At most the heat pump's
+        own limit: beyond it the booster, not this estimate, takes over."""
+
+        sensors_c = self.thermal_model.mixed_temperature(
+            data.current_temp_top, data.current_temp_bottom
+        )
+
+        if (
+            not data.boiler_on_current
+            or data.run_start_temp_top is None
+            or data.run_start_temp_bottom is None
+            or data.compressor_elapsed_hours <= 0.0
+        ):
+            return sensors_c
+
+        start_c = self.thermal_model.mixed_temperature(
+            data.run_start_temp_top, data.run_start_temp_bottom
+        )
+        outdoor_c = (
+            data.outdoor_temperature_forecast[0]
+            if data.outdoor_temperature_forecast
+            else None
+        )
+        # The mean heat over the time run so far, its ramp included.
+        heat_w = self._heat_at(outdoor_c) * self._ramp_fraction(
+            data.compressor_elapsed_hours
+        )
+        a_d, b_d = discretize_zoh(
+            *lumped_tank_state_space(
+                self.thermal_model.volume_l,
+                self.thermal_model.ua_top_w_per_k
+                + self.thermal_model.ua_bottom_w_per_k,
+            ),
+            data.compressor_elapsed_hours * 3600.0,
+        )
+        estimate_c = float(
+            a_d[0, 0] * start_c
+            + b_d[0, 0] * float(data.ambient_temperature)
+            + b_d[0, 1] * heat_w
+        )
+        limit_c = self.thermal_model.heat_pump_max_tank_temperature_c
+
+        return min(estimate_c, limit_c) if limit_c is not None else estimate_c
 
     def _ramp_fraction(self, dt_hours: float) -> float:
         """Share of _heat_w a step delivers when the compressor starts in it.
@@ -1642,9 +1761,7 @@ class MPCOptimizer:
         a_d, b_d = discretize_zoh(a, b, self.config.step_hours * 3600.0)
         tap_forecast_w = data.tap_forecast_w or (0.0,) * horizon
 
-        initial_temperature = self.thermal_model.mixed_temperature(
-            data.current_temp_top, data.current_temp_bottom
-        )
+        initial_temperature = self._initial_temperature(data)
         temperatures = [float(initial_temperature)]
 
         # A coarse block the plan only partly uses is a run that stops inside
@@ -1795,17 +1912,29 @@ class MPCOptimizer:
 
         # The objective's own energy terms (see _build_objective), so what is
         # reported of a plan's cost is what the plan was chosen on.
-        electricity_kwh = (
-            sum(pyo.value(model.draw_w[k]) * plan.dt_hours[k] for k in model.K) / 1000.0
-        )
-        grid_kwh = (
-            sum(
-                weight * pyo.value(model.active_power_w[k, s]) * plan.dt_hours[k]
-                for k in model.K
-                for s, weight in enumerate(model.mpc_scenario_weights)
+        electricity_step_kwh = [0.0] * horizon
+        grid_step_kwh = [0.0] * horizon
+
+        for m in model.K:
+            slots = [i for i in range(horizon) if plan.fine_to_model[i] == m]
+            drawn_w = sum(electrical_power_w[i] for i in slots)
+            block_kwh = pyo.value(model.draw_w[m]) * plan.dt_hours[m] / 1000.0
+            block_grid_kwh = (
+                sum(
+                    weight * pyo.value(model.active_power_w[m, s])
+                    for s, weight in enumerate(model.mpc_scenario_weights)
+                )
+                * plan.dt_hours[m]
+                / 1000.0
             )
-            / 1000.0
-        )
+
+            for i in slots:
+                share = electrical_power_w[i] / drawn_w if drawn_w else 1 / len(slots)
+                electricity_step_kwh[i] = block_kwh * share
+                grid_step_kwh[i] = block_grid_kwh * share
+
+        electricity_kwh = sum(electricity_step_kwh)
+        grid_kwh = sum(grid_step_kwh)
 
         return MPCResult(
             schedule=schedule,
@@ -1820,4 +1949,6 @@ class MPCOptimizer:
             zone_temperatures=zone_temperatures,
             electricity_kwh=electricity_kwh,
             grid_kwh=grid_kwh,
+            electricity_step_kwh=tuple(electricity_step_kwh),
+            grid_step_kwh=tuple(grid_step_kwh),
         )

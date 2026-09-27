@@ -68,14 +68,21 @@ def test_a_mixed_tank_is_its_sensors_average():
     assert MIXING_MODEL.mixed_temperature(46.0, 46.0) == 46.0
 
 
-def test_a_stratified_tank_holds_the_cold_layer_below_its_sensors():
-    """Fully stratified: 35% of the tank at 15 degC, the rest at the 41 degC
-    average; half as stratified, half that layer."""
+def test_one_sensor_step_apart_is_a_mixed_tank():
+    """At rest the sensors flip a 0.5 K step apart: no stratification."""
 
-    assert MIXING_MODEL.mixed_temperature(45.0, 37.0) == pytest.approx(
+    assert MIXING_MODEL.mixed_temperature(46.0, 45.5) == 45.75
+
+
+def test_a_stratified_tank_holds_the_cold_layer_below_its_sensors():
+    """Fully stratified - 8 K beyond one sensor step: 35% of the tank at
+    15 degC, the rest at the 41 degC average; half as stratified, half that
+    layer."""
+
+    assert MIXING_MODEL.mixed_temperature(45.25, 36.75) == pytest.approx(
         41.0 - 0.35 * (41.0 - 15.0)
     )
-    assert MIXING_MODEL.mixed_temperature(43.0, 39.0) == pytest.approx(
+    assert MIXING_MODEL.mixed_temperature(43.25, 38.75) == pytest.approx(
         41.0 - 0.35 * 0.5 * (41.0 - 15.0)
     )
 

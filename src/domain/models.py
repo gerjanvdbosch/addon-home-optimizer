@@ -12,6 +12,10 @@ from typing import ClassVar, Literal
 import numpy as np
 
 ForecasterType = Literal["baseload", "tap"]
+# The tank sensors report in steps of this (K; every reading on real data lies
+# on a 0.5 K grid), and at rest they flip between two neighbouring steps: a
+# difference of one step is no stratification the sensors can show.
+TANK_SENSOR_RESOLUTION_K = 0.5
 # In the order they are calibrated (see app.bootstrap): space_heating is
 # fitted against the building model's estimate of the floor's mass.
 IdentificationType = Literal[
@@ -68,7 +72,8 @@ class BoilerThermalModel:
     # fills the tank from the bottom, so two point sensors in the stratified
     # tank misstate its mean. Its share of the volume, its temperature (deg C,
     # an effective one: the cold water warms against the tank above it), and
-    # the stratification (top minus bottom sensor, K) at which it is full.
+    # the stratification (top minus bottom sensor, beyond one sensor step, K)
+    # at which it is full.
     # None until runs have shown it; the sensors' average then stands for the
     # tank.
     cold_layer_fraction: float | None = None
@@ -79,8 +84,10 @@ class BoilerThermalModel:
         """The tank's mean temperature (deg C): what mixing it gives, and so
         what a plan starts from. The layer counts in proportion to the
         stratification the sensors show, up to full at cold_layer_spread_k: a
-        tank mixed by a run has none until it is tapped again. Scalars or
-        arrays."""
+        tank mixed by a run has none until it is tapped again. Only beyond one
+        sensor step (TANK_SENSOR_RESOLUTION_K): the sensors of a tank at rest
+        flip a step apart, which read as stratification dropped the tank 1.4 K
+        on every flip (real data, 28 September 2026). Scalars or arrays."""
 
         average = (top_c + bottom_c) / 2.0
 
@@ -91,7 +98,11 @@ class BoilerThermalModel:
         ):
             return average
 
-        share = np.clip((top_c - bottom_c) / self.cold_layer_spread_k, 0.0, 1.0)
+        share = np.clip(
+            (top_c - bottom_c - TANK_SENSOR_RESOLUTION_K) / self.cold_layer_spread_k,
+            0.0,
+            1.0,
+        )
 
         return average - self.cold_layer_fraction * share * (
             average - self.cold_water_temperature_c

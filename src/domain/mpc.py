@@ -130,6 +130,12 @@ class MPCInput:
     # counterpart of boiler_on_current.
     space_on_current: bool = False
     compressor_elapsed_hours: float = 0.0
+    # The tank's two sensors just before the DHW run under way began (deg C),
+    # None without one: while it heats, the sensors lag the heat already in
+    # the tank, and the plan starts from what the run has put in since instead
+    # (see MPCOptimizer._initial_temperature).
+    run_start_temp_top: float | None = None
+    run_start_temp_bottom: float | None = None
     # How long ago the last run ended (hours), 0 while heating - no new run
     # starts until MPCConfig.heat_pump_min_off_steps have passed since then.
     idle_elapsed_hours: float = 0.0
@@ -163,3 +169,7 @@ class MPCResult:
     # solar scenarios. The rest is own sun.
     electricity_kwh: float = 0.0
     grid_kwh: float = 0.0
+    # The same two per step (kWh), summing to them: a block's share in
+    # proportion to the power each of its steps draws.
+    electricity_step_kwh: tuple[float, ...] = ()
+    grid_step_kwh: tuple[float, ...] = ()

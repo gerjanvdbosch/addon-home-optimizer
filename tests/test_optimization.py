@@ -1,6 +1,8 @@
+import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -8,6 +10,8 @@ from app.optimization import Optimization
 from domain.config import BoilerConfig, LegionellaConfig
 from domain.models import BoilerThermalModel
 from domain.mpc import MPCConfig, MPCInput, MPCResult
+from domain.sensors import SensorReference
+from domain.state import SeriesPoint
 from domain.time import local_day_start
 from features.optimizer import MPCOptimizer
 
@@ -223,9 +227,10 @@ def test_one_sensor_at_temperature_does_not_count_as_disinfected():
     assert 60.0 in _targets_with_legionella(1, 61.0, 58.0)
 
 
-def test_the_plan_log_reports_the_objective_s_own_energy(caplog):
+def test_the_plan_log_reports_the_objective_s_own_energy_per_day(caplog):
     """1.00 kWh of which 0.50 from the grid, as the optimizer counted them:
-    the import at the price, the sun at the export it forgoes."""
+    the import at the price, the sun at the export it forgoes - per day, and
+    in total."""
 
     result = MPCResult(
         schedule=(0, 1, 1, 0),
@@ -237,13 +242,41 @@ def test_the_plan_log_reports_the_objective_s_own_energy(caplog):
         termination_condition="optimal",
         electricity_kwh=1.0,
         grid_kwh=0.5,
+        electricity_step_kwh=(0.0, 0.5, 0.5, 0.0),
+        grid_step_kwh=(0.0, 0.25, 0.25, 0.0),
     )
 
     with caplog.at_level("INFO", logger="app.optimization"):
         Optimization.log_dhw_plan(result, TIMES, MPCConfig())
 
-    assert "to 48.2 degC | 1.00 kWh, of which sun 0.50 and grid 0.50" in caplog.text
-    assert "EUR 0.150" in caplog.text
+    assert "to 48.2 degC: 1.00 kWh, of which sun 0.50 and grid 0.50" in caplog.text
+    assert "(expected), EUR 0.150 | total 1.00 kWh, EUR 0.150" in caplog.text
+
+
+def test_the_plan_log_splits_its_energy_by_day(caplog):
+    """A run today and one tomorrow: each day's own electricity and cost."""
+
+    times = [START + timedelta(hours=12 * i) for i in range(4)]
+    result = MPCResult(
+        schedule=(1, 0, 1, 0),
+        temperatures=TEMPERATURES,
+        electrical_power_w=(2000.0, 0.0, 2000.0, 0.0),
+        heat_w=(0.0,) * 4,
+        objective_value=0.0,
+        solver_status="optimal",
+        termination_condition="optimal",
+        electricity_kwh=1.5,
+        grid_kwh=1.0,
+        electricity_step_kwh=(0.5, 0.0, 1.0, 0.0),
+        grid_step_kwh=(0.0, 0.0, 1.0, 0.0),
+    )
+
+    with caplog.at_level("INFO", logger="app.optimization"):
+        Optimization.log_dhw_plan(result, times, MPCConfig())
+
+    assert ": 0.50 kWh, of which sun 0.50 and grid 0.00" in caplog.text
+    assert ": 1.00 kWh, of which sun 0.00 and grid 1.00" in caplog.text
+    assert "| total 1.50 kWh" in caplog.text
 
 
 def test_explain_logs_the_plan_beside_earlier_finishes(caplog):
@@ -261,10 +294,97 @@ def test_explain_logs_the_plan_beside_earlier_finishes(caplog):
         target_temperature_top=(10.0,) * (steps - 1) + (45.0,),
     )
     times = [NOW + timedelta(minutes=15 * i) for i in range(steps)]
-    optimizer = MPCOptimizer(TANK, MPCConfig())
+    optimizer = MPCOptimizer(replace(TANK, setpoint_overshoot_k=1.7), MPCConfig())
 
     with caplog.at_level("INFO", logger="app.optimization"):
         Optimization.explain_dhw_plan(optimizer, data, optimizer.solve(data), times)
 
     for line in ("plan:", "0.5 h earlier:", "1 h earlier:", "2 h earlier:"):
         assert line in caplog.text
+
+    # Each finishes where the plan does, not an overshoot above it.
+    ends = re.findall(r"to (\d+\.\d) degC", caplog.text)
+    assert float(ends[1]) - float(ends[0]) < 0.5
+
+
+DAY = datetime(2026, 9, 28, tzinfo=UTC)
+
+
+def _changes(*changes: tuple[str, object]) -> list[SeriesPoint]:
+    """Reported changes at "HH:MM:SS" on DAY."""
+
+    return [
+        SeriesPoint(time=DAY + pd.Timedelta(clock), value=value)
+        for clock, value in changes
+    ]
+
+
+def test_a_run_under_way_began_at_its_change_into_dhw():
+    """The state changed to DHW at 13:15:38; the compressor came up minutes
+    later, the pump circulating at 0 Hz before it - the run's own start."""
+
+    state = _changes(("09:00:00", "Uit"), ("13:15:38", "SWW"))
+    frequency = _changes(("12:00:00", 0.0), ("13:18:00", 38.0), ("13:25:00", 57.0))
+
+    assert Optimization.dhw_timing(
+        state, frequency, "SWW", DAY + pd.Timedelta("13:45:00")
+    ) == (True, DAY + pd.Timedelta("13:15:38"), 0.0)
+
+
+def test_the_booster_is_no_compressor_run():
+    """0 Hz after the compressor has run in this DHW stretch: the booster has
+    taken over, and no compressor run is under way."""
+
+    state = _changes(("09:00:00", "Uit"), ("13:15:38", "SWW"))
+    frequency = _changes(("13:18:00", 57.0), ("13:55:00", 0.0))
+
+    assert Optimization.dhw_timing(
+        state, frequency, "SWW", DAY + pd.Timedelta("14:05:00")
+    ) == (True, None, 0.0)
+
+
+def test_the_pause_runs_from_the_change_that_ended_the_run():
+    state = _changes(("13:15:38", "SWW"), ("13:53:30", "Uit"))
+
+    assert Optimization.dhw_timing(
+        state, [], "SWW", DAY + pd.Timedelta("14:23:30")
+    ) == (False, None, 0.5)
+
+
+def test_readings_on_a_grid_read_the_same_as_changes():
+    """Quarter-hour readings, as before: the run began at its first DHW one."""
+
+    state = _changes(("13:00:00", "Uit"), ("13:15:00", "SWW"), ("13:30:00", "SWW"))
+    frequency = _changes(("13:15:00", 38.0), ("13:30:00", 57.0))
+
+    assert Optimization.dhw_timing(
+        state, frequency, "SWW", DAY + pd.Timedelta("13:40:00")
+    ) == (True, DAY + pd.Timedelta("13:15:00"), 0.0)
+
+
+def test_the_heat_pump_changes_are_read_per_series():
+    """The loaded frame holds both series on their own change times: each
+    keeps its own points, and a series with none is empty."""
+
+    frame = pd.DataFrame(
+        {
+            "time": [DAY + pd.Timedelta("13:15:38"), DAY + pd.Timedelta("13:18:00")],
+            "state": ["SWW", None],
+            "frequency": [None, 38.0],
+        }
+    )
+    optimization = Optimization.__new__(Optimization)
+    optimization.loader = SimpleNamespace(load=lambda *_: frame)
+    config = SimpleNamespace(
+        heat_pump=SimpleNamespace(
+            state=SensorReference(entity_id="state"),
+            compressor_frequency=SensorReference(entity_id="frequency"),
+        )
+    )
+
+    state, frequency = optimization._heat_pump_changes(config, DAY)
+
+    assert state == _changes(("13:15:38", "SWW"))
+    assert frequency == _changes(("13:18:00", 38.0))
+    optimization.loader = SimpleNamespace(load=lambda *_: frame[["time", "state"]])
+    assert optimization._heat_pump_changes(config, DAY)[1] == []

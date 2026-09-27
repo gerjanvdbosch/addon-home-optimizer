@@ -13,7 +13,7 @@ from domain.jobs import OptimizeConfig
 from domain.models import BoilerThermalModel
 from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.physics import CP_WATER_J_PER_KG_K, RHO_WATER_KG_PER_L
-from domain.state import State
+from domain.state import SeriesPoint, State
 from domain.time import local_day_start, to_local_time
 from features.boiler import BoilerThermalIdentifier
 from features.building import BuildingThermalIdentifier
@@ -111,72 +111,35 @@ class Optimization:
         cop_model = cop_identifier.model
 
         dhw_state = config.heat_pump.states.dhw
-        heat_pump_state = state.measurements.heat_pump.state
-        boiler_on_current = bool(heat_pump_state) and (
-            heat_pump_state[-1].value == dhw_state
+        now = datetime.now(timezone.utc)
+        boiler_on_current, run_start, idle_elapsed_hours = self.dhw_timing(
+            *self._heat_pump_changes(config, now), dhw_state, now
         )
+        compressor_elapsed_hours = (
+            (now - run_start).total_seconds() / 3600.0 if run_start else 0.0
+        )
+        run_start_temp_top = run_start_temp_bottom = None
 
-        # From the first quarter hour of the trailing run of COMPRESSOR
-        # readings. The operating state alone is not enough: it stays on DHW
-        # while the resistive booster finishes the tank, and the booster runs
-        # with the compressor off (see BoilerThermalIdentifier.booster_active),
-        # so counting those quarter hours would credit the minimum runtime with
-        # time the compressor did not run. The frequency reports 0 Hz exactly
-        # then, which is the compressor's own account of itself.
-        #
-        # Each reading is the state at its quarter hour's start, so the run may
-        # have begun up to a quarter hour earlier: the elapsed time errs short,
-        # and the run in progress is protected that much longer rather than too
-        # briefly.
-        frequency = {
-            point.time: point.value
-            for point in state.measurements.heat_pump.compressor_frequency
-        }
+        if run_start is not None:
+            # The tank as the run found it: the last sensor reading of a
+            # measurement interval (one planning step) that ended before it
+            # began - none if the run began before the day's readings do.
+            reading_interval = timedelta(hours=mpc_config.step_hours)
+            boiler = state.measurements.heat_pump.boiler
+            before_top = [
+                p
+                for p in boiler.top_temperature
+                if p.time + reading_interval <= run_start
+            ]
+            before_bottom = [
+                p
+                for p in boiler.bottom_temperature
+                if p.time + reading_interval <= run_start
+            ]
 
-        def compressor_running(point) -> bool:
-            if point.value != dhw_state:
-                return False
-
-            # Without a frequency reading the state is all there is, and
-            # assuming the compressor ran keeps a real run protected.
-            return frequency.get(point.time, 1.0) > 0.0
-
-        compressor_elapsed_hours = 0.0
-
-        if boiler_on_current:
-            run_start = heat_pump_state[-1].time
-
-            for point in reversed(heat_pump_state):
-                if not compressor_running(point):
-                    break
-                run_start = point.time
-
-            compressor_elapsed_hours = max(
-                0.0, (datetime.now(timezone.utc) - run_start).total_seconds() / 3600.0
-            )
-
-        # The other way round for the pause between runs (see
-        # MPCConfig.boiler_min_off_steps): how long ago the last run ended. The
-        # first reading that is not DHW is the earliest the run can have ended,
-        # so this too errs short and the pause is kept rather than cut.
-        idle_elapsed_hours = 0.0
-
-        if not boiler_on_current:
-            idle_start = heat_pump_state[-1].time if heat_pump_state else None
-
-            for point in reversed(heat_pump_state):
-                if point.value == dhw_state:
-                    break
-                idle_start = point.time
-
-            idle_elapsed_hours = (
-                max(
-                    0.0,
-                    (datetime.now(timezone.utc) - idle_start).total_seconds() / 3600.0,
-                )
-                if idle_start is not None
-                else 0.0
-            )
+            if before_top and before_bottom:
+                run_start_temp_top = before_top[-1].value
+                run_start_temp_bottom = before_bottom[-1].value
 
         # Aligned against solar's own forecast timestamps, not assumed to share
         # them: the tap forecaster is fit/predicted independently (see
@@ -224,6 +187,8 @@ class Optimization:
             solar_p10_w=solar_p10,
             solar_p90_w=solar_p90,
             compressor_elapsed_hours=compressor_elapsed_hours,
+            run_start_temp_top=run_start_temp_top,
+            run_start_temp_bottom=run_start_temp_bottom,
             idle_elapsed_hours=idle_elapsed_hours,
             baseload_forecast_w=tuple(
                 self.state_manager.baseload_forecast(
@@ -261,6 +226,130 @@ class Optimization:
 
         self._plan_space_heating(optimizer, data, state, config, forecast_times)
 
+    def _heat_pump_changes(
+        self, config: Config, now: datetime
+    ) -> tuple[list[SeriesPoint], list[SeriesPoint]]:
+        """The operating state's and compressor frequency's own changes since
+        the previous local midnight, for dhw_timing - so a run or pause that
+        spans midnight is seen.
+
+        Their changes, not the state's quarter-hour readings: when a DHW run
+        began sets how much heat it has put in so far (see
+        MPCOptimizer._initial_temperature), and a quarter's reading placed that
+        at the quarter's start. Replayed over 41 real runs, the tank a run had
+        heated came out 2.3 K off on average from the quarter's start against
+        1.6 K from the exact one, and a run begun late in its quarter 4.1 K too
+        warm - up to 16 minutes of run misjudged. Both only report on change, so
+        this is a few dozen points a day; the dashboard keeps its quarter hours.
+        """
+
+        frame = self.loader.load(
+            DatasetBuilder()
+            .timeseries(
+                "state", config.heat_pump.state, aggregation=None, fill="previous"
+            )
+            .timeseries(
+                "frequency",
+                config.heat_pump.compressor_frequency,
+                aggregation=None,
+                fill="previous",
+            )
+            .build(),
+            local_day_start(now, days=-1).astimezone(timezone.utc),
+            now,
+        )
+
+        def changes(column: str) -> list[SeriesPoint]:
+            if column not in frame:
+                return []
+
+            points = frame[["time", column]].dropna()
+
+            return [
+                SeriesPoint(time=time, value=value)
+                for time, value in points.itertuples(index=False)
+            ]
+
+        return changes("state"), changes("frequency")
+
+    @staticmethod
+    def dhw_timing(
+        heat_pump_state: list[SeriesPoint],
+        compressor_frequency: list[SeriesPoint],
+        dhw_state: str,
+        now: datetime,
+    ) -> tuple[bool, datetime | None, float]:
+        """(whether a DHW run is under way, when its compressor run began, None
+        without one, hours since the last DHW run ended - 0 while one runs),
+        from the operating state's and compressor frequency's changes: each
+        value holds from its own time until the next.
+
+        The compressor run, not the operating state alone: the state stays on
+        DHW while the resistive booster finishes the tank, and the booster runs
+        with the compressor off at 0 Hz (see BoilerThermalIdentifier.booster_
+        active), so counting that time would credit the minimum runtime with
+        time the compressor did not run. A run's first minutes at 0 Hz, the
+        pump circulating before the compressor comes up, are the run's own
+        start and count. Without a frequency the state is all there is, and
+        assuming the compressor ran keeps a real run protected. The pause is
+        taken from the change that ended the last DHW run - from the first
+        change loaded (the previous local midnight's, see _heat_pump_changes)
+        if none shows, which errs short and keeps it.
+        """
+
+        if not heat_pump_state:
+            return False, None, 0.0
+
+        def frequency_at(time: datetime) -> float:
+            value = 1.0
+
+            for point in compressor_frequency:
+                if point.time > time:
+                    break
+                value = point.value
+
+            return value
+
+        if heat_pump_state[-1].value == dhw_state:
+            # The change into DHW that began the stretch under way.
+            dhw_start = heat_pump_state[-1].time
+
+            for point in reversed(heat_pump_state):
+                if point.value != dhw_state:
+                    break
+                dhw_start = point.time
+
+            changes = sorted(
+                {dhw_start}
+                | {p.time for p in compressor_frequency if dhw_start < p.time <= now}
+            )
+            run_start = dhw_start
+            compressor_ran = False
+
+            for time in changes:
+                running = frequency_at(time) > 0.0
+
+                if running:
+                    compressor_ran = True
+                elif compressor_ran:
+                    # The booster has taken over; the compressor may start again.
+                    run_start = None
+                    continue
+
+                if run_start is None:
+                    run_start = time
+
+            return True, run_start, 0.0
+
+        idle_start = heat_pump_state[-1].time
+
+        for point in reversed(heat_pump_state):
+            if point.value == dhw_state:
+                break
+            idle_start = point.time
+
+        return False, None, max(0.0, (now - idle_start).total_seconds() / 3600.0)
+
     @staticmethod
     def dhw_runs(schedule: tuple[int, ...]) -> list[tuple[int, int]]:
         """(first, last) step of each planned run."""
@@ -282,37 +371,58 @@ class Optimization:
         times: list[datetime],
         mpc_config: MPCConfig,
     ) -> str:
-        """What a hot water plan does and what it expects that to cost: each
-        run's time and end temperature, its electricity and how much of it is
-        expected from the grid, as the plan's own objective counts them (see
-        MPCResult.electricity_kwh) - so the cheaper of two plans here is the one
-        the optimizer would choose. The cost is the import at the price and the
-        own sun at the export it forgoes; not the whole objective, which also
-        prices starts and shortfalls and so is no amount of money."""
+        """What a hot water plan does and what it expects that to cost, per
+        local day: each run's time and end temperature, the day's electricity
+        and how much of it is expected from the grid, as the plan's own
+        objective counts them (see MPCResult.electricity_kwh) - so the cheaper
+        of two plans here is the one the optimizer would choose - and the total.
+        The cost is the import at the price and the own sun at the export it
+        forgoes; not the whole objective, which also prices starts and
+        shortfalls and so is no amount of money."""
 
         runs = cls.dhw_runs(result.schedule)
 
         if not runs:
             return "no run within the horizon"
 
-        solar_kwh = result.electricity_kwh - result.grid_kwh
-        cost_eur = (
-            result.grid_kwh * mpc_config.price_eur_per_kwh
-            + solar_kwh * mpc_config.feed_in_price_eur_per_kwh
-        )
+        def cost_eur(electricity_kwh: float, grid_kwh: float) -> float:
+            return (
+                grid_kwh * mpc_config.price_eur_per_kwh
+                + (electricity_kwh - grid_kwh) * mpc_config.feed_in_price_eur_per_kwh
+            )
+
         step = timedelta(hours=mpc_config.step_hours)
         last = len(result.temperatures) - 1
-        runs_text = ", ".join(
-            f"{to_local_time(times[first]):%a %H:%M}-"
-            f"{to_local_time(times[end] + step):%H:%M} "
-            f"to {result.temperatures[min(end + 1, last)]:.1f} degC"
-            for first, end in runs
-        )
+        day = [to_local_time(time).date() for time in times]
+        days = []
 
-        return (
-            f"{runs_text} | {result.electricity_kwh:.2f} kWh, of which sun "
-            f"{solar_kwh:.2f} and grid {result.grid_kwh:.2f} (expected) "
-            f"| EUR {cost_eur:.3f}"
+        for date in dict.fromkeys(day[first] for first, _ in runs):
+            runs_text = ", ".join(
+                f"{to_local_time(times[first]):%H:%M}-"
+                f"{to_local_time(times[end] + step):%H:%M} "
+                f"to {result.temperatures[min(end + 1, last)]:.1f} degC"
+                for first, end in runs
+                if day[first] == date
+            )
+            electricity_kwh = sum(
+                kwh
+                for kwh, d in zip(result.electricity_step_kwh, day, strict=False)
+                if d == date
+            )
+            grid_kwh = sum(
+                kwh
+                for kwh, d in zip(result.grid_step_kwh, day, strict=False)
+                if d == date
+            )
+            days.append(
+                f"{date:%a} {runs_text}: {electricity_kwh:.2f} kWh, of which sun "
+                f"{electricity_kwh - grid_kwh:.2f} and grid {grid_kwh:.2f} "
+                f"(expected), EUR {cost_eur(electricity_kwh, grid_kwh):.3f}"
+            )
+
+        return " | ".join(days) + (
+            f" | total {result.electricity_kwh:.2f} kWh, "
+            f"EUR {cost_eur(result.electricity_kwh, result.grid_kwh):.3f}"
         )
 
     @classmethod
@@ -356,6 +466,11 @@ class Optimization:
         lines = [f"  {'plan:':<16}{cls.dhw_summary(result, times, mpc_config)}"]
 
         run_steps = runs[0][1] - runs[0][0] + 1
+        # The target the plan's end answers: a run planned to a target ends the
+        # heat pump's overshoot above it (see MPCOptimizer), so forcing end_c
+        # itself had each alternative end that overshoot higher again (real
+        # data: 49.5 against the plan's 47.7 degC) and look dearer than it is.
+        forced_c = end_c - (optimizer.thermal_model.setpoint_overshoot_k or 0.0)
 
         for hours in cls.EXPLAIN_EARLIER_HOURS:
             k = finish - round(hours / mpc_config.step_hours)
@@ -367,7 +482,7 @@ class Optimization:
                 continue
 
             targets = list(data.target_temperature_top)
-            targets[k] = max(targets[k], end_c)
+            targets[k] = max(targets[k], forced_c)
             forced = dataclasses.replace(data, target_temperature_top=tuple(targets))
             summary = cls.dhw_summary(optimizer.solve(forced), times, mpc_config)
             lines.append(f"  {f'{hours:g} h earlier:':<16}{summary}")

@@ -4,7 +4,7 @@ import pytest
 
 from domain.models import BoilerThermalModel
 from domain.state import BoilerMeasurement, SeriesPoint, State
-from web.charts import continued, dashboard_chart, mixed_tank
+from web.charts import continued, dashboard_chart, ended, mixed_tank, read_at
 
 START = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
 
@@ -33,6 +33,16 @@ def test_without_measurements_the_plan_is_drawn_whole():
     planned = _points([31.0, 46.0])
 
     assert continued([], planned) == planned
+
+
+def test_the_running_quarters_power_gives_way_to_the_plan():
+    """A run started in the running quarter measured 0 W over its first
+    second; the plan's 1870 W for that quarter is drawn instead."""
+
+    measured = ended(_points([563.0, 0.0]), START + timedelta(minutes=15, seconds=1))
+    planned = _points([1870.0, 2214.0], first=1)
+
+    assert [p.value for p in continued(measured, planned)] == [563.0, 1870.0, 2214.0]
 
 
 def test_the_dashboard_renders_without_any_data():
@@ -74,3 +84,14 @@ def test_the_dashboard_renders_with_a_calibrated_boiler():
     state.measurements.heat_pump.boiler = BOILER
 
     assert "Boiler bottom" in dashboard_chart(state, MODEL)
+
+
+def test_a_quarters_last_reading_is_drawn_when_it_was_read():
+    """At the quarter's end, and at the update in the quarter still running."""
+
+    updated = START + timedelta(minutes=20)
+
+    assert [p.time for p in read_at(_points([31.0, 41.0]), updated)] == [
+        START + timedelta(minutes=15),
+        updated,
+    ]
