@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from features.space_heating import SpaceHeatingIdentifier
+from features.floor import FloorCircuitIdentifier
 
 SUPPLY_AT_ZERO_C = 34.0
 SUPPLY_PER_OUTDOOR_K = -0.5
@@ -43,8 +43,8 @@ def _runs(lengths: list[int], rng: np.random.Generator) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _identifier() -> SpaceHeatingIdentifier:
-    return SpaceHeatingIdentifier(52.0, 5.0, Path("."))
+def _identifier() -> FloorCircuitIdentifier:
+    return FloorCircuitIdentifier(52.0, 5.0, Path("."))
 
 
 def test_fit_recovers_the_curve_the_floor_and_the_shortest_runs():
@@ -80,3 +80,22 @@ def test_split_keeps_runs_whole_and_the_only_run_for_training():
 
     assert set(rows.loc[identifier._in_test(rows), "run"]) == {5}
     assert not identifier._in_test(_runs([14], np.random.default_rng(6))).any()
+
+
+def test_cooling_fit_reads_runs_that_take_heat_from_the_floor():
+    """Cooling runs mirror heating ones: supply below the mass, heat negative,
+    and a warmer day on a colder supply. The same floor comes out."""
+
+    rows = _runs([8, 12, 16, 10, 20, 6, 14, 18], np.random.default_rng(3))
+    rows["T_out"] = 35.0 - rows["T_out"]
+    rows["T_supply"] = 40.0 - rows["T_supply"]
+    rows["Q_floor_w"] = CONDUCTANCE_W_PER_K * (rows["T_supply"] - rows["T_mass"])
+
+    identifier = FloorCircuitIdentifier(52.0, 5.0, Path("."), key="cooling")
+    model = identifier.fit(rows, 0.25)
+
+    assert identifier.name == "space_cooling"
+    assert model.supply_per_outdoor_k == pytest.approx(SUPPLY_PER_OUTDOOR_K, abs=0.05)
+    assert model.conductance_w_per_k == pytest.approx(CONDUCTANCE_W_PER_K, rel=0.05)
+    assert model.min_runtime_hours == pytest.approx(2.0)
+    assert model.heat_w(30.0, 20.0) < 0.0

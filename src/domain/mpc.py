@@ -129,6 +129,18 @@ class MPCInput:
     # Whether the heat pump is serving the zone right now, the space-heating
     # counterpart of boiler_on_current.
     space_on_current: bool = False
+    # Whether the zone is cooled rather than heated: the heat pump serves the
+    # floor in the one mode it is set to (see HeatPumpConfig.mode).
+    zone_cooling: bool = False
+    # While cooling, the coldest the thermal mass may become per step (deg C):
+    # the dew point above the floor as forecast (see features.dew_point) plus a
+    # margin (see BuildingConfig.dew_point_margin). Empty bounds nothing.
+    zone_mass_minimum_c: tuple[float, ...] = ()
+    # While cooling, the coldest the supply may be per step (deg C): the dew
+    # point where uninsulated pipes carry it (see
+    # BuildingConfig.insulated_pipes). Empty leaves the supply to the floor
+    # and the compressor.
+    zone_supply_minimum_c: tuple[float, ...] = ()
     compressor_elapsed_hours: float = 0.0
     # The tank's two sensors just before the DHW run under way began (deg C),
     # None without one: while it heats, the sensors lag the heat already in
@@ -164,6 +176,13 @@ class MPCResult:
     space_schedule: tuple[int, ...] = ()
     space_heat_w: tuple[float, ...] = ()
     zone_temperatures: tuple[float, ...] = ()
+    # The supply each step runs the floor at (deg C), NaN where it does not:
+    # the heat pump's own curve while heating, the plan's choice while cooling
+    # - the setpoint to give it. Empty without a space-heating model.
+    space_supply_c: tuple[float, ...] = ()
+    # The electricity the zone's plan draws per step (W), positive either way:
+    # its heat, taken or given, over the COP.
+    space_electrical_w: tuple[float, ...] = ()
     # The plan's electricity over the horizon exactly as its objective prices
     # it (kWh): the whole draw, and the part expected from the grid over the
     # solar scenarios. The rest is own sun.

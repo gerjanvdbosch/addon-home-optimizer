@@ -114,6 +114,12 @@ class HeatPumpConfig(BaseModel):
     # Without it, Open-Meteo's temperature attribute is used instead - which
     # planning has to use for the future in any case.
     outdoor_temperature: SensorReference | None = Field(default=None)
+    # The operating mode the heat pump is set to (on the Ecodan a select whose
+    # options read "Verwarmen ..." or "Koelen ..."): a mode starting with
+    # states.cooling plans the zone cooled rather than heated. Set by hand,
+    # since the heat pump can only serve the floor in the mode it is in. None
+    # plans heating.
+    mode: SensorReference | None = Field(default=None)
     boiler: BoilerConfig = Field()
     states: HeatPumpStates = Field(default_factory=HeatPumpStates)
 
@@ -227,6 +233,26 @@ class BuildingConfig(BaseModel):
     # incidence/soiling factor, all of which are <= 1 (see
     # BuildingThermalIdentifier.calibrate).
     south_glazing: list[SouthGlazing] = Field(default_factory=list)
+    # Dew point (deg C) of the air above every cooled floor, the highest of
+    # which bounds how cold the floor may be cooled: water condenses on a
+    # surface below the dew point of the air touching it. A dew point rather
+    # than temperature and humidity, because that is the quantity the bound is
+    # on and the sensors report it themselves. Only rooms where chilled water
+    # runs belong here, a cooled floor or exposed pipes: elsewhere nothing is
+    # cold enough to condense on. Empty plans no cooling.
+    dew_points: list[SensorReference] = Field(default_factory=list)
+    # How far above that dew point the thermal mass must stay while cooling
+    # (K). The mass is the screed the floor surface lies on, but a lumped one:
+    # where the chilled water enters a loop the screed runs colder than its
+    # mean, by about half the loop's temperature drop (3.7 K on this
+    # installation) times the water's share of the screed's coupling (719 W/K
+    # to the water against 653 W/K to the air), so about 1 K.
+    dew_point_margin: float = Field(default=1.0, ge=0.0)
+    # Whether every pipe carrying chilled water, manifolds included, is
+    # vapour-tight insulated. Only then does the floor alone bound the supply:
+    # a bare pipe is at the supply temperature and condenses within minutes,
+    # so without that the supply itself must stay above the dew point.
+    insulated_pipes: bool = Field(default=False)
 
 
 class SolcastAttributes(BaseModel):
@@ -258,6 +284,11 @@ class OpenMeteoAttributes(BaseModel):
     wind_direction: str = Field(default="wind_direction_10m")
     wind_speed: str = Field(default="wind_speed_10m")
     precipitation: str = Field(default="precipitation")
+    # Outdoor humidity, which ventilation carries indoors (see
+    # features.dew_point): the dew point itself, and the relative humidity it
+    # is computed from where no dew point was stored yet.
+    dew_point: str = Field(default="dew_point_2m")
+    relative_humidity: str = Field(default="relative_humidity_2m")
 
     def items(self):
         return (
@@ -273,6 +304,8 @@ class OpenMeteoAttributes(BaseModel):
             ("wind_direction", self.wind_direction),
             ("wind_speed", self.wind_speed),
             ("precipitation", self.precipitation),
+            ("dew_point", self.dew_point),
+            ("relative_humidity", self.relative_humidity),
         )
 
 

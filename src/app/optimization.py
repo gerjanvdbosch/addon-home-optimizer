@@ -12,15 +12,21 @@ from domain.config import BoilerConfig, Config
 from domain.jobs import OptimizeConfig
 from domain.models import BoilerThermalModel
 from domain.mpc import MPCConfig, MPCInput, MPCResult
-from domain.physics import CP_WATER_J_PER_KG_K, RHO_WATER_KG_PER_L
+from domain.physics import (
+    CP_WATER_J_PER_KG_K,
+    RHO_WATER_KG_PER_L,
+    dew_point_from_humidity_c,
+    indoor_dew_point_c,
+)
 from domain.state import SeriesPoint, State
 from domain.time import local_day_start, to_local_time
 from features.boiler import BoilerThermalIdentifier
 from features.building import BuildingThermalIdentifier
 from features.cop import HeatPumpCOPIdentifier
 from features.dataset import DatasetBuilder, DatasetLoader
+from features.dew_point import DewPointIdentifier
+from features.floor import FloorCircuitIdentifier
 from features.optimizer import SOLAR_SCENARIO_WEIGHTS, MPCOptimizer
-from features.space_heating import SpaceHeatingIdentifier
 from infrastructure.home_assistant import HomeAssistant
 from infrastructure.repositories import ConfigRepository
 
@@ -216,6 +222,7 @@ class Optimization:
             temperatures=result.temperatures,
             power_w=result.electrical_power_w,
             times=forecast_times,
+            heat_w=result.heat_w,
         )
 
         self.publish_dhw(result, forecast_times, thermal_model)
@@ -224,7 +231,9 @@ class Optimization:
         if optimize_config.explain:
             self.explain_dhw_plan(optimizer, data, result, forecast_times)
 
-        self._plan_space_heating(optimizer, data, state, config, forecast_times)
+        self._plan_space_heating(
+            optimizer, data, state, config, forecast_times, optimize_config.cooling
+        )
 
     def _heat_pump_changes(
         self, config: Config, now: datetime
@@ -631,6 +640,7 @@ class Optimization:
         state: State,
         config: Config,
         times: list[datetime],
+        cooling: bool | None = None,
     ) -> None:
         """The building's side of a plan: the zone's state, and a second plan
         with the zone as a second demand on the compressor.
@@ -647,6 +657,10 @@ class Optimization:
         solved apart from the hot water plan acted on above, so that plan stays
         exactly what it was - sharing the compressor, the zone would otherwise
         move it. Only planned with a comfort ceiling configured.
+
+        Cooled rather than heated while the heat pump is set to cool (see
+        HeatPumpConfig.mode), from the cooling runs' own models, and only with
+        dew points configured: the floor may not be cooled below them.
         """
 
         identifier = BuildingThermalIdentifier(
@@ -701,6 +715,20 @@ class Optimization:
             return
 
         heat_pump_state = state.measurements.heat_pump.state
+        states = config.heat_pump.states
+        mode = state.measurements.heat_pump.mode
+        # The heat pump's own mode unless this run asks for one (see
+        # OptimizeConfig.cooling).
+        if cooling is None:
+            cooling = bool(mode) and str(mode[-1].value).startswith(states.cooling)
+        dew_point_c = self._dew_point_forecast(state, times, optimizer.config)
+
+        if cooling and dew_point_c is None:
+            logger.info(
+                "Shadow space-cooling plan skipped: no dew point to keep the "
+                "floor above (see building.dew_points)"
+            )
+            return
 
         zone_data = dataclasses.replace(
             data,
@@ -722,17 +750,34 @@ class Optimization:
             zone_internal_gain_w=tuple(planned["internal_gain_w"].fillna(0.0)),
             zone_solar_gain_w=tuple(planned["solar_gain_w"].fillna(0.0)),
             space_on_current=bool(heat_pump_state)
-            and heat_pump_state[-1].value == config.heat_pump.states.heating,
+            and heat_pump_state[-1].value
+            == (states.cooling if cooling else states.heating),
+            zone_cooling=cooling,
+            zone_mass_minimum_c=(
+                tuple(c + config.building.dew_point_margin for c in dew_point_c)
+                if cooling
+                else ()
+            ),
+            zone_supply_minimum_c=(
+                tuple(dew_point_c)
+                if cooling and not config.building.insulated_pipes
+                else ()
+            ),
         )
 
-        # How the heat pump runs the floor by itself - None until heating runs
-        # have shown it, and the plan may then choose the zone's heat freely.
-        space_heating = SpaceHeatingIdentifier(
-            self.state_manager.latitude, self.state_manager.longitude, self.models_path
+        # How the heat pump runs the floor by itself in this mode - None until
+        # its runs have shown it, and the plan may then choose the zone's heat
+        # freely.
+        key = "cooling" if cooling else "heating"
+        floor_circuit = FloorCircuitIdentifier(
+            self.state_manager.latitude,
+            self.state_manager.longitude,
+            self.models_path,
+            key=key,
         )
-        space_heating.load(self.models_path)
-        heating_cop = HeatPumpCOPIdentifier(key="heating")
-        heating_cop.load(path=self.models_path)
+        floor_circuit.load(self.models_path)
+        space_cop = HeatPumpCOPIdentifier(key=key)
+        space_cop.load(path=self.models_path)
 
         try:
             result = MPCOptimizer(
@@ -740,8 +785,8 @@ class Optimization:
                 config=optimizer.config,
                 cop_model=optimizer.cop_model,
                 building_model=identifier.model,
-                space_heating_model=space_heating.model,
-                heating_cop_model=heating_cop.model,
+                floor_circuit_model=floor_circuit.model,
+                space_cop_model=space_cop.model,
             ).solve(zone_data)
         except RuntimeError as error:
             # Nothing acts on this plan, so a failure here must not take the
@@ -749,16 +794,74 @@ class Optimization:
             logger.warning("Shadow space-heating plan failed: %s", error)
             return
 
+        # The supply of the first planned step: while cooling, the setpoint
+        # the plan would give the heat pump.
+        supply_c = next((c for c in result.space_supply_c if not math.isnan(c)), None)
         logger.info(
-            "Shadow space-heating plan: %.1f kWh into the zone over the horizon",
+            "Shadow space-%s plan: %.1f kWh into the zone over the horizon, "
+            "first run at %s degC supply",
+            key,
             sum(result.space_heat_w) * optimizer.config.step_hours / 1000.0,
+            "unknown" if supply_c is None else f"{supply_c:.1f}",
         )
 
         self.state_manager.update_building_schedule(
             heat_w=result.space_heat_w,
             temperatures=result.zone_temperatures,
             times=times,
+            supply_c=result.space_supply_c,
+            power_w=result.space_electrical_w,
         )
+
+    def _dew_point_forecast(
+        self, state: State, times: list[datetime], mpc_config: MPCConfig
+    ) -> list[float] | None:
+        """The indoor dew point at each step (deg C), None without one measured.
+
+        From the one measured now, carried along the outdoor forecast by the
+        identified moisture balance (see features.dew_point) - Open-Meteo's dew
+        point, or its temperature and humidity where it has none. Held at the
+        measured one without that model or forecast, as before there was one.
+        Stored as a prediction, so the dashboard draws what the plan used.
+        """
+
+        measured = state.measurements.building.dew_point
+
+        if not measured:
+            return None
+
+        now_c = float(measured[-1].value)
+        identifier = DewPointIdentifier()
+        identifier.load(self.models_path)
+        weather = state.forecast.open_meteo
+
+        def aligned(points: list[SeriesPoint]) -> pd.Series:
+            return pd.Series(
+                self.state_manager.align_predictions(points, times, default=np.nan)
+            )
+
+        outdoor_c = aligned(weather.dew_point).fillna(
+            dew_point_from_humidity_c(
+                aligned(weather.temperature), aligned(weather.relative_humidity)
+            )
+        )
+
+        if identifier.model is None or outdoor_c.isna().all():
+            forecast_c = [now_c] * len(times)
+        else:
+            # A gap in the forecast holds its neighbour's value.
+            forecast_c = indoor_dew_point_c(
+                identifier.model,
+                now_c,
+                outdoor_c.ffill().bfill().to_numpy(),
+                mpc_config.step_hours,
+            ).tolist()
+
+        self.state_manager.update_prediction(
+            "dew_point", pd.Series(forecast_c, index=times)
+        )
+
+        return forecast_c
 
     def publish_dhw(
         self,

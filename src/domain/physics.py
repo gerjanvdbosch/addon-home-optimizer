@@ -10,7 +10,7 @@ that estimates their states and to the planner that acts on them.
 
 import numpy as np
 
-from domain.models import BuildingThermalModel
+from domain.models import BuildingThermalModel, DewPointModel
 
 # Physical constants (water), not fit parameters.
 RHO_WATER_KG_PER_L = 1.0
@@ -231,3 +231,64 @@ def internal_gain_w(
     """
 
     return internal_gain_fraction * baseload_w + occupants * Q_PERSON_SENSIBLE_W
+
+
+# Magnus over water (Sonntag's coefficients), in both directions: the relation
+# the Xiaomi sensors report their dew point by (their dew point is this formula
+# on their own temperature and humidity to within 0.05 K on real data), so an
+# indoor sensor's dew point and one computed from Open-Meteo's humidity are the
+# same quantity.
+MAGNUS_A = 17.62
+MAGNUS_B_C = 243.12
+MAGNUS_E0_PA = 611.2
+
+
+def vapour_pressure_pa(dew_point_c):
+    """The partial pressure of water vapour in air with this dew point (Pa):
+    the saturation pressure there. Scalars or arrays."""
+
+    return MAGNUS_E0_PA * np.exp(MAGNUS_A * dew_point_c / (MAGNUS_B_C + dew_point_c))
+
+
+def dew_point_c(vapour_pressure_pa):
+    """The dew point of air holding water vapour at this pressure (deg C)."""
+
+    g = np.log(vapour_pressure_pa / MAGNUS_E0_PA)
+
+    return MAGNUS_B_C * g / (MAGNUS_A - g)
+
+
+def dew_point_from_humidity_c(temperature_c, relative_humidity_pct):
+    """The dew point of air at this temperature and relative humidity (deg C)."""
+
+    return dew_point_c(vapour_pressure_pa(temperature_c) * relative_humidity_pct / 100)
+
+
+def indoor_dew_point_c(
+    model: DewPointModel,
+    dew_point_now_c,
+    outdoor_dew_point_c,
+    dt_hours: float,
+) -> np.ndarray:
+    """The indoor dew point at the start of each step, from the one now and the
+    outdoor dew point over each step (steps along the last axis; one run per
+    leading index, so many starts can be run at once).
+
+    A moisture balance in vapour pressure, which is what ventilation mixes
+    linearly: de/dt = (e_out + delta_e - e) / tau. tau is the ventilation's
+    time constant stretched by what walls and furnishings buffer; delta_e is
+    the surplus the occupants' own moisture keeps indoors, their production
+    over the ventilation. Held constant over each step, so each advances
+    exactly: e[k+1] = e[k] + (1 - exp(-dt / tau)) (e_out[k] + delta_e - e[k]).
+    """
+
+    weight = 1.0 - np.exp(-dt_hours / model.time_constant_hours)
+    outdoor = vapour_pressure_pa(np.asarray(outdoor_dew_point_c, dtype=float))
+    e = vapour_pressure_pa(np.asarray(dew_point_now_c, dtype=float))
+    pressures = []
+
+    for k in range(outdoor.shape[-1]):
+        pressures.append(e)
+        e = e + weight * (outdoor[..., k] + model.moisture_surplus_pa - e)
+
+    return dew_point_c(np.stack(pressures, axis=-1))

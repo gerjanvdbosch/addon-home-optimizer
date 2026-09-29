@@ -6,18 +6,26 @@ space-heating run delivers is not a decision a plan can make. What a plan
 decides is when the zone is heated; how much heat that brings follows from
 the curve and from the floor it heats. This identifies both, and the run
 length the heat pump keeps to, from its own heating runs.
+
+Cooling is the same floor run the other way, identified the same way from
+cooling runs: the heat is negative, the supply below the mass, and the supply
+is the one the heat pump holds by itself (real data: 0.5 K below its zone
+flow setpoint once settled). The conductance is the same pipes in the same
+screed, so both fits estimate one physical quantity (real data: 768 W/K from
+heating runs, 674 W/K from three cooling runs).
 """
 
 import logging
 import math
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pandas as pd
 
 from domain.config import Config, HeatPumpStates
 from domain.dataset import DatasetDefinition
-from domain.models import SpaceHeatingModel
+from domain.models import FloorCircuitModel
 from features.building import BuildingThermalIdentifier
 from features.cop import HeatPumpCOPIdentifier
 from features.identifier import SystemIdentifier
@@ -25,7 +33,7 @@ from features.identifier import SystemIdentifier
 logger = logging.getLogger(__name__)
 
 
-class SpaceHeatingIdentifier(SystemIdentifier[SpaceHeatingModel]):
+class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
     # Chronological split, as for every other identifier here - but by whole
     # runs: half a run in each split would validate a run on itself.
     TRAIN_RATIO = 0.80
@@ -35,9 +43,22 @@ class SpaceHeatingIdentifier(SystemIdentifier[SpaceHeatingModel]):
     # for its short ones. The 10th percentile rather than the minimum, so one
     # run cut short by a defrost or a restart does not set it.
     MIN_RUNTIME_QUANTILE = 0.10
+    # The least heat it moves, for the same reason a low quantile rather than
+    # the minimum: a single reading caught mid-defrost or mid-stop is not the
+    # compressor's lowest speed.
+    MIN_HEAT_QUANTILE = 0.10
 
-    def __init__(self, latitude: float, longitude: float, models_path: Path) -> None:
+    def __init__(
+        self,
+        latitude: float,
+        longitude: float,
+        models_path: Path,
+        key: Literal["heating", "cooling"] = "heating",
+    ) -> None:
         super().__init__()
+        # Which HeatPumpStates mode this instance fits, as in
+        # HeatPumpCOPIdentifier.
+        self.key = key
         # The floor's heat lands in the building's thermal mass, which only the
         # building model can estimate - so it is fitted against that estimate,
         # the same state the MPC plans with.
@@ -47,12 +68,22 @@ class SpaceHeatingIdentifier(SystemIdentifier[SpaceHeatingModel]):
         self.states = HeatPumpStates()
 
     @property
+    def mode(self) -> str:
+        return getattr(self.states, self.key)
+
+    @property
+    def sign(self) -> float:
+        """The sign of the heat this mode brings into the floor."""
+
+        return -1.0 if self.key == "cooling" else 1.0
+
+    @property
     def name(self) -> str:
-        return "space_heating"
+        return f"space_{self.key}"
 
     @property
     def label(self) -> str:
-        return "Space heating"
+        return f"Space {self.key}"
 
     @property
     def unit(self) -> str:
@@ -64,7 +95,7 @@ class SpaceHeatingIdentifier(SystemIdentifier[SpaceHeatingModel]):
         return self.building.dataset(config)
 
     def runs(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Every reading of a heating run, with the thermal mass's estimate, the
+        """Every reading of a run in this mode, with the thermal mass's estimate, the
         run it belongs to, and whether the heat pump had settled by then.
 
         Past its start-up only (see HeatPumpCOPIdentifier.STARTUP): while the
@@ -83,25 +114,26 @@ class SpaceHeatingIdentifier(SystemIdentifier[SpaceHeatingModel]):
         prepared = self.building.prepare(df).reset_index(drop=True)
         prepared["T_mass"] = self.building.estimate(df)["mass"].to_numpy()
 
-        heating = prepared["state"] == self.states.heating
-        prepared["run"] = (heating & ~heating.shift(fill_value=False)).cumsum()
+        running = prepared["state"] == self.mode
+        prepared["run"] = (running & ~running.shift(fill_value=False)).cumsum()
         start = (
-            prepared["time"].where(heating).groupby(prepared["run"]).transform("min")
+            prepared["time"].where(running).groupby(prepared["run"]).transform("min")
         )
-        prepared["settled"] = heating & (
+        prepared["settled"] = running & (
             prepared["time"] - start >= HeatPumpCOPIdentifier.STARTUP
         )
 
-        return prepared.loc[heating]
+        return prepared.loc[running]
 
-    def fit(self, rows: pd.DataFrame, dt_hours: float) -> SpaceHeatingModel:
-        """The model from heating-run readings (see runs()).
+    def fit(self, rows: pd.DataFrame, dt_hours: float) -> FloorCircuitModel:
+        """The model from this mode's run readings (see runs()).
 
         The heating curve: supply = a + b * T_outdoor, over settled readings.
         Flat at their mean supply when the runs do not show the slope - a
         supply rising with the outdoor temperature, or a slope within its own
         standard error, says the outdoor range was too narrow, not that the
-        curve is shaped that way.
+        curve is shaped that way. Cooling too: a warmer day asks for a colder
+        supply, as a colder one asks for a warmer supply while heating.
         The floor: Q = G * (supply - T_mass), a conductance from the supply
         water to the mass. It covers both the water warming the screed and the
         water cooling on its way through the loop - G = 1 / (1 / UA_floor +
@@ -114,10 +146,10 @@ class SpaceHeatingIdentifier(SystemIdentifier[SpaceHeatingModel]):
         chose.
         """
 
-        settled = rows[rows["settled"] & (rows["Q_floor_w"] > 0.0)]
+        settled = rows[rows["settled"] & (self.sign * rows["Q_floor_w"] > 0.0)]
 
         if settled.empty:
-            raise ValueError("Space heating needs at least one settled heating run.")
+            raise ValueError(f"{self.label} needs at least one settled run.")
 
         slope, intercept = 0.0, float(settled["T_supply"].mean())
 
@@ -130,8 +162,9 @@ class SpaceHeatingIdentifier(SystemIdentifier[SpaceHeatingModel]):
                 slope, intercept = float(fit_slope), float(fit_intercept)
             else:
                 logger.warning(
-                    "Space heating: supply slope %.2f K/K not shown by these "
+                    "%s: supply slope %.2f K/K not shown by these "
                     "runs - a flat curve at their mean supply %.1f degC.",
+                    self.label,
                     fit_slope,
                     intercept,
                 )
@@ -149,11 +182,12 @@ class SpaceHeatingIdentifier(SystemIdentifier[SpaceHeatingModel]):
             * dt_hours
         )
 
-        return SpaceHeatingModel(
+        return FloorCircuitModel(
             supply_at_zero_outdoor_c=intercept,
             supply_per_outdoor_k=slope,
             conductance_w_per_k=conductance,
             min_runtime_hours=max(min_runtime_hours, dt_hours),
+            min_heat_w=float(np.quantile(np.abs(heat), self.MIN_HEAT_QUANTILE)),
         )
 
     def _in_test(self, rows: pd.DataFrame) -> pd.Series:
@@ -165,7 +199,7 @@ class SpaceHeatingIdentifier(SystemIdentifier[SpaceHeatingModel]):
 
         return rows["run"].isin(runs[train_runs:])
 
-    def calibrate(self, df: pd.DataFrame) -> SpaceHeatingModel:
+    def calibrate(self, df: pd.DataFrame) -> FloorCircuitModel:
         rows = self.runs(df)
         train = rows[~self._in_test(rows)]
         dt_hours = float(rows["dt_seconds"].median()) / 3600.0
@@ -173,12 +207,14 @@ class SpaceHeatingIdentifier(SystemIdentifier[SpaceHeatingModel]):
         self.model = self.fit(train, dt_hours)
 
         logger.info(
-            "Space heating calibrated: supply = %.1f %+.2f * T_out degC, "
-            "G = %.0f W/K, runs of at least %.2f h",
+            "%s calibrated: supply = %.1f %+.2f * T_out degC, "
+            "G = %.0f W/K, runs of at least %.2f h and %.0f W",
+            self.label,
             self.model.supply_at_zero_outdoor_c,
             self.model.supply_per_outdoor_k,
             self.model.conductance_w_per_k,
             self.model.min_runtime_hours,
+            self.model.min_heat_w,
         )
 
         return self.model
@@ -189,11 +225,15 @@ class SpaceHeatingIdentifier(SystemIdentifier[SpaceHeatingModel]):
 
         model = self.get_model()
         rows = self.runs(df)
-        test = rows[self._in_test(rows) & rows["settled"] & (rows["Q_floor_w"] > 0.0)]
+        test = rows[
+            self._in_test(rows)
+            & rows["settled"]
+            & (self.sign * rows["Q_floor_w"] > 0.0)
+        ]
 
         if test.empty:
             raise ValueError(
-                "No settled heating run held out to validate on - the model is "
+                "No settled run held out to validate on - the model is "
                 "fitted on every run there is."
             )
 
@@ -209,7 +249,8 @@ class SpaceHeatingIdentifier(SystemIdentifier[SpaceHeatingModel]):
         }
 
         logger.info(
-            "Space heating validation: MAE %.0f W, bias %+.0f W over %d runs",
+            "%s validation: MAE %.0f W, bias %+.0f W over %d runs",
+            self.label,
             metrics["mae_w"],
             metrics["bias_w"],
             int(metrics["runs"]),

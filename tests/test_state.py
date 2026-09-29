@@ -7,6 +7,8 @@ import pytest
 from app.state import StateManager
 from domain.state import SeriesPoint, State
 from features.solar import nowcast_solar
+from infrastructure.repositories import StateRepository
+from infrastructure.storage import JsonStorage
 
 LATITUDE = 52.0
 LONGITUDE = 5.0
@@ -158,3 +160,31 @@ def test_baseload_without_a_forecast_uses_the_measurement_only_for_now():
     result = _state_manager().baseload_forecast(_baseload_state([], 180.0), TIMES, NOW)
 
     assert result == [180.0, 0.0]
+
+
+def test_the_floors_plan_joins_the_heat_pumps(tmp_path):
+    """One machine, one plan: the floor's power and heat are added to the
+    tank's, cooling counted positive, and a new run starts from the tank's
+    plan again rather than adding on top of the last one."""
+    manager = _state_manager()
+    manager.state_repository = StateRepository(JsonStorage(tmp_path / "state.json"))
+    times = [NOW + timedelta(minutes=15 * i) for i in range(3)]
+
+    for _ in range(2):
+        manager.update_schedule(
+            schedule=[1, 0, 0],
+            temperatures=[45.0, 46.0, 46.0],
+            power_w=[1500.0, 0.0, 0.0],
+            times=times,
+            heat_w=[6000.0, 0.0, 0.0],
+        )
+        manager.update_building_schedule(
+            heat_w=[0.0, -3571.0, -3571.0],
+            temperatures=[21.5, 21.4, 21.3],
+            times=times,
+            power_w=[0.0, 800.0, 820.0],
+        )
+
+    plan = manager.load().schedule.heat_pump
+    assert [p.value for p in plan.power] == [1500.0, 800.0, 820.0]
+    assert [p.value for p in plan.heat] == [6000.0, 3571.0, 3571.0]

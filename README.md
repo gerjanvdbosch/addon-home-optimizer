@@ -52,6 +52,7 @@ rest:
         is_day,\
         temperature_2m,\
         relative_humidity_2m,\
+        dew_point_2m,\
         global_tilted_irradiance,\
         direct_radiation,\
         direct_normal_irradiance,\
@@ -76,6 +77,7 @@ rest:
           - is_day
           - temperature_2m
           - relative_humidity_2m
+          - dew_point_2m
           - global_tilted_irradiance
           - direct_radiation
           - direct_normal_irradiance
@@ -184,6 +186,7 @@ actions:
           "solar": "sensor.pv_output",
           "baseload": "sensor.stroomverbruik_base_load",
           "heat_pump": {
+            "mode": "select.ecodan_heatpump_ca09ec_gekozen_werking_mode",
             "state": "sensor.ecodan_heatpump_ca09ec_status_bedrijf",
             "power": "sensor.warmtepomp_geschat_vermogen",
             "supply_temperature": "sensor.ecodan_heatpump_ca09ec_aanvoer_temp",
@@ -237,6 +240,12 @@ actions:
               [2.0, ["cover.slaapkamer_groot_1", "current_position"]],
               [2.0, ["cover.slaapkamer_groot_2", "current_position"]],
               [2.0, ["cover.slaapkamer_achter_3", "current_position"]]
+            ],
+            "insulated_pipes": false,
+            "dew_point_margin": 1.0,
+            "dew_points": [
+              "sensor.xiaomi_sensor_1_condensatie_temperatuur", 
+              "sensor.xiaomi_sensor_2_condensatie_temperatuur"
             ]
           },
           "forecast": {

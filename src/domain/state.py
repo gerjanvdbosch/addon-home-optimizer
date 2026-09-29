@@ -31,6 +31,8 @@ class HeatPumpMeasurement(BaseModel):
     supply_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
     return_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
     compressor_frequency: list[SeriesPoint[float]] = Field(default_factory=list)
+    # The operating mode it is set to (see HeatPumpConfig.mode).
+    mode: list[SeriesPoint[str]] = Field(default_factory=list)
     boiler: BoilerMeasurement = Field(default_factory=BoilerMeasurement)
 
 
@@ -42,6 +44,9 @@ class BuildingMeasurement(BaseModel):
     # setpoint refers to. Kept apart so the dashboard compares the model
     # against the quantity it actually models.
     zone_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
+    # The highest of config.building.dew_points: the air most likely to
+    # condense on a cooled surface.
+    dew_point: list[SeriesPoint[float]] = Field(default_factory=list)
 
 
 class Measurements(BaseModel):
@@ -73,6 +78,8 @@ class OpenMeteoForecast(BaseModel):
     wind_direction: list[SeriesPoint[float]] = Field(default_factory=list)
     wind_speed: list[SeriesPoint[float]] = Field(default_factory=list)
     precipitation: list[SeriesPoint[float]] = Field(default_factory=list)
+    dew_point: list[SeriesPoint[float]] = Field(default_factory=list)
+    relative_humidity: list[SeriesPoint[float]] = Field(default_factory=list)
 
     def items(self):
         return (
@@ -84,6 +91,8 @@ class OpenMeteoForecast(BaseModel):
             ("wind_direction", self.wind_direction),
             ("wind_speed", self.wind_speed),
             ("precipitation", self.precipitation),
+            ("dew_point", self.dew_point),
+            ("relative_humidity", self.relative_humidity),
         )
 
 
@@ -107,6 +116,9 @@ class Predictions(BaseModel):
     # horizon, and lagging and damped relative to the air as a heavy mass
     # should be. This is also the state an MPC must start a plan from.
     thermal_mass: list[SeriesPoint[float]] = Field(default_factory=list)
+    # The indoor dew point over the plan's horizon (see features.dew_point):
+    # what a cooled floor must stay above.
+    dew_point: list[SeriesPoint[float]] = Field(default_factory=list)
 
 
 class BoilerSchedule(BaseModel):
@@ -115,16 +127,23 @@ class BoilerSchedule(BaseModel):
 
 
 class HeatPumpSchedule(BaseModel):
+    # One machine, one plan: the electricity it draws (W) and the heat it
+    # delivers (W), each for the tank and the floor together - the floor's
+    # heat as a magnitude, so cooling counts positive too.
     power: list[SeriesPoint[float]] = Field(default_factory=list)
+    heat: list[SeriesPoint[float]] = Field(default_factory=list)
     boiler: BoilerSchedule = Field(default_factory=BoilerSchedule)
 
 
 class BuildingSchedule(BaseModel):
     target_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
-    # The shadow plan: space heating as it would be planned, for comparison
-    # with what the thermostats do - never acted on (see Optimization).
-    heat: list[SeriesPoint[float]] = Field(default_factory=list)
+    # The shadow plan: the zone as it would be planned, for comparison with
+    # what the thermostats do - never acted on (see Optimization). Its heat
+    # and power are the heat pump's (see HeatPumpSchedule).
     temperatures: list[SeriesPoint[float]] = Field(default_factory=list)
+    # The supply each planned step runs the floor at: while cooling, the
+    # setpoint the plan would give the heat pump. Only steps it runs.
+    supply: list[SeriesPoint[float]] = Field(default_factory=list)
 
 
 class Schedule(BaseModel):

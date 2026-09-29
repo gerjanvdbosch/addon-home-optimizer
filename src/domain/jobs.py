@@ -85,6 +85,11 @@ class OptimizeConfig(BaseModel):
     # (see Optimization.explain_dhw_plan) - a few more solves, so off unless
     # asked for.
     explain: bool = Field(default=False)
+    # Plan the zone cooled (True) or heated (False) whatever mode the heat pump
+    # is set to, to see a mode's plan before switching the heat pump over.
+    # Only this run: the next one follows the heat pump again. None follows it
+    # now (see HeatPumpConfig.mode).
+    cooling: bool | None = Field(default=None)
 
 
 @dataclass

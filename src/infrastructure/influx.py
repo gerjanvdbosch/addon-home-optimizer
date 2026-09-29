@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Iterable, Protocol, cast
+from typing import Any, cast
 
 from influxdb import InfluxDBClient
 from influxdb.resultset import ResultSet
@@ -9,13 +9,8 @@ from domain.sensors import (
     Aggregation,
     FillMethod,
     InfluxSensor,
-    SensorAttributesReference,
     SensorReference,
 )
-
-
-class AttributeDefinition(Protocol):
-    def items(self) -> Iterable[tuple[str, str]]: ...
 
 
 class InfluxDatabase:
@@ -120,18 +115,6 @@ class InfluxSensorResolver:
             entity_id=sensor.entity_id,
             attribute=sensor.attribute,
         )
-
-    def resolve_attributes(
-        self,
-        sensor: "SensorAttributesReference[AttributeDefinition]",
-    ) -> dict[str, InfluxSensor]:
-        return {
-            name: self._resolve(
-                entity_id=sensor.entity_id,
-                attribute=attribute,
-            )
-            for name, attribute in sensor.attributes.items()
-        }
 
     def _resolve(
         self,

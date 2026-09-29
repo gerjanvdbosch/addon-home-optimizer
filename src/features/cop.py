@@ -37,19 +37,11 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
     differences relevant to the optimizer's costing - hence one instance per
     mode rather than one shared model.
 
-    HEATING MODES ONLY (HeatPumpStates.dhw and .heating). This does not
-    describe cooling, and an instance for the cooling mode was tried and
-    removed. Two
-    independent reasons: prepare() requires delta_t_water = T_supply - T_return
-    to be positive, which it never is while cooling (the supply is the colder
-    side), so every genuine cooling row is discarded and only transitional
-    artifacts survive; and the formula itself assumes the water is the hot
-    side. Cooling reverses the roles - the chilled water is the evaporator and
-    outdoor air the condenser - so its efficiency is EER = eta * T_evap_K /
-    (T_cond_K - T_evap_K), with the useful output being heat removed. Applying
-    the expression above to cooling gives T_cond < T_evap and hence a negative
-    COP. A cooling model needs its own identifier, not another instance of
-    this one.
+    Cooling (HeatPumpStates.cooling) reverses the roles: the chilled water is
+    the evaporator and outdoor air the condenser, so its efficiency is
+    EER = eta * T_evap_K / (T_cond_K - T_evap_K), with the useful output the
+    heat taken from the water - T_return above T_supply rather than below (see
+    HeatPumpCOPModel.cooling).
     """
 
     TRAIN_RATIO = 0.80
@@ -155,7 +147,9 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
     STARTUP = pd.Timedelta(minutes=15)
 
     def __init__(
-        self, key: Literal["dhw", "heating"], models_path: Path | None = None
+        self,
+        key: Literal["dhw", "heating", "cooling"],
+        models_path: Path | None = None,
     ) -> None:
         super().__init__()
         # Which HeatPumpStates mode this instance fits, and its stable name
@@ -174,6 +168,10 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         """The heat_pump.state value this instance's data is filtered to."""
 
         return getattr(self.states, self.key)
+
+    @property
+    def cooling(self) -> bool:
+        return self.key == "cooling"
 
     @property
     def name(self) -> str:
@@ -280,7 +278,12 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
 
         df = df.dropna(subset=numeric_columns).copy()
 
+        # Positive in the direction this mode moves heat: into the water while
+        # heating, out of it while cooling.
         df["delta_t_water"] = df["T_supply"] - df["T_return"]
+
+        if self.cooling:
+            df["delta_t_water"] = -df["delta_t_water"]
 
         # Calorimetric thermal output in Watts - identical formula to
         # boiler.py's own calorimetric Q_in override (reuses the same water
@@ -385,6 +388,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         T_outdoor: np.ndarray,
         T_supply: np.ndarray,
         delta_t_cond: float,
+        cooling: bool = False,
     ) -> np.ndarray:
         eta_carnot, delta_t_evap = parameters
 
@@ -400,6 +404,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             eta_carnot=eta_carnot,
             delta_t_cond=delta_t_cond,
             delta_t_evap=delta_t_evap,
+            cooling=cooling,
         )
 
         return trial_model.cop(T_outdoor, T_supply)
@@ -408,8 +413,11 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         self,
         df: pd.DataFrame,
     ) -> HeatPumpCOPModel:
-        # From the raw readings: prepare() leaves the start-up out.
-        start_ramp_seconds, start_step_power_w = self._start_up(df)
+        # From the raw readings: prepare() leaves the start-up out. Only DHW
+        # planning uses it (see below).
+        start_ramp_seconds, start_step_power_w = (
+            self._start_up(df) if self.key == "dhw" else (0.0, 0.0)
+        )
         df = self.prepare(df)
 
         if len(df) < 10:
@@ -443,6 +451,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
                 T_outdoor,
                 T_supply,
                 self.FIXED_DELTA_T_COND,
+                self.cooling,
             )
 
             return COP_predicted - COP_measured
@@ -503,6 +512,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
                 eta_carnot=1.0,
                 delta_t_cond=self.FIXED_DELTA_T_COND,
                 delta_t_evap=delta_t_evap,
+                cooling=self.cooling,
             ).cop(T_outdoor, T_supply)
             eta_carnot = float(np.dot(carnot, COP_measured) / np.dot(carnot, carnot))
             residual = COP_measured - eta_carnot * carnot
@@ -545,6 +555,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             eta_carnot=eta_carnot,
             delta_t_cond=self.FIXED_DELTA_T_COND,
             delta_t_evap=delta_t_evap,
+            cooling=self.cooling,
         )
 
         # The reference supply and the Q_th line are what DHW planning costs a
@@ -600,23 +611,34 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
     def _shared_delta_t_evap(
         self, delta_t_evap: float, std_error: float
     ) -> float | None:
-        """The DHW model's evaporator approach, for a heating fit that cannot
-        pin down its own.
+        """The DHW model's outdoor coil approach, for a heating or cooling fit
+        that cannot pin down its own.
 
-        Both modes draw heat through the same outdoor evaporator, so its
-        approach is one physical quantity; what differs between them is the
-        supply temperature, which eta_carnot and the condenser side carry.
+        Every mode exchanges heat with outdoor air through the same coil, so
+        its approach is one physical quantity; what differs between them is the
+        supply temperature, which eta_carnot and the water side carry.
         Separating the approach from eta_carnot takes a spread in lift, which
         a few heating runs at one floor supply do not have - there the DHW
         fit, over a far wider lift range, is the better estimate. None when
         the heating fit's own approach is identified, or when there is no DHW
         model to take it from.
+
+        Cooling always takes it. There the coil condenses rather than
+        evaporates, but rejects about the heat it absorbs while heating (real
+        data: ~5 kW either way), so its approach is taken to be the same. On
+        three days of real cooling runs, a free approach ran to 35 K with
+        eta_carnot at 0.79 for an RMSE of 0.52 against 0.57 at the DHW
+        approach: chasing a bound, not converging.
         """
 
         if self.key == "dhw" or self.models_path is None:
             return None
 
-        if np.isfinite(std_error) and std_error <= abs(delta_t_evap):
+        if (
+            not self.cooling
+            and np.isfinite(std_error)
+            and std_error <= abs(delta_t_evap)
+        ):
             return None
 
         dhw = HeatPumpCOPIdentifier(key="dhw")
@@ -627,7 +649,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
 
         logger.info(
             "Heat pump COP calibration (%s): delta_t_evap=%.2f+/-%.2f K is not "
-            "identified here - using the DHW fit's %.2f K (same evaporator) "
+            "identified here - using the DHW fit's %.2f K (same outdoor coil) "
             "and fitting eta_carnot alone.",
             self.mode,
             delta_t_evap,
@@ -836,6 +858,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             T_outdoor,
             T_supply,
             self.model.delta_t_cond,
+            self.model.cooling,
         )
 
         r2 = float(

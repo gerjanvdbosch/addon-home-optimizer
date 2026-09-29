@@ -62,8 +62,9 @@ class Container:
         from features.boiler import BoilerThermalIdentifier
         from features.building import BuildingThermalIdentifier
         from features.cop import HeatPumpCOPIdentifier
+        from features.dew_point import DewPointIdentifier
+        from features.floor import FloorCircuitIdentifier
         from features.solar import SolarBiasIdentifier
-        from features.space_heating import SpaceHeatingIdentifier
 
         latitude, longitude = self.settings.latitude, self.settings.longitude
 
@@ -81,19 +82,26 @@ class Container:
                 # per mode is what HeatPumpCOPIdentifier is built for.
                 # Registered before the season starts so it calibrates from the
                 # first runs rather than from whatever is left when someone
-                # remembers. Cooling is deliberately absent: there the water is
-                # the COLD side and this model does not describe it (see the
-                # class docstring).
+                # remembers. Cooling likewise, with the water as the cold side
+                # (see the class docstring).
                 HeatPumpCOPIdentifier(key="heating", models_path=self.models_path),
+                HeatPumpCOPIdentifier(key="cooling", models_path=self.models_path),
                 BuildingThermalIdentifier(latitude=latitude, longitude=longitude),
                 SolarBiasIdentifier(latitude=latitude, longitude=longitude),
                 # After the building: it fits against that model's estimate of
                 # the floor's mass.
-                SpaceHeatingIdentifier(
+                FloorCircuitIdentifier(
                     latitude=latitude,
                     longitude=longitude,
                     models_path=self.models_path,
                 ),
+                FloorCircuitIdentifier(
+                    latitude=latitude,
+                    longitude=longitude,
+                    models_path=self.models_path,
+                    key="cooling",
+                ),
+                DewPointIdentifier(),
             ],
         )
 

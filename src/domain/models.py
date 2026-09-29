@@ -22,9 +22,12 @@ IdentificationType = Literal[
     "boiler",
     "cop_dhw",
     "cop_heating",
+    "cop_cooling",
     "building",
     "solar",
     "space_heating",
+    "space_cooling",
+    "dew_point",
 ]
 
 
@@ -110,6 +113,19 @@ class BoilerThermalModel:
 
 
 @dataclass
+class DewPointModel:
+    """How the indoor dew point follows the outdoor one (see
+    physics.indoor_dew_point_c)."""
+
+    # How long ventilation takes to carry a change of outdoor humidity
+    # indoors, stretched by what walls and furnishings buffer (hours).
+    time_constant_hours: float
+    # The vapour pressure the occupants' own moisture keeps indoors above the
+    # outdoor air's (Pa).
+    moisture_surplus_pa: float
+
+
+@dataclass
 class BuildingThermalModel:
     """Two-node (2R2C) grey-box model of one thermal zone.
 
@@ -164,10 +180,10 @@ KELVIN_OFFSET_C = 273.15
 
 
 @dataclass
-class SpaceHeatingModel:
-    """How the heat pump runs the floor circuit by itself (see
-    features.space_heating): the supply temperature it chooses, the heat that
-    brings into the floor, and how long it runs."""
+class FloorCircuitModel:
+    """How the heat pump runs the floor circuit by itself, heating or cooling
+    (see features.floor): the supply temperature it chooses, the heat
+    that brings into the floor, and how long it runs."""
 
     # Its heating curve, supply = a + b * T_outdoor (deg C, K per K).
     supply_at_zero_outdoor_c: float
@@ -177,12 +193,18 @@ class SpaceHeatingModel:
     conductance_w_per_k: float
     # The shortest runs it makes (hours).
     min_runtime_hours: float
+    # The least heat a settled run moves (W, a magnitude): the compressor at
+    # its lowest speed. Asked for less, the heat pump cannot turn down further
+    # and takes the water past its setpoint instead (real cooling data: 3.4-3.6
+    # kW at 22-30 Hz, the water a median 0.5 K colder than set). 0.0 for a
+    # model from before it was identified.
+    min_heat_w: float = 0.0
 
     def supply_c(self, outdoor_c):
         return self.supply_at_zero_outdoor_c + self.supply_per_outdoor_k * outdoor_c
 
     def heat_w(self, outdoor_c, mass_c):
-        """The heat a run delivers into the floor (W)."""
+        """The heat a run delivers into the floor (W), negative cooling."""
 
         return self.conductance_w_per_k * (self.supply_c(outdoor_c) - mass_c)
 
@@ -214,8 +236,14 @@ class HeatPumpCOPModel:
     POWER_FIT_T_HIGH_C: ClassVar[float] = 60.0
 
     eta_carnot: float
+    # The approaches of the water-side plate exchanger and the outdoor coil
+    # (K), named for heating, where the plate condenses and the coil
+    # evaporates. Cooling reverses both roles on the same two exchangers.
     delta_t_cond: float
     delta_t_evap: float
+    # Whether this describes cooling: the useful output is then the heat
+    # taken from the chilled water, so cop() is the cooling EER.
+    cooling: bool = False
     # The 95th percentile of this mode's own observed supply temperature
     # (see HeatPumpCOPIdentifier.calibrate()) - planning's stand-in for the
     # heat pump's actual supply temperature, which it has no forecast for
@@ -283,6 +311,12 @@ class HeatPumpCOPModel:
         HeatPumpCOPIdentifier._predict_cop (arrays, one call per fit
         iteration).
         """
+
+        if self.cooling:
+            T_evap_K = T_supply - self.delta_t_cond + KELVIN_OFFSET_C
+            T_cond_K = T_outdoor + self.delta_t_evap + KELVIN_OFFSET_C
+
+            return self.eta_carnot * T_evap_K / (T_cond_K - T_evap_K)
 
         T_cond_K = T_supply + self.delta_t_cond + KELVIN_OFFSET_C
         T_evap_K = T_outdoor - self.delta_t_evap + KELVIN_OFFSET_C

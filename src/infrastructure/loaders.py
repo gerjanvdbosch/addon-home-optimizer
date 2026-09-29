@@ -10,6 +10,7 @@ and never see any of this.
 """
 
 import ast
+import logging
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Literal
@@ -25,6 +26,35 @@ from domain.dataset import (
 from domain.sensors import InfluxSensor, SensorReference
 from domain.time import parse_datetime
 from infrastructure.influx import InfluxDatabase, InfluxSensorResolver
+
+logger = logging.getLogger(__name__)
+
+
+def resolve_attributes(
+    resolver: InfluxSensorResolver,
+    definition: AttributeSeriesDefinition | AttributeTimeSeriesDefinition,
+) -> dict[str, InfluxSensor]:
+    """The attributes a definition asks for, as stored. One the entity has
+    never published is left out, with a warning, rather than failing the whole
+    load: its column is then simply absent, as it is from any snapshot that
+    lacks it - so a newly configured attribute (say Open-Meteo's dew point)
+    does not break every model until its first publication."""
+
+    attributes = dict(definition.sensor.attributes.items())
+    sensors = {}
+
+    for name in definition.attributes:
+        try:
+            sensors[name] = resolver.resolve(
+                SensorReference(
+                    entity_id=definition.sensor.entity_id,
+                    attribute=attributes[name],
+                )
+            )
+        except ValueError as error:
+            logger.warning("Attribute %s left out: %s", name, error)
+
+    return sensors
 
 
 def resample_dataframe(
@@ -153,17 +183,8 @@ class AttributeSeriesLoader(DataLoader):
         end: datetime,
     ) -> pd.DataFrame:
         # Only the attributes asked for: each is a query of its own, and the
-        # state asks for one of Open-Meteo's twelve.
-        attributes = dict(definition.sensor.attributes.items())
-        sensors = {
-            name: self.resolver.resolve(
-                SensorReference(
-                    entity_id=definition.sensor.entity_id,
-                    attribute=attributes[name],
-                )
-            )
-            for name in definition.attributes
-        }
+        # state asks for a few of Open-Meteo's.
+        sensors = resolve_attributes(self.resolver, definition)
 
         time_sensor = self.resolver.resolve(
             SensorReference(
@@ -315,7 +336,9 @@ class AttributeTimeSeriesLoader(DataLoader):
         start: datetime,
         end: datetime,
     ) -> pd.DataFrame:
-        sensors = self.resolver.resolve_attributes(definition.sensor)
+        # Only the attributes asked for, as above: resolving all of them made
+        # one Open-Meteo attribute missing from the database fail every load.
+        sensors = resolve_attributes(self.resolver, definition)
 
         time_sensor = self.resolver.resolve(
             SensorReference(

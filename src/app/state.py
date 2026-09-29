@@ -287,12 +287,17 @@ class StateManager:
         temperatures: Sequence[float],
         power_w: Sequence[float],
         times: list[datetime],
+        heat_w: Sequence[float] = (),
     ) -> None:
         state = self.load()
 
         state.schedule.heat_pump.power = [
             SeriesPoint(time=t, value=float(on) * float(power))
             for t, on, power in zip(times, schedule, power_w, strict=False)
+        ]
+        state.schedule.heat_pump.heat = [
+            SeriesPoint(time=t, value=float(heat))
+            for t, heat in zip(times, heat_w, strict=False)
         ]
 
         state.schedule.heat_pump.boiler.temperatures = [
@@ -319,16 +324,34 @@ class StateManager:
         heat_w: Sequence[float],
         temperatures: Sequence[float],
         times: list[datetime],
+        supply_c: Sequence[float] = (),
+        power_w: Sequence[float] = (),
     ) -> None:
-        state = self.load()
+        """The zone's shadow plan. Its heat and power go into the heat pump's
+        plan beside the tank's (see update_schedule, which rewrote those this
+        same run): one machine serves both."""
 
-        state.schedule.building.heat = [
-            SeriesPoint(time=t, value=float(value))
-            for t, value in zip(times, heat_w, strict=False)
-        ]
+        state = self.load()
+        heat_pump = state.schedule.heat_pump
+
+        def plus(points: list[SeriesPoint], values: Sequence[float]) -> list:
+            extra = {t: float(v) for t, v in zip(times, values, strict=False)}
+            return [
+                SeriesPoint(time=p.time, value=p.value + extra.get(p.time, 0.0))
+                for p in points
+            ]
+
+        heat_pump.power = plus(heat_pump.power, power_w)
+        heat_pump.heat = plus(heat_pump.heat, [abs(h) for h in heat_w])
         state.schedule.building.temperatures = [
             SeriesPoint(time=t, value=float(value))
             for t, value in zip(times, temperatures, strict=False)
+        ]
+        # NaN where the floor is not run; left out, so no line is drawn there.
+        state.schedule.building.supply = [
+            SeriesPoint(time=t, value=float(value))
+            for t, value in zip(times, supply_c, strict=False)
+            if not math.isnan(value)
         ]
 
         self.state_repository.save(state)
@@ -372,6 +395,16 @@ class StateManager:
         state.measurements.building.setpoint = self._parse_series(
             df, "thermostat_setpoint"
         )
+        state.measurements.heat_pump.mode = self._parse_series(df, "heat_pump_mode")
+        dew_points = [
+            column for column in df.columns if column.startswith("dew_point_")
+        ]
+
+        if dew_points:
+            state.measurements.building.dew_point = self._parse_series(
+                df.assign(dew_point=df[dew_points].max(axis=1, skipna=True)),
+                "dew_point",
+            )
 
         for forecast_source in ["solcast", "open_meteo"]:
             source_obj = getattr(state.forecast, forecast_source)
@@ -443,7 +476,7 @@ class StateManager:
         ]
 
     def _dataset(self, config: Config) -> DatasetDefinition:
-        return (
+        builder = (
             DatasetBuilder()
             .attribute_series(
                 "solcast",
@@ -453,7 +486,9 @@ class StateManager:
             .attribute_series(
                 "open_meteo",
                 config.forecast.open_meteo,
-                attributes=["temperature"],
+                # Humidity for the indoor dew point's forecast (see
+                # features.dew_point), either as stored.
+                attributes=["temperature", "dew_point", "relative_humidity"],
             )
             .timeseries(
                 "pv_production",
@@ -547,5 +582,26 @@ class StateManager:
                 fill="previous",
                 # See boiler_top_temperature - a state, so the last reading.
             )
-            .build()
         )
+
+        # Both states, so the last reading: a mode only reports when it is
+        # changed, and a dew point changes slowly.
+        if config.heat_pump.mode is not None:
+            builder = builder.timeseries(
+                "heat_pump_mode",
+                config.heat_pump.mode,
+                aggregation="last",
+                interval="15m",
+                fill="previous",
+            )
+
+        for i, sensor in enumerate(config.building.dew_points):
+            builder = builder.timeseries(
+                f"dew_point_{i}",
+                sensor,
+                aggregation="last",
+                interval="15m",
+                fill="previous",
+            )
+
+        return builder.build()

@@ -22,6 +22,7 @@ def add_series(
     unit: str | None = "",
     row: int | None = None,
     col: int | None = None,
+    connectgaps: bool = True,
 ) -> None:
     if line is None:
         line = dict(width=2)
@@ -36,12 +37,37 @@ def add_series(
             legendgroup=legendgroup,
             showlegend=showlegend,
             visible=visible,
-            connectgaps=True,
+            connectgaps=connectgaps,
             hovertemplate=f"%{{y:.{decimal}f}} {unit}<extra>%{{fullData.name}}</extra>",
         ),
         row=row,
         col=col,
     )
+
+
+def broken_between_runs(points: list, step: timedelta) -> list:
+    """Points that exist only while something runs, with a gap (NaN) a step
+    after each run ends, so a line drawn through them stops there rather than
+    bridging the time nothing ran."""
+
+    broken = []
+
+    for previous, point in zip([None, *points], points, strict=False):
+        if previous is not None and point.time - previous.time > step:
+            broken.append(SeriesPoint(time=previous.time + step, value=float("nan")))
+        broken.append(point)
+
+    return broken
+
+
+def joined(measured: list, planned: list) -> list:
+    """One line of both: the measured points, then the planned ones after the
+    last of them."""
+
+    if not measured:
+        return planned
+
+    return measured + [p for p in planned if p.time > measured[-1].time]
 
 
 def continued(measured: list, planned: list) -> list:
@@ -178,18 +204,7 @@ def dashboard_chart(
 
     series(
         "Solar",
-        state.measurements.solar,
-        line=dict(width=1.5, color="#FFA15A", shape="spline"),
-        legendgroup="solar",
-        showlegend=False,
-        unit="W",
-        row=1,
-        col=1,
-    )
-
-    series(
-        "Solar",
-        continued(state.measurements.solar, state.predictions.solar),
+        joined(state.measurements.solar, state.predictions.solar),
         line=dict(width=1.5, color="#FFA15A", shape="spline"),
         legendgroup="solar",
         unit="W",
@@ -217,51 +232,29 @@ def dashboard_chart(
 
     series(
         "Baseload",
-        state.measurements.baseload,
+        joined(state.measurements.baseload, state.predictions.baseload),
         unit="W",
         row=1,
         col=1,
         line=dict(width=1, color="rgba(239, 85, 59, 0.5)", shape="spline"),
-        legendgroup="baseload",
-    )
-
-    series(
-        "Baseload",
-        continued(state.measurements.baseload, state.predictions.baseload),
-        line=dict(width=1, color="rgba(239, 85, 59, 0.5)", shape="spline"),
-        legendgroup="baseload",
-        showlegend=False,
-        unit="W",
-        row=1,
-        col=1,
-    )
-
-    heat_pump_power = ended(state.measurements.heat_pump.power, state.updated)
-
-    series(
-        "Heat pump",
-        heat_pump_power,
-        unit="W",
-        row=1,
-        col=1,
-        line=dict(width=2, color="#AB63FA", shape="hv"),
-        legendgroup="heat_pump",
-        showlegend=False,
     )
 
     series(
         "Heat pump",
-        continued(heat_pump_power, state.schedule.heat_pump.power),
+        joined(
+            ended(state.measurements.heat_pump.power, state.updated),
+            state.schedule.heat_pump.power,
+        ),
         unit="W",
         row=1,
         col=1,
         line=dict(width=2, color="#AB63FA", shape="hv"),
-        legendgroup="heat_pump",
     )
 
+    # The heat it delivers: into the tank, and into or out of the floor.
     series(
-        "Space heating (shadow)",
-        state.schedule.building.heat,
+        "Heat pump heat",
+        state.schedule.heat_pump.heat,
         unit="W",
         row=1,
         col=1,
@@ -333,6 +326,35 @@ def dashboard_chart(
         decimal=2,
     )
 
+    # The supply the shadow plan runs the floor at - while cooling, the
+    # setpoint it would give the heat pump - only while a run holds it.
+    series(
+        "Supply plan (shadow)",
+        broken_between_runs(
+            state.schedule.building.supply, timedelta(hours=MPCConfig().step_hours)
+        ),
+        row=2,
+        col=1,
+        line=dict(width=1.5, color="#19D3F3", shape="hv", dash="dash"),
+        visible="legendonly",
+        unit="°C",
+        decimal=1,
+        connectgaps=False,
+    )
+
+    # What a cooled floor, and uninsulated pipes, must stay above: measured,
+    # then as the plan forecast it.
+    series(
+        "Dew point",
+        joined(state.measurements.building.dew_point, state.predictions.dew_point),
+        row=2,
+        col=1,
+        line=dict(width=1, color="#B6E880", shape="spline"),
+        visible="legendonly",
+        unit="°C",
+        decimal=1,
+    )
+
     series(
         "Outside",
         state.forecast.open_meteo.temperature,
@@ -358,8 +380,8 @@ def dashboard_chart(
     measured_average = mixed_tank(boiler, boiler_model)
 
     for name, points in (
-        ("Boiler top", boiler.top_temperature),
         ("Boiler bottom", boiler.bottom_temperature),
+        ("Boiler top", boiler.top_temperature),
     ):
         series(
             name,

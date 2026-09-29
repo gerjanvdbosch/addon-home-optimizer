@@ -8,8 +8,8 @@ from domain.dynamics import discretize_zoh
 from domain.models import (
     BoilerThermalModel,
     BuildingThermalModel,
+    FloorCircuitModel,
     HeatPumpCOPModel,
-    SpaceHeatingModel,
 )
 from domain.mpc import MPCConfig, MPCInput
 from domain.physics import (
@@ -1357,7 +1357,7 @@ def test_space_runs_are_as_long_and_as_strong_as_the_heat_pump_makes_them():
     but not how much: the heat follows from the curve and the floor, and a run
     lasts at least as long as the heat pump's own shortest ones."""
 
-    space = SpaceHeatingModel(
+    space = FloorCircuitModel(
         supply_at_zero_outdoor_c=28.0,
         supply_per_outdoor_k=-0.4,
         conductance_w_per_k=400.0,
@@ -1368,7 +1368,7 @@ def test_space_runs_are_as_long_and_as_strong_as_the_heat_pump_makes_them():
         MPCConfig(),
         cop_model=COP_MODEL,
         building_model=TWO_NODE,
-        space_heating_model=space,
+        floor_circuit_model=space,
     ).solve(_cold_day())
 
     fine_steps = int(MPCConfig().fine_horizon_hours / MPCConfig().step_hours)
@@ -1420,7 +1420,7 @@ def test_space_heating_is_costed_with_the_heating_cop_once_there_is_one():
 
         return optimizer._space_cop(5.0)
 
-    assert space_cop(heating_cop_model=heating_cop) < space_cop()
+    assert space_cop(space_cop_model=heating_cop) < space_cop()
     assert space_cop() == pytest.approx(
         COP_MODEL.clamped_cop(5.0, MPCOptimizer.SPACE_HEATING_SUPPLY_C)
     )
@@ -1653,3 +1653,105 @@ def test_a_run_under_way_starts_from_the_heat_it_has_put_in():
     assert optimizer._initial_temperature(
         replace(data, compressor_elapsed_hours=5.0)
     ) == pytest.approx(55.0)
+
+
+def _hot_day(**overrides):
+    steps = 96
+    defaults = dict(
+        solar_forecast_w=[0.0] * steps,
+        target_temperature_top=(10.0,) * steps,
+        outdoor_temperature_forecast=(30.0,) * steps,
+        zone_temperature=24.0,
+        zone_mass_temperature=23.5,
+        zone_target_temperature=(18.0,) * steps,
+        zone_maximum_temperature=(22.5,) * steps,
+        zone_internal_gain_w=(150.0,) * steps,
+        zone_cooling=True,
+    )
+    defaults.update(overrides)
+
+    return _make_input(**defaults)
+
+
+COOLING = FloorCircuitModel(
+    supply_at_zero_outdoor_c=16.0,
+    supply_per_outdoor_k=-0.1,
+    conductance_w_per_k=719.0,
+    min_runtime_hours=1.0,
+    min_heat_w=3500.0,
+)
+
+
+def _cool(data):
+    return MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE,
+        floor_circuit_model=COOLING,
+        space_cop_model=replace(COP_MODEL, cooling=True),
+    ).solve(data)
+
+
+def test_cooling_keeps_the_floor_above_the_dew_point():
+    """A warm zone is cooled, never by less than the compressor's least, and
+    the floor's mass - supply less Q / G - stays above the dew point bound."""
+
+    result = _cool(_hot_day(zone_mass_minimum_c=(21.0,) * 96))
+    heat = np.asarray(result.space_heat_w)
+    on = np.asarray(result.space_schedule, dtype=bool)
+
+    assert on.any(), "expected the zone to be cooled"
+    assert (heat <= 1e-6).all()
+    assert (-heat[on] >= COOLING.min_heat_w - 1e-3).all()
+    # What it draws is positive, and less than the heat it moves (EER > 1).
+    power = np.asarray(result.space_electrical_w)
+    assert (power[on] > 0.0).all()
+    assert (power[on] < -heat[on]).all()
+    assert power[~on] == pytest.approx(0.0, abs=1e-6)
+
+    supply = np.asarray(result.space_supply_c)[on]
+    mass = supply - heat[on] / COOLING.conductance_w_per_k
+    assert (mass >= 21.0 - 1e-6).all()
+
+
+def test_the_floor_follows_a_dew_point_forecast_step_by_step():
+    """A dew point forecast to rise halfway holds the mass above each step's
+    own bound: low early, high late."""
+
+    bound = (20.0,) * 48 + (23.5,) * 48
+    result = _cool(_hot_day(zone_mass_minimum_c=bound))
+    heat = np.asarray(result.space_heat_w)
+    on = np.asarray(result.space_schedule, dtype=bool)
+
+    assert on.any(), "expected the zone to be cooled"
+
+    mass = np.asarray(result.space_supply_c) - heat / COOLING.conductance_w_per_k
+    assert (mass[on] >= np.asarray(bound)[on] - 1e-6).all()
+
+
+def test_uninsulated_pipes_rule_out_a_supply_below_the_dew_point():
+    """With the supply held above a high dew point, the floor cannot take the
+    compressor's least - at most 719 W/K over the ~3.4 K from a mass that
+    warms to ~24.4 degC - so no supply does both and the zone is not cooled."""
+
+    result = _cool(
+        _hot_day(zone_mass_minimum_c=(19.0,) * 96, zone_supply_minimum_c=(21.0,) * 96)
+    )
+
+    assert not any(result.space_schedule)
+
+
+def test_a_run_the_zone_opens_is_not_charged_the_tanks_ramp():
+    """The start-up ramp is the tank's: a compressor run that begins on the
+    floor, with no hot water wanted, can still be planned."""
+
+    result = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=replace(COP_MODEL, start_ramp_seconds=800.0),
+        building_model=TWO_NODE,
+    ).solve(_cold_day())
+
+    assert any(result.space_schedule), "expected the zone to be heated"
+    assert not any(result.schedule)
