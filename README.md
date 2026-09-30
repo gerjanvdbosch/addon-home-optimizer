@@ -217,6 +217,8 @@ actions:
             },
           },
           "building": {
+            "control_cooling": true, 
+            "control_heating": true,
             "thermostat": {
               "temperature": "sensor.danfoss_15_temperature",
               "setpoint": ["climate.danfoss_icon_woonkamer", "temperature"]

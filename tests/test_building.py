@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 import pytest
+from pvlib import irradiance, solarposition
 
 from domain.config import Config
 from domain.dynamics import discretize_zoh, kalman_states
@@ -15,10 +16,10 @@ from domain.physics import (
     RHO_AIR_KG_PER_M3,
     floor_heat_w,
     solar_gain_w,
-    two_node_zone_state_space,
     zone_observation,
+    zone_state_space,
 )
-from features.building import BuildingThermalIdentifier
+from features.building import BuildingThermalIdentifier, facade_irradiance_w_per_m2
 
 TRUE_VOLUME_M3 = 120.0
 TRUE_ZONE_AREA_M2 = 46.0
@@ -34,6 +35,7 @@ TRUE_MODEL = BuildingThermalModel(
     # the operative-temperature reading has its own test below.
     sensor_mass_fraction=0.0,
     internal_gain_fraction=0.6,
+    floor_heat_fraction=0.7,
 )
 
 
@@ -150,7 +152,6 @@ def _raw_frame() -> pd.DataFrame:
             "T_out": t_out,
             "direct_radiation": direct,
             "diffuse_radiation": diffuse,
-            "direct_normal_irradiance": 900.0 * daylight,
             "temperature": t_out,
             "state": np.where(cooling, COOLING_STATE, OFF_STATE),
             "flow_lpm": np.where(cooling, COOLING_FLOW_LPM, 0.0),
@@ -173,19 +174,6 @@ def _identifier() -> BuildingThermalIdentifier:
     identifier.shutter_columns = ["shutter_0"]
     identifier.presence_columns = ["presence_0"]
     return identifier
-
-
-def _true_parameters() -> np.ndarray:
-    return np.array(
-        [
-            TRUE_MODEL.ua_envelope_w_per_k,
-            TRUE_MODEL.ua_air_mass_w_per_k,
-            TRUE_MODEL.c_air_j_per_k,
-            TRUE_MODEL.c_mass_j_per_k,
-            TRUE_MODEL.a_eff_m2,
-            TRUE_MODEL.internal_gain_fraction,
-        ]
-    )
 
 
 def _simulate(
@@ -211,7 +199,7 @@ def _simulate(
 
     inputs = identifier._inputs(TRUE_MODEL, prepared)
 
-    a_d, b_d = discretize_zoh(*two_node_zone_state_space(TRUE_MODEL), DT_SECONDS)
+    a_d, b_d = discretize_zoh(*zone_state_space(TRUE_MODEL), DT_SECONDS)
     observation = zone_observation(TRUE_MODEL)
 
     state = np.array([21.0, 21.0])
@@ -283,6 +271,11 @@ def test_calibrate_recovers_known_parameters():
     # The mass capacity sets how long the building coasts, the quantity the
     # whole two-node structure exists for.
     assert model.c_mass_j_per_k == pytest.approx(TRUE_MODEL.c_mass_j_per_k, rel=0.25)
+    # How much of a floor run reaches the zone, which sets what a planned run
+    # does to it.
+    assert model.floor_heat_fraction == pytest.approx(
+        TRUE_MODEL.floor_heat_fraction, abs=0.15
+    )
 
 
 def test_validate_reports_forward_simulation_accuracy():
@@ -302,13 +295,16 @@ def test_validate_flags_a_parameter_pinned_at_a_bound(caplog):
     identifier = _identifier()
     df = _simulate(np.random.default_rng(2))
     identifier.calibrate(df)
+    # The synthetic sensor reads pure air, which is its own lower bound: the
+    # fit sits on it by construction, so count only what pinning adds.
+    before = identifier.validate(df)["pinned_parameters"]
 
     identifier.model.ua_envelope_w_per_k = identifier.MAX_UA_ENVELOPE_W_PER_K
 
     with caplog.at_level("WARNING"):
         metrics = identifier.validate(df)
 
-    assert metrics["pinned_parameters"] == 1
+    assert metrics["pinned_parameters"] == before + 1
     assert "ua_envelope_w_per_k is pinned at a bound" in caplog.text
 
 
@@ -647,7 +643,7 @@ def test_filter_infers_the_unmeasured_mass_node():
 
     prepared = identifier.prepare(df)
     model = identifier.model
-    a, b = identifier._state_space(model)
+    a, b = zone_state_space(model)
 
     measured = prepared["T_air"].to_numpy(dtype=float)
     estimates = kalman_states(
@@ -727,9 +723,10 @@ def test_envelope_trend_ignores_sunlit_windows():
     """Solar gain and the outdoor difference move together, so a trend fitted
     over every window measures the net of two errors instead of the envelope.
 
-    Measured on real data: over all windows the single-node model slopes
-    +0.0009 K/K and looks clean, while after dark it slopes -0.0218 - its
-    oversized solar term cancelling its own envelope error. Only dark windows
+    Measured on real data: over all windows the single-node model this
+    replaced slopes +0.0009 K/K and looks clean, while after dark it slopes
+    -0.0218 - its oversized solar term cancelling its own envelope error. Only
+    dark windows
     isolate the envelope.
     """
 
@@ -907,7 +904,7 @@ def _simulate_operative(rng: np.random.Generator, fraction: float) -> pd.DataFra
     true_model = replace(TRUE_MODEL, sensor_mass_fraction=fraction)
     inputs = identifier._inputs(true_model, prepared)
 
-    a_d, b_d = discretize_zoh(*two_node_zone_state_space(true_model), DT_SECONDS)
+    a_d, b_d = discretize_zoh(*zone_state_space(true_model), DT_SECONDS)
     observation = zone_observation(true_model)
 
     state = np.array([21.0, 21.0])
@@ -949,7 +946,7 @@ def test_filter_corrects_the_mass_node_through_a_mixed_reading():
     prepared = identifier.prepare(_raw_frame())
     true_model = replace(TRUE_MODEL, sensor_mass_fraction=0.3)
     inputs = identifier._inputs(true_model, prepared)
-    a, b = two_node_zone_state_space(true_model)
+    a, b = zone_state_space(true_model)
     a_d, b_d = discretize_zoh(a, b, DT_SECONDS)
     observation = zone_observation(true_model)
 
@@ -992,7 +989,7 @@ def test_filter_lets_an_unmodelled_floor_flow_disturb_the_mass():
     identifier = _identifier()
     prepared = identifier.prepare(_raw_frame())
     inputs = identifier._inputs(TRUE_MODEL, prepared)
-    a, b = two_node_zone_state_space(TRUE_MODEL)
+    a, b = zone_state_space(TRUE_MODEL)
     a_d, b_d = discretize_zoh(a, b, DT_SECONDS)
 
     # The house receives four fifths of the floor heat the meter reports.
@@ -1024,3 +1021,36 @@ def test_filter_lets_an_unmodelled_floor_flow_disturb_the_mass():
         return float(np.abs(estimates[50:, 1] - states[50:, 1]).mean())
 
     assert mass_error(identifier.DISTURBANCE_INPUTS) < mass_error((1,))
+
+
+def test_facade_irradiance_follows_from_the_horizontal_components():
+    """The beam's normal intensity comes from its horizontal share by
+    geometry, so the facade sees the sun from those two components alone."""
+
+    noon = pd.Series([pd.Timestamp("2026-08-11T11:30Z")])
+    zenith = solarposition.get_solarposition(
+        pd.DatetimeIndex(noon), latitude=52.39, longitude=5.79
+    )["apparent_zenith"].to_numpy()
+    expected = irradiance.get_total_irradiance(
+        surface_tilt=90.0,
+        surface_azimuth=180.0,
+        solar_zenith=zenith,
+        solar_azimuth=solarposition.get_solarposition(
+            pd.DatetimeIndex(noon), latitude=52.39, longitude=5.79
+        )["azimuth"].to_numpy(),
+        dni=500.0 / np.cos(np.radians(zenith)),
+        ghi=np.array([700.0]),
+        dhi=np.array([200.0]),
+        model="isotropic",
+    )["poa_global"]
+
+    facade = facade_irradiance_w_per_m2(
+        noon,
+        direct_horizontal=np.array([500.0]),
+        diffuse_horizontal=np.array([200.0]),
+        latitude=52.39,
+        longitude=5.79,
+    )
+
+    assert facade[0] > 300.0
+    assert facade[0] == pytest.approx(float(np.asarray(expected)[0]), rel=1e-6)

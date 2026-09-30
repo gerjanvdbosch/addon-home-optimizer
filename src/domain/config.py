@@ -253,6 +253,12 @@ class BuildingConfig(BaseModel):
     # a bare pipe is at the supply temperature and condenses within minutes,
     # so without that the supply itself must stay above the dew point.
     insulated_pipes: bool = Field(default=False)
+    # Whether the plan drives the floor in each mode: it then publishes when
+    # the floor runs and, cooling, the supply setpoint for Home Assistant to
+    # hand the heat pump (see Optimization.publish_zone). Off, the zone is
+    # planned but the heat pump runs the floor by itself.
+    control_heating: bool = Field(default=False)
+    control_cooling: bool = Field(default=False)
 
 
 class SolcastAttributes(BaseModel):

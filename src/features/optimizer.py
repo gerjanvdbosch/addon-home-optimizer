@@ -1117,7 +1117,11 @@ class MPCOptimizer:
             # Cooling moves heat the other way, so its magnitude is what draws.
             if hasattr(model, "q_space_w"):
                 moved_w = model.space_sign * model.q_space_w[k]
-                electrical_w = electrical_w + moved_w / model.space_cop[k]
+                electrical_w = electrical_w + (
+                    model.space_power_w[k]
+                    if hasattr(model, "space_power_w")
+                    else moved_w / model.space_cop[k]
+                )
                 running = running + moved_w / self._heat_w
 
             model.active_power_constraint.add(model.draw_w[k] >= electrical_w)
@@ -1187,7 +1191,9 @@ class MPCOptimizer:
         own limit: beyond it the booster, not this estimate, takes over."""
 
         sensors_c = self.thermal_model.mixed_temperature(
-            data.current_temp_top, data.current_temp_bottom
+            data.current_temp_top,
+            data.current_temp_bottom,
+            data.current_stratification_k,
         )
 
         if (
@@ -1199,7 +1205,9 @@ class MPCOptimizer:
             return sensors_c
 
         start_c = self.thermal_model.mixed_temperature(
-            data.run_start_temp_top, data.run_start_temp_bottom
+            data.run_start_temp_top,
+            data.run_start_temp_bottom,
+            data.run_start_stratification_k,
         )
         outdoor_c = (
             data.outdoor_temperature_forecast[0]
@@ -1726,6 +1734,26 @@ class MPCOptimizer:
         # sink's range, which the unheated and flat-out rollouts bound.
         model.space_sink_on = pyo.Var(model.K)
         conductance = operating.conductance_w_per_k
+        # The cooling EER model, where runs have shown one: without it the
+        # flat per-step COP above prices the zone.
+        efficiency = (
+            self.space_cop_model
+            if cooling
+            and self.space_cop_model is not None
+            and self.space_cop_model.cooling
+            else None
+        )
+
+        if efficiency is not None:
+            model.space_power_w = pyo.Var(model.K, domain=pyo.NonNegativeReals)
+
+        def cooling_draw_w(cooling_w: float, outdoor: float, sink_c: float) -> float:
+            """The electricity (W) for this cooling from a mass at sink_c."""
+
+            supply_c = sink_c - cooling_w / conductance
+
+            return cooling_w / float(efficiency.clamped_cop(outdoor, supply_c))
+
         supply_minimum_c = (
             self._aggregate(data.zone_supply_minimum_c, plan, max)
             if data.zone_supply_minimum_c
@@ -1760,6 +1788,44 @@ class MPCOptimizer:
                 model.zone_constraints.add(
                     -model.q_space_w[k] >= operating.min_heat_w * on
                 )
+
+                # What that cooling draws: the heat over the EER at the supply
+                # it takes, T_sink - Q / G - so colder water for more cooling,
+                # a higher lift and a lower EER (real data: 5.3 at the least
+                # cooling, 5.0 at 4.5 kW, from a 21 degC floor on a 25 degC
+                # day). Convex in the cooling for a given mass, so the tangents
+                # at a few points bound it from below and the plan, paying
+                # for it, sits on the curve. The mass it is cooled from enters
+                # to first order around the uncooled one, on the exact product
+                # T_sink * on (so nothing while off): across mass and cooling
+                # together the draw is not convex, and priced against the
+                # uncooled mass alone it read the supply too warm by the run's
+                # own cooling of the mass - some 3.5% per kelvin, 5.6% on a
+                # hot day's run - where planning twice, the second time against
+                # the mass the first planned, doubled the solve.
+                if efficiency is not None:
+                    reference_c = float(unheated[k][sink])
+
+                    for point_w in np.linspace(0.0, max_heat_w, 7):
+                        draw_w = cooling_draw_w(point_w, zone_outdoor_c[k], reference_c)
+                        per_w = (
+                            cooling_draw_w(
+                                point_w + 1.0, zone_outdoor_c[k], reference_c
+                            )
+                            - draw_w
+                        )
+                        per_k = (
+                            cooling_draw_w(
+                                point_w, zone_outdoor_c[k], reference_c + 0.1
+                            )
+                            - draw_w
+                        ) / 0.1
+                        model.zone_constraints.add(
+                            model.space_power_w[k]
+                            >= draw_w
+                            + per_w * (-model.q_space_w[k] - point_w)
+                            + per_k * (sink_on - reference_c * on)
+                        )
 
                 # A supply no colder than uninsulated pipes allow, so no more
                 # than the floor takes from water at that temperature. Together
@@ -2077,7 +2143,9 @@ class MPCOptimizer:
             # The electricity that heat costs, as the objective prices it:
             # the heat moved, either way, over the step's COP.
             space_electrical_w = tuple(
-                model.space_sign * space_heat_model[m] / model.space_cop[m]
+                float(pyo.value(model.space_power_w[m]))
+                if hasattr(model, "space_power_w")
+                else model.space_sign * space_heat_model[m] / model.space_cop[m]
                 for m in plan.fine_to_model
             )
 

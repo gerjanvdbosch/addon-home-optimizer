@@ -8,6 +8,7 @@ import pandas as pd
 
 from domain.config import Config
 from domain.dataset import DatasetDefinition
+from domain.physics import tank_stratification_k
 from domain.state import SeriesPoint, State
 from domain.time import local_day_start, to_local_time
 from features.dataset import DatasetBuilder, DatasetLoader
@@ -307,9 +308,14 @@ class StateManager:
 
         self.state_repository.save(state)
 
+    def update_supply_setpoint(self, point: SeriesPoint | None) -> None:
+        state = self.load()
+        state.schedule.building.supply_setpoint = point
+        self.state_repository.save(state)
+
     def update_zone(self, temperature: pd.Series, thermal_mass: pd.Series) -> None:
         """The zone as the optimization job estimates it (see
-        Optimization._plan_space_heating): its measured temperature, and the
+        Optimization._zone): its measured temperature, and the
         thermal mass no sensor measures."""
 
         state = self.load()
@@ -327,9 +333,9 @@ class StateManager:
         supply_c: Sequence[float] = (),
         power_w: Sequence[float] = (),
     ) -> None:
-        """The zone's shadow plan. Its heat and power go into the heat pump's
-        plan beside the tank's (see update_schedule, which rewrote those this
-        same run): one machine serves both."""
+        """The zone's part of the plan, not acted on yet. Its heat and power go
+        into the heat pump's plan beside the tank's (see update_schedule, which
+        rewrote those this same run): one plan, one machine serving both."""
 
         state = self.load()
         heat_pump = state.schedule.heat_pump
@@ -376,6 +382,10 @@ class StateManager:
         state.measurements.solar = self._parse_series(df, "pv_production")
         state.measurements.baseload = self._parse_series(df, "baseload")
         state.measurements.heat_pump.state = self._parse_series(df, "heat_pump_state")
+        state.measurements.heat_pump.return_temperature = self._parse_series(
+            df, "heat_pump_return_temperature"
+        )
+        state.measurements.heat_pump.flow = self._parse_series(df, "heat_pump_flow")
         state.measurements.heat_pump.power = self._parse_series(df, "heat_pump_power")
         state.measurements.heat_pump.compressor_frequency = self._parse_series(
             df, "heat_pump_compressor_frequency"
@@ -389,6 +399,25 @@ class StateManager:
         state.measurements.heat_pump.boiler.ambient_temperature = self._parse_series(
             df, "boiler_ambient_temperature"
         )
+
+        if config is not None and {
+            "heat_pump_state",
+            "boiler_top_temperature",
+            "boiler_bottom_temperature",
+        } <= set(df.columns):
+            # Mixed where a quarter hour began on DHW (heat_pump_state is each
+            # quarter's first): a run shorter than a quarter hour that begins
+            # and ends inside one is not seen, and its tank read as at rest.
+            df = df.assign(
+                boiler_stratification=tank_stratification_k(
+                    pd.to_numeric(df["boiler_top_temperature"], errors="coerce"),
+                    pd.to_numeric(df["boiler_bottom_temperature"], errors="coerce"),
+                    df["heat_pump_state"] == config.heat_pump.states.dhw,
+                )
+            )
+            state.measurements.heat_pump.boiler.stratification = self._parse_series(
+                df, "boiler_stratification"
+            )
         state.measurements.building.temperature = self._parse_series(
             df, "thermostat_temperature"
         )
@@ -526,6 +555,24 @@ class StateManager:
             .timeseries(
                 "heat_pump_power",
                 config.heat_pump.power,
+                interval="15m",
+                aggregation="mean",
+                fill=0,
+            )
+            # What the floor sends back and how fast, which a cooling run's
+            # supply setpoint follows (see Optimization.zone_setpoint_c). The
+            # return a state, so its last reading; flow rate-like, stopping
+            # when the pump does.
+            .timeseries(
+                "heat_pump_return_temperature",
+                config.heat_pump.return_temperature,
+                interval="15m",
+                aggregation="last",
+                fill="previous",
+            )
+            .timeseries(
+                "heat_pump_flow",
+                config.heat_pump.flow,
                 interval="15m",
                 aggregation="mean",
                 fill=0,

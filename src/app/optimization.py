@@ -40,6 +40,11 @@ class Optimization:
     DHW_STATUS_ENTITY = "binary_sensor.home_optimizer_dhw_status"
     DHW_START_ENTITY = "sensor.home_optimizer_dhw_start"
     DHW_SETPOINT_ENTITY = "sensor.home_optimizer_dhw_setpoint"
+    # The floor's, published the same way while the plan drives it (see
+    # publish_zone).
+    ZONE_STATUS_ENTITY = "binary_sensor.home_optimizer_zone_status"
+    ZONE_START_ENTITY = "sensor.home_optimizer_zone_start"
+    ZONE_SETPOINT_ENTITY = "sensor.home_optimizer_zone_setpoint"
 
     def __init__(
         self,
@@ -118,8 +123,9 @@ class Optimization:
 
         dhw_state = config.heat_pump.states.dhw
         now = datetime.now(timezone.utc)
+        heat_pump_changes = self._heat_pump_changes(config, now)
         boiler_on_current, run_start, idle_elapsed_hours = self.dhw_timing(
-            *self._heat_pump_changes(config, now), dhw_state, now
+            *heat_pump_changes, dhw_state, now
         )
         compressor_elapsed_hours = (
             (now - run_start).total_seconds() / 3600.0 if run_start else 0.0
@@ -133,6 +139,10 @@ class Optimization:
         if not 0.0 < first_step_hours < mpc_config.step_hours:
             first_step_hours = None
         run_start_temp_top = run_start_temp_bottom = None
+        run_start_stratification_k = None
+        stratification = {
+            p.time: p.value for p in state.measurements.heat_pump.boiler.stratification
+        }
 
         if run_start is not None:
             # The tank as the run found it: the last sensor reading of a
@@ -154,6 +164,7 @@ class Optimization:
             if before_top and before_bottom:
                 run_start_temp_top = before_top[-1].value
                 run_start_temp_bottom = before_bottom[-1].value
+                run_start_stratification_k = stratification.get(before_top[-1].time)
 
         # Aligned against solar's own forecast timestamps, not assumed to share
         # them: the tap forecaster is fit/predicted independently (see
@@ -195,6 +206,10 @@ class Optimization:
                 -1
             ].value,
             boiler_on_current=boiler_on_current,
+            current_stratification_k=stratification.get(
+                state.measurements.heat_pump.boiler.top_temperature[-1].time
+            ),
+            run_start_stratification_k=run_start_stratification_k,
             target_temperature_top=target_temps,
             tap_forecast_w=tap_forecast,
             outdoor_temperature_forecast=outdoor_temperature_forecast,
@@ -215,10 +230,38 @@ class Optimization:
             data, forecast_times, config.heat_pump.boiler, thermal_model, mpc_config
         )
 
-        optimizer = MPCOptimizer(
+        # One plan for the one heat pump: the tank and, where it can be
+        # planned, the zone, sharing the compressor. Only the hot water part is
+        # acted on (see publish_dhw); the zone is not ours to drive yet.
+        dhw_only = MPCOptimizer(
             thermal_model=thermal_model, config=mpc_config, cop_model=cop_model
         )
-        result = optimizer.solve(data)
+        optimizer, planned = dhw_only, data
+        zone = self._zone(
+            state, config, forecast_times, mpc_config, optimize_config.cooling
+        )
+
+        if zone is not None:
+            inputs, models = zone
+            optimizer = MPCOptimizer(
+                thermal_model=thermal_model,
+                config=mpc_config,
+                cop_model=cop_model,
+                **models,
+            )
+            planned = dataclasses.replace(data, **inputs)
+
+        try:
+            result = optimizer.solve(planned)
+        except RuntimeError as error:
+            if zone is None:
+                raise
+
+            # The zone is not acted on, so it must not take the hot water plan
+            # down with it: without it, that is the plan as it always was.
+            logger.warning("Plan with the zone failed, hot water alone: %s", error)
+            zone, optimizer, planned = None, dhw_only, data
+            result = optimizer.solve(planned)
 
         logger.info(
             "Optimization completed: schedule=%s objective=%.3f",
@@ -238,10 +281,38 @@ class Optimization:
         self.log_dhw_plan(result, forecast_times, mpc_config)
 
         if optimize_config.explain:
-            self.explain_dhw_plan(optimizer, data, result, forecast_times)
+            self.explain_dhw_plan(optimizer, planned, result, forecast_times)
 
-        self._plan_space_heating(
-            optimizer, data, state, config, forecast_times, optimize_config.cooling
+        if zone is not None:
+            # While cooling, the supply of the first planned run: the setpoint
+            # the plan would give the heat pump.
+            supply_c = next(
+                (c for c in result.space_supply_c if not math.isnan(c)), None
+            )
+            logger.info(
+                "Zone plan: %.1f kWh into the zone over the horizon, first run "
+                "at %s degC supply",
+                sum(result.space_heat_w) * mpc_config.step_hours / 1000.0,
+                "unknown" if supply_c is None else f"{supply_c:.1f}",
+            )
+
+        # Empty without a zone plan, so the dashboard shows none rather than
+        # an old one.
+        self.state_manager.update_building_schedule(
+            heat_w=result.space_heat_w,
+            temperatures=result.zone_temperatures,
+            times=forecast_times,
+            supply_c=result.space_supply_c,
+            power_w=result.space_electrical_w,
+        )
+        self.publish_zone(
+            result,
+            forecast_times,
+            state,
+            config,
+            planned if zone is not None else None,
+            heat_pump_changes[0],
+            now,
         )
 
     def _heat_pump_changes(
@@ -604,7 +675,9 @@ class Optimization:
             thermal_model.volume_l * RHO_WATER_KG_PER_L * CP_WATER_J_PER_KG_K
         )
         start_c = thermal_model.mixed_temperature(
-            data.current_temp_top, data.current_temp_bottom
+            data.current_temp_top,
+            data.current_temp_bottom,
+            data.current_stratification_k,
         )
         limit_c = thermal_model.heat_pump_max_tank_temperature_c or temperature
         seconds = (
@@ -642,30 +715,33 @@ class Optimization:
             key=lambda k: (covered[k] - covered[max(k - run_steps, 0)], k),
         )
 
-    def _plan_space_heating(
+    def _zone(
         self,
-        optimizer: MPCOptimizer,
-        data: MPCInput,
         state: State,
         config: Config,
         times: list[datetime],
+        mpc_config: MPCConfig,
         cooling: bool | None = None,
-    ) -> None:
-        """The building's side of a plan: the zone's state, and a second plan
-        with the zone as a second demand on the compressor.
+    ) -> tuple[dict, dict] | None:
+        """The zone as a second demand on the compressor: what the plan needs
+        of it (MPCInput fields) and the models it plans it with
+        (MPCOptimizer arguments), or None where it cannot be planned.
 
         The zone is estimated here, where it is planned, rather than on every
         state update: one load and one filter pass give both the state a plan
         starts from and the measured temperature and thermal mass the dashboard
         draws. Two-node, because only that structure has the thermal mass a
-        floor buffer is made of.
+        floor buffer is made of. Only planned with a comfort ceiling
+        configured.
 
-        The plan itself is a shadow: stored for the dashboard and never acted
-        on. Before a plan may drive the thermostats it has to be seen to make
-        sense against what they actually do, over a heating season. It is
-        solved apart from the hot water plan acted on above, so that plan stays
-        exactly what it was - sharing the compressor, the zone would otherwise
-        move it. Only planned with a comfort ceiling configured.
+        Acted on only where configured (BuildingConfig.control_heating and
+        control_cooling, see publish_zone). Elsewhere the heat pump runs the
+        floor by itself, so a floor run under way is not the plan's to hold:
+        it is left out (space_on_current), rather than keep the tank waiting on
+        a run the plan cannot stop. The Ecodan hands over to hot water when
+        asked; were it not to, hot water would wait for the floor exactly as it
+        did before the zone was planned at all. Where the plan drives the
+        floor, the run under way is its own and counts.
 
         Cooled rather than heated while the heat pump is set to cool (see
         HeatPumpConfig.mode), from the cooling runs' own models, and only with
@@ -678,7 +754,7 @@ class Optimization:
         identifier.load(self.models_path)
 
         if identifier.model is None:
-            return
+            return None
 
         now = datetime.now(timezone.utc)
         # From the previous local midnight, so the dashboard has yesterday
@@ -686,7 +762,7 @@ class Optimization:
         start = local_day_start(now, days=-1).astimezone(timezone.utc) - timedelta(
             hours=identifier.MASS_WARMUP_HOURS
         )
-        end = times[-1] + timedelta(hours=optimizer.config.step_hours)
+        end = times[-1] + timedelta(hours=mpc_config.step_hours)
         baseload = pd.Series(
             {point.time: point.value for point in state.predictions.baseload}
         )
@@ -701,7 +777,7 @@ class Optimization:
             # Normal right after a restart with no measurements yet, or before
             # the weather forecast reaches past now.
             logger.warning("No zone estimate: %s", error)
-            return
+            return None
 
         zone.index = pd.to_datetime(zone.index, utc=True)
         self.state_manager.update_zone(
@@ -711,36 +787,32 @@ class Optimization:
         maximum = config.building.maximum_temperature
 
         if maximum is None:
-            return
+            return None
 
         # The plan starts where the filter's estimate of the whole zone state
         # stands at its first step: the air node, and the mass.
         planned = zone.reindex(pd.DatetimeIndex(times))
 
         if planned[["air", "mass"]].iloc[0].isna().any():
-            logger.info(
-                "Shadow space-heating plan skipped: no zone estimate at %s", times[0]
-            )
-            return
+            logger.info("Zone not planned: no zone estimate at %s", times[0])
+            return None
 
-        heat_pump_state = state.measurements.heat_pump.state
         states = config.heat_pump.states
         mode = state.measurements.heat_pump.mode
         # The heat pump's own mode unless this run asks for one (see
         # OptimizeConfig.cooling).
         if cooling is None:
             cooling = bool(mode) and str(mode[-1].value).startswith(states.cooling)
-        dew_point_c = self._dew_point_forecast(state, times, optimizer.config)
+        dew_point_c = self._dew_point_forecast(state, times, mpc_config)
 
         if cooling and dew_point_c is None:
             logger.info(
-                "Shadow space-cooling plan skipped: no dew point to keep the "
-                "floor above (see building.dew_points)"
+                "Zone not planned: no dew point to keep the floor above while "
+                "cooling (see building.dew_points)"
             )
-            return
+            return None
 
-        zone_data = dataclasses.replace(
-            data,
+        inputs = dict(
             zone_temperature=float(planned["air"].iloc[0]),
             zone_mass_temperature=float(planned["mass"].iloc[0]),
             zone_target_temperature=tuple(
@@ -758,9 +830,6 @@ class Optimization:
             # "assume none" align_predictions makes for any missing forecast.
             zone_internal_gain_w=tuple(planned["internal_gain_w"].fillna(0.0)),
             zone_solar_gain_w=tuple(planned["solar_gain_w"].fillna(0.0)),
-            space_on_current=bool(heat_pump_state)
-            and heat_pump_state[-1].value
-            == (states.cooling if cooling else states.heating),
             zone_cooling=cooling,
             zone_mass_minimum_c=(
                 tuple(c + config.building.dew_point_margin for c in dew_point_c)
@@ -773,6 +842,12 @@ class Optimization:
                 else ()
             ),
         )
+
+        heat_pump_state = state.measurements.heat_pump.state
+        mode_state = states.cooling if cooling else states.heating
+
+        if self.controlled(config, cooling) and heat_pump_state:
+            inputs["space_on_current"] = heat_pump_state[-1].value == mode_state
 
         # How the heat pump runs the floor by itself in this mode - None until
         # its runs have shown it, and the plan may then choose the zone's heat
@@ -788,38 +863,10 @@ class Optimization:
         space_cop = HeatPumpCOPIdentifier(key=key)
         space_cop.load(path=self.models_path)
 
-        try:
-            result = MPCOptimizer(
-                thermal_model=optimizer.thermal_model,
-                config=optimizer.config,
-                cop_model=optimizer.cop_model,
-                building_model=identifier.model,
-                floor_circuit_model=floor_circuit.model,
-                space_cop_model=space_cop.model,
-            ).solve(zone_data)
-        except RuntimeError as error:
-            # Nothing acts on this plan, so a failure here must not take the
-            # hot water plan above down with it.
-            logger.warning("Shadow space-heating plan failed: %s", error)
-            return
-
-        # The supply of the first planned step: while cooling, the setpoint
-        # the plan would give the heat pump.
-        supply_c = next((c for c in result.space_supply_c if not math.isnan(c)), None)
-        logger.info(
-            "Shadow space-%s plan: %.1f kWh into the zone over the horizon, "
-            "first run at %s degC supply",
-            key,
-            sum(result.space_heat_w) * optimizer.config.step_hours / 1000.0,
-            "unknown" if supply_c is None else f"{supply_c:.1f}",
-        )
-
-        self.state_manager.update_building_schedule(
-            heat_w=result.space_heat_w,
-            temperatures=result.zone_temperatures,
-            times=times,
-            supply_c=result.space_supply_c,
-            power_w=result.space_electrical_w,
+        return inputs, dict(
+            building_model=identifier.model,
+            floor_circuit_model=floor_circuit.model,
+            space_cop_model=space_cop.model,
         )
 
     def _dew_point_forecast(
@@ -871,6 +918,174 @@ class Optimization:
         )
 
         return forecast_c
+
+    @staticmethod
+    def controlled(config: Config, cooling: bool) -> bool:
+        """Whether the plan drives the floor in this mode."""
+
+        building = config.building
+
+        return building.control_cooling if cooling else building.control_heating
+
+    @staticmethod
+    def running_since(changes: list[SeriesPoint], mode_state: str) -> datetime | None:
+        """When the heat pump entered the mode it is in now (from its state's
+        own changes), None when it is not in it."""
+
+        if not changes or changes[-1].value != mode_state:
+            return None
+
+        since = changes[-1].time
+
+        for point in reversed(changes):
+            if point.value != mode_state:
+                break
+            since = point.time
+
+        return since
+
+    @staticmethod
+    def zone_setpoint_c(
+        planned_c: float,
+        cooling_w: float,
+        return_c: float | None,
+        flow_lpm: float | None,
+        minimum_c: float | None,
+        previous_c: float | None,
+    ) -> float:
+        """The supply setpoint for a cooling run under way (deg C), to the heat
+        pump's half degree.
+
+        From the water the floor sends back, return - Q / (m_dot c_p): the
+        supply that takes the planned cooling from it, set on what the floor
+        does rather than on the plan's estimate of a mass no sensor measures
+        (0.5-1 K off, enough to put the heat pump under its least cooling or
+        the supply under the dew point). The plan's own supply without a
+        return to go on - a run's first quarter hour, while the loop still
+        holds the still water it stood with. Never above an earlier setpoint of
+        the same run: raised over the water in the loop, the heat pump turns
+        down past its least and stops. Never below the supply minimum (the dew
+        point uninsulated pipes carry), which comes first - a run whose dew
+        point rose past it is for the plan to stop.
+        """
+
+        setpoint_c = planned_c
+
+        if return_c is not None and flow_lpm:
+            water_w_per_k = flow_lpm / 60.0 * RHO_WATER_KG_PER_L * CP_WATER_J_PER_KG_K
+            setpoint_c = return_c - cooling_w / water_w_per_k
+
+        if previous_c is not None:
+            setpoint_c = min(setpoint_c, previous_c)
+
+        # The nearest half degree, as for the hot water setpoint - but never
+        # rounded under the minimum.
+        rounded_c = math.floor(round(2 * setpoint_c, 2) + 0.5) / 2
+
+        if minimum_c is not None:
+            rounded_c = max(rounded_c, math.ceil(round(2 * minimum_c, 2)) / 2)
+
+        return rounded_c
+
+    def publish_zone(
+        self,
+        result: MPCResult,
+        times: list[datetime],
+        state: State,
+        config: Config,
+        data: MPCInput | None,
+        heat_pump_state: list[SeriesPoint],
+        now: datetime,
+    ) -> None:
+        """Writes the plan's floor decision to Home Assistant, as publish_dhw
+        does the hot water's: on/off for the quarter hour running now, the
+        start of the run under way or the next one planned, and - cooling - the
+        supply setpoint while a run is under way (see zone_setpoint_c).
+
+        All three 'unknown' where the plan does not drive the floor in the mode
+        the heat pump is in (BuildingConfig.control_heating/control_cooling) or
+        cannot plan the zone at all: nothing then for an automation to act on.
+        The setpoint 'unknown' outside a run too, and always while heating,
+        where the heat pump takes its supply from its own curve.
+        """
+
+        status = start = setpoint = "unknown"
+        published = None
+
+        if (
+            data is not None
+            and result.space_schedule
+            and self.controlled(config, data.zone_cooling)
+        ):
+            schedule = result.space_schedule
+            running = schedule[0] == 1
+            states = config.heat_pump.states
+            since = self.running_since(
+                heat_pump_state,
+                states.cooling if data.zone_cooling else states.heating,
+            )
+            first = next((k for k, on in enumerate(schedule) if on), None)
+            status = "on" if running else "off"
+
+            if first is not None:
+                start = (
+                    since if running and since is not None else times[first]
+                ).isoformat()
+
+            if data.zone_cooling and running and result.space_supply_c:
+                measured = state.measurements.heat_pump
+                step = timedelta(hours=MPCConfig().step_hours)
+                settled = since is not None and now - since >= step
+                previous = state.schedule.building.supply_setpoint
+                published = self.zone_setpoint_c(
+                    planned_c=result.space_supply_c[0],
+                    cooling_w=-result.space_heat_w[0],
+                    return_c=(
+                        measured.return_temperature[-1].value
+                        if settled and measured.return_temperature
+                        else None
+                    ),
+                    flow_lpm=(
+                        measured.flow[-1].value if settled and measured.flow else None
+                    ),
+                    minimum_c=(
+                        data.zone_supply_minimum_c[0]
+                        if data.zone_supply_minimum_c
+                        else None
+                    ),
+                    previous_c=(
+                        previous.value
+                        if previous is not None
+                        and since is not None
+                        and previous.time >= since
+                        else None
+                    ),
+                )
+                setpoint = str(published)
+
+        self.state_manager.update_supply_setpoint(
+            SeriesPoint(time=now, value=published) if published is not None else None
+        )
+
+        self.home_assistant.set_state(
+            self.ZONE_STATUS_ENTITY,
+            status,
+            {"friendly_name": "Home Optimizer zone status"},
+        )
+        self.home_assistant.set_state(
+            self.ZONE_START_ENTITY,
+            start,
+            {"friendly_name": "Home Optimizer zone start", "device_class": "timestamp"},
+        )
+        self.home_assistant.set_state(
+            self.ZONE_SETPOINT_ENTITY,
+            setpoint,
+            {
+                "friendly_name": "Home Optimizer zone setpoint",
+                "device_class": "temperature",
+                "unit_of_measurement": "°C",
+            },
+        )
 
     def publish_dhw(
         self,

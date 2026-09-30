@@ -34,8 +34,8 @@ from domain.physics import (
     floor_heat_w,
     internal_gain_w,
     solar_gain_w,
-    two_node_zone_state_space,
     zone_observation,
+    zone_state_space,
 )
 from domain.sensors import Aggregation, FillMethod, SensorReference
 from features.dataset import DatasetBuilder
@@ -52,9 +52,8 @@ VERTICAL_FACADE_TILT_DEG = 90.0
 
 def facade_irradiance_w_per_m2(
     interval_midpoints: pd.Series,
-    direct_normal: np.ndarray,
+    direct_horizontal: np.ndarray,
     diffuse_horizontal: np.ndarray,
-    global_horizontal: np.ndarray,
     latitude: float,
     longitude: float,
 ) -> np.ndarray:
@@ -62,8 +61,17 @@ def facade_irradiance_w_per_m2(
 
     The Open-Meteo `global_tilted_irradiance` attribute already in the config is
     computed for the PV array's own tilt and azimuth, so it does not describe
-    this facade; the transposition is redone here from the three components
-    Open-Meteo reports independently of any surface (DNI, DHI, GHI).
+    this facade; the transposition is redone here from the horizontal direct
+    and diffuse components Open-Meteo reports independently of any surface.
+
+    The beam's normal intensity follows from its horizontal share by geometry,
+    DNI = B_horizontal / cos(zenith) (pvlib's irradiance.dni, which zeroes it
+    with the sun near the horizon): the same as Open-Meteo's own DNI to within
+    a watt per square metre on this installation (2106 daytime quarter hours,
+    ratio 0.999). Derived rather than read, because that attribute was first
+    stored three days after the others, and those days' missing DNI read as no
+    sun at all on the facade - three hot days the fit and the zone's rollouts
+    then saw without sun.
 
     The irradiance values are means over a step, so the transposition uses the
     sun's position at that step's MIDPOINT rather than its start - over 15
@@ -81,12 +89,17 @@ def facade_irradiance_w_per_m2(
         pd.DatetimeIndex(interval_midpoints), latitude=latitude, longitude=longitude
     )
 
+    zenith = position["apparent_zenith"].to_numpy()
+    # Global horizontal irradiance is the direct and diffuse sum by definition.
+    global_horizontal = np.nan_to_num(direct_horizontal) + np.nan_to_num(
+        diffuse_horizontal
+    )
     total = irradiance.get_total_irradiance(
         surface_tilt=VERTICAL_FACADE_TILT_DEG,
         surface_azimuth=SOUTH_FACADE_AZIMUTH_DEG,
-        solar_zenith=position["apparent_zenith"].to_numpy(),
+        solar_zenith=zenith,
         solar_azimuth=position["azimuth"].to_numpy(),
-        dni=direct_normal,
+        dni=irradiance.dni(global_horizontal, diffuse_horizontal, zenith),
         ghi=global_horizontal,
         dhi=diffuse_horizontal,
         model="isotropic",
@@ -281,6 +294,14 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # not dominant part of the house, so the fit starts mid-range.
     INITIAL_INTERNAL_GAIN_FRACTION = 0.5
 
+    # Share of the measured floor heat reaching the zone (see
+    # BuildingThermalModel.floor_heat_fraction). At most all of it; at least a
+    # tenth, since the rooms with a thermostat are the bulk of the dwelling's
+    # floor - below that the zone would not be the house it is meant to model.
+    # Started below 1, since pipe runs and ground always take some.
+    MIN_FLOOR_HEAT_FRACTION = 0.1
+    INITIAL_FLOOR_HEAT_FRACTION = 0.8
+
     def __init__(self, latitude: float, longitude: float) -> None:
         super().__init__()
         self.latitude = latitude
@@ -381,13 +402,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         "a_eff_m2",
         "sensor_mass_fraction",
         "internal_gain_fraction",
+        "floor_heat_fraction",
     )
-
-    @staticmethod
-    def _state_space(model) -> tuple[np.ndarray, np.ndarray]:
-        """The structure this identifier fits."""
-
-        return two_node_zone_state_space(model)
 
     @staticmethod
     def _parameters(model: BuildingThermalModel) -> np.ndarray:
@@ -400,6 +416,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 model.a_eff_m2,
                 model.sensor_mass_fraction,
                 model.internal_gain_fraction,
+                model.floor_heat_fraction,
             ]
         )
 
@@ -412,6 +429,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             a_eff_m2=float(x[4]),
             sensor_mass_fraction=float(x[5]),
             internal_gain_fraction=float(x[6]),
+            floor_heat_fraction=float(x[7]),
         )
 
     def _shutter_open_fraction(self, df: pd.DataFrame) -> pd.Series:
@@ -508,7 +526,6 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             "baseload_w",
             "direct_radiation",
             "diffuse_radiation",
-            "direct_normal_irradiance",
         ]
         missing_columns = [
             column for column in required_columns if column not in df.columns
@@ -555,7 +572,6 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             "baseload_w",
             "direct_radiation",
             "diffuse_radiation",
-            "direct_normal_irradiance",
         ]
 
         for column in numeric_columns:
@@ -599,14 +615,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         df["I_facade_w_per_m2"] = facade_irradiance_w_per_m2(
             df["time"] + pd.to_timedelta(forward_dt / 2.0, unit="s"),
-            direct_normal=df["direct_normal_irradiance"].to_numpy(dtype=float),
+            direct_horizontal=df["direct_radiation"].to_numpy(dtype=float),
             diffuse_horizontal=df["diffuse_radiation"].to_numpy(dtype=float),
-            # Open-Meteo reports the direct component on the horizontal plane
-            # separately from the diffuse one, and GHI is their sum by
-            # definition of global horizontal irradiance.
-            global_horizontal=(
-                df["direct_radiation"].fillna(0.0) + df["diffuse_radiation"].fillna(0.0)
-            ).to_numpy(dtype=float),
             latitude=self.latitude,
             longitude=self.longitude,
         )
@@ -724,7 +734,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         model = self._model_from_parameters(x)
         inputs = self._inputs(model, df)
-        a, b = self._state_space(model)
+        a, b = zone_state_space(model)
 
         measured = df["T_air"].to_numpy(dtype=float)
         dt_seconds = df["dt_seconds"].to_numpy(dtype=float)
@@ -838,6 +848,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 0.0,
                 0.0,
                 0.0,
+                self.MIN_FLOOR_HEAT_FRACTION,
             ]
         )
 
@@ -849,6 +860,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.MAX_C_MASS_J_PER_K,
                 max_aperture,
                 self.MAX_SENSOR_MASS_FRACTION,
+                1.0,
                 1.0,
             ]
         )
@@ -862,6 +874,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.INITIAL_APERTURE_FRACTION * max_aperture,
                 self.INITIAL_SENSOR_MASS_FRACTION,
                 self.INITIAL_INTERNAL_GAIN_FRACTION,
+                self.INITIAL_FLOOR_HEAT_FRACTION,
             ]
         )
 
@@ -1185,7 +1198,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # peak in the afternoon - on this installation they correlate about
         # +0.4 - so a trend fitted over all windows measures the NET of two
         # errors and can read clean while both are large. Measured directly:
-        # over all windows the single-node model slopes +0.0009 K/K, but after
+        # over all windows the single-node model this replaced slopes +0.0009
+        # K/K, but after
         # dark it slopes -0.0218, its oversized solar term having cancelled its
         # own envelope error. After dark the envelope stands alone.
         dark = (
@@ -1359,7 +1373,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         model = self.get_model()
         prepared = self.prepare(df)
 
-        a, b = self._state_space(model)
+        a, b = zone_state_space(model)
 
         estimates = kalman_states(
             a,
@@ -1458,7 +1472,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 np.isnan(aligned), prepared["baseload_w"], aligned
             )
 
-        a, b = self._state_space(model)
+        a, b = zone_state_space(model)
         inputs = self._inputs(model, prepared)
         dt_seconds = prepared["dt_seconds"].to_numpy(dtype=float)
 
@@ -1552,7 +1566,6 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             attributes=[
                 "direct_radiation",
                 "diffuse_radiation",
-                "direct_normal_irradiance",
                 "temperature",
                 # Instantaneous like temperature, so not shifted either. Read
                 # by validate()'s wind diagnostic only - the model has no
@@ -1565,7 +1578,6 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             target_shift=[
                 "direct_radiation",
                 "diffuse_radiation",
-                "direct_normal_irradiance",
             ],
         )
 

@@ -388,3 +388,40 @@ def test_the_heat_pump_changes_are_read_per_series():
     assert frequency == _changes(("13:18:00", 38.0))
     optimization.loader = SimpleNamespace(load=lambda *_: frame[["time", "state"]])
     assert optimization._heat_pump_changes(config, DAY)[1] == []
+
+
+def test_a_settled_cooling_run_is_set_the_planned_heat_below_its_return():
+    """4 kW taken from 20 L/min (1393 W/K) is 2.9 K under an 18.4 degC
+    return: 15.5 degC, to the half degree."""
+
+    assert Optimization.zone_setpoint_c(16.8, 4000.0, 18.4, 20.0, None, None) == 15.5
+
+
+def test_a_cooling_setpoint_without_a_return_is_the_planned_supply():
+    assert Optimization.zone_setpoint_c(16.8, 4000.0, None, None, None, None) == 17.0
+    assert Optimization.zone_setpoint_c(16.8, 4000.0, 18.4, 0.0, None, None) == 17.0
+
+
+def test_a_cooling_setpoint_never_rises_within_its_run():
+    assert Optimization.zone_setpoint_c(16.8, 4000.0, 19.4, 20.0, None, 15.5) == 15.5
+
+
+def test_a_cooling_setpoint_never_goes_under_its_minimum():
+    """Rounded up to the half degree at or above a 15.2 degC dew point, even
+    past an earlier setpoint of the run."""
+
+    assert Optimization.zone_setpoint_c(16.8, 4000.0, 18.4, 20.0, 15.2, 15.0) == 15.5
+
+
+def test_a_run_is_under_way_since_its_change_into_the_mode():
+    changes = [
+        SeriesPoint(time=START, value="Uit"),
+        SeriesPoint(time=START + timedelta(minutes=7), value="Koelen"),
+        SeriesPoint(time=START + timedelta(minutes=40), value="Koelen"),
+    ]
+
+    assert Optimization.running_since(changes, "Koelen") == TIMES[0] + timedelta(
+        minutes=7
+    )
+    assert Optimization.running_since(changes, "Verwarmen") is None
+    assert Optimization.running_since(changes[:1], "Koelen") is None

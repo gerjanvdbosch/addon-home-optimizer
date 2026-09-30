@@ -145,6 +145,8 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
     # out from 15 minutes on, it settles at 12-14 K whether the cut is at 15,
     # 20 or 25 minutes.
     STARTUP = pd.Timedelta(minutes=15)
+    # See calibrate(): the most efficient readings a cooling fit is held to.
+    MAX_COP_QUANTILE = 0.95
 
     def __init__(
         self,
@@ -557,6 +559,16 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             delta_t_evap=delta_t_evap,
             cooling=self.cooling,
         )
+
+        # Cooling is planned down to a lift of a kelvin or two - water just
+        # below a warm floor on a mild evening - far below what its runs cover
+        # (real data: 5-30 K), and the Carnot form rises steeply there. Held
+        # to the best the runs showed; a quantile, so one noisy reading does
+        # not set it. A fixed auxiliary draw would describe the flattening,
+        # but three days of runs could not separate it from eta_carnot
+        # (fitted per held-out day: 350-660 W, and an eta above 1).
+        if self.cooling:
+            self.model.max_cop = float(np.quantile(COP_measured, self.MAX_COP_QUANTILE))
 
         # The reference supply and the Q_th line are what DHW planning costs a
         # tank charge with, at 30-60 degC supply. Space heating is costed at

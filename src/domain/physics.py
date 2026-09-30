@@ -66,6 +66,35 @@ def tank_state_space(
     return a, b
 
 
+def tank_stratification_k(top_c, bottom_c, mixing) -> np.ndarray:
+    """The stratification the cold layer below the tank's sensors is read from
+    (K, see BoilerThermalModel.mixed_temperature): the top sensor less the
+    bottom one, held at its largest since the tank was last mixed. Arrays in
+    time order; mixing where the tank heats.
+
+    Tapping fills that layer from the bottom and only mixing empties it, so at
+    rest it does not shrink - whereas the sensors' difference does, whenever
+    the top steps down a sensor step (TANK_SENSOR_RESOLUTION_K) on standing
+    loss. Read from the difference itself, a tank at rest warmed 1.2 K the
+    moment its top stepped from 46.5 to 46.0 degC over a 45.5 degC bottom, and
+    cooled 1.7 K again on the bottom's next step (real data, 30 September
+    2026). While the tank heats, the difference as it is: what a run leaves is
+    where the layer starts from after it. Before the first mixing the readings
+    show, held from the first reading: the layer before them is not known.
+    Missing readings hold what was held.
+    """
+
+    spread = np.asarray(top_c, dtype=float) - np.asarray(bottom_c, dtype=float)
+    mixing = np.asarray(mixing, dtype=bool)
+    held = spread.copy()
+
+    for i in range(1, len(held)):
+        if not (mixing[i] or mixing[i - 1]):
+            held[i] = np.fmax(held[i - 1], spread[i])
+
+    return held
+
+
 # A start dead time was tried for this planning model and rejected: no heat into
 # the tank for a run's first 15 minutes, since real runs show the supply water
 # 7-11 degC colder than the tank for ~10 minutes (the loop between heat pump and
@@ -109,15 +138,16 @@ def lumped_tank_state_space(
     return a, b
 
 
-def two_node_zone_state_space(
+def zone_state_space(
     model: BuildingThermalModel,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Continuous state-space for dx/dt = A x + B u.
+    """Continuous state-space of the zone for dx/dt = A x + B u - what the
+    Kalman filter, a rollout and the MPC all drive.
 
     x = [T_air, T_mass], u = [T_outdoor, Q_internal, Q_solar, Q_floor]:
 
         C_air  dT_air/dt  = UA_env (T_out - T_air) + UA_am (T_mass - T_air) + Q_int
-        C_mass dT_mass/dt = UA_am  (T_air - T_mass) + Q_sol + Q_floor
+        C_mass dT_mass/dt = UA_am  (T_air - T_mass) + Q_sol + f_floor Q_floor
 
     Q_solar and Q_floor drive the mass node, not the air node. The floor
     circuit physically runs inside the screed, and air is effectively
@@ -143,21 +173,11 @@ def two_node_zone_state_space(
     b = np.array(
         [
             [ua_env / c_air, 1.0 / c_air, 0.0, 0.0],
-            [0.0, 0.0, 1.0 / c_mass, 1.0 / c_mass],
+            [0.0, 0.0, 1.0 / c_mass, model.floor_heat_fraction / c_mass],
         ]
     )
 
     return a, b
-
-
-def zone_state_space(
-    model: BuildingThermalModel,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Continuous state-space of the zone, with the input vector u =
-    [T_outdoor, Q_internal, Q_solar, Q_floor] and the air temperature as its
-    first state - what the Kalman filter, a rollout and the MPC all drive."""
-
-    return two_node_zone_state_space(model)
 
 
 def zone_observation(

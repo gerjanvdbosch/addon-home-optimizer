@@ -65,6 +65,11 @@ class MPCInput:
     current_temp_top: float
     current_temp_bottom: float
     boiler_on_current: bool
+    # The stratification the cold layer is read from now and just before the
+    # DHW run under way began (K, see physics.tank_stratification_k); None
+    # reads it from the sensors' difference then.
+    current_stratification_k: float | None = None
+    run_start_stratification_k: float | None = None
     target_temperature_top: tuple[float, ...] = ()
     # Forecasted expected additional heat-sink power (W) from tap draws (see
     # features/tap.py's TapForecaster), on top of the passive UA loss already in

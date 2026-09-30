@@ -75,24 +75,28 @@ class BoilerThermalModel:
     # fills the tank from the bottom, so two point sensors in the stratified
     # tank misstate its mean. Its share of the volume, its temperature (deg C,
     # an effective one: the cold water warms against the tank above it), and
-    # the stratification (top minus bottom sensor, beyond one sensor step, K)
-    # at which it is full.
+    # the stratification (top minus bottom sensor as tank_stratification_k holds
+    # it, beyond one sensor step, K) at which it is full.
     # None until runs have shown it; the sensors' average then stands for the
     # tank.
     cold_layer_fraction: float | None = None
     cold_water_temperature_c: float | None = None
     cold_layer_spread_k: float | None = None
 
-    def mixed_temperature(self, top_c, bottom_c):
+    def mixed_temperature(self, top_c, bottom_c, stratification_k=None):
         """The tank's mean temperature (deg C): what mixing it gives, and so
         what a plan starts from. The layer counts in proportion to the
-        stratification the sensors show, up to full at cold_layer_spread_k: a
-        tank mixed by a run has none until it is tapped again. Only beyond one
-        sensor step (TANK_SENSOR_RESOLUTION_K): the sensors of a tank at rest
-        flip a step apart, which read as stratification dropped the tank 1.4 K
-        on every flip (real data, 28 September 2026). Scalars or arrays."""
+        stratification, up to full at cold_layer_spread_k: held since the tank
+        was last mixed (see physics.tank_stratification_k), or without that
+        history the sensors' own difference now. Only beyond one sensor step
+        (TANK_SENSOR_RESOLUTION_K): the sensors of a tank at rest flip a step
+        apart, which read as stratification dropped the tank 1.4 K on every flip
+        (real data, 28 September 2026). Scalars or arrays."""
 
         average = (top_c + bottom_c) / 2.0
+
+        if stratification_k is None:
+            stratification_k = top_c - bottom_c
 
         if (
             self.cold_layer_fraction is None
@@ -102,7 +106,7 @@ class BoilerThermalModel:
             return average
 
         share = np.clip(
-            (top_c - bottom_c - TANK_SENSOR_RESOLUTION_K) / self.cold_layer_spread_k,
+            (stratification_k - TANK_SENSOR_RESOLUTION_K) / self.cold_layer_spread_k,
             0.0,
             1.0,
         )
@@ -132,7 +136,7 @@ class BuildingThermalModel:
     x = [T_air, T_mass]:
 
         C_air  dT_air/dt  = UA_env (T_out - T_air) + UA_am (T_mass - T_air) + Q_int
-        C_mass dT_mass/dt = UA_am  (T_air - T_mass) + Q_sol + Q_floor
+        C_mass dT_mass/dt = UA_am  (T_air - T_mass) + Q_sol + f_floor Q_floor
 
     Q_floor and Q_sol enter the mass node rather than the air node because that
     is where the physics puts them: the floor circuit runs inside the screed,
@@ -171,6 +175,14 @@ class BuildingThermalModel:
     # heat inside this zone. The baseload sensor measures the whole house; the
     # modelled zone is only part of it.
     internal_gain_fraction: float
+    # Share of the measured floor-circuit heat that reaches this zone. The
+    # calorimeter sits at the heat pump and measures every loop, while the
+    # zone is the rooms with a thermostat: loops under the hall, kitchen,
+    # bathroom and stairs, the pipe run from the shed and the ground below the
+    # ground-floor slab take the rest. Taken as 1 before it was identified,
+    # the model cooled the zone by 0.2-0.7 K over real cooling runs that left it
+    # where it was.
+    floor_heat_fraction: float = 1.0
 
 
 # Exact by definition of the Kelvin scale (0 degC = 273.15 K) - used
@@ -244,6 +256,12 @@ class HeatPumpCOPModel:
     # Whether this describes cooling: the useful output is then the heat
     # taken from the chilled water, so cop() is the cooling EER.
     cooling: bool = False
+    # The most efficient the heat pump was seen to be (see clamped_cop):
+    # MAX_COP until a fit sets it. Beyond its measured lift the Carnot form
+    # keeps rising while the machine does not - fan, pump and electronics draw
+    # the same however small the lift - so a cooling plan at 1 K of lift was
+    # priced at an EER of 7.6 where the heat pump never showed more than 6.3.
+    max_cop: float = MAX_COP
     # The 95th percentile of this mode's own observed supply temperature
     # (see HeatPumpCOPIdentifier.calibrate()) - planning's stand-in for the
     # heat pump's actual supply temperature, which it has no forecast for
@@ -324,12 +342,12 @@ class HeatPumpCOPModel:
         return self.eta_carnot * T_cond_K / (T_cond_K - T_evap_K)
 
     def clamped_cop(self, T_outdoor, T_supply):
-        """cop() held inside the [MIN_COP, MAX_COP] sanity range, so an
-        outdoor/supply combination outside anything the model was fitted on
-        cannot turn into an absurd power estimate. Scalars or arrays.
+        """cop() held inside [MIN_COP, max_cop], so an outdoor/supply
+        combination outside anything the model was fitted on cannot turn into
+        an absurd power estimate. Scalars or arrays.
         """
 
-        return np.clip(self.cop(T_outdoor, T_supply), self.MIN_COP, self.MAX_COP)
+        return np.clip(self.cop(T_outdoor, T_supply), self.MIN_COP, self.max_cop)
 
     def planned_power_at_reference_points(self, T_outdoor):
         """Electrical power (W) at POWER_FIT_T_LOW_C and POWER_FIT_T_HIGH_C

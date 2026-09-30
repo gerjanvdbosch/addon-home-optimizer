@@ -118,11 +118,14 @@ def mixed_tank(
     a calibrated model."""
 
     bottom_by_time = {p.time: p.value for p in boiler.bottom_temperature}
+    stratification_by_time = {p.time: p.value for p in boiler.stratification}
 
     return [
         SeriesPoint(
             time=p.time,
-            value=model.mixed_temperature(p.value, bottom_by_time[p.time])
+            value=model.mixed_temperature(
+                p.value, bottom_by_time[p.time], stratification_by_time.get(p.time)
+            )
             if model is not None
             else (p.value + bottom_by_time[p.time]) / 2.0,
         )
@@ -310,9 +313,9 @@ def dashboard_chart(
         decimal=2,
     )
 
-    # Where the zone goes: under the shadow plan, drawn against what the
-    # thermostats actually do - and where it goes left alone whenever that
-    # plan heats nothing. Nothing acts on it yet.
+    # Where the zone goes under the plan, drawn against what the thermostats
+    # actually do - and where it goes left alone whenever the plan heats
+    # nothing. Its zone part is not acted on yet, hence "shadow".
     series(
         "Zone plan (shadow)",
         continued(
@@ -326,7 +329,7 @@ def dashboard_chart(
         decimal=2,
     )
 
-    # The supply the shadow plan runs the floor at - while cooling, the
+    # The supply the plan runs the floor at - while cooling, the
     # setpoint it would give the heat pump - only while a run holds it.
     series(
         "Supply plan (shadow)",
@@ -376,6 +379,7 @@ def dashboard_chart(
     boiler = BoilerMeasurement(
         top_temperature=read_at(measured.top_temperature, state.updated),
         bottom_temperature=read_at(measured.bottom_temperature, state.updated),
+        stratification=measured.stratification,
     )
     measured_average = mixed_tank(boiler, boiler_model)
 

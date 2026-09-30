@@ -1,10 +1,12 @@
 from dataclasses import replace
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from domain.models import BoilerThermalModel
 from domain.mpc import MPCConfig, MPCInput
+from domain.physics import tank_stratification_k
 from features.boiler import BoilerThermalIdentifier, booster_active
 from features.cop import HeatPumpCOPIdentifier
 from features.optimizer import MPCOptimizer
@@ -394,3 +396,18 @@ def test_a_tank_near_the_limit_still_starts_and_hands_over():
 
     assert any(result.schedule), "expected the tank to be heated at all"
     assert result.temperatures[20] >= 60.0 - 1e-6
+
+
+def test_a_tank_at_rest_keeps_its_cold_layer_when_its_top_steps_down():
+    """30 September 2026 at rest: a tap drops the bottom a kelvin, the top
+    later steps down on standing loss. The layer stays, so the tank cools
+    rather than warming 1.2 K on the top's step; a run mixes it away."""
+
+    top = [46.5, 46.5, 46.0, 46.0, 47.0, 47.0]
+    bottom = [46.5, 45.5, 45.5, 45.0, 46.5, 46.5]
+    mixing = [False, False, False, False, True, False]
+    held = tank_stratification_k(top, bottom, mixing)
+    mixed = MIXING_MODEL.mixed_temperature(np.array(top), np.array(bottom), held)
+
+    assert list(held) == [0.0, 1.0, 1.0, 1.0, 0.5, 0.5]
+    assert np.all(np.diff(mixed[:4]) <= 0.0)

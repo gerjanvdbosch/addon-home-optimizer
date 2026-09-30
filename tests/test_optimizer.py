@@ -1713,8 +1713,13 @@ def test_a_run_started_mid_quarter_ramps_up_in_what_is_left_of_it():
     assert result.heat_w[1] == pytest.approx(6000.0, rel=0.02)
 
 
+HOT_DAY_STEPS = 48
+
+
 def _hot_day(**overrides):
-    steps = 96
+    """Twelve hours at 30 degC outdoors, a zone above its ceiling."""
+
+    steps = HOT_DAY_STEPS
     defaults = dict(
         solar_forecast_w=[0.0] * steps,
         target_temperature_top=(10.0,) * steps,
@@ -1755,7 +1760,7 @@ def test_cooling_keeps_the_floor_above_the_dew_point():
     """A warm zone is cooled, never by less than the compressor's least, and
     the floor's mass - supply less Q / G - stays above the dew point bound."""
 
-    result = _cool(_hot_day(zone_mass_minimum_c=(21.0,) * 96))
+    result = _cool(_hot_day(zone_mass_minimum_c=(21.0,) * HOT_DAY_STEPS))
     heat = np.asarray(result.space_heat_w)
     on = np.asarray(result.space_schedule, dtype=bool)
 
@@ -1766,6 +1771,12 @@ def test_cooling_keeps_the_floor_above_the_dew_point():
     power = np.asarray(result.space_electrical_w)
     assert (power[on] > 0.0).all()
     assert (power[on] < -heat[on]).all()
+    # The heat over the EER at the supply it runs at - colder water for more
+    # cooling costing more per kWh of it.
+    eer = replace(COP_MODEL, cooling=True).clamped_cop(
+        30.0, np.asarray(result.space_supply_c)[on]
+    )
+    assert power[on] == pytest.approx(-heat[on] / eer, rel=0.01)
     assert power[~on] == pytest.approx(0.0, abs=1e-6)
 
     supply = np.asarray(result.space_supply_c)[on]
@@ -1777,7 +1788,8 @@ def test_the_floor_follows_a_dew_point_forecast_step_by_step():
     """A dew point forecast to rise halfway holds the mass above each step's
     own bound: low early, high late."""
 
-    bound = (20.0,) * 48 + (23.5,) * 48
+    half = HOT_DAY_STEPS // 2
+    bound = (20.0,) * half + (23.5,) * half
     result = _cool(_hot_day(zone_mass_minimum_c=bound))
     heat = np.asarray(result.space_heat_w)
     on = np.asarray(result.space_schedule, dtype=bool)
@@ -1796,7 +1808,10 @@ def test_the_supply_never_rises_within_a_cooling_run():
     plan)."""
 
     result = _cool(
-        _hot_day(zone_mass_minimum_c=(15.0,) * 96, zone_supply_minimum_c=(19.0,) * 96)
+        _hot_day(
+            zone_mass_minimum_c=(15.0,) * HOT_DAY_STEPS,
+            zone_supply_minimum_c=(19.0,) * HOT_DAY_STEPS,
+        )
     )
     on = np.asarray(result.space_schedule, dtype=bool)
     supply = np.asarray(result.space_supply_c)
@@ -1814,7 +1829,10 @@ def test_uninsulated_pipes_rule_out_a_supply_below_the_dew_point():
     warms to ~24.4 degC - so no supply does both and the zone is not cooled."""
 
     result = _cool(
-        _hot_day(zone_mass_minimum_c=(19.0,) * 96, zone_supply_minimum_c=(21.0,) * 96)
+        _hot_day(
+            zone_mass_minimum_c=(19.0,) * HOT_DAY_STEPS,
+            zone_supply_minimum_c=(21.0,) * HOT_DAY_STEPS,
+        )
     )
 
     assert not any(result.space_schedule)

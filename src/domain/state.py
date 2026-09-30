@@ -23,6 +23,9 @@ class BoilerMeasurement(BaseModel):
     top_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
     bottom_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
     ambient_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
+    # Top less bottom, held since the tank was last mixed (K, see
+    # physics.tank_stratification_k): what the cold layer is read from.
+    stratification: list[SeriesPoint[float]] = Field(default_factory=list)
 
 
 class HeatPumpMeasurement(BaseModel):
@@ -30,6 +33,7 @@ class HeatPumpMeasurement(BaseModel):
     power: list[SeriesPoint[float]] = Field(default_factory=list)
     supply_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
     return_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
+    flow: list[SeriesPoint[float]] = Field(default_factory=list)
     compressor_frequency: list[SeriesPoint[float]] = Field(default_factory=list)
     # The operating mode it is set to (see HeatPumpConfig.mode).
     mode: list[SeriesPoint[str]] = Field(default_factory=list)
@@ -137,13 +141,16 @@ class HeatPumpSchedule(BaseModel):
 
 class BuildingSchedule(BaseModel):
     target_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
-    # The shadow plan: the zone as it would be planned, for comparison with
-    # what the thermostats do - never acted on (see Optimization). Its heat
-    # and power are the heat pump's (see HeatPumpSchedule).
+    # The zone's part of the plan, for comparison with what the thermostats
+    # do - not acted on yet (see Optimization._zone). Its heat and power are
+    # the heat pump's (see HeatPumpSchedule).
     temperatures: list[SeriesPoint[float]] = Field(default_factory=list)
     # The supply each planned step runs the floor at: while cooling, the
     # setpoint the plan would give the heat pump. Only steps it runs.
     supply: list[SeriesPoint[float]] = Field(default_factory=list)
+    # The supply setpoint last published during a cooling run, which a later
+    # one in the same run may not exceed (see Optimization.zone_setpoint_c).
+    supply_setpoint: SeriesPoint[float] | None = None
 
 
 class Schedule(BaseModel):

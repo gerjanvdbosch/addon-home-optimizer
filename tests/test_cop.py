@@ -559,6 +559,9 @@ def test_cooling_fit_reads_the_heat_taken_from_the_water(tmp_path):
     assert model.eta_carnot == pytest.approx(TRUE_ETA_CARNOT, rel=1e-6)
     # EER falls as the lift from chilled water to outdoor air grows.
     assert model.cop(20.0, 14.0) > model.cop(34.0, 14.0)
+    # Held to the best EER its runs showed: no more at a lift they never had.
+    assert model.max_cop < model.cop(14.0, 14.0)
+    assert model.clamped_cop(14.0, 14.0) == pytest.approx(model.max_cop)
     assert identifier.validate(df)["rmse"] == pytest.approx(0.0, abs=1e-6)
 
 
