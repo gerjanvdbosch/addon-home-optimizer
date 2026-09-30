@@ -124,6 +124,14 @@ class Optimization:
         compressor_elapsed_hours = (
             (now - run_start).total_seconds() / 3600.0 if run_start else 0.0
         )
+        # The plan starts now, partway into the quarter its first step belongs
+        # to (see MPCInput.first_step_hours).
+        first_step_hours = (
+            forecast_times[0] + timedelta(hours=mpc_config.step_hours) - now
+        ).total_seconds() / 3600.0
+
+        if not 0.0 < first_step_hours < mpc_config.step_hours:
+            first_step_hours = None
         run_start_temp_top = run_start_temp_bottom = None
 
         if run_start is not None:
@@ -195,6 +203,7 @@ class Optimization:
             compressor_elapsed_hours=compressor_elapsed_hours,
             run_start_temp_top=run_start_temp_top,
             run_start_temp_bottom=run_start_temp_bottom,
+            first_step_hours=first_step_hours,
             idle_elapsed_hours=idle_elapsed_hours,
             baseload_forecast_w=tuple(
                 self.state_manager.baseload_forecast(

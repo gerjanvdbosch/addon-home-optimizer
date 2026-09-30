@@ -148,6 +148,15 @@ class MPCInput:
     # (see MPCOptimizer._initial_temperature).
     run_start_temp_top: float | None = None
     run_start_temp_bottom: float | None = None
+    # What is left of the running quarter (hours): the plan starts from the
+    # state now, so its first step runs from now to that quarter's end and
+    # every step after it is a whole quarter again. None is a whole step. A
+    # whole first step started at the quarter's beginning counted its elapsed
+    # part twice - heat already in the tank now, and a whole quarter more
+    # (real data, 30 Sep: a plan made 13 minutes into a quarter put the tank
+    # 6 K above what the quarter's end measured, and ended its run 8 minutes
+    # early) - and let a run it starts now heat the whole quarter.
+    first_step_hours: float | None = None
     # How long ago the last run ended (hours), 0 while heating - no new run
     # starts until MPCConfig.heat_pump_min_off_steps have passed since then.
     idle_elapsed_hours: float = 0.0

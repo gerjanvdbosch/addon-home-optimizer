@@ -1655,6 +1655,64 @@ def test_a_run_under_way_starts_from_the_heat_it_has_put_in():
     ) == pytest.approx(55.0)
 
 
+def _hot_water_soon(due: int = 4, **overrides) -> MPCInput:
+    """A cold tank wanted hot at step `due`, too soon to wait."""
+
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[due] = 45.0
+
+    return _make_input(
+        current_temp_top=30.0,
+        current_temp_bottom=30.0,
+        target_temperature_top=tuple(target),
+        idle_elapsed_hours=5.0,
+        **overrides,
+    )
+
+
+def test_a_plan_made_mid_quarter_heats_only_what_is_left_of_it():
+    """Ten minutes into a quarter the tank already holds that quarter's heat
+    so far; the plan's first step is the five minutes left, so the tank at the
+    quarter's end is the tank now plus five minutes of heat - not a quarter's."""
+
+    optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig())
+    data = _hot_water_soon(
+        boiler_on_current=True,
+        compressor_elapsed_hours=1.0,
+        first_step_hours=5.0 / 60.0,
+    )
+    result = optimizer.solve(data)
+
+    a_d, b_d = discretize_zoh(
+        *lumped_tank_state_space(
+            THERMAL_MODEL.volume_l,
+            THERMAL_MODEL.ua_top_w_per_k + THERMAL_MODEL.ua_bottom_w_per_k,
+        ),
+        300.0,
+    )
+    expected_c = (
+        a_d[0, 0] * 30.0 + b_d[0, 0] * 20.0 + b_d[0, 1] * THERMAL_MODEL.q_in_nominal_w
+    )
+
+    assert result.schedule[0] == 1
+    assert result.temperatures[0] == pytest.approx(30.0)
+    assert result.temperatures[1] == pytest.approx(expected_c, abs=0.01)
+
+
+def test_a_run_started_mid_quarter_ramps_up_in_what_is_left_of_it():
+    """Started ten minutes into a quarter, a run has five minutes of it left,
+    all of them on its 300 s ramp: half the steady heat over that part."""
+
+    ramped = replace(THERMAL_MODEL, q_in_steady_w=6000.0, q_in_ramp_seconds=300.0)
+    result = MPCOptimizer(ramped, MPCConfig()).solve(
+        _hot_water_soon(due=2, first_step_hours=5.0 / 60.0)
+    )
+
+    assert result.schedule[0] == 1
+    assert result.heat_w[0] == pytest.approx(3000.0, rel=0.02)
+    assert result.heat_w[1] == pytest.approx(6000.0, rel=0.02)
+
+
 def _hot_day(**overrides):
     steps = 96
     defaults = dict(
@@ -1728,6 +1786,26 @@ def test_the_floor_follows_a_dew_point_forecast_step_by_step():
 
     mass = np.asarray(result.space_supply_c) - heat / COOLING.conductance_w_per_k
     assert (mass[on] >= np.asarray(bound)[on] - 1e-6).all()
+
+
+def test_the_supply_never_rises_within_a_cooling_run():
+    """Raising the setpoint over the loop's water stops the compressor, so a
+    run cools at a falling or steady supply. Free to choose each step's heat,
+    the plan otherwise ran at the dew point bound, then at its least - the
+    supply stepping up (19.07 to 19.15 degC here, 15.2 to 16.2 in a real
+    plan)."""
+
+    result = _cool(
+        _hot_day(zone_mass_minimum_c=(15.0,) * 96, zone_supply_minimum_c=(19.0,) * 96)
+    )
+    on = np.asarray(result.space_schedule, dtype=bool)
+    supply = np.asarray(result.space_supply_c)
+
+    assert on.any(), "expected the zone to be cooled"
+
+    for k in range(len(on) - 1):
+        if on[k] and on[k + 1]:
+            assert supply[k + 1] <= supply[k] + 1e-6
 
 
 def test_uninsulated_pipes_rule_out_a_supply_below_the_dew_point():

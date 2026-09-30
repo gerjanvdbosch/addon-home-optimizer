@@ -66,7 +66,17 @@ class SystemIdentifier(Generic[SystemModel]):
             logger.warning(f"Model {self.name} not calibrated")
             return
 
-        self.model = load(target_file)
+        # A model saved by an older version names a class since renamed or
+        # moved: as good as none until recalibrated, rather than failing every
+        # job that loads it.
+        try:
+            self.model = load(target_file)
+        except (AttributeError, ModuleNotFoundError) as error:
+            logger.warning(
+                "Model %s is from an older version (%s) - recalibrate it",
+                self.name,
+                error,
+            )
 
     @staticmethod
     def _parameter_std_errors(fit_result) -> np.ndarray:

@@ -198,6 +198,14 @@ class MPCOptimizer:
         if data.compressor_elapsed_hours < 0:
             raise ValueError("compressor_elapsed_hours cannot be negative.")
 
+        if data.first_step_hours is not None and not (
+            0.0 < data.first_step_hours <= self.config.step_hours
+        ):
+            raise ValueError(
+                "first_step_hours must lie within one step, got "
+                f"{data.first_step_hours}."
+            )
+
         if data.baseload_forecast_w and len(data.baseload_forecast_w) != horizon:
             raise ValueError(
                 "baseload_forecast_w must be empty or have the same length as "
@@ -219,7 +227,9 @@ class MPCOptimizer:
         if self.config.coarse_step_hours <= 0:
             raise ValueError("coarse_step_hours must be greater than zero.")
 
-    def _build_step_plan(self, horizon: int) -> _StepPlan:
+    def _build_step_plan(
+        self, horizon: int, first_step_hours: float | None = None
+    ) -> _StepPlan:
         """See _StepPlan's docstring for why. fine_horizon_hours=0 disables
         coarsening entirely (every step stays at step_hours resolution) - a
         valid, simplest-possible configuration, not a special case requiring
@@ -246,6 +256,10 @@ class MPCOptimizer:
             dt_hours.append(block * step_hours)
             i += block
 
+        # The plan starts now, partway into the first quarter.
+        if first_step_hours is not None and dt_hours:
+            dt_hours[0] -= step_hours - first_step_hours
+
         return _StepPlan(fine_to_model=fine_to_model, dt_hours=dt_hours)
 
     def _aggregate(
@@ -263,8 +277,25 @@ class MPCOptimizer:
 
     def _build_model(self, data: MPCInput) -> pyo.ConcreteModel:
         horizon = len(data.solar_forecast_w)
-        plan = self._build_step_plan(horizon)
+        plan = self._build_step_plan(horizon, data.first_step_hours)
         num_steps = plan.num_steps
+        # When each step begins, in hours from now.
+        step_start_h = np.cumsum([0.0, *plan.dt_hours[:-1]])
+
+        def steps_within(hours: float, first: int = 0) -> range:
+            """The steps from `first` on that begin within `hours` of it: what
+            a duration covers counted in the plan's own steps, the first of
+            which may be the rest of a quarter."""
+
+            end = first
+
+            while (
+                end < num_steps
+                and step_start_h[end] - step_start_h[first] < hours - 1e-9
+            ):
+                end += 1
+
+            return range(first, end)
 
         def mean(values: list[float]) -> float:
             return sum(values) / len(values)
@@ -678,12 +709,7 @@ class MPCOptimizer:
         fine_steps = sum(1 for dt in plan.dt_hours if dt <= self.config.step_hours)
 
         for start in range(fine_steps):
-            for offset in range(min_runtime):
-                k = start + offset
-
-                if k >= num_steps:
-                    continue
-
+            for k in steps_within(min_runtime * self.config.step_hours, start):
                 # A compressor start buys compressor time, and space heating
                 # is compressor time: the heat pump serves the zone or the tank
                 # from the same machine. Leaving space_on out meant a plan that
@@ -711,10 +737,8 @@ class MPCOptimizer:
         # and anything acting on it, would flip for nothing. Skipped where the
         # model cannot represent that run: a tank above the heat pump's limit
         # with no booster to plan with.
-        remaining_steps = math.ceil(
-            (min_runtime * self.config.step_hours - data.compressor_elapsed_hours)
-            / self.config.step_hours
-            - 1e-9
+        remaining = steps_within(
+            min_runtime * self.config.step_hours - data.compressor_elapsed_hours
         )
         unrepresentable = (
             heat_pump_max_c is not None
@@ -724,7 +748,7 @@ class MPCOptimizer:
         model.running_run = pyo.ConstraintList()
 
         if data.boiler_on_current and not unrepresentable:
-            for k in range(min(max(remaining_steps, 0), num_steps)):
+            for k in remaining:
                 model.running_run.add(heating(model, k) >= 1)
 
         # The heat pump stays off for heat_pump_min_off_steps after a run ends,
@@ -747,13 +771,9 @@ class MPCOptimizer:
                 )
 
         if not data.boiler_on_current:
-            waiting_steps = math.ceil(
-                (min_off * self.config.step_hours - data.idle_elapsed_hours)
-                / self.config.step_hours
-                - 1e-9
-            )
-
-            for k in range(min(max(waiting_steps, 0), num_steps)):
+            for k in steps_within(
+                min_off * self.config.step_hours - data.idle_elapsed_hours
+            ):
                 model.minimum_off_time.add(heating(model, k) == 0)
 
         model.thermal_dynamics = pyo.ConstraintList()
@@ -1057,10 +1077,11 @@ class MPCOptimizer:
             # heating, exact for the horizon's first run and close for a later
             # one, so the objective stays linear.
             if start_power_w:
-                ramp = self._ramp_fraction(self.config.step_hours)
+                start_h = min(self.config.step_hours, plan.dt_hours[k])
+                ramp = self._ramp_fraction(start_h)
                 heat_pump_power_w += (
                     (start_power_w - ramp * (alpha + beta * t_floor[k]))
-                    * self.config.step_hours
+                    * start_h
                     / plan.dt_hours[k]
                     * model.tank_start[k]
                 )
@@ -1153,7 +1174,8 @@ class MPCOptimizer:
         return cop.q_in_at_zero_outdoor_w + cop.q_in_per_outdoor_w_per_k * outdoor_c
 
     def _initial_temperature(self, data: MPCInput) -> float:
-        """The tank the plan starts from (deg C): mixed from its sensors (see
+        """The tank the plan starts from now (deg C) - its first step runs from
+        now (see MPCInput.first_step_hours): mixed from its sensors (see
         BoilerThermalModel.mixed_temperature), or while a DHW run is under way
         the tank mixed just before it began plus the heat the run has put in
         since, less the standing loss - the same ramp and heat input the plan
@@ -1765,14 +1787,37 @@ class MPCOptimizer:
             if conductance * (supply - low) <= max_heat_w:
                 model.zone_constraints.add(model.q_space_w[k] >= floor_w)
 
+        # Within a cooling run the supply only falls. Raised above the water
+        # already in the loop, the setpoint asks for less cooling than the
+        # compressor gives at its lowest speed: it stops, and starts again later
+        # - a start the plan would not see. Colder is always possible, and a
+        # run whose dew point bound rises past it has to stop.
+        #
+        # Stated on supply * on = sink * on + Q / G, exact through the product
+        # above and 0 while off: a step that stops is then free, and one after
+        # a stop free up to the warmest supply there is. Stated on the supply
+        # itself, with a big-M on both steps, the solver ran into its time
+        # limit on a single day's plan.
+        if cooling:
+            warmest_supply_c = max(float(state[sink]) for state in warmest)
+
+            def supply_on(k: int):
+                return model.space_sink_on[k] + model.q_space_w[k] / conductance
+
+            for k in range(num_steps - 1):
+                model.zone_constraints.add(
+                    supply_on(k + 1)
+                    <= supply_on(k) + warmest_supply_c * (1 - model.space_on[k])
+                )
+
         # And for as long as it runs by itself at the least: a run begun is
         # held that long (the standard minimum-up form, a start within the last
         # min_runtime steps keeps it on). Only in the fine region, like the
         # compressor's own minimum runtime; a coarse block already spans it.
-        min_run_steps = math.ceil(
-            operating.min_runtime_hours / self.config.step_hours - 1e-9
-        )
         fine_steps = sum(1 for dt in plan.dt_hours if dt <= self.config.step_hours)
+        # When each step begins, in hours: the first may be the rest of a
+        # quarter (see MPCInput.first_step_hours).
+        step_start_h = np.cumsum([0.0, *plan.dt_hours[:-1]])
         model.space_start = pyo.Var(model.K, bounds=(0.0, 1.0))
 
         for k in range(num_steps):
@@ -1785,7 +1830,9 @@ class MPCOptimizer:
             model.zone_constraints.add(
                 sum(
                     model.space_start[j]
-                    for j in range(max(0, k - min_run_steps + 1), k + 1)
+                    for j in range(k + 1)
+                    if step_start_h[k] - step_start_h[j]
+                    < operating.min_runtime_hours - 1e-9
                 )
                 <= model.space_on[k]
             )
@@ -1858,7 +1905,23 @@ class MPCOptimizer:
             self.thermal_model.volume_l,
             self.thermal_model.ua_top_w_per_k + self.thermal_model.ua_bottom_w_per_k,
         )
-        a_d, b_d = discretize_zoh(a, b, self.config.step_hours * 3600.0)
+        tank_steps: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+
+        def slot_hours(i: int) -> float:
+            """How long fine slot i lasts: a quarter, or what is left of the
+            first one (see MPCInput.first_step_hours)."""
+
+            if i == 0 and data.first_step_hours is not None:
+                return data.first_step_hours
+
+            return self.config.step_hours
+
+        def tank_step(hours: float) -> tuple[np.ndarray, np.ndarray]:
+            if hours not in tank_steps:
+                tank_steps[hours] = discretize_zoh(a, b, hours * 3600.0)
+
+            return tank_steps[hours]
+
         tap_forecast_w = data.tap_forecast_w or (0.0,) * horizon
 
         initial_temperature = self._initial_temperature(data)
@@ -1904,6 +1967,8 @@ class MPCOptimizer:
                 start_slots.add(slots[0])
 
             for n, i in enumerate(slots):
+                hours_i = slot_hours(i)
+                a_d, b_d = tank_step(hours_i)
                 passive = (
                     a_d[0, 0] * temperatures[i]
                     + b_d[0, 0] * float(data.ambient_temperature)
@@ -1919,25 +1984,23 @@ class MPCOptimizer:
                     # energy the block's own step lost to it (see
                     # _ramp_fraction).
                     rate_w = self._heat_at(outdoor_at(i)) * (
-                        self._ramp_fraction(self.config.step_hours)
-                        if starts and n == 0
-                        else 1.0
+                        self._ramp_fraction(hours_i) if starts and n == 0 else 1.0
                     )
-                    hours = min(self.config.step_hours, heat_pump_wh / rate_w)
-                    heat_pump_w[i] = rate_w * hours / self.config.step_hours
+                    hours = min(hours_i, heat_pump_wh / rate_w)
+                    heat_pump_w[i] = rate_w * hours / hours_i
                     heat_pump_wh -= rate_w * hours
 
                     booster_w[i] = (
                         min(
-                            booster_heat_w * (self.config.step_hours - hours),
+                            booster_heat_w * (hours_i - hours),
                             booster_wh,
                             max(max_tank_c - passive - b_d[0, 1] * heat_pump_w[i], 0.0)
                             / b_d[0, 1]
-                            * self.config.step_hours,
+                            * hours_i,
                         )
-                        / self.config.step_hours
+                        / hours_i
                     )
-                    booster_wh -= booster_w[i] * self.config.step_hours
+                    booster_wh -= booster_w[i] * hours_i
 
                 if i + 1 < horizon:
                     temperatures.append(

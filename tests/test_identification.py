@@ -1,11 +1,15 @@
 import logging
+import sys
+import types
 from pathlib import Path
 
 import pandas as pd
 import pytest
+from joblib import dump
 
 from app.identification import Identification
 from domain.jobs import CalibrateConfig, ValidateConfig
+from features.dew_point import DewPointIdentifier
 
 
 class _Identifier:
@@ -169,3 +173,28 @@ def test_validate_by_name_fails_loudly(tmp_path):
         _identification([_Identifier("boiler"), broken], tmp_path).validate(
             ValidateConfig(target="space_heating", days=60)
         )
+
+
+class Retired:
+    """A model class as an older version saved it."""
+
+
+def test_a_model_saved_by_an_older_version_loads_as_none(tmp_path, caplog):
+    """Its class since renamed or moved, it cannot be unpickled: the model is
+    as good as uncalibrated - with a warning to recalibrate - rather than
+    failing every job that loads it."""
+
+    module = types.ModuleType("retired_models")
+    module.Retired = Retired
+    Retired.__module__ = "retired_models"
+    sys.modules["retired_models"] = module
+    dump(Retired(), tmp_path / "dew_point.joblib")
+    del sys.modules["retired_models"]
+
+    identifier = DewPointIdentifier()
+
+    with caplog.at_level(logging.WARNING):
+        identifier.load(tmp_path)
+
+    assert identifier.model is None
+    assert "recalibrate" in caplog.text
