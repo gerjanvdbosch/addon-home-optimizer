@@ -218,8 +218,8 @@ class MPCOptimizer:
         if self.config.boiler_electrical_power_w < 0:
             raise ValueError("boiler_electrical_power_w cannot be negative.")
 
-        if self.config.boiler_min_runtime_steps < 1:
-            raise ValueError("boiler_min_runtime_steps must be at least 1.")
+        if self.config.compressor_min_runtime_steps < 1:
+            raise ValueError("compressor_min_runtime_steps must be at least 1.")
 
         if self.config.fine_horizon_hours < 0:
             raise ValueError("fine_horizon_hours cannot be negative.")
@@ -705,7 +705,7 @@ class MPCOptimizer:
 
         model.minimum_runtime = pyo.ConstraintList()
 
-        min_runtime = self.config.boiler_min_runtime_steps
+        min_runtime = self.config.compressor_min_runtime_steps
         fine_steps = sum(1 for dt in plan.dt_hours if dt <= self.config.step_hours)
 
         for start in range(fine_steps):
@@ -1247,9 +1247,16 @@ class MPCOptimizer:
 
         # Timed from the run's own start where the COP model has it (see
         # HeatPumpCOPModel.start_ramp_seconds).
-        ramp_seconds = (
-            self.cop_model and self.cop_model.start_ramp_seconds
-        ) or self.thermal_model.q_in_ramp_seconds
+        return self._ramp_share(
+            dt_hours,
+            (self.cop_model and self.cop_model.start_ramp_seconds)
+            or self.thermal_model.q_in_ramp_seconds,
+        )
+
+    @staticmethod
+    def _ramp_share(dt_hours: float, ramp_seconds: float | None) -> float:
+        """See _ramp_fraction: the share of a step's heat a compressor
+        starting in it delivers, over a ramp of ramp_seconds."""
 
         if not ramp_seconds:
             return 1.0
@@ -1526,6 +1533,48 @@ class MPCOptimizer:
             for k in range(num_steps)
         ]
 
+        # A run the zone opens starts the compressor, and the compressor does
+        # not move its heat at once: as for the tank (see _ramp_fraction), the
+        # step it starts in delivers its heat less the ramp's shortfall (real
+        # cooling data, 30 runs: 68% over the first quarter hour, a 530 s
+        # linear ramp's 71%). q_space_w stays the heat the heat pump runs at -
+        # what its supply, its least heat and its draw follow - so the start
+        # step is priced at running power: the ramp costs heat, hardly power
+        # (real data: 79% of running power over that quarter). A run the tank
+        # hands over carries no ramp: the compressor is already at speed.
+        ramp_seconds = (
+            self.space_cop_model.start_ramp_seconds
+            if self.space_cop_model is not None
+            and self.space_cop_model.cooling == cooling
+            else 0.0
+        )
+
+        def floor_w(k: int):
+            """The heat the floor takes in step k (W)."""
+
+            if not ramp_seconds:
+                return model.q_space_w[k]
+
+            share = self._ramp_share(plan.dt_hours[k], ramp_seconds)
+
+            return model.q_space_w[k] - sign * (1.0 - share) * model.space_ramp_w[k]
+
+        if ramp_seconds:
+            # |Q| * (the zone starts the compressor), exact: the start is 0 or 1
+            # wherever the binaries are, and the heat bounded by the compressor.
+            model.space_ramp_w = pyo.Var(model.K, bounds=(0.0, max_heat_w))
+
+            for k in range(num_steps):
+                zone_start = model.compressor_start[k] - model.tank_start[k]
+                moved_w = sign * model.q_space_w[k]
+
+                for bound in (
+                    model.space_ramp_w[k] <= max_heat_w * zone_start,
+                    model.space_ramp_w[k] <= moved_w,
+                    model.space_ramp_w[k] >= moved_w - max_heat_w * (1 - zone_start),
+                ):
+                    model.zone_constraints.add(bound)
+
         discretized: dict[float, tuple[np.ndarray, np.ndarray]] = {}
         zone_outdoor_c = [
             float(outdoor_c[k]) if outdoor_c else float(data.ambient_temperature)
@@ -1572,6 +1621,30 @@ class MPCOptimizer:
                     model.space_on[k] <= 1 - model.boiler_on[k - 1]
                 )
 
+        # A day's cooling comes before its hot water: a hot water run warms
+        # the attic the tank stands in, and cooling after it gives more chance
+        # of condensation - so once the tank has been heated on a day, that
+        # day is not cooled again (booster included: it warms the attic too).
+        # A latch per day, reset at local midnight: no more than "the tank has
+        # been heated today", which the cooling bound below keeps at its least.
+        # A coarse block counts as the day it begins in.
+        if cooling and data.zone_local_day:
+            day = self._aggregate(data.zone_local_day, plan, min)
+            model.dhw_today = pyo.Var(model.K, bounds=(0.0, 1.0))
+
+            for k in range(num_steps):
+                model.zone_constraints.add(model.dhw_today[k] >= model.tank_heating[k])
+
+                if k == 0:
+                    earlier = int(data.dhw_earlier_today)
+                elif day[k] == day[k - 1]:
+                    earlier = model.dhw_today[k - 1]
+                else:
+                    continue
+
+                model.zone_constraints.add(model.dhw_today[k] >= earlier)
+                model.zone_constraints.add(model.space_on[k] <= 1 - earlier)
+
         for k in range(num_steps):
             # Heat only flows to the zone while the valve points at it.
             model.zone_constraints.add(
@@ -1607,7 +1680,7 @@ class MPCOptimizer:
                     + b_d[i, 0] * outdoor
                     + b_d[i, 1] * float(internal_gain_w[k])
                     + b_d[i, 2] * float(solar_gain_w[k])
-                    + b_d[i, 3] * model.q_space_w[k]
+                    + b_d[i, 3] * floor_w(k)
                 )
 
         # What a thermostat reads of the plan: an operative temperature, part
@@ -1875,33 +1948,6 @@ class MPCOptimizer:
                     supply_on(k + 1)
                     <= supply_on(k) + warmest_supply_c * (1 - model.space_on[k])
                 )
-
-        # And for as long as it runs by itself at the least: a run begun is
-        # held that long (the standard minimum-up form, a start within the last
-        # min_runtime steps keeps it on). Only in the fine region, like the
-        # compressor's own minimum runtime; a coarse block already spans it.
-        fine_steps = sum(1 for dt in plan.dt_hours if dt <= self.config.step_hours)
-        # When each step begins, in hours: the first may be the rest of a
-        # quarter (see MPCInput.first_step_hours).
-        step_start_h = np.cumsum([0.0, *plan.dt_hours[:-1]])
-        model.space_start = pyo.Var(model.K, bounds=(0.0, 1.0))
-
-        for k in range(num_steps):
-            previous = int(data.space_on_current) if k == 0 else model.space_on[k - 1]
-            model.zone_constraints.add(
-                model.space_start[k] >= model.space_on[k] - previous
-            )
-
-        for k in range(fine_steps):
-            model.zone_constraints.add(
-                sum(
-                    model.space_start[j]
-                    for j in range(k + 1)
-                    if step_start_h[k] - step_start_h[j]
-                    < operating.min_runtime_hours - 1e-9
-                )
-                <= model.space_on[k]
-            )
 
     def _build_objective(
         self,

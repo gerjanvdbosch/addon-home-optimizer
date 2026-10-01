@@ -143,7 +143,7 @@ def dashboard_chart(
         shared_xaxes=True,
         vertical_spacing=0.06,
         subplot_titles=("Power", "Climate", "Boiler"),
-        row_heights=[0.5, 0.25, 0.25],
+        row_heights=[0.4, 0.3, 0.3],
     )
 
     # Exactly today and tomorrow in local time. Points outside are dropped, not
@@ -329,22 +329,6 @@ def dashboard_chart(
         decimal=2,
     )
 
-    # The supply the plan runs the floor at - while cooling, the
-    # setpoint it would give the heat pump - only while a run holds it.
-    series(
-        "Supply plan (shadow)",
-        broken_between_runs(
-            state.schedule.building.supply, timedelta(hours=MPCConfig().step_hours)
-        ),
-        row=2,
-        col=1,
-        line=dict(width=1.5, color="#19D3F3", shape="hv", dash="dash"),
-        visible="legendonly",
-        unit="°C",
-        decimal=1,
-        connectgaps=False,
-    )
-
     # What a cooled floor, and uninsulated pipes, must stay above: measured,
     # then as the plan forecast it.
     series(
@@ -356,6 +340,22 @@ def dashboard_chart(
         visible="legendonly",
         unit="°C",
         decimal=1,
+    )
+
+    # The supply the plan runs the floor at - while cooling, the
+    # setpoint it would give the heat pump - only while a run holds it.
+    series(
+        "Supply plan",
+        broken_between_runs(
+            state.schedule.building.supply, timedelta(hours=MPCConfig().step_hours)
+        ),
+        row=2,
+        col=1,
+        line=dict(width=1, color="#636EFA", shape="hv"),
+        visible="legendonly",
+        unit="°C",
+        decimal=1,
+        connectgaps=False,
     )
 
     series(

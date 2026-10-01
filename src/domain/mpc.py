@@ -11,7 +11,11 @@ class MPCConfig:
     # available (see MPCOptimizer._electrical_power_w) - otherwise superseded
     # by the calibrated, outdoor-temperature-dependent COP model.
     boiler_electrical_power_w: float = 3000.0
-    boiler_min_runtime_steps: int = 2
+    # The compressor's minimum runtime (0.5 hour), in every mode: it serves
+    # the tank and the floor alike. The shortest complete runs the heat pump
+    # made by itself are about as long (real cooling data: 20-30 min); longer
+    # runs show the demand of their day, not a limit of the machine.
+    compressor_min_runtime_steps: int = 2
     # The heat pump stays off this many steps after a run (0.5 hour). A start is not
     # free: real runs put an estimated 0.4-0.5 kWh into reheating the loop and
     # coil before the tank gains anything (estimated from how far the tank
@@ -32,7 +36,12 @@ class MPCConfig:
     # heat lost by the next day. At most the price: exporting cannot pay more
     # than importing costs, or the plan would import to earn.
     feed_in_price_eur_per_kwh: float = 0.07
-    weight_switching: float = 0.1
+    # What a compressor start costs (EUR): its energy - a tank start puts some
+    # 0.4-0.5 kWh into the loop and coil before the tank gains anything, about
+    # 0.10 at the price - plus 0.15 for the wear of a start, a choice rather
+    # than a measurement. The plan then makes an extra start only where it
+    # saves about 1 kWh or keeps a promise.
+    weight_switching: float = 0.25
     weight_temperature_slack: float = 1000.0
     # Decisions within this many hours of now keep the full step_hours
     # resolution; steps beyond that are aggregated into coarse_step_hours
@@ -146,6 +155,12 @@ class MPCInput:
     # BuildingConfig.insulated_pipes). Empty leaves the supply to the floor
     # and the compressor.
     zone_supply_minimum_c: tuple[float, ...] = ()
+    # While cooling, the local calendar day each step lies in (any number that
+    # differs between days), and whether the tank was heated earlier today: a
+    # day's cooling comes before its hot water (see
+    # MPCOptimizer._add_space_heating). Empty orders nothing.
+    zone_local_day: tuple[int, ...] = ()
+    dhw_earlier_today: bool = False
     compressor_elapsed_hours: float = 0.0
     # The tank's two sensors just before the DHW run under way began (deg C),
     # None without one: while it heats, the sensors lag the heat already in

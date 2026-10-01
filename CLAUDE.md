@@ -79,6 +79,7 @@ Guidelines for coding agents in this repository.
 ## Git
 
 * Leave final changes uncommitted in the current branch/worktree; I review and
-  commit them.
+  commit them. This also applies to background sessions: edit the main checkout
+  directly instead of isolating in a worktree.
 * Do not create or switch branches, and do not push.
 * A temporary worktree may be used for testing if needed.

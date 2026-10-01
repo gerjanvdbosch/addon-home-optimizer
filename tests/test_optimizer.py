@@ -16,6 +16,8 @@ from domain.physics import (
     CP_WATER_J_PER_KG_K,
     RHO_WATER_KG_PER_L,
     lumped_tank_state_space,
+    zone_observation,
+    zone_state_space,
 )
 from features.optimizer import MIP_ABSOLUTE_GAP_EUR, MPCOptimizer
 
@@ -193,7 +195,7 @@ def test_thermal_dynamics_matches_manual_discretization():
 
     # Minimum runtime of 1 so an arbitrary short on/off pattern doesn't conflict
     # with the (unrelated) scheduling constraint this test isn't exercising.
-    optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig(boiler_min_runtime_steps=1))
+    optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig(compressor_min_runtime_steps=1))
     model = optimizer._build_model(data)
 
     # Force a known, arbitrary on/off pattern and re-derive T by hand - one that
@@ -242,7 +244,7 @@ def test_minimum_runtime_is_respected():
     target = [10.0] * len(SOLAR_FORECAST_W)
     target[10] = 40.0
 
-    config = MPCConfig(boiler_min_runtime_steps=4)
+    config = MPCConfig(compressor_min_runtime_steps=4)
     data = _make_input(target_temperature_top=tuple(target))
 
     optimizer = MPCOptimizer(THERMAL_MODEL, config)
@@ -257,7 +259,9 @@ def test_minimum_runtime_is_respected():
             while j < len(schedule) and schedule[j] == 1:
                 run_length += 1
                 j += 1
-            assert run_length >= config.boiler_min_runtime_steps or j == len(schedule)
+            assert run_length >= config.compressor_min_runtime_steps or j == len(
+                schedule
+            )
             k = j
         else:
             k += 1
@@ -272,7 +276,7 @@ def test_the_heat_pump_stays_off_for_a_while_after_a_run():
     target[8] = 40.0
     target[12] = 45.0
 
-    config = MPCConfig(heat_pump_min_off_steps=4, boiler_min_runtime_steps=1)
+    config = MPCConfig(heat_pump_min_off_steps=4, compressor_min_runtime_steps=1)
     result = MPCOptimizer(THERMAL_MODEL, config).solve(
         _make_input(target_temperature_top=tuple(target))
     )
@@ -293,7 +297,7 @@ def test_no_run_starts_before_the_pause_since_the_last_one_has_passed():
     target = [10.0] * len(SOLAR_FORECAST_W)
     target[6] = 45.0
 
-    config = MPCConfig(heat_pump_min_off_steps=4, boiler_min_runtime_steps=1)
+    config = MPCConfig(heat_pump_min_off_steps=4, compressor_min_runtime_steps=1)
     optimizer = MPCOptimizer(THERMAL_MODEL, config)
     data = _make_input(
         target_temperature_top=tuple(target),
@@ -462,7 +466,7 @@ def test_a_run_just_started_keeps_heating_until_its_minimum_runtime():
     config = MPCConfig()
     result = MPCOptimizer(THERMAL_MODEL, config).solve(_running_run_input(0.1))
 
-    assert result.schedule[: config.boiler_min_runtime_steps] == (1, 1)
+    assert result.schedule[: config.compressor_min_runtime_steps] == (1, 1)
 
 
 def test_a_run_past_its_minimum_runtime_may_stop():
@@ -614,7 +618,7 @@ def test_reported_electrical_power_rises_as_tank_heats_through_a_run():
     )
 
     optimizer = MPCOptimizer(
-        THERMAL_MODEL, MPCConfig(boiler_min_runtime_steps=4), cop_model=COP_MODEL
+        THERMAL_MODEL, MPCConfig(compressor_min_runtime_steps=4), cop_model=COP_MODEL
     )
     result = optimizer.solve(data)
 
@@ -1355,13 +1359,12 @@ TWO_NODE = BuildingThermalModel(
 def test_space_runs_are_as_long_and_as_strong_as_the_heat_pump_makes_them():
     """Once its heating runs are known, the plan decides when the zone is heated
     but not how much: the heat follows from the curve and the floor, and a run
-    lasts at least as long as the heat pump's own shortest ones."""
+    lasts at least the compressor's own minimum runtime."""
 
     space = FloorCircuitModel(
         supply_at_zero_outdoor_c=28.0,
         supply_per_outdoor_k=-0.4,
         conductance_w_per_k=400.0,
-        min_runtime_hours=1.5,
     )
     result = MPCOptimizer(
         THERMAL_MODEL,
@@ -1389,7 +1392,9 @@ def test_space_runs_are_as_long_and_as_strong_as_the_heat_pump_makes_them():
             runs[-1] += 1
 
     # A run cut off by the end of the fine region may be shorter.
-    assert all(length >= 6 for length in runs[:-1])
+    assert all(
+        length >= MPCConfig().compressor_min_runtime_steps for length in runs[:-1]
+    )
 
 
 def test_a_comfort_tolerance_lets_small_predicted_dips_go():
@@ -1740,7 +1745,6 @@ COOLING = FloorCircuitModel(
     supply_at_zero_outdoor_c=16.0,
     supply_per_outdoor_k=-0.1,
     conductance_w_per_k=719.0,
-    min_runtime_hours=1.0,
     min_heat_w=3500.0,
 )
 
@@ -1782,6 +1786,75 @@ def test_cooling_keeps_the_floor_above_the_dew_point():
     supply = np.asarray(result.space_supply_c)[on]
     mass = supply - heat[on] / COOLING.conductance_w_per_k
     assert (mass >= 21.0 - 1e-6).all()
+
+
+def test_a_cooling_run_takes_its_ramp_from_the_floor_in_the_step_it_starts():
+    """The compressor needs its ramp to reach the heat it runs at, so the
+    quarter a run starts in takes that heat less the ramp's shortfall from the
+    floor: 1 - 530 / 1800 of it."""
+
+    ramp_s = 530.0
+    data = _hot_day()
+    result = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE,
+        floor_circuit_model=COOLING,
+        space_cop_model=replace(COP_MODEL, cooling=True, start_ramp_seconds=ramp_s),
+    ).solve(data)
+
+    assert result.space_schedule[0] == 1, "expected a run to start now"
+
+    a_d, b_d = discretize_zoh(*zone_state_space(TWO_NODE), 900.0)
+
+    def zone_after(floor_w: float) -> float:
+        state = a_d @ np.array(
+            [data.zone_temperature, data.zone_mass_temperature]
+        ) + b_d @ np.array([30.0, 150.0, 0.0, floor_w])
+
+        return float(zone_observation(TWO_NODE) @ state)
+
+    heat_w = result.space_heat_w[0]
+    share = 1.0 - ramp_s / (2.0 * 900.0)
+
+    assert result.zone_temperatures[1] == pytest.approx(
+        zone_after(share * heat_w), abs=1e-4
+    )
+    assert abs(zone_after(heat_w) - zone_after(share * heat_w)) > 1e-2
+
+
+def test_a_day_is_cooled_before_its_hot_water():
+    """Hot water warms the attic, so a day's cooling comes first: no cooling
+    after the tank is heated that day, and none at all on a day it already
+    was - until local midnight."""
+
+    half = HOT_DAY_STEPS // 2
+    target = [10.0] * HOT_DAY_STEPS
+    target[half - 1] = 45.0
+    result = _cool(
+        _hot_day(
+            target_temperature_top=tuple(target),
+            zone_local_day=(0,) * HOT_DAY_STEPS,
+        )
+    )
+    tank = np.flatnonzero(result.schedule)
+    zone = np.flatnonzero(result.space_schedule)
+
+    assert tank.size and zone.size, "expected both the tank and the zone served"
+    assert zone.max() < tank.min()
+
+    # Heated earlier today: no cooling before midnight, halfway, and after it.
+    result = _cool(
+        _hot_day(
+            zone_local_day=(0,) * half + (1,) * half,
+            dhw_earlier_today=True,
+        )
+    )
+    zone = np.flatnonzero(result.space_schedule)
+
+    assert zone.size, "expected the next day cooled"
+    assert zone.min() >= half
 
 
 def test_the_floor_follows_a_dew_point_forecast_step_by_step():

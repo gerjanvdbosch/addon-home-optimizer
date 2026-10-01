@@ -4,8 +4,11 @@ The heat pump chooses its own supply temperature - from its heating curve and
 modulation, running long at low power rather than cycling - so the heat a
 space-heating run delivers is not a decision a plan can make. What a plan
 decides is when the zone is heated; how much heat that brings follows from
-the curve and from the floor it heats. This identifies both, and the run
-length the heat pump keeps to, from its own heating runs.
+the curve and from the floor it heats. This identifies both from its own
+heating runs. How long a run lasts is not identified here: a run's length
+shows the demand of its day (real cooling runs: 20 min to 5 h), not a limit
+of the machine - that is the compressor's own minimum runtime, the same in
+every mode (MPCConfig.compressor_min_runtime_steps).
 
 Cooling is the same floor run the other way, identified the same way from
 cooling runs: the heat is negative, the supply below the mass, and the supply
@@ -16,7 +19,6 @@ heating runs, 674 W/K from three cooling runs).
 """
 
 import logging
-import math
 from pathlib import Path
 from typing import Literal
 
@@ -38,14 +40,9 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
     # runs: half a run in each split would validate a run on itself.
     TRAIN_RATIO = 0.80
 
-    # The shortest runs the heat pump makes by itself, not its typical one: a
-    # plan may not ask for shorter runs than it ever runs, but it may well ask
-    # for its short ones. The 10th percentile rather than the minimum, so one
-    # run cut short by a defrost or a restart does not set it.
-    MIN_RUNTIME_QUANTILE = 0.10
-    # The least heat it moves, for the same reason a low quantile rather than
-    # the minimum: a single reading caught mid-defrost or mid-stop is not the
-    # compressor's lowest speed.
+    # The least heat it moves: a low quantile rather than the minimum, as a
+    # single reading caught mid-defrost or mid-stop is not the compressor's
+    # lowest speed.
     MIN_HEAT_QUANTILE = 0.10
 
     def __init__(
@@ -125,7 +122,7 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
 
         return prepared.loc[running]
 
-    def fit(self, rows: pd.DataFrame, dt_hours: float) -> FloorCircuitModel:
+    def fit(self, rows: pd.DataFrame) -> FloorCircuitModel:
         """The model from this mode's run readings (see runs()).
 
         The heating curve: supply = a + b * T_outdoor, over settled readings.
@@ -139,11 +136,6 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
         water cooling on its way through the loop - G = 1 / (1 / UA_floor +
         1 / (2 m_dot c_p)) - and is fitted through the origin, because no heat
         flows at no temperature difference.
-
-        The run length from complete runs only: one cut off by the edge of the
-        data says nothing about how long it would have lasted, and one that
-        never settled is a start-up that failed, not a run the heat pump
-        chose.
         """
 
         settled = rows[rows["settled"] & (self.sign * rows["Q_floor_w"] > 0.0)]
@@ -173,20 +165,10 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
         heat = settled["Q_floor_w"].to_numpy(dtype=float)
         conductance = float(np.dot(lift, heat) / np.dot(lift, lift))
 
-        lengths = (
-            rows[rows["run"].isin(settled["run"])].groupby("run").size() * dt_hours
-        )
-        complete = lengths.iloc[1:-1] if len(lengths) > 2 else lengths
-        min_runtime_hours = float(
-            math.floor(complete.quantile(self.MIN_RUNTIME_QUANTILE) / dt_hours)
-            * dt_hours
-        )
-
         return FloorCircuitModel(
             supply_at_zero_outdoor_c=intercept,
             supply_per_outdoor_k=slope,
             conductance_w_per_k=conductance,
-            min_runtime_hours=max(min_runtime_hours, dt_hours),
             min_heat_w=float(np.quantile(np.abs(heat), self.MIN_HEAT_QUANTILE)),
         )
 
@@ -202,18 +184,15 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
     def calibrate(self, df: pd.DataFrame) -> FloorCircuitModel:
         rows = self.runs(df)
         train = rows[~self._in_test(rows)]
-        dt_hours = float(rows["dt_seconds"].median()) / 3600.0
-
-        self.model = self.fit(train, dt_hours)
+        self.model = self.fit(train)
 
         logger.info(
             "%s calibrated: supply = %.1f %+.2f * T_out degC, "
-            "G = %.0f W/K, runs of at least %.2f h and %.0f W",
+            "G = %.0f W/K, at least %.0f W",
             self.label,
             self.model.supply_at_zero_outdoor_c,
             self.model.supply_per_outdoor_k,
             self.model.conductance_w_per_k,
-            self.model.min_runtime_hours,
             self.model.min_heat_w,
         )
 

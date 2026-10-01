@@ -849,6 +849,16 @@ class Optimization:
         if self.controlled(config, cooling) and heat_pump_state:
             inputs["space_on_current"] = heat_pump_state[-1].value == mode_state
 
+        # The measurements start at local midnight, so any hot water among
+        # them was today's.
+        if cooling and config.building.dhw_after_cooling:
+            inputs["zone_local_day"] = tuple(
+                to_local_time(t).toordinal() for t in times
+            )
+            inputs["dhw_earlier_today"] = any(
+                point.value == states.dhw for point in heat_pump_state
+            )
+
         # How the heat pump runs the floor by itself in this mode - None until
         # its runs have shown it, and the plan may then choose the zone's heat
         # freely.

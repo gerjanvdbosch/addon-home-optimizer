@@ -244,6 +244,7 @@ actions:
               [2.0, ["cover.slaapkamer_achter_3", "current_position"]]
             ],
             "insulated_pipes": false,
+            "dhw_after_cooling": true,
             "dew_point_margin": 1.0,
             "dew_points": [
               "sensor.xiaomi_sensor_1_condensatie_temperatuur", 
@@ -415,11 +416,14 @@ actions:
 
 Home Optimizer writes the following entities to Home Assistant:
 
-| Entity                                    | Description                                                |
-|-------------------------------------------|------------------------------------------------------------|
-| `binary_sensor.home_optimizer_dhw_status` | `on` while the current quarter hour is planned to heat DHW |
-| `sensor.home_optimizer_dhw_start`         | Start of the next planned DHW run (`unknown` if none)      |
-| `sensor.home_optimizer_dhw_setpoint`      | DHW setpoint (°C) for that run (`unknown` if none)         |
+| Entity                                     | Description                                                                         |
+|--------------------------------------------|-------------------------------------------------------------------------------------|
+| `binary_sensor.home_optimizer_dhw_status`  | `on` while the current quarter hour is planned to heat DHW                          |
+| `sensor.home_optimizer_dhw_start`          | Start of the next planned DHW run (`unknown` if none)                               |
+| `sensor.home_optimizer_dhw_setpoint`       | DHW setpoint (°C) for that run (`unknown` if none)                                  |
+| `binary_sensor.home_optimizer_zone_status` | `on` while the current quarter hour is planned to heat or cool the zone             |
+| `sensor.home_optimizer_zone_start`         | Start of the zone run under way or the next one planned (`unknown` if none)         |
+| `sensor.home_optimizer_zone_setpoint`      | Cooling supply setpoint (°C) while a cooling run is under way (`unknown` otherwise) |
 
 ## Development
 

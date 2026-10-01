@@ -195,7 +195,7 @@ KELVIN_OFFSET_C = 273.15
 class FloorCircuitModel:
     """How the heat pump runs the floor circuit by itself, heating or cooling
     (see features.floor): the supply temperature it chooses, the heat
-    that brings into the floor, and how long it runs."""
+    that brings into the floor, and the least it can bring."""
 
     # Its heating curve, supply = a + b * T_outdoor (deg C, K per K).
     supply_at_zero_outdoor_c: float
@@ -203,8 +203,6 @@ class FloorCircuitModel:
     # From the supply water to the building's thermal mass (W/K), both the
     # screed's uptake and the water cooling through the loop.
     conductance_w_per_k: float
-    # The shortest runs it makes (hours).
-    min_runtime_hours: float
     # The least heat a settled run moves (W, a magnitude): the compressor at
     # its lowest speed. Asked for less, the heat pump cannot turn down further
     # and takes the water past its setpoint instead (real cooling data: 3.4-3.6
@@ -308,13 +306,14 @@ class HeatPumpCOPModel:
     # COP of 4 where the steady model gave 5.3). 0.0 until calibrated: planning
     # then costs that step on the power line too.
     start_step_power_w: float = 0.0
-    # How long the compressor takes to reach that heat after a DHW run starts
-    # (s), read off the energy the start-up leaves short (see
+    # How long the compressor takes to reach its heat after a run in this mode
+    # starts (s), read off the energy the start-up leaves short (see
     # BoilerThermalIdentifier._identify_heat_input_ramp) - from minute
     # readings, timed from the run's own start. The boiler's own estimate from
     # 5-minute readings timed runs up to 5 minutes early, from the start of the
     # interval they switched on in (real data: 1005 s against 790-830 s per
-    # minute). 0.0 until calibrated: planning then uses the boiler's.
+    # minute). 0.0 until calibrated: DHW planning then uses the boiler's, a
+    # floor run none (real cooling data: 530 s over 30 runs).
     start_ramp_seconds: float = 0.0
 
     def cop(self, T_outdoor: float, T_supply: float) -> float:

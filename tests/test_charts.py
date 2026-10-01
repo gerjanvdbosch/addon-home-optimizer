@@ -100,7 +100,7 @@ def test_the_dashboard_draws_a_cooling_plan():
 
     html = dashboard_chart(state)
 
-    assert "Supply plan (shadow)" in html
+    assert "Supply plan" in html
     assert "Heat pump heat" in html
     assert html.count('"name":"Dew point"') == 1
     assert to_local_time(measured_at).isoformat() in html

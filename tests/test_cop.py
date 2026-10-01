@@ -529,10 +529,11 @@ def test_heating_fit_takes_the_evaporator_approach_from_dhw(tmp_path):
     assert model.q_th_at_power_fit_high_w == 0.0
 
 
-def test_cooling_fit_reads_the_heat_taken_from_the_water(tmp_path):
+def test_cooling_fit_reads_the_heat_taken_from_the_water(tmp_path, monkeypatch):
     """While cooling the water returns warmer than it left and the outdoor
     coil condenses: the fit keeps those rows, takes the coil's approach from
-    DHW even where it could fit its own, and scores the cooling EER."""
+    DHW even where it could fit its own, and scores the cooling EER. Its
+    start-up goes into the model too: a floor run is planned with its ramp."""
 
     dhw = HeatPumpCOPIdentifier(key="dhw")
     dhw.model = TRUE_COP_MODEL
@@ -552,9 +553,11 @@ def test_cooling_fit_reads_the_heat_taken_from_the_water(tmp_path):
     df["P_el"] = heat_w / cooling.cop(df["T_outdoor"], df["T_supply"])
 
     identifier = HeatPumpCOPIdentifier(key="cooling", models_path=tmp_path)
+    monkeypatch.setattr(identifier, "_start_up", lambda _: (530.0, 700.0))
     model = identifier.calibrate(df)
 
     assert model.cooling
+    assert (model.start_ramp_seconds, model.start_step_power_w) == (530.0, 700.0)
     assert model.delta_t_evap == TRUE_DELTA_T_EVAP
     assert model.eta_carnot == pytest.approx(TRUE_ETA_CARNOT, rel=1e-6)
     # EER falls as the lift from chilled water to outdoor air grows.
@@ -578,11 +581,16 @@ def test_heat_input_is_flat_when_the_outdoor_temperature_does_not_vary():
     assert HeatPumpCOPIdentifier._fit_heat_input(df) == pytest.approx((6200.0, 0.0))
 
 
-def test_the_start_up_is_read_from_the_readings_as_loaded():
-    """Twelve 40-minute DHW runs at minute readings, their heat rising linearly
+@pytest.mark.parametrize(
+    ("key", "state", "sign"),
+    [("dhw", SWW_STATE, 1.0), ("cooling", HeatPumpStates().cooling, -1.0)],
+)
+def test_the_start_up_is_read_from_the_readings_as_loaded(key, state, sign):
+    """Twelve 40-minute runs at minute readings, their heat rising linearly
     to 6 kW over 800 s and their power to 2 kW over the same time: the ramp is
     recovered, and the first 15 minutes draw (2 kW over 800 s at half, then
-    full) 2000 * (1 - 400 / 900) = 1111 W."""
+    full) 2000 * (1 - 400 / 900) = 1111 W. Cooling the same, with the heat
+    taken from the water."""
 
     rows = []
     time = pd.Timestamp("2026-09-20 10:00", tz="UTC")
@@ -598,16 +606,17 @@ def test_the_start_up_is_read_from_the_readings_as_loaded():
             rows.append(
                 dict(
                     time=time,
-                    state=SWW_STATE if on else "Uit",
+                    state=state if on else "Uit",
                     P_el=2000.0 * rise if on else 0.0,
                     flow_lpm=FLOW_LPM if on else 0.0,
-                    T_supply=45.0 + (6000.0 * rise / water_w_per_k if on else 0.0),
+                    T_supply=45.0
+                    + sign * (6000.0 * rise / water_w_per_k if on else 0.0),
                     T_return=45.0,
                 )
             )
             time += pd.Timedelta(minutes=1)
 
-    ramp_s, power_w = HeatPumpCOPIdentifier(key="dhw")._start_up(pd.DataFrame(rows))
+    ramp_s, power_w = HeatPumpCOPIdentifier(key=key)._start_up(pd.DataFrame(rows))
 
     assert ramp_s == pytest.approx(800.0, rel=0.02)
     assert power_w == pytest.approx(2000.0 * (1.0 - 400.0 / 900.0), rel=0.01)

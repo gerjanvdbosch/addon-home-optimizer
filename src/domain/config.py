@@ -253,6 +253,11 @@ class BuildingConfig(BaseModel):
     # a bare pipe is at the supply temperature and condenses within minutes,
     # so without that the supply itself must stay above the dew point.
     insulated_pipes: bool = Field(default=False)
+    # Whether a day's cooling comes before its hot water: a hot water run
+    # warms the attic the tank stands in, and cooling after it gives more
+    # chance of condensation. On, a day the tank has been heated is not cooled
+    # again until local midnight (see MPCOptimizer._add_space_heating).
+    dhw_after_cooling: bool = Field(default=True)
     # Whether the plan drives the floor in each mode: it then publishes when
     # the floor runs and, cooling, the supply setpoint for Home Assistant to
     # hand the heat pump (see Optimization.publish_zone). Off, the zone is

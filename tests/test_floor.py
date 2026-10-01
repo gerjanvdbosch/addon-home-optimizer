@@ -47,31 +47,28 @@ def _identifier() -> FloorCircuitIdentifier:
     return FloorCircuitIdentifier(52.0, 5.0, Path("."))
 
 
-def test_fit_recovers_the_curve_the_floor_and_the_shortest_runs():
+def test_fit_recovers_the_curve_and_the_floor():
     # The first and the last run are cut off by the edges of the data.
     lengths = [8, 12, 16, 10, 20, 6, 14, 18]
-    model = _identifier().fit(_runs(lengths, np.random.default_rng(3)), 0.25)
+    model = _identifier().fit(_runs(lengths, np.random.default_rng(3)))
 
     assert model.supply_per_outdoor_k == pytest.approx(SUPPLY_PER_OUTDOOR_K, abs=0.05)
     assert model.supply_at_zero_outdoor_c == pytest.approx(SUPPLY_AT_ZERO_C, abs=0.5)
     assert model.conductance_w_per_k == pytest.approx(CONDUCTANCE_W_PER_K, rel=0.05)
-    # 10th percentile of the complete runs (1.5 ... 5 h), on the 15-minute grid.
-    assert model.min_runtime_hours == pytest.approx(2.0)
 
 
 def test_one_run_gives_a_flat_curve_at_its_supply():
-    """One run sits at one outdoor temperature: it shows the floor and the
-    run length, but no slope for the curve."""
+    """One run sits at one outdoor temperature: it shows the floor, but no
+    slope for the curve."""
 
     rows = _runs([14], np.random.default_rng(4))
-    model = _identifier().fit(rows, 0.25)
+    model = _identifier().fit(rows)
 
     assert model.supply_per_outdoor_k == 0.0
     assert model.supply_at_zero_outdoor_c == pytest.approx(
         rows.loc[rows["settled"], "T_supply"].mean()
     )
     assert model.conductance_w_per_k == pytest.approx(CONDUCTANCE_W_PER_K, rel=0.05)
-    assert model.min_runtime_hours == pytest.approx(3.5)
 
 
 def test_split_keeps_runs_whole_and_the_only_run_for_training():
@@ -92,10 +89,9 @@ def test_cooling_fit_reads_runs_that_take_heat_from_the_floor():
     rows["Q_floor_w"] = CONDUCTANCE_W_PER_K * (rows["T_supply"] - rows["T_mass"])
 
     identifier = FloorCircuitIdentifier(52.0, 5.0, Path("."), key="cooling")
-    model = identifier.fit(rows, 0.25)
+    model = identifier.fit(rows)
 
     assert identifier.name == "space_cooling"
     assert model.supply_per_outdoor_k == pytest.approx(SUPPLY_PER_OUTDOOR_K, abs=0.05)
     assert model.conductance_w_per_k == pytest.approx(CONDUCTANCE_W_PER_K, rel=0.05)
-    assert model.min_runtime_hours == pytest.approx(2.0)
     assert model.heat_w(30.0, 20.0) < 0.0

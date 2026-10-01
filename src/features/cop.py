@@ -415,11 +415,10 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         self,
         df: pd.DataFrame,
     ) -> HeatPumpCOPModel:
-        # From the raw readings: prepare() leaves the start-up out. Only DHW
-        # planning uses it (see below).
-        start_ramp_seconds, start_step_power_w = (
-            self._start_up(df) if self.key == "dhw" else (0.0, 0.0)
-        )
+        # From the raw readings: prepare() leaves the start-up out. DHW
+        # planning uses both, a floor run its ramp (see
+        # MPCOptimizer._add_space_heating).
+        start_ramp_seconds, start_step_power_w = self._start_up(df)
         df = self.prepare(df)
 
         if len(df) < 10:
@@ -558,6 +557,8 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             delta_t_cond=self.FIXED_DELTA_T_COND,
             delta_t_evap=delta_t_evap,
             cooling=self.cooling,
+            start_step_power_w=start_step_power_w,
+            start_ramp_seconds=start_ramp_seconds,
         )
 
         # Cooling is planned down to a lift of a kelvin or two - water just
@@ -576,6 +577,14 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         # MPCOptimizer._space_cop), so a heating fit has no use for them - and
         # a line fitted at ~25-30 degC floor supply extrapolated to 60 degC
         # would mean nothing.
+        logger.info(
+            "Heat pump COP calibration (%s): a %.0f s ramp and %.0f W "
+            "electrical over a run's first step",
+            self.mode,
+            self.model.start_ramp_seconds,
+            self.model.start_step_power_w,
+        )
+
         if self.key != "dhw":
             return self.model
 
@@ -592,8 +601,6 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             self.model.q_in_at_zero_outdoor_w,
             self.model.q_in_per_outdoor_w_per_k,
         ) = self._fit_heat_input(train_df)
-        self.model.start_step_power_w = start_step_power_w
-        self.model.start_ramp_seconds = start_ramp_seconds
 
         logger.info(
             "Heat pump COP calibration (%s): reference_supply_temperature_c="
@@ -609,13 +616,10 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         )
         logger.info(
             "Heat pump COP calibration (%s): heat into the tank after the "
-            "start-up %.1f W at 0 degC outdoor, %+.1f W per K outdoor; a "
-            "%.0f s ramp and %.0f W electrical over a run's first step",
+            "start-up %.1f W at 0 degC outdoor, %+.1f W per K outdoor",
             self.mode,
             self.model.q_in_at_zero_outdoor_w,
             self.model.q_in_per_outdoor_w_per_k,
-            self.model.start_ramp_seconds,
-            self.model.start_step_power_w,
         )
 
         return self.model
@@ -740,9 +744,10 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         starts within a minute of when it really did, and prepare() has not yet
         left the start-up out. The ramp as the boiler reads it (see
         BoilerThermalIdentifier._identify_heat_input_ramp), from the
-        calorimetric heat; the power the median, over runs that lasted past
-        their first step (MPCConfig.step_hours) without the booster, of their
-        mean power over it. 0.0 for either without such runs."""
+        calorimetric heat in the direction this mode moves it; the power the
+        median, over runs that lasted past their first step
+        (MPCConfig.step_hours) without the booster, of their mean power over
+        it. 0.0 for either without such runs."""
 
         df = self._bridge_reporting_gaps(
             df.sort_values("time")
@@ -760,8 +765,11 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             * CP_WATER_J_PER_KG_K
             * df["flow_lpm"]
             * (
-                pd.to_numeric(df["T_supply"], errors="coerce")
-                - pd.to_numeric(df["T_return"], errors="coerce")
+                (-1.0 if self.cooling else 1.0)
+                * (
+                    pd.to_numeric(df["T_supply"], errors="coerce")
+                    - pd.to_numeric(df["T_return"], errors="coerce")
+                )
             ).clip(lower=0.0)
         )
         _, ramp_seconds = BoilerThermalIdentifier()._identify_heat_input_ramp(
