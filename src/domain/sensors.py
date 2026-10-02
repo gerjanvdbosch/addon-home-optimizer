@@ -35,6 +35,11 @@ Aggregation = Literal[
     "median",
     "spread",
     "stddev",
+    # The mean over time rather than over readings: Home Assistant stores a
+    # reading only when the value changes, so each holds until the next. A
+    # plain mean weighs every reading alike, and a sensor that reports more
+    # often at some values than at others is then biased towards those.
+    "time_mean",
 ]
 
 

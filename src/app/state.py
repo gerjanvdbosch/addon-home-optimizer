@@ -305,6 +305,10 @@ class StateManager:
             SeriesPoint(time=t, value=float(val))
             for t, val in zip(times, temperatures, strict=False)
         ]
+        state.schedule.heat_pump.boiler.on = [
+            SeriesPoint(time=t, value=int(on))
+            for t, on in zip(times, schedule, strict=False)
+        ]
 
         self.state_repository.save(state)
 
@@ -332,6 +336,7 @@ class StateManager:
         times: list[datetime],
         supply_c: Sequence[float] = (),
         power_w: Sequence[float] = (),
+        on: Sequence[int] = (),
     ) -> None:
         """The zone's part of the plan, not acted on yet. Its heat and power go
         into the heat pump's plan beside the tank's (see update_schedule, which
@@ -358,6 +363,10 @@ class StateManager:
             SeriesPoint(time=t, value=float(value))
             for t, value in zip(times, supply_c, strict=False)
             if not math.isnan(value)
+        ]
+        state.schedule.building.on = [
+            SeriesPoint(time=t, value=int(value))
+            for t, value in zip(times, on, strict=False)
         ]
 
         self.state_repository.save(state)
@@ -519,18 +528,22 @@ class StateManager:
                 # features.dew_point), either as stored.
                 attributes=["temperature", "dew_point", "relative_humidity"],
             )
+            # Powers and flows over time (see Aggregation's "time_mean"):
+            # the heat pump's power reports every few seconds while running
+            # but seldom at 0, and a run that stopped a minute into a quarter
+            # was drawn at 745 W through all of it, against 49 W over time
+            # (real data, 2 Oct 13:45).
             .timeseries(
                 "pv_production",
                 config.solar,
-                aggregation="mean",
+                aggregation="time_mean",
                 interval="15m",
             )
             .timeseries(
                 "baseload",
                 config.baseload,
-                aggregation="mean",
+                aggregation="time_mean",
                 interval="15m",
-                fill="previous",
             )
             .timeseries(
                 "heat_pump_state",
@@ -556,8 +569,7 @@ class StateManager:
                 "heat_pump_power",
                 config.heat_pump.power,
                 interval="15m",
-                aggregation="mean",
-                fill=0,
+                aggregation="time_mean",
             )
             # What the floor sends back and how fast, which a cooling run's
             # supply setpoint follows (see Optimization.zone_setpoint_c). The
@@ -574,8 +586,7 @@ class StateManager:
                 "heat_pump_flow",
                 config.heat_pump.flow,
                 interval="15m",
-                aggregation="mean",
-                fill=0,
+                aggregation="time_mean",
             )
             .timeseries(
                 "thermostat_temperature",

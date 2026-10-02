@@ -62,6 +62,13 @@ class MPCConfig:
     # in 1-8 s. Should a harder one come up, the best plan found by then is
     # used - better than a plan that never comes.
     solve_time_limit_s: float = 30.0
+    # The most the solve's starting point may take (s; see
+    # MPCOptimizer._warm_start): with all but the first step's decisions
+    # fixed it took 0.2 s on real data, where the whole solve took 10 s - a
+    # host slow enough to stop the whole solve at its limit still has it
+    # many times over. Should it fail, the solve starts cold with its full
+    # time, so a job takes at most the two limits together.
+    warm_start_time_limit_s: float = 5.0
 
 
 @dataclass(frozen=True)
@@ -180,6 +187,11 @@ class MPCInput:
     # How long ago the last run ended (hours), 0 while heating - no new run
     # starts until MPCConfig.heat_pump_min_off_steps have passed since then.
     idle_elapsed_hours: float = 0.0
+    # The previous plan at this plan's steps: whether it heated the tank and
+    # served the zone (1/0), the solve's starting point (see
+    # MPCOptimizer.solve). Empty starts the solve cold.
+    previous_tank_on: tuple[int, ...] = ()
+    previous_space_on: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)

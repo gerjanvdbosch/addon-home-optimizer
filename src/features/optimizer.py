@@ -1,5 +1,6 @@
 import logging
 import math
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -116,11 +117,19 @@ class MPCOptimizer:
             "mip_rel_gap": 0.0,
         }
         time_limit_s = self.config.solve_time_limit_s
-        solver.config.time_limit = time_limit_s
         solver.config.load_solution = False
         # HiGHS's own progress log, at INFO by default, buried the plan's own
         # lines under dozens per solve: kept, but for debugging.
         solver.config.log_level = logging.DEBUG
+        started = time.monotonic()
+        solver.config.warmstart = self._warm_start(model, data, solver)
+        # A start found is part of the solve and shares its time; one that
+        # failed takes none of it - the cold solve then needs all of it.
+        solver.config.time_limit = (
+            time_limit_s - (time.monotonic() - started)
+            if solver.config.warmstart
+            else time_limit_s
+        )
         results = solver.solve(model)
         stopped_early = (
             results.termination_condition == TerminationCondition.maxTimeLimit
@@ -148,6 +157,62 @@ class MPCOptimizer:
             )
 
         return self._extract_result(model, data, results.termination_condition)
+
+    def _warm_start(
+        self, model: pyo.ConcreteModel, data: MPCInput, solver: Highs
+    ) -> bool:
+        """Load the previous plan, one quarter on, into the model as the
+        solve's starting point; whether there was one that holds.
+
+        A solve stopped at its time limit publishes the best plan found by
+        then, and on the Home Assistant host that was at times far from
+        optimal: on 2 Oct two runs where one would do and a run before
+        sunrise, each 0.23 EUR dearer than the plan the solve before had
+        found. Started from that plan, the solve can only improve on it.
+
+        The previous plan's decisions are fixed beyond the first step - the
+        one that changed since - and the rest solved for, a small problem,
+        so the start meets this plan's constraints and current state."""
+
+        if not data.previous_tank_on and not data.previous_space_on:
+            return False
+
+        def decisions(previous: tuple[int, ...]) -> list[int]:
+            """The previous plan per model step: on in a coarse block when it
+            was on anywhere in it."""
+
+            per_step = [0] * model.mpc_step_plan.num_steps
+
+            for i, m in enumerate(model.mpc_step_plan.fine_to_model):
+                if i < len(previous) and previous[i]:
+                    per_step[m] = 1
+
+            return per_step
+
+        fixed = []
+
+        for variable, previous in (
+            (model.tank_heating, data.previous_tank_on),
+            (model.space_on, data.previous_space_on),
+        ):
+            for k, on in enumerate(decisions(previous)):
+                if k > 0 and not variable[k].fixed:
+                    variable[k].fix(on)
+                    fixed.append(variable[k])
+
+        solver.config.time_limit = self.config.warm_start_time_limit_s
+        results = solver.solve(model)
+
+        for variable in fixed:
+            variable.unfix()
+
+        if results.best_feasible_objective is None:
+            logger.debug("Previous plan does not hold: solving cold")
+            return False
+
+        results.solution_loader.load_vars()
+
+        return True
 
     def _validate_input(self, data: MPCInput) -> None:
         horizon = len(data.solar_forecast_w)
@@ -1506,8 +1571,8 @@ class MPCOptimizer:
         observation = zone_observation(building)
         num_states = a.shape[0]
 
-        # State 0 is the air, state 1 the thermal mass - screed and internal
-        # walls - that the floor's heat lands in.
+        # State 0 is the room - air, furnishings, internal walls - and state 1
+        # the floor slab the floor's heat lands in (see BuildingThermalModel).
         model.ZONE_STATES = pyo.RangeSet(0, num_states - 1)
         model.zone_state = pyo.Var(model.K, model.ZONE_STATES)
         model.q_space_w = pyo.Var(
@@ -1774,8 +1839,9 @@ class MPCOptimizer:
         sink = num_states - 1
 
         # Water condenses on a floor below the dew point of the air above it.
-        # The floor lies on the mass, so while cooling the mass may not be
-        # cooled below the dew point (plus a margin, see
+        # The floor's surface lies between the slab and the room, so while
+        # cooling the slab may not be cooled below the dew point (plus a
+        # margin, see
         # BuildingConfig.dew_point_margin). Hard, unlike comfort: a wet floor
         # is not traded against a warm room. Always feasible, since cooling
         # only lowers the mass - where the zone alone would sit below the

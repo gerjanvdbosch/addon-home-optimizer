@@ -18,10 +18,12 @@ from domain.mpc import MPCConfig
 from domain.physics import (
     CP_WATER_J_PER_KG_K,
     RHO_WATER_KG_PER_L,
+    layered_tank_state_space,
     lumped_tank_state_space,
     tank_state_space,
     tank_stratification_k,
 )
+from domain.time import to_local_time
 from features.dataset import DatasetBuilder
 from features.identifier import SystemIdentifier
 
@@ -814,55 +816,118 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         # fixed constants, so this can happen for an unusual installation/interval.
         x0 = np.clip(x0, lower_bounds, upper_bounds)
 
-        ordinary_fit = least_squares(
-            combined_residuals, x0=x0, bounds=(lower_bounds, upper_bounds)
-        )
+        def fit(ua_w_per_k: float | None = None):
+            """(the ordinary fit's parameters, the robust fit, its parameters,
+            f_scale); with ua_w_per_k, UA_top and UA_bottom held at half of it
+            each (see _identify_standing_loss) and only the rest fitted."""
 
-        if not ordinary_fit.success:
-            logger.warning(
-                "Boiler thermal ordinary fit did not fully converge: %s",
-                ordinary_fit.message,
+            free = slice(0, 5) if ua_w_per_k is None else slice(2, 5)
+
+            def full(p: np.ndarray) -> np.ndarray:
+                if ua_w_per_k is None:
+                    return p
+
+                return np.r_[ua_w_per_k / 2.0, ua_w_per_k / 2.0, p]
+
+            ordinary_fit = least_squares(
+                lambda p: combined_residuals(full(p)),
+                x0=x0[free],
+                bounds=(lower_bounds[free], upper_bounds[free]),
+            )
+            ordinary_x = full(ordinary_fit.x)
+
+            if not ordinary_fit.success:
+                logger.warning(
+                    "Boiler thermal ordinary fit did not fully converge: %s",
+                    ordinary_fit.message,
+                )
+
+            # Robust refit: downweight timesteps with unusually large one-step
+            # error via a standard robust loss instead of a hand-picked hard
+            # exclusion threshold. f_scale comes from the ordinary fit's own
+            # residual spread (MAD), not an assumed constant. This is
+            # parameter-identification machinery only - it does not claim to
+            # detect tap draws, it just limits their influence on the fit. Kept to
+            # one-step residuals only, same meaning as before decay_residuals
+            # existed.
+            ordinary_residuals = one_step_residuals(ordinary_x)
+
+            f_scale = self.MAD_TO_STD * float(
+                np.median(np.abs(ordinary_residuals - np.median(ordinary_residuals)))
             )
 
-        # Robust refit: downweight timesteps with unusually large one-step error via a
-        # standard robust loss instead of a hand-picked hard exclusion threshold.
-        # f_scale comes from the ordinary fit's own residual spread (MAD), not an
-        # assumed constant. This is parameter-identification machinery only - it does
-        # not claim to detect tap draws, it just limits their influence on the fit.
-        # Kept to one-step residuals only, same meaning as before decay_residuals
-        # existed.
-        ordinary_residuals = one_step_residuals(ordinary_fit.x)
+            f_scale = max(f_scale, self.MIN_F_SCALE)
 
-        f_scale = self.MAD_TO_STD * float(
-            np.median(np.abs(ordinary_residuals - np.median(ordinary_residuals)))
-        )
+            # decay_residuals live on a different, much larger natural scale than
+            # one_step_residuals (that is the whole point - see
+            # PASSIVE_DECAY_HORIZON_HOURS). Applying the single f_scale above to both
+            # in the same soft_l1 robust loss would treat every decay residual as an
+            # extreme outlier and suppress exactly the signal just added. Estimating
+            # decay residuals' own MAD-based scale and rescaling them to
+            # one-step-equivalent units before the robust refit (below) keeps the
+            # same soft_l1(f_scale) threshold meaningful for both groups, without
+            # changing where either group's minimum actually is.
+            ordinary_decay_residuals = decay_residuals(ordinary_x)
 
-        f_scale = max(f_scale, self.MIN_F_SCALE)
-
-        # decay_residuals live on a different, much larger natural scale than
-        # one_step_residuals (that is the whole point - see
-        # PASSIVE_DECAY_HORIZON_HOURS). Applying the single f_scale above to both
-        # in the same soft_l1 robust loss would treat every decay residual as an
-        # extreme outlier and suppress exactly the signal just added. Estimating
-        # decay residuals' own MAD-based scale and rescaling them to
-        # one-step-equivalent units before the robust refit (below) keeps the
-        # same soft_l1(f_scale) threshold meaningful for both groups, without
-        # changing where either group's minimum actually is.
-        ordinary_decay_residuals = decay_residuals(ordinary_fit.x)
-
-        if len(ordinary_decay_residuals) > 0:
-            f_scale_decay = self.MAD_TO_STD * float(
-                np.median(
-                    np.abs(
-                        ordinary_decay_residuals - np.median(ordinary_decay_residuals)
+            if len(ordinary_decay_residuals) > 0:
+                f_scale_decay = self.MAD_TO_STD * float(
+                    np.median(
+                        np.abs(
+                            ordinary_decay_residuals
+                            - np.median(ordinary_decay_residuals)
+                        )
                     )
                 )
-            )
-        else:
-            f_scale_decay = self.MIN_F_SCALE
+            else:
+                f_scale_decay = self.MIN_F_SCALE
 
-        f_scale_decay = max(f_scale_decay, self.MIN_F_SCALE)
-        decay_weight = f_scale / f_scale_decay
+            f_scale_decay = max(f_scale_decay, self.MIN_F_SCALE)
+            decay_weight = f_scale / f_scale_decay
+
+            # Rows are deliberately not excluded where the tap forecaster predicts a
+            # draw: that forecaster is trained on this model's own residual, and on
+            # 90 days of real data excluding them raised UA_top+UA_bottom from 2.07
+            # to 2.56 W/K, turning the post-heating 6 h cooling bias from +0.05 K
+            # into +0.33 K while validation stayed equal. The robust loss below
+            # already limits the influence of draws.
+
+            robust_fit = least_squares(
+                lambda p: combined_residuals(full(p), decay_weight),
+                x0=ordinary_fit.x,
+                bounds=(lower_bounds[free], upper_bounds[free]),
+                loss="soft_l1",
+                f_scale=f_scale,
+            )
+
+            if not robust_fit.success:
+                logger.warning(
+                    "Boiler thermal robust fit did not fully converge: %s",
+                    robust_fit.message,
+                )
+
+            return ordinary_x, robust_fit, full(robust_fit.x), f_scale
+
+        ordinary_x, robust_fit, parameters, f_scale = fit()
+        self.model = _model_from_parameters(parameters, self.volume_l)
+
+        # The standing loss from tap-free nights needs the cold layer, read from
+        # the runs' heat balance with this first fit's loss; a run's hour of it
+        # is small, and the layer is read again below with the final one.
+        self.model.cold_layer_fraction, self.model.cold_water_temperature_c, _ = (
+            self._identify_cold_layer(df)
+        )
+        standing_loss = self._identify_standing_loss(train_df)
+
+        if standing_loss is not None:
+            logger.info(
+                "Boiler thermal calibration: standing loss %.2f±%.2f W/K from "
+                "tap-free nights (the first fit gave %.2f W/K); UA_top and "
+                "UA_bottom held at half of it each.",
+                standing_loss[0],
+                standing_loss[1],
+                self.model.ua_top_w_per_k + self.model.ua_bottom_w_per_k,
+            )
+            ordinary_x, robust_fit, parameters, f_scale = fit(standing_loss[0])
 
         # Purely informational: how much idle-period training data deviates from the
         # ambient-loss/mixing model by more than the robust fit already discounts.
@@ -875,7 +940,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         # Same post-heating-tail exclusion as the fit itself: those rows are already
         # known to be unreliable idle evidence, so they must not also inflate this
         # diagnostic's flag count.
-        full_row_residuals = row_residuals(ordinary_fit.x)
+        full_row_residuals = row_residuals(ordinary_x)
         idle_mask_train = (~boiler_on[:-1]) & clean_transition
         idle_indices = np.nonzero(idle_mask_train)[0]
         idle_row_residuals = full_row_residuals[idle_mask_train]
@@ -1089,28 +1154,12 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
                 flag_rate(cool_residuals) * 100,
             )
 
-        # Rows are deliberately not excluded where the tap forecaster predicts a
-        # draw: that forecaster is trained on this model's own residual, and on
-        # 90 days of real data excluding them raised UA_top+UA_bottom from 2.07
-        # to 2.56 W/K, turning the post-heating 6 h cooling bias from +0.05 K
-        # into +0.33 K while validation stayed equal. The robust loss below
-        # already limits the influence of draws.
-
-        robust_fit = least_squares(
-            lambda parameters: combined_residuals(parameters, decay_weight),
-            x0=ordinary_fit.x,
-            bounds=(lower_bounds, upper_bounds),
-            loss="soft_l1",
-            f_scale=f_scale,
-        )
-
-        if not robust_fit.success:
-            logger.warning(
-                "Boiler thermal robust fit did not fully converge: %s",
-                robust_fit.message,
-            )
-
         std_errors = self._parameter_std_errors(robust_fit)
+
+        if standing_loss is not None:
+            std_errors = np.r_[
+                standing_loss[1] / 2.0, standing_loss[1] / 2.0, std_errors
+            ]
 
         parameter_names = [
             "ua_top_w_per_k",
@@ -1129,19 +1178,19 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             "UA_top=%.3f±%.3f W/K, UA_bottom=%.3f±%.3f W/K, "
             "UA_mix_idle=%.3f±%.3f W/K, UA_mix_active=%.1f±%.1f W/K, "
             "Q_in=%.1f±%.1f W",
-            robust_fit.x[0],
+            parameters[0],
             std_errors[0],
-            robust_fit.x[1],
+            parameters[1],
             std_errors[1],
-            robust_fit.x[2],
+            parameters[2],
             std_errors[2],
-            robust_fit.x[3],
+            parameters[3],
             std_errors[3],
-            robust_fit.x[4],
+            parameters[4],
             std_errors[4],
         )
 
-        self.model = _model_from_parameters(robust_fit.x, self.volume_l)
+        self.model = _model_from_parameters(parameters, self.volume_l)
 
         steady_w, ramp_seconds = self._identify_heat_input_ramp(df)
         self.model.q_in_steady_w = steady_w
@@ -1326,6 +1375,111 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
     # Fewer runs than this cannot tell the layer's size from its temperature:
     # the two trade off against each other.
     MIN_COLD_LAYER_RUNS = 10
+
+    # Nights are the tank's tap-free rest: in the local hours before this one,
+    # over 90 days of real data, no idle quarter hour showed the bottom sensor
+    # dropping 1 K - the mark of cold water drawn in - against 19-36% of them
+    # at 21-22 h, and 1% even with nobody home (timed appliances, trackers).
+    STANDING_LOSS_NIGHT_END_HOUR = 6
+    # A night's standing loss cools the tank about one sensor step
+    # (TANK_SENSOR_RESOLUTION_K), so the loss is only seen over many: on real
+    # data the two halves of 89 nights still put it at 1.7 and 2.2 W/K. With
+    # fewer, the fit is left as it was.
+    MIN_STANDING_LOSS_NIGHTS = 30
+
+    def _identify_standing_loss(self, df: pd.DataFrame) -> tuple[float, float] | None:
+        """(the tank's heat loss coefficient to its surroundings W/K, its
+        standard error) from tap-free nights at rest; None with too few such
+        nights or no cold layer identified.
+
+        At rest after an evening's tapping, the cold water below the bottom
+        sensor (see BoilerThermalModel.cold_layer_fraction) warms against the
+        tank above it, so the bottom sensor cools without the tank losing that
+        heat. A model without that layer takes it for standing loss: fitted on
+        the same 89 nights, the two-node model's loss grew with the evening's
+        stratification from 2.9 to 6.1 W/K. With the layer as a node of its own
+        (see physics.layered_tank_state_space) the loss is 2.1 and 2.4 W/K
+        whether the night starts mixed or stratified, and the same whatever
+        share of the tank the layer is given (1.92 W/K at 25, 52 and 75%) -
+        that share trades against the layer's temperature and is taken from
+        the runs' heat balance. The layer's temperature at the start of each
+        night is not measured, so it is fitted per night.
+        """
+
+        model = self.model
+
+        if model is None or model.cold_layer_fraction is None:
+            return None
+
+        local = df["time"].map(to_local_time)
+        last_heating = df["time"].where(df["boiler_on"]).ffill()
+        at_rest = ~df["boiler_on"] & (
+            (df["time"] - last_heating).dt.total_seconds().fillna(np.inf)
+            > self.POST_HEATING_TAIL_SECONDS
+        )
+        dt = float(df["dt_seconds"].median())
+        steps = int(round(self.STANDING_LOSS_NIGHT_END_HOUR * 3600.0 / dt))
+        night = local.map(lambda t: t.hour < self.STANDING_LOSS_NIGHT_END_HOUR)
+        nights = [
+            rows
+            for _, rows in df[night].groupby(local[night].map(lambda t: t.date()))
+            if len(rows) == steps
+            and at_rest[rows.index].all()
+            and np.allclose(rows["dt_seconds"].iloc[1:], dt)
+        ]
+
+        if len(nights) < self.MIN_STANDING_LOSS_NIGHTS:
+            return None
+
+        top = np.stack([rows["T_top"].to_numpy(dtype=float) for rows in nights])
+        bottom = np.stack([rows["T_bottom"].to_numpy(dtype=float) for rows in nights])
+        ambient = np.stack([rows["T_ambient"].to_numpy(dtype=float) for rows in nights])
+        count = len(nights)
+
+        def residuals(p: np.ndarray) -> np.ndarray:
+            a_d, b_d = discretize_zoh(
+                *layered_tank_state_space(
+                    model.volume_l, p[0], model.cold_layer_fraction, p[1], p[2]
+                ),
+                dt,
+            )
+            state = np.column_stack([top[:, 0], bottom[:, 0], p[3:]])
+            errors = []
+
+            for k in range(1, steps):
+                state = state @ a_d.T + ambient[:, k - 1, None] * b_d.T
+                errors.append(state[:, :2] - np.column_stack([top[:, k], bottom[:, k]]))
+
+            return np.stack(errors, axis=1).ravel()
+
+        # Each night's layer temperature only moves that night's residuals.
+        sparsity = np.zeros((count * (steps - 1) * 2, 3 + count), dtype=int)
+        sparsity[:, :3] = 1
+        for i in range(count):
+            sparsity[i * (steps - 1) * 2 : (i + 1) * (steps - 1) * 2, 3 + i] = 1
+
+        # The layer lies below the bottom sensor, so it is no warmer.
+        layer_upper = bottom[:, 0]
+        layer_start = np.clip(
+            model.cold_water_temperature_c or layer_upper, 0.0, layer_upper
+        )
+        fit = least_squares(
+            residuals,
+            np.r_[
+                model.ua_top_w_per_k + model.ua_bottom_w_per_k,
+                self.INITIAL_UA_MIX_IDLE_W_PER_K,
+                self.INITIAL_UA_MIX_IDLE_W_PER_K,
+                layer_start,
+            ],
+            bounds=(np.zeros(3 + count), np.r_[np.inf, np.inf, np.inf, layer_upper]),
+            jac_sparsity=sparsity,
+            x_scale="jac",
+        )
+
+        # The Jacobian comes back sparse (see jac_sparsity).
+        fit.jac = fit.jac.toarray()
+
+        return float(fit.x[0]), float(self._parameter_std_errors(fit)[0])
 
     def _identify_cold_layer(
         self, df: pd.DataFrame
@@ -1610,14 +1764,24 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
     def _planner_run_errors(self, df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
         """Replays MPCOptimizer's single-node planning model (lumped_tank_state_space
-        with a constant q_in_nominal_w while on) over every real heating run in
+        with q_in_steady_w and its ramp while on) over every real heating run in
         `df` it can follow without a data gap or a following run interfering,
-        starting from the measured tank average at the run's start with the
-        run's real on/off timing. Returns planned minus measured tank average
-        (K) after one MPC step (MPCConfig.step_hours - the step the optimizer
-        actually executes) and PLANNER_CHECK_SETTLE_S after the run ends - the
-        checks that matter for planning, which the two-node rollout in
-        validate() does not make.
+        from the tank as the plan reads it at the run's start - mixed, the cold
+        layer below the sensors included (see BoilerThermalModel
+        .mixed_temperature) - with the run's real on/off timing. Returns planned
+        minus real tank (K) after one MPC step (MPCConfig.step_hours - the step
+        the optimizer actually executes) and PLANNER_CHECK_SETTLE_S after the run
+        ends - the checks that matter for planning, which the two-node rollout
+        in validate() does not make.
+
+        Both against the tank's heat, not the sensors: a run stirs the cold
+        layer up past them, and their average fell 4 K below the plan in the
+        first step while heat went in (real data, 77 runs). After the run the
+        tank is mixed and read as the plan reads it; after the first step it is
+        that tank less the heat measured going in since (the calorimetry, see
+        prepare()) plus the standing loss meanwhile - the heat balance that
+        _identify_cold_layer reads the layer from. Where that heat is not
+        measured, no first-step error is given.
         """
 
         model = self.model
@@ -1625,9 +1789,21 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             model.volume_l, model.ua_top_w_per_k + model.ua_bottom_w_per_k
         )
         seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
-        T_average = ((df["T_top"] + df["T_bottom"]) / 2.0).to_numpy(dtype=float)
+        top = df["T_top"].to_numpy(dtype=float)
+        bottom = df["T_bottom"].to_numpy(dtype=float)
         T_ambient = df["T_ambient"].to_numpy(dtype=float)
         on = df["boiler_on"].to_numpy(dtype=bool)
+        T_tank = model.mixed_temperature(
+            top, bottom, tank_stratification_k(top, bottom, on)
+        )
+        heat_w = pd.to_numeric(df["q_in_override_w"], errors="coerce").to_numpy()
+        loss_w = model.ua_top_w_per_k * (top - T_ambient) + model.ua_bottom_w_per_k * (
+            bottom - T_ambient
+        )
+        net_j = (np.where(on, heat_w, 0.0) - loss_w) * np.r_[np.diff(seconds), 0.0]
+        heat_capacity_j_per_k = (
+            RHO_WATER_KG_PER_L * model.volume_l * CP_WATER_J_PER_KG_K
+        )
         booster = (
             df["booster_on"].to_numpy(dtype=bool)
             if "booster_on" in df.columns
@@ -1664,7 +1840,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             ):
                 continue
 
-            T = T_average[start]
+            T = T_tank[start]
 
             for i in range(start, settled):
                 dt = float(seconds[i + 1] - seconds[i])
@@ -1682,12 +1858,19 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
                     q_in = booster_heat_w
                 elif on[i]:
                     # Coming up to speed, exactly as the optimizer plans it
-                    # (see MPCOptimizer._ramp_fraction).
+                    # (see MPCOptimizer._ramp_fraction): the step's mean share
+                    # of a linear rise. Its share at the step's start instead
+                    # left out half a step of the ramp - 0.28 kWh a run, and
+                    # every run 1.2 K colder than the plan really makes it.
                     q_in = model.q_in_steady_w or model.q_in_nominal_w
                     ramp = model.q_in_ramp_seconds
 
                     if ramp:
-                        q_in *= min(1.0, (seconds[i] - seconds[start]) / ramp)
+                        t0 = seconds[i] - seconds[start]
+                        t1 = t0 + dt
+                        rising_s = np.clip([t0, t1], 0.0, ramp)
+                        risen = (rising_s[1] ** 2 - rising_s[0] ** 2) / (2.0 * ramp)
+                        q_in *= (risen + max(t1 - ramp, 0.0) - max(t0 - ramp, 0.0)) / dt
                 else:
                     q_in = 0.0
 
@@ -1698,10 +1881,11 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
                 T = T_next
 
-                if i + 1 == first_check:
-                    first_step_errors.append(T - T_average[i + 1])
+                if i + 1 == first_check and not np.isnan(net_j[i + 1 : settled]).any():
+                    heat_since_c = net_j[i + 1 : settled].sum() / heat_capacity_j_per_k
+                    first_step_errors.append(T - (T_tank[settled] - heat_since_c))
 
-            run_end_errors.append(T - T_average[settled])
+            run_end_errors.append(T - T_tank[settled])
 
         return np.array(first_step_errors), np.array(run_end_errors)
 
@@ -1957,11 +2141,11 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         run_end_bias_k, run_end_mae_k = _median_and_mae(run_end_errors)
 
         logger.info(
-            "Boiler thermal validation, planning model (single node, q_in_nominal_w="
+            "Boiler thermal validation, planning model (single node, q_in_steady_w="
             "%.0f W) over %d heating runs: after the first %.0f min median "
             "error=%+.2f K, MAE=%.2f K | %.0f min after the run median "
             "error=%+.2f K, MAE=%.2f K (planned minus measured).",
-            self.model.q_in_nominal_w,
+            self.model.q_in_steady_w or self.model.q_in_nominal_w,
             run_end_errors.size,
             MPCConfig().step_hours * 60.0,
             first_step_bias_k,

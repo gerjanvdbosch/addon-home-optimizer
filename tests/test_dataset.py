@@ -1,8 +1,10 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+
+import pytest
 
 from domain.dataset import AttributeSeriesDefinition
 from domain.sensors import InfluxSensor, SensorAttributesReference
-from infrastructure.loaders import AttributeSeriesLoader
+from infrastructure.loaders import AttributeSeriesLoader, time_weighted_means
 
 # A forecast covering whole UTC days, published twice: yesterday's covers the
 # hours before 00:00 UTC that the local day already asks for.
@@ -23,7 +25,7 @@ LOCAL_MIDNIGHT = datetime(2026, 9, 17, 22, tzinfo=UTC)
 class _Influx:
     """The forecast sensor, published yesterday at 21:00 UTC and today at 00:00."""
 
-    def find(self, measurement, entity_id, field):
+    def find(self, measurement, entity_id, field, before=None):
         return {"value": str(TODAY[field])}
 
     def find_series(self, measurement, entity_id, field, start, end, **kwargs):
@@ -91,3 +93,36 @@ def test_without_an_earlier_forecast_only_the_newest_one_is_used():
             return []
 
     assert _load(_Only())[0] == (datetime(2026, 9, 18, 0, tzinfo=UTC), 13.8)
+
+
+def test_a_reading_counts_for_as_long_as_it_held():
+    """A run at 2400 W stopping one minute into a quarter, its last readings
+    many, the 0 after it one: a plain mean of the quarter's readings gives
+    1600 W, the time it held 160 W. The reading in force at the start holds
+    into the window; the running quarter counts up to the end."""
+
+    start = datetime(2026, 10, 2, 11, 30, tzinfo=UTC)
+    readings = [(-5.0, 2400.0), (14.0, 2400.0), (14.5, 2400.0), (16.0, 0.0)]
+    points = [
+        {"time": (start + timedelta(minutes=m)).isoformat(), "value": v}
+        for m, v in readings
+    ]
+
+    means = time_weighted_means(points, start, start + timedelta(minutes=20), "15m")
+
+    assert [p["time"] for p in means] == [
+        start.isoformat(),
+        (start + timedelta(minutes=15)).isoformat(),
+    ]
+    assert means[0]["value"] == pytest.approx(2400.0)
+    assert means[1]["value"] == pytest.approx(2400.0 * 1 / 5)
+
+
+def test_nothing_is_known_before_the_first_reading():
+    start = datetime(2026, 10, 2, 11, 30, tzinfo=UTC)
+    points = [{"time": (start + timedelta(minutes=20)).isoformat(), "value": 100.0}]
+
+    means = time_weighted_means(points, start, start + timedelta(minutes=30), "15m")
+
+    assert [p["value"] for p in means] == [None, pytest.approx(100.0)]
+    assert time_weighted_means([], start, start + timedelta(minutes=30), "15m") == []

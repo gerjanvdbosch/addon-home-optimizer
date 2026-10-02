@@ -66,6 +66,44 @@ def tank_state_space(
     return a, b
 
 
+def layered_tank_state_space(
+    volume_l: float,
+    ua_w_per_k: float,
+    layer_fraction: float,
+    k_top_bottom_w_per_k: float,
+    k_bottom_layer_w_per_k: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Continuous state-space for dx/dt = A x + B T_ambient of a tank at rest,
+    x = [T_top, T_bottom, T_layer]: the two sensed nodes and the cold layer
+    below the bottom sensor (see BoilerThermalModel.cold_layer_fraction).
+
+        C_top    dT_top/dt    = UA_top (T_amb - T_top) + K_tb (T_bottom - T_top)
+        C_bottom dT_bottom/dt = UA_bottom (T_amb - T_bottom)
+                                + K_tb (T_top - T_bottom) + K_bl (T_layer - T_bottom)
+        C_layer  dT_layer/dt  = UA_layer (T_amb - T_layer) + K_bl (T_bottom - T_layer)
+
+    The layer holds layer_fraction of the volume, the sensed nodes half of the
+    rest each. The standing loss is spread over the nodes in proportion to their
+    volume: the same loss per height of the cylinder, nothing being known that
+    would make one part lose more. The internal couplings conserve the tank's
+    energy, so only UA takes it out.
+    """
+
+    shares = np.array([(1 - layer_fraction) / 2, (1 - layer_fraction) / 2])
+    shares = np.append(shares, layer_fraction)
+    capacities = RHO_WATER_KG_PER_L * volume_l * CP_WATER_J_PER_KG_K * shares
+    k_tb, k_bl = k_top_bottom_w_per_k, k_bottom_layer_w_per_k
+    coupling = np.array(
+        [[-k_tb, k_tb, 0.0], [k_tb, -k_tb - k_bl, k_bl], [0.0, k_bl, -k_bl]]
+    )
+    losses = ua_w_per_k * shares
+
+    a = (coupling - np.diag(losses)) / capacities[:, None]
+    b = (losses / capacities)[:, None]
+
+    return a, b
+
+
 def tank_stratification_k(top_c, bottom_c, mixing) -> np.ndarray:
     """The stratification the cold layer below the tank's sensors is read from
     (K, see BoilerThermalModel.mixed_temperature): the top sensor less the
@@ -147,12 +185,13 @@ def zone_state_space(
     x = [T_air, T_mass], u = [T_outdoor, Q_internal, Q_solar, Q_floor]:
 
         C_air  dT_air/dt  = UA_env (T_out - T_air) + UA_am (T_mass - T_air) + Q_int
-        C_mass dT_mass/dt = UA_am  (T_air - T_mass) + Q_sol + f_floor Q_floor
+        C_mass dT_mass/dt = UA_am  (T_air - T_mass) + Q_sol + Q_floor
 
-    Q_solar and Q_floor drive the mass node, not the air node. The floor
-    circuit physically runs inside the screed, and air is effectively
-    transparent to shortwave radiation, which is absorbed by floor and
-    furnishings - this is the same structure as the boiler's, where heat is
+    The air node is the room, the mass node the floor slab (see
+    BuildingThermalModel). Q_solar and Q_floor drive the slab, not the room.
+    The floor circuit physically runs inside the screed, and air is effectively
+    transparent to shortwave radiation, which the floor absorbs - this is the
+    same structure as the boiler's, where heat is
     supplied at the bottom rather than uniformly. It is also what produces the
     observed lag between sun or compressor and room temperature, without any
     added delay term.
@@ -173,7 +212,7 @@ def zone_state_space(
     b = np.array(
         [
             [ua_env / c_air, 1.0 / c_air, 0.0, 0.0],
-            [0.0, 0.0, 1.0 / c_mass, model.floor_heat_fraction / c_mass],
+            [0.0, 0.0, 1.0 / c_mass, 1.0 / c_mass],
         ]
     )
 

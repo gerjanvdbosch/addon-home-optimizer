@@ -136,13 +136,26 @@ class BuildingThermalModel:
     x = [T_air, T_mass]:
 
         C_air  dT_air/dt  = UA_env (T_out - T_air) + UA_am (T_mass - T_air) + Q_int
-        C_mass dT_mass/dt = UA_am  (T_air - T_mass) + Q_sol + f_floor Q_floor
+        C_mass dT_mass/dt = UA_am  (T_air - T_mass) + Q_sol + Q_floor
 
-    Q_floor and Q_sol enter the mass node rather than the air node because that
-    is where the physics puts them: the floor circuit runs inside the screed,
-    and air is effectively transparent to shortwave radiation, which is
-    absorbed by the floor and furnishings. Q_int (metabolic and appliance
-    heat) is released convectively into the air.
+    The air node is the room: its air, furnishings and internal walls, which
+    follow one another closely. The mass node is the floor slab - screed and
+    the concrete floor it lies on - with the floor circuit in it, coupled to
+    the room only through its surface. Q_floor and Q_sol enter the slab because
+    that is where the physics puts them: the pipes run in the screed, and air is
+    effectively transparent to shortwave radiation, which the floor absorbs.
+    Q_int (metabolic and appliance heat) is released convectively into the air.
+
+    All of the measured floor heat enters the slab: every room is in the zone,
+    the pipe run from the shed is insulated and buried, and the run through the
+    attic exchanges too little with it to matter (real data: the attic 9 K
+    warmer than the water, against some 2 kW missing). With the internal walls
+    lumped with the slab instead, a fit had to discard half of the measured
+    cooling to match the rooms. The slab takes it: a floor at 4-5 K below the
+    room passes 1.5-2 kW through its surface (EN 1264), the rest of a 4.4 kW
+    run cools the slab and returns to the room hours later (real data,
+    cross-validated on 19 cooling runs: -0.37 K per 10 kWh of cooling before,
+    +0.03 to +0.04 after).
 
     One model serves both heating and cooling: none of these parameters
     describes the heat pump. Q_floor is a measured calorimetric input carrying
@@ -164,25 +177,16 @@ class BuildingThermalModel:
     # lumped parameter because those three factors only ever appear as their
     # product in the heat balance, and the g-value is not separately measured.
     a_eff_m2: float
-    # Share of the thermostat's reading that follows the mass node rather than
-    # the air. A wall-mounted sensor exchanges longwave radiation with floor
-    # and walls, so what it reports is an operative temperature somewhere
-    # between the two - 0 is a pure air sensor, 0.5 the textbook operative
-    # temperature in still air. It belongs to the sensor, not to the balance:
-    # no heat flows because of it.
+    # Share of the thermostat's reading that follows the slab rather than the
+    # room. A wall-mounted sensor exchanges longwave radiation with the floor
+    # as well as the walls, so what it reports is an operative temperature -
+    # 0 reads the room node alone, 0.5 the floor as much as the room. It
+    # belongs to the sensor, not to the balance: no heat flows because of it.
     sensor_mass_fraction: float
     # Fraction of the house-wide baseload electrical power that is released as
     # heat inside this zone. The baseload sensor measures the whole house; the
     # modelled zone is only part of it.
     internal_gain_fraction: float
-    # Share of the measured floor-circuit heat that reaches this zone. The
-    # calorimeter sits at the heat pump and measures every loop, while the
-    # zone is the rooms with a thermostat: loops under the hall, kitchen,
-    # bathroom and stairs, the pipe run from the shed and the ground below the
-    # ground-floor slab take the rest. Taken as 1 before it was identified,
-    # the model cooled the zone by 0.2-0.7 K over real cooling runs that left it
-    # where it was.
-    floor_heat_fraction: float = 1.0
 
 
 # Exact by definition of the Kelvin scale (0 degC = 273.15 K) - used

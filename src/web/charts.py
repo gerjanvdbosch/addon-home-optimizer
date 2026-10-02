@@ -85,16 +85,18 @@ def continued(measured: list, planned: list) -> list:
 
 
 def read_at(points: list[SeriesPoint], updated: datetime) -> list[SeriesPoint]:
-    """A quarter's last reading at the time it was read: the quarter's end, or
-    the state's update in the quarter still running. InfluxDB labels the
-    quarter at its start (see StateManager._dataset), where a heating tank was
-    drawn a quarter early - flat through the running quarter, and then jumping
-    to the plan."""
+    """Each ended quarter's last reading at the quarter's end, when it was
+    read. InfluxDB labels the quarter at its start (see
+    StateManager._dataset), where a heating tank was drawn a quarter early -
+    flat through the running quarter, and then jumping to the plan. The
+    running quarter is left to the plan, as in ended(): drawn at the update
+    it put a point between the quarters, and the line bent there."""
 
     quarter = timedelta(hours=MPCConfig().step_hours)
 
     return [
-        SeriesPoint(time=min(p.time + quarter, updated), value=p.value) for p in points
+        SeriesPoint(time=p.time + quarter, value=p.value)
+        for p in ended(points, updated)
     ]
 
 
@@ -379,7 +381,7 @@ def dashboard_chart(
     boiler = BoilerMeasurement(
         top_temperature=read_at(measured.top_temperature, state.updated),
         bottom_temperature=read_at(measured.bottom_temperature, state.updated),
-        stratification=measured.stratification,
+        stratification=read_at(measured.stratification, state.updated),
     )
     measured_average = mixed_tank(boiler, boiler_model)
 

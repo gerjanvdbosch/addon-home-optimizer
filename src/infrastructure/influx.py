@@ -31,11 +31,15 @@ class InfluxDatabase:
         measurement: str,
         entity_id: str,
         field: str,
+        before: datetime | None = None,
     ) -> dict[str, Any] | None:
+        """The latest reading, or the latest before `before`."""
+
+        until = f"AND time < '{before.isoformat()}'" if before else ""
         query = f"""
         SELECT "{field}" AS value
         FROM "{measurement}"
-        WHERE "entity_id" = '{entity_id}'
+        WHERE "entity_id" = '{entity_id}' {until}
         ORDER BY time DESC
         LIMIT 1
         """

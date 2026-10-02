@@ -225,6 +225,18 @@ class Optimization:
                     state, forecast_times, datetime.now(timezone.utc)
                 )
             ),
+            previous_tank_on=tuple(
+                int(on)
+                for on in self.state_manager.align_predictions(
+                    state.schedule.heat_pump.boiler.on, forecast_times
+                )
+            ),
+            previous_space_on=tuple(
+                int(on)
+                for on in self.state_manager.align_predictions(
+                    state.schedule.building.on, forecast_times
+                )
+            ),
         )
         data = self._with_legionella(
             data, forecast_times, config.heat_pump.boiler, thermal_model, mpc_config
@@ -304,6 +316,7 @@ class Optimization:
             times=forecast_times,
             supply_c=result.space_supply_c,
             power_w=result.space_electrical_w,
+            on=result.space_schedule,
         )
         self.publish_zone(
             result,
@@ -734,14 +747,12 @@ class Optimization:
         floor buffer is made of. Only planned with a comfort ceiling
         configured.
 
-        Acted on only where configured (BuildingConfig.control_heating and
-        control_cooling, see publish_zone). Elsewhere the heat pump runs the
-        floor by itself, so a floor run under way is not the plan's to hold:
+        Published for Home Assistant (see publish_zone), but the floor is run
+        outside this app, so a floor run under way is not the plan's to hold:
         it is left out (space_on_current), rather than keep the tank waiting on
         a run the plan cannot stop. The Ecodan hands over to hot water when
         asked; were it not to, hot water would wait for the floor exactly as it
-        did before the zone was planned at all. Where the plan drives the
-        floor, the run under way is its own and counts.
+        did before the zone was planned at all.
 
         Cooled rather than heated while the heat pump is set to cool (see
         HeatPumpConfig.mode), from the cooling runs' own models, and only with
@@ -843,12 +854,6 @@ class Optimization:
             ),
         )
 
-        heat_pump_state = state.measurements.heat_pump.state
-        mode_state = states.cooling if cooling else states.heating
-
-        if self.controlled(config, cooling) and heat_pump_state:
-            inputs["space_on_current"] = heat_pump_state[-1].value == mode_state
-
         # The measurements start at local midnight, so any hot water among
         # them was today's.
         if cooling and config.building.dhw_after_cooling:
@@ -856,7 +861,8 @@ class Optimization:
                 to_local_time(t).toordinal() for t in times
             )
             inputs["dhw_earlier_today"] = any(
-                point.value == states.dhw for point in heat_pump_state
+                point.value == states.dhw
+                for point in state.measurements.heat_pump.state
             )
 
         # How the heat pump runs the floor by itself in this mode - None until
@@ -928,14 +934,6 @@ class Optimization:
         )
 
         return forecast_c
-
-    @staticmethod
-    def controlled(config: Config, cooling: bool) -> bool:
-        """Whether the plan drives the floor in this mode."""
-
-        building = config.building
-
-        return building.control_cooling if cooling else building.control_heating
 
     @staticmethod
     def running_since(changes: list[SeriesPoint], mode_state: str) -> datetime | None:
@@ -1012,9 +1010,8 @@ class Optimization:
         start of the run under way or the next one planned, and - cooling - the
         supply setpoint while a run is under way (see zone_setpoint_c).
 
-        All three 'unknown' where the plan does not drive the floor in the mode
-        the heat pump is in (BuildingConfig.control_heating/control_cooling) or
-        cannot plan the zone at all: nothing then for an automation to act on.
+        All three 'unknown' where the zone cannot be planned at all: nothing
+        then for an automation to act on.
         The setpoint 'unknown' outside a run too, and always while heating,
         where the heat pump takes its supply from its own curve.
         """
@@ -1022,11 +1019,7 @@ class Optimization:
         status = start = setpoint = "unknown"
         published = None
 
-        if (
-            data is not None
-            and result.space_schedule
-            and self.controlled(config, data.zone_cooling)
-        ):
+        if data is not None and result.space_schedule:
             schedule = result.space_schedule
             running = schedule[0] == 1
             states = config.heat_pump.states

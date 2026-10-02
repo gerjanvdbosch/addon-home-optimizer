@@ -258,12 +258,6 @@ class BuildingConfig(BaseModel):
     # chance of condensation. On, a day the tank has been heated is not cooled
     # again until local midnight (see MPCOptimizer._add_space_heating).
     dhw_after_cooling: bool = Field(default=True)
-    # Whether the plan drives the floor in each mode: it then publishes when
-    # the floor runs and, cooling, the supply setpoint for Home Assistant to
-    # hand the heat pump (see Optimization.publish_zone). Off, the zone is
-    # planned but the heat pump runs the floor by itself.
-    control_heating: bool = Field(default=False)
-    control_cooling: bool = Field(default=False)
 
 
 class SolcastAttributes(BaseModel):

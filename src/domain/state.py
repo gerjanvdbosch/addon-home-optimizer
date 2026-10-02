@@ -128,6 +128,9 @@ class Predictions(BaseModel):
 class BoilerSchedule(BaseModel):
     target_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
     temperatures: list[SeriesPoint[float]] = Field(default_factory=list)
+    # Whether the plan heats the tank (1/0): the next plan starts from it (see
+    # MPCInput.previous_tank_on).
+    on: list[SeriesPoint[int]] = Field(default_factory=list)
 
 
 class HeatPumpSchedule(BaseModel):
@@ -148,6 +151,8 @@ class BuildingSchedule(BaseModel):
     # The supply each planned step runs the floor at: while cooling, the
     # setpoint the plan would give the heat pump. Only steps it runs.
     supply: list[SeriesPoint[float]] = Field(default_factory=list)
+    # Whether the plan serves the zone (1/0), as BoilerSchedule.on.
+    on: list[SeriesPoint[int]] = Field(default_factory=list)
     # The supply setpoint last published during a cooling run, which a later
     # one in the same run may not exceed (see Optimization.zone_setpoint_c).
     supply_setpoint: SeriesPoint[float] | None = None

@@ -231,37 +231,29 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     MAX_UA_ENVELOPE_W_PER_K = 500.0
     INITIAL_UA_ENVELOPE_W_PER_K = 150.0
 
-    # Convective/radiative coupling between the internal mass surfaces (floor,
-    # internal walls) and room air: a combined surface coefficient of roughly
-    # 3-8 W/m2K over an internal surface area of tens to a few hundred m2.
-    MIN_UA_AIR_MASS_W_PER_K = 50.0
-    MAX_UA_AIR_MASS_W_PER_K = 2000.0
-    INITIAL_UA_AIR_MASS_W_PER_K = 400.0
+    # From the floor slab's surface to the room, per m2 of floor: EN 1264's
+    # surface coefficient (about 7 W/m2K cooling, 10.8 heating) in series with
+    # the screed and covering above the pipes, which take it down to some 2.5.
+    MIN_UA_AIR_MASS_W_PER_M2_K = 2.5
+    MAX_UA_AIR_MASS_W_PER_M2_K = 11.0
+    INITIAL_UA_AIR_MASS_W_PER_M2_K = 6.0
 
-    # The air node's capacity is at least the zone's own air (rho*V*cp) and at
-    # most that many times more, covering the light furnishings and surface
-    # layers that follow the air almost instantly. Both bounds are derived from
-    # the configured volume, never asserted in Joules. Ten times air is about
-    # what furnishings can physically account for: roughly 10 kg/m2 of wood over
-    # the floor area is 2.1 MJ/K against 0.3 MJ/K of air, so about 8x.
-    #
-    # On real data this pins at the upper bound, which is reported rather than
-    # tuned away. Raising a ceiling a parameter is chasing is not evidence for a
-    # larger true value - the same trap already documented for
-    # HeatPumpCOPIdentifier.MAX_DELTA_T_EVAP. The likely physical cause is that
-    # the zone temperature comes from wall-mounted thermostats, whose own
-    # response lags the air they measure, so the fit needs a slower "air" node
-    # than air actually is.
-    MIN_AIR_CAPACITY_MULTIPLE = 1.0
-    MAX_AIR_CAPACITY_MULTIPLE = 10.0
-    INITIAL_AIR_CAPACITY_MULTIPLE = 3.0
+    # The room node per m2 of floor: at least its air (rho*V*cp, from the
+    # configured volume); at most air, furnishings (some 10 kg/m2 of wood, 25
+    # kJ/m2K) and internal walls - about a square metre of 10 cm calcium silicate
+    # brick per square metre of floor, 160 kJ/m2K - with room to spare. The
+    # walls belong here, not with the slab: they follow the room air closely
+    # (a three-node fit coupled them to it at its 2000 W/K ceiling), while the
+    # slab exchanges with the room through its surface only.
+    MAX_AIR_CAPACITY_J_PER_M2_K = 250.0e3
+    INITIAL_AIR_CAPACITY_J_PER_M2_K = 100.0e3
 
-    # Screed, floor slab and internal walls. 2 MJ/K is about a tonne of
-    # concrete (cp ~ 880 J/kgK), the least a floor-heated dwelling can have;
-    # 50 MJ/K is tens of tonnes, more structure than a house of this size has.
-    MIN_C_MASS_J_PER_K = 2.0e6
-    MAX_C_MASS_J_PER_K = 50.0e6
-    INITIAL_C_MASS_J_PER_K = 15.0e6
+    # The floor slab per m2: at least 4 cm of screed (2000 kg/m3, 850 J/kgK);
+    # at most 8 cm of screed on 26 cm of concrete (2200 and 2400 kg/m3,
+    # 1000 J/kgK) - a new build's ground floor, insulated below.
+    MIN_C_MASS_J_PER_M2_K = 68.0e3
+    MAX_C_MASS_J_PER_M2_K = 800.0e3
+    INITIAL_C_MASS_J_PER_M2_K = 400.0e3
 
     # Fraction of the configured south glass area used as the starting guess
     # for the effective aperture: a typical double-glazing g-value times a
@@ -270,37 +262,26 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     INITIAL_APERTURE_FRACTION = 0.5
 
     # A wall thermostat exchanges longwave radiation with the surfaces around
-    # it, so it reads an operative temperature between air and mass rather than
-    # air alone (see BuildingThermalModel.sensor_mass_fraction). 0.5 is that
-    # textbook average in still air, and the ceiling here: the sensor sits in
-    # moving room air, so it cannot follow the surfaces more closely than
-    # evenly. On this installation's cooling data the fit runs into that
-    # ceiling, which says the thermostats follow the structure at least that
-    # closely - reported rather than tuned away, like every other pinned bound
-    # here, and one for the heating season to settle.
+    # it, so it reads an operative temperature between the room and the floor
+    # rather than the room alone (see BuildingThermalModel.sensor_mass_fraction).
+    # 0.5 is the textbook average in still air, and the ceiling here: the sensor
+    # sits in moving room air, so it cannot follow a surface more closely than
+    # evenly. Not yet settled by the data: 0 on either half of July-October,
+    # the 0.5 ceiling on August-September alone.
     MAX_SENSOR_MASS_FRACTION = 0.5
     INITIAL_SENSOR_MASS_FRACTION = 0.25
 
-    # An unmodelled heat flow can enter either node: the air through
-    # ventilation, a stove or a visitor, the mass through heat that was
-    # measured into the floor circuit but lost in the pipe run before the
-    # screed (this heat pump stands in a shed). Q_internal and Q_floor are the
-    # input channels that land there, so the filter carries one disturbance per
-    # node instead of claiming the mass is driven exactly as measured.
+    # An unmodelled heat flow can enter either node: the room through
+    # ventilation, a stove or a visitor, the slab through a calorimeter that
+    # reads somewhat off. Q_internal and Q_floor are the input channels that
+    # land there, so the filter carries one disturbance per node instead of
+    # claiming the slab is driven exactly as measured.
     DISTURBANCE_INPUTS = (1, 3)
 
     # Share of the house-wide baseload dissipated inside the modelled zone.
     # Physically a fraction, hence [0, 1]; the living zone is a substantial but
     # not dominant part of the house, so the fit starts mid-range.
     INITIAL_INTERNAL_GAIN_FRACTION = 0.5
-
-    # Share of the measured floor heat reaching the zone (see
-    # BuildingThermalModel.floor_heat_fraction). At most all of it; at least a
-    # tenth, since the rooms with a thermostat are the bulk of the dwelling's
-    # floor - below that the zone would not be the house it is meant to model.
-    # Started below 1, since pipe runs and ground always take some.
-    MIN_FLOOR_HEAT_FRACTION = 0.1
-    INITIAL_FLOOR_HEAT_FRACTION = 0.8
 
     def __init__(self, latitude: float, longitude: float) -> None:
         super().__init__()
@@ -402,7 +383,6 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         "a_eff_m2",
         "sensor_mass_fraction",
         "internal_gain_fraction",
-        "floor_heat_fraction",
     )
 
     @staticmethod
@@ -416,7 +396,6 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 model.a_eff_m2,
                 model.sensor_mass_fraction,
                 model.internal_gain_fraction,
-                model.floor_heat_fraction,
             ]
         )
 
@@ -429,7 +408,6 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             a_eff_m2=float(x[4]),
             sensor_mass_fraction=float(x[5]),
             internal_gain_fraction=float(x[6]),
-            floor_heat_fraction=float(x[7]),
         )
 
     def _shutter_open_fraction(self, df: pd.DataFrame) -> pd.Series:
@@ -818,11 +796,11 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     def _bounds(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """(lower, initial, upper) for the parameter vector.
 
-        The two capacity-related bounds are derived from configuration rather
-        than asserted: the air node cannot hold less than the zone's own air,
-        and the effective solar aperture cannot exceed the geometric glass area
-        because it is that area times a g-value and an incidence factor, both at
-        most one.
+        The capacity and coupling bounds are derived from configuration rather
+        than asserted: per m2 of the configured floor, and the room node never
+        less than the zone's own air. The effective solar aperture cannot exceed
+        the geometric glass area because it is that area times a g-value and an
+        incidence factor, both at most one.
         """
 
         if self.volume_m3 <= 0.0:
@@ -833,6 +811,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             )
 
         air_capacity = RHO_AIR_KG_PER_M3 * self.volume_m3 * CP_AIR_J_PER_KG_K
+        floor_m2 = sum(self.room_areas_m2)
 
         # least_squares needs a strictly positive bound width, so a zone with no
         # configured south glass gets a numerically-zero aperture rather than a
@@ -842,25 +821,23 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         lower = np.array(
             [
                 self.MIN_UA_ENVELOPE_W_PER_K,
-                self.MIN_UA_AIR_MASS_W_PER_K,
-                self.MIN_AIR_CAPACITY_MULTIPLE * air_capacity,
-                self.MIN_C_MASS_J_PER_K,
+                self.MIN_UA_AIR_MASS_W_PER_M2_K * floor_m2,
+                air_capacity,
+                self.MIN_C_MASS_J_PER_M2_K * floor_m2,
                 0.0,
                 0.0,
                 0.0,
-                self.MIN_FLOOR_HEAT_FRACTION,
             ]
         )
 
         upper = np.array(
             [
                 self.MAX_UA_ENVELOPE_W_PER_K,
-                self.MAX_UA_AIR_MASS_W_PER_K,
-                self.MAX_AIR_CAPACITY_MULTIPLE * air_capacity,
-                self.MAX_C_MASS_J_PER_K,
+                self.MAX_UA_AIR_MASS_W_PER_M2_K * floor_m2,
+                max(self.MAX_AIR_CAPACITY_J_PER_M2_K * floor_m2, air_capacity),
+                self.MAX_C_MASS_J_PER_M2_K * floor_m2,
                 max_aperture,
                 self.MAX_SENSOR_MASS_FRACTION,
-                1.0,
                 1.0,
             ]
         )
@@ -868,13 +845,12 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         initial = np.array(
             [
                 self.INITIAL_UA_ENVELOPE_W_PER_K,
-                self.INITIAL_UA_AIR_MASS_W_PER_K,
-                self.INITIAL_AIR_CAPACITY_MULTIPLE * air_capacity,
-                self.INITIAL_C_MASS_J_PER_K,
+                self.INITIAL_UA_AIR_MASS_W_PER_M2_K * floor_m2,
+                self.INITIAL_AIR_CAPACITY_J_PER_M2_K * floor_m2,
+                self.INITIAL_C_MASS_J_PER_M2_K * floor_m2,
                 self.INITIAL_APERTURE_FRACTION * max_aperture,
                 self.INITIAL_SENSOR_MASS_FRACTION,
                 self.INITIAL_INTERNAL_GAIN_FRACTION,
-                self.INITIAL_FLOOR_HEAT_FRACTION,
             ]
         )
 

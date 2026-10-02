@@ -3,6 +3,7 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
+from pyomo.contrib.appsi.solvers.highs import Highs
 
 from domain.dynamics import discretize_zoh
 from domain.models import (
@@ -473,6 +474,30 @@ def test_a_run_past_its_minimum_runtime_may_stop():
     result = MPCOptimizer(THERMAL_MODEL, MPCConfig()).solve(_running_run_input(1.0))
 
     assert result.schedule[0] == 0
+
+
+def test_the_solve_starts_from_the_previous_plan_and_still_finds_the_best():
+    """A solve stopped at its time limit publishes its best plan so far, so it
+    starts from the previous one: loaded beyond the first step as it was, and
+    left behind where a better plan exists - here a run before the sun."""
+
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[18] = 45.0
+    previous = tuple(int(k in (2, 3, 4)) for k in range(len(SOLAR_FORECAST_W)))
+    data = _make_input(target_temperature_top=tuple(target), previous_tank_on=previous)
+    optimizer = MPCOptimizer(THERMAL_MODEL, NO_FEED_IN)
+
+    model = optimizer._build_model(data)
+    assert optimizer._warm_start(model, data, Highs())
+    assert [round(model.tank_heating[k].value) for k in model.K][1:] == list(
+        previous[1:]
+    )
+
+    warm = optimizer.solve(data)
+    cold = optimizer.solve(replace(data, previous_tank_on=()))
+
+    assert warm.schedule == cold.schedule
+    assert not any(warm.schedule[:8])
 
 
 def test_validate_input_rejects_mismatched_target_length():

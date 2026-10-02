@@ -35,7 +35,6 @@ TRUE_MODEL = BuildingThermalModel(
     # the operative-temperature reading has its own test below.
     sensor_mass_fraction=0.0,
     internal_gain_fraction=0.6,
-    floor_heat_fraction=0.7,
 )
 
 
@@ -271,11 +270,6 @@ def test_calibrate_recovers_known_parameters():
     # The mass capacity sets how long the building coasts, the quantity the
     # whole two-node structure exists for.
     assert model.c_mass_j_per_k == pytest.approx(TRUE_MODEL.c_mass_j_per_k, rel=0.25)
-    # How much of a floor run reaches the zone, which sets what a planned run
-    # does to it.
-    assert model.floor_heat_fraction == pytest.approx(
-        TRUE_MODEL.floor_heat_fraction, abs=0.15
-    )
 
 
 def test_validate_reports_forward_simulation_accuracy():
@@ -566,7 +560,9 @@ def test_validate_flags_a_model_that_cannot_predict_the_forced_response(caplog):
     identifier.MIN_ACTIVE_WINDOWS = 1
     # Break only the coupling to delivered heat: free drift stays fine, the
     # response to the floor circuit does not.
-    identifier.model.c_mass_j_per_k = identifier.MIN_C_MASS_J_PER_K
+    identifier.model.c_mass_j_per_k = identifier.MIN_C_MASS_J_PER_M2_K * sum(
+        identifier.room_areas_m2
+    )
 
     with caplog.at_level("WARNING"):
         metrics = identifier.validate(df)

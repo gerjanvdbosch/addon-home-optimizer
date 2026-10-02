@@ -144,11 +144,10 @@ def test_the_dashboard_renders_with_a_calibrated_boiler():
 
 
 def test_a_quarters_last_reading_is_drawn_when_it_was_read():
-    """At the quarter's end, and at the update in the quarter still running."""
+    """At the quarter's end; the quarter still running is left to the plan."""
 
     updated = START + timedelta(minutes=20)
 
     assert [p.time for p in read_at(_points([31.0, 41.0]), updated)] == [
-        START + timedelta(minutes=15),
-        updated,
+        START + timedelta(minutes=15)
     ]

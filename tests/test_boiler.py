@@ -12,7 +12,12 @@ import pytest
 
 from domain.dynamics import discretize_zoh
 from domain.models import BoilerThermalModel
-from domain.physics import lumped_tank_state_space, tank_state_space
+from domain.physics import (
+    layered_tank_state_space,
+    lumped_tank_state_space,
+    tank_state_space,
+)
+from domain.time import local_day_start
 from features.boiler import BoilerThermalIdentifier, _rollout
 
 TRUE_VOLUME_L = 200.0
@@ -1302,6 +1307,13 @@ def _single_node_runs(start_delay_s: float) -> tuple[BoilerThermalModel, pd.Data
         T = 30.0
         for i in range(idle_before + run_length + idle_after):
             on = idle_before <= i < idle_before + run_length
+            seconds_into_run = (i - idle_before) * DT_SECONDS
+            heating_fraction = (
+                min(max(seconds_into_run + DT_SECONDS - start_delay_s, 0.0), DT_SECONDS)
+                / DT_SECONDS
+                if on
+                else 0.0
+            )
             rows.append(
                 {
                     "time": start + timedelta(seconds=len(rows) * DT_SECONDS),
@@ -1309,14 +1321,11 @@ def _single_node_runs(start_delay_s: float) -> tuple[BoilerThermalModel, pd.Data
                     "T_bottom": T,
                     "T_ambient": T_AMBIENT_C,
                     "boiler_on": on,
+                    # The heat that really went in, as the calorimetry measures it.
+                    "q_in_override_w": (
+                        model.q_in_nominal_w * heating_fraction if on else np.nan
+                    ),
                 }
-            )
-            seconds_into_run = (i - idle_before) * DT_SECONDS
-            heating_fraction = (
-                min(max(seconds_into_run + DT_SECONDS - start_delay_s, 0.0), DT_SECONDS)
-                / DT_SECONDS
-                if on
-                else 0.0
             )
             T = (
                 a_d[0, 0] * T
@@ -1336,7 +1345,9 @@ def test_planner_run_errors_are_zero_when_the_tank_follows_the_planning_model():
 
     assert first_step_errors.size == 4
     assert run_end_errors.size == 4
-    assert first_step_errors == pytest.approx(0.0, abs=1e-9)
+    # The heat balance sums the standing loss per step rather than integrating
+    # it exactly: a few hundredths of a kelvin.
+    assert first_step_errors == pytest.approx(0.0, abs=0.02)
     assert run_end_errors == pytest.approx(0.0, abs=1e-9)
 
 
@@ -1411,3 +1422,48 @@ def test_identify_heat_input_ramp_needs_enough_runs():
     assert identifier._identify_heat_input_ramp(
         _ramp_frame(runs=3, steady_w=6000.0, ramp_seconds=600.0)
     ) == (None, None)
+
+
+def test_standing_loss_is_found_past_the_cold_layer_warming_at_night():
+    """Nights after evening tapping: the layer below the bottom sensor warms
+    against the tank above it, so the bottom sensor cools faster than the
+    tank loses heat. Read through sensors on the 0.5 K grid, the standing loss
+    still comes out as simulated, not as the layer's warming."""
+
+    ua, k_tb, k_bl, layer = 2.0, 1.0, 2.0, 0.5
+    a_d, b_d = discretize_zoh(
+        *layered_tank_state_space(TRUE_VOLUME_L, ua, layer, k_tb, k_bl), DT_SECONDS
+    )
+    identifier = BoilerThermalIdentifier()
+    steps = int(identifier.STANDING_LOSS_NIGHT_END_HOUR * 3600 / DT_SECONDS)
+    rng = np.random.default_rng(0)
+    rows = []
+
+    for night in range(identifier.MIN_STANDING_LOSS_NIGHTS):
+        start = local_day_start(datetime(2026, 9, 1, tzinfo=timezone.utc), night)
+        state = np.array([50.0, 45.0, rng.uniform(25.0, 40.0)])
+
+        for k in range(steps):
+            rows.append((start + timedelta(seconds=k * DT_SECONDS), *state[:2]))
+            state = a_d @ state + b_d[:, 0] * T_AMBIENT_C
+
+    df = pd.DataFrame(rows, columns=["time", "T_top", "T_bottom"])
+    df[["T_top", "T_bottom"]] = (df[["T_top", "T_bottom"]] * 2).round() / 2
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    df["T_ambient"] = T_AMBIENT_C
+    df["boiler_on"] = False
+    df["dt_seconds"] = DT_SECONDS
+    identifier.model = BoilerThermalModel(
+        volume_l=TRUE_VOLUME_L,
+        ua_top_w_per_k=1.0,
+        ua_bottom_w_per_k=1.0,
+        ua_mix_idle_w_per_k=0.3,
+        ua_mix_active_w_per_k=600.0,
+        q_in_nominal_w=4500.0,
+        cold_layer_fraction=layer,
+        cold_water_temperature_c=30.0,
+    )
+
+    found, _ = identifier._identify_standing_loss(df)
+
+    assert found == pytest.approx(ua, rel=0.1)

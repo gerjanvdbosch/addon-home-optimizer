@@ -15,6 +15,7 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any, Literal
 
+import numpy as np
 import pandas as pd
 
 from domain.dataset import (
@@ -94,6 +95,48 @@ def resample_dataframe(
     return resampled
 
 
+def time_weighted_means(
+    points: list[dict[str, Any]], start: datetime, end: datetime, interval: str
+) -> list[dict[str, Any]]:
+    """The mean over time per interval from `start` to `end`, each reading
+    holding until the next (see Aggregation's "time_mean"); the running
+    interval up to `end`. None before the first reading. No limit on how long a
+    reading holds: a sensor that does not change is not stored again, so a
+    long silence is a value that held, as Home Assistant's own history draws
+    it."""
+
+    readings = pd.Series(
+        pd.to_numeric([p["value"] for p in points], errors="coerce"),
+        index=pd.DatetimeIndex([parse_datetime(p["time"]) for p in points]),
+    ).dropna()
+    readings = readings[~readings.index.duplicated(keep="last")].sort_index()
+
+    if readings.empty:
+        return []
+
+    step = pd.Timedelta(interval)
+    edges = pd.date_range(pd.Timestamp(start).floor(step), end, freq=step)
+    edges = edges.append(pd.DatetimeIndex([pd.Timestamp(end)])).unique()
+    edge_s = (edges - edges[0]).total_seconds().to_numpy()
+    at = (readings.index - edges[0]).total_seconds().to_numpy()
+    values = readings.to_numpy(dtype=float)
+
+    # The signal's integral from the first reading: at each reading, and from
+    # there at each edge. Time before the first reading has no value.
+    integral = np.concatenate([[0.0], np.cumsum(values[:-1] * np.diff(at))])
+    held = np.maximum(np.searchsorted(at, edge_s, side="right") - 1, 0)
+    at_edges = np.where(
+        edge_s >= at[0], integral[held] + values[held] * (edge_s - at[held]), 0.0
+    )
+    covered = np.diff(np.maximum(edge_s, at[0]))
+    means = np.diff(at_edges) / np.where(covered > 0, covered, np.nan)
+
+    return [
+        {"time": time.isoformat(), "value": None if np.isnan(mean) else mean}
+        for time, mean in zip(edges[:-1], means, strict=True)
+    ]
+
+
 class TimeSeriesLoader(DataLoader):
     """The series of one sensor over time."""
 
@@ -108,6 +151,7 @@ class TimeSeriesLoader(DataLoader):
         self, definition: TimeSeriesDefinition, start: datetime, end: datetime
     ) -> pd.DataFrame:
         sensor = self.resolver.resolve(definition.sensor)
+        time_mean = definition.aggregation == "time_mean"
 
         points = self.influx.find_series(
             measurement=sensor.measurement,
@@ -115,10 +159,22 @@ class TimeSeriesLoader(DataLoader):
             field=sensor.field,
             start=start,
             end=end,
-            aggregation=definition.aggregation,
+            aggregation=None if time_mean else definition.aggregation,
             interval=definition.interval,
             fill=definition.fill,
         )
+
+        if time_mean:
+            # The reading in force at the start holds into the window.
+            before = self.influx.find(
+                measurement=sensor.measurement,
+                entity_id=sensor.entity_id,
+                field=sensor.field,
+                before=start,
+            )
+            points = time_weighted_means(
+                ([before] if before else []) + points, start, end, definition.interval
+            )
 
         if not points and definition.fill == "previous":
             last_point = self.influx.find(

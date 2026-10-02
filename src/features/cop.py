@@ -368,7 +368,8 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         # until HeatPumpConfig.booster has enough history - residual
         # booster-heater contamination), so a mean is more outlier-sensitive
         # than this diagnostic needs it to be.
-        supply_bin_edges = [0.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0, np.inf]
+        # 5 K bins from cooling's supply (15-25 degC) up to the tank's limit.
+        supply_bin_edges = [0.0, *np.arange(15.0, 65.0, 5.0), np.inf]
         supply_bin = pd.cut(df["T_supply"], bins=supply_bin_edges, right=False)
         q_th_summary = df.groupby(supply_bin, observed=True).agg(
             count=("Q_th", "count"),
