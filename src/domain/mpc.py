@@ -24,8 +24,9 @@ class MPCConfig:
     # more than it stores. It also makes a run end high enough by itself: the
     # plan knows it cannot top up afterwards.
     heat_pump_min_off_steps: int = 2
-    # Flat price for now - will become a per-installation config option later.
-    price_eur_per_kwh: float = 0.23
+    # The flat prices (EUR/kWh) a plan uses where MPCInput carries none; the
+    # installation's own come from Config.prices.
+    import_price_eur_per_kwh: float = 0.23
     # What an exported kWh brings in (EUR/kWh), and so what the heat pump's own
     # solar really costs: the export it forgoes. Equal to the price under net
     # metering (salderen, in the Netherlands until 2027), which credits an
@@ -35,7 +36,7 @@ class MPCConfig:
     # 48 instead of 47 degC for a 45 degC target, with a fifth of the stored
     # heat lost by the next day. At most the price: exporting cannot pay more
     # than importing costs, or the plan would import to earn.
-    feed_in_price_eur_per_kwh: float = 0.07
+    export_price_eur_per_kwh: float = 0.07
     # What a compressor start costs (EUR): its energy - a tank start puts some
     # 0.4-0.5 kWh into the loop and coil before the tank gains anything, about
     # 0.10 at the price - plus 0.15 for the wear of a start, a choice rather
@@ -192,6 +193,10 @@ class MPCInput:
     # MPCOptimizer.solve). Empty starts the solve cold.
     previous_tank_on: tuple[int, ...] = ()
     previous_space_on: tuple[int, ...] = ()
+    # What a kWh costs from the grid and brings in exported per step (EUR/kWh):
+    # a high and low tariff or dynamic prices. Empty uses MPCConfig's flat ones.
+    import_price_eur_per_kwh: tuple[float, ...] = ()
+    export_price_eur_per_kwh: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -76,10 +76,9 @@ class ValidateConfig(BaseModel):
 
 
 class OptimizeConfig(BaseModel):
-    # MPC horizon in 15-minute steps (same convention as PredictConfig.steps) -
-    # fixed here so the optimizer always plans over this many steps, rather
-    # than incidentally following however many points the last solar
-    # prediction happened to produce.
+    # The most the MPC horizon may span, in 15-minute steps (same convention
+    # as PredictConfig.steps); it ends at the end of tomorrow (see
+    # Optimization.run).
     steps: int = Field(default=192)
     # Also log the plan beside alternatives that finish its first run earlier
     # (see Optimization.explain_dhw_plan) - a few more solves, so off unless

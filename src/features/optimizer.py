@@ -220,9 +220,18 @@ class MPCOptimizer:
         if horizon < 2:
             raise ValueError("MPC horizon must contain at least 2 steps.")
 
-        if self.config.feed_in_price_eur_per_kwh > self.config.price_eur_per_kwh:
+        for name in ("import_price_eur_per_kwh", "export_price_eur_per_kwh"):
+            if getattr(data, name) and len(getattr(data, name)) != horizon:
+                raise ValueError(
+                    f"{name} must be empty or have the same length as "
+                    f"solar_forecast_w ({horizon}), got {len(getattr(data, name))}."
+                )
+
+        if any(
+            export > import_ for import_, export in zip(*self.prices(data), strict=True)
+        ):
             raise ValueError(
-                "feed_in_price_eur_per_kwh may not exceed price_eur_per_kwh."
+                "export_price_eur_per_kwh may not exceed import_price_eur_per_kwh."
             )
 
         if len(data.target_temperature_top) != horizon:
@@ -291,6 +300,19 @@ class MPCOptimizer:
 
         if self.config.coarse_step_hours <= 0:
             raise ValueError("coarse_step_hours must be greater than zero.")
+
+    def prices(self, data: MPCInput) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        """The import and export price per fine step (EUR/kWh): the input's
+        own, or the config's flat ones where it carries none."""
+
+        horizon = len(data.solar_forecast_w)
+
+        return (
+            data.import_price_eur_per_kwh
+            or (self.config.import_price_eur_per_kwh,) * horizon,
+            data.export_price_eur_per_kwh
+            or (self.config.export_price_eur_per_kwh,) * horizon,
+        )
 
     def _build_step_plan(
         self, horizon: int, first_step_hours: float | None = None
@@ -1207,9 +1229,18 @@ class MPCOptimizer:
         # mostly have sun, so later heat is rarely pure grid heat. Heat needed
         # after tomorrow's targets is planned once it comes within the horizon;
         # surplus sun is not stored for demand beyond it.
+        # A coarse block's mean price is its exact cost for energy drawn evenly
+        # over it, which is all its one decision can express.
+        import_price, export_price = (
+            self._aggregate(p, plan, mean) for p in self.prices(data)
+        )
         model.objective = pyo.Objective(
             expr=self._build_objective(
-                model, plan, [weight for weight, _ in solar_scenarios]
+                model,
+                plan,
+                [weight for weight, _ in solar_scenarios],
+                import_price,
+                export_price,
             ),
             sense=pyo.minimize,
         )
@@ -2020,6 +2051,8 @@ class MPCOptimizer:
         model: pyo.ConcreteModel,
         plan: _StepPlan,
         scenario_weights: list[float],
+        import_price_eur_per_kwh: list[float],
+        export_price_eur_per_kwh: list[float],
     ):
         objective = 0.0
 
@@ -2034,10 +2067,10 @@ class MPCOptimizer:
             # What the house pays for the heat pump against not running it at
             # all: the grid energy at the price, and the own solar it uses at
             # the export that solar would otherwise have earned.
-            feed_in = self.config.feed_in_price_eur_per_kwh
+            export = export_price_eur_per_kwh[k]
             objective += (
-                self.config.price_eur_per_kwh - feed_in
-            ) * grid_energy_kwh + feed_in * energy_kwh
+                import_price_eur_per_kwh[k] - export
+            ) * grid_energy_kwh + export * energy_kwh
 
             objective += self.config.weight_switching * model.compressor_start[k]
 

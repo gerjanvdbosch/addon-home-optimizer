@@ -83,7 +83,6 @@ class OpenMeteoForecast(BaseModel):
     wind_speed: list[SeriesPoint[float]] = Field(default_factory=list)
     precipitation: list[SeriesPoint[float]] = Field(default_factory=list)
     dew_point: list[SeriesPoint[float]] = Field(default_factory=list)
-    relative_humidity: list[SeriesPoint[float]] = Field(default_factory=list)
 
     def items(self):
         return (
@@ -96,7 +95,6 @@ class OpenMeteoForecast(BaseModel):
             ("wind_speed", self.wind_speed),
             ("precipitation", self.precipitation),
             ("dew_point", self.dew_point),
-            ("relative_humidity", self.relative_humidity),
         )
 
 

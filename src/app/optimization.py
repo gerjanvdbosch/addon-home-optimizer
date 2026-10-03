@@ -8,16 +8,16 @@ import numpy as np
 import pandas as pd
 
 from app.state import StateManager
-from domain.config import BoilerConfig, Config
+from domain.config import BoilerConfig, Config, Price, Tariff
 from domain.jobs import OptimizeConfig
 from domain.models import BoilerThermalModel
 from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.physics import (
     CP_WATER_J_PER_KG_K,
     RHO_WATER_KG_PER_L,
-    dew_point_from_humidity_c,
     indoor_dew_point_c,
 )
+from domain.sensors import SensorReference
 from domain.state import SeriesPoint, State
 from domain.time import local_day_start, to_local_time
 from features.boiler import BoilerThermalIdentifier
@@ -66,38 +66,57 @@ class Optimization:
 
         mpc_config = MPCConfig()
 
-        # Fixed to optimize_config.steps so the MPC horizon is an explicit
-        # choice, not whatever length the last solar prediction happened to
-        # produce (which itself may have used a different PredictConfig.steps).
-        # Falls back to however many steps are actually available (a shorter
-        # horizon is still a valid, physically meaningful plan) rather than
-        # inventing missing forecast data.
-        steps = min(optimize_config.steps, len(state.predictions.solar))
+        # From the quarter hour running now to the end of tomorrow, the
+        # clock's choice rather than however far the last solar prediction
+        # happened to reach: the weather forecasts end there, so planning
+        # beyond it would plan on guesses, and solved over 48 instead of 26
+        # hours the same first run took twice as long (real data, 2 Oct). At
+        # most optimize_config.steps. A forecast that falls short is extended
+        # (see StateManager.extend_forecast), except the sun.
+        step = timedelta(hours=mpc_config.step_hours)
+        now = datetime.now(timezone.utc)
+        first = pd.Timestamp(now).floor(step).to_pydatetime()
+        steps = min(
+            optimize_config.steps, (local_day_start(now, days=2) - first) // step
+        )
+        forecast_times = [first + i * step for i in range(steps)]
 
-        if steps < optimize_config.steps:
-            logger.warning(
-                "Solar prediction covers only %d of the requested %d optimize "
-                "steps; planning over %d steps instead.",
-                len(state.predictions.solar),
-                optimize_config.steps,
-                steps,
+        def extended(
+            points: list[SeriesPoint], fallback: float | None = None
+        ) -> tuple[float, ...]:
+            return tuple(
+                self.state_manager.extend_forecast(
+                    {p.time: p.value for p in points}, forecast_times, fallback
+                )
             )
 
-        solar_forecast = [p.value for p in state.predictions.solar[:steps]]
-        forecast_times = [p.time for p in state.predictions.solar[:steps]]
+        # No sun where Solcast has none: the weather another day had is no
+        # forecast, and a plan counting on sun that does not come heats on
+        # the grid at the last moment.
+        def solar(points: list[SeriesPoint]) -> tuple[float, ...]:
+            return tuple(self.state_manager.align_predictions(points, forecast_times))
 
-        # The expected-cost scenarios need the band at exactly the p50
-        # prediction's own times; if it doesn't fully cover them (not
-        # calibrated yet, no Solcast p10/p90), plan on p50 alone rather than
-        # inventing the missing values.
-        p10_by_time = {p.time: p.value for p in state.predictions.solar_p10}
-        p90_by_time = {p.time: p.value for p in state.predictions.solar_p90}
+        predictions = state.predictions
+        solar_forecast = list(solar(predictions.solar))
+        # Within the horizon Solcast normally has every step, so a gap means
+        # it has stopped updating - worth fixing at the source.
+        forecast_solar = {p.time for p in predictions.solar}
+        missing = [t for t in forecast_times if t not in forecast_solar]
 
-        if all(t in p10_by_time and t in p90_by_time for t in forecast_times):
-            solar_p10 = tuple(p10_by_time[t] for t in forecast_times)
-            solar_p90 = tuple(p90_by_time[t] for t in forecast_times)
-        else:
+        if missing:
+            logger.warning(
+                "Solar forecast misses %d of %d steps (first %s): planned "
+                "without sun there; is Solcast still updating?",
+                len(missing),
+                len(forecast_times),
+                to_local_time(missing[0]).strftime("%a %H:%M"),
+            )
+
+        if not predictions.solar_p10 or not predictions.solar_p90:
             solar_p10, solar_p90 = (), ()
+        else:
+            solar_p10 = solar(predictions.solar_p10)
+            solar_p90 = solar(predictions.solar_p90)
 
         # The stored state.schedule.heat_pump.boiler.target_temperature is
         # resolved against *today's* timestamps (see StateManager.update()) - not
@@ -122,7 +141,11 @@ class Optimization:
         cop_model = cop_identifier.model
 
         dhw_state = config.heat_pump.states.dhw
-        now = datetime.now(timezone.utc)
+
+        import_price, export_price = (
+            self._price(schedule, forecast_times)
+            for schedule in (config.prices.import_, config.prices.export)
+        )
         heat_pump_changes = self._heat_pump_changes(config, now)
         boiler_on_current, run_start, idle_elapsed_hours = self.dhw_timing(
             *heat_pump_changes, dhw_state, now
@@ -166,30 +189,15 @@ class Optimization:
                 run_start_temp_bottom = before_bottom[-1].value
                 run_start_stratification_k = stratification.get(before_top[-1].time)
 
-        # Aligned against solar's own forecast timestamps, not assumed to share
-        # them: the tap forecaster is fit/predicted independently (see
-        # features/tap.py) and may not have been run at all, or over a
-        # different horizon - align_predictions falls back to 0.0 (no draws
-        # assumed) wherever no matching point exists, the same assumption
-        # implicitly made before this forecast existed.
-        tap_forecast = tuple(
-            self.state_manager.align_predictions(state.predictions.tap, forecast_times)
-        )
+        # No draws assumed beyond the tap forecast, the assumption made before
+        # it existed.
+        tap_forecast = extended(predictions.tap, 0.0)
 
-        # state.forecast.open_meteo.temperature is the raw Open-Meteo forecast
-        # (see StateManager._map()), not a model prediction, so it is only
-        # ever missing outright (fresh install, forecast fetch not yet run) -
-        # left empty in that case rather than defaulting every step to 0.0
-        # deg C, which align_predictions' usual "assume none" fallback would
-        # do here (a plausible default for "no tap draws", not for "outdoor
-        # temperature"). MPCOptimizer falls back to the flat
-        # boiler_electrical_power_w assumption when this is empty.
+        # Empty without any Open-Meteo forecast (fresh install, fetch not yet
+        # run), not 0 deg C: MPCOptimizer then falls back to the flat
+        # boiler_electrical_power_w assumption.
         outdoor_temperature_forecast = (
-            tuple(
-                self.state_manager.align_predictions(
-                    state.forecast.open_meteo.temperature, forecast_times
-                )
-            )
+            extended(state.forecast.open_meteo.temperature)
             if state.forecast.open_meteo.temperature
             else ()
         )
@@ -221,9 +229,7 @@ class Optimization:
             first_step_hours=first_step_hours,
             idle_elapsed_hours=idle_elapsed_hours,
             baseload_forecast_w=tuple(
-                self.state_manager.baseload_forecast(
-                    state, forecast_times, datetime.now(timezone.utc)
-                )
+                self.state_manager.baseload_forecast(state, forecast_times, now)
             ),
             previous_tank_on=tuple(
                 int(on)
@@ -237,6 +243,8 @@ class Optimization:
                     state.schedule.building.on, forecast_times
                 )
             ),
+            import_price_eur_per_kwh=import_price,
+            export_price_eur_per_kwh=export_price,
         )
         data = self._with_legionella(
             data, forecast_times, config.heat_pump.boiler, thermal_model, mpc_config
@@ -290,7 +298,7 @@ class Optimization:
         )
 
         self.publish_dhw(result, forecast_times, thermal_model)
-        self.log_dhw_plan(result, forecast_times, mpc_config)
+        self.log_dhw_plan(result, forecast_times, optimizer, planned)
 
         if optimize_config.explain:
             self.explain_dhw_plan(optimizer, planned, result, forecast_times)
@@ -466,12 +474,44 @@ class Optimization:
 
         return [(first, last) for first, last in runs]
 
+    def _price(
+        self,
+        price: Price,
+        times: list[datetime],
+    ) -> tuple[float, ...]:
+        """A configured price per step (EUR/kWh); empty for a sensor, whose
+        dynamic prices are not read yet, so the plan falls back to MPCConfig's
+        flat ones."""
+
+        if isinstance(price, Tariff):
+            return tuple(
+                weekend if to_local_time(t).weekday() >= 5 else weekday
+                for t, weekday, weekend in zip(
+                    times,
+                    self._price(price.weekdays, times),
+                    self._price(price.weekend, times),
+                    strict=True,
+                )
+            )
+
+        if isinstance(price, SensorReference):
+            logger.warning(
+                "Prices from %s are not read yet: planning on flat prices.",
+                price.entity_id,
+            )
+            return ()
+
+        return tuple(
+            point.value for point in self.state_manager.resolve_schedule(price, times)
+        )
+
     @classmethod
     def dhw_summary(
         cls,
         result: MPCResult,
         times: list[datetime],
-        mpc_config: MPCConfig,
+        optimizer: MPCOptimizer,
+        data: MPCInput,
     ) -> str:
         """What a hot water plan does and what it expects that to cost, per
         local day: each run's time and end temperature, the day's electricity
@@ -487,13 +527,16 @@ class Optimization:
         if not runs:
             return "no run within the horizon"
 
-        def cost_eur(electricity_kwh: float, grid_kwh: float) -> float:
-            return (
-                grid_kwh * mpc_config.price_eur_per_kwh
-                + (electricity_kwh - grid_kwh) * mpc_config.feed_in_price_eur_per_kwh
+        cost_step_eur = [
+            grid * import_ + (electricity - grid) * export
+            for electricity, grid, import_, export in zip(
+                result.electricity_step_kwh,
+                result.grid_step_kwh,
+                *optimizer.prices(data),
+                strict=False,
             )
-
-        step = timedelta(hours=mpc_config.step_hours)
+        ]
+        step = timedelta(hours=optimizer.config.step_hours)
         last = len(result.temperatures) - 1
         day = [to_local_time(time).date() for time in times]
         days = []
@@ -516,15 +559,17 @@ class Optimization:
                 for kwh, d in zip(result.grid_step_kwh, day, strict=False)
                 if d == date
             )
+            cost_eur = sum(
+                eur for eur, d in zip(cost_step_eur, day, strict=False) if d == date
+            )
             days.append(
                 f"{date:%a} {runs_text}: {electricity_kwh:.2f} kWh, of which sun "
                 f"{electricity_kwh - grid_kwh:.2f} and grid {grid_kwh:.2f} "
-                f"(expected), EUR {cost_eur(electricity_kwh, grid_kwh):.3f}"
+                f"(expected), EUR {cost_eur:.3f}"
             )
 
         return " | ".join(days) + (
-            f" | total {result.electricity_kwh:.2f} kWh, "
-            f"EUR {cost_eur(result.electricity_kwh, result.grid_kwh):.3f}"
+            f" | total {result.electricity_kwh:.2f} kWh, EUR {sum(cost_step_eur):.3f}"
         )
 
     @classmethod
@@ -532,9 +577,10 @@ class Optimization:
         cls,
         result: MPCResult,
         times: list[datetime],
-        mpc_config: MPCConfig,
+        optimizer: MPCOptimizer,
+        data: MPCInput,
     ) -> None:
-        logger.info("DHW plan: %s", cls.dhw_summary(result, times, mpc_config))
+        logger.info("DHW plan: %s", cls.dhw_summary(result, times, optimizer, data))
 
     # How much earlier explain_dhw_plan has the first run finish (hours): the
     # question a plan usually raises is why it does not run earlier, in more sun.
@@ -565,7 +611,7 @@ class Optimization:
         mpc_config = optimizer.config
         finish = runs[0][1] + 1
         end_c = result.temperatures[min(finish, len(result.temperatures) - 1)]
-        lines = [f"  {'plan:':<16}{cls.dhw_summary(result, times, mpc_config)}"]
+        lines = [f"  {'plan:':<16}{cls.dhw_summary(result, times, optimizer, data)}"]
 
         run_steps = runs[0][1] - runs[0][0] + 1
         # The target the plan's end answers: a run planned to a target ends the
@@ -586,7 +632,7 @@ class Optimization:
             targets = list(data.target_temperature_top)
             targets[k] = max(targets[k], forced_c)
             forced = dataclasses.replace(data, target_temperature_top=tuple(targets))
-            summary = cls.dhw_summary(optimizer.solve(forced), times, mpc_config)
+            summary = cls.dhw_summary(optimizer.solve(forced), times, optimizer, forced)
             lines.append(f"  {f'{hours:g} h earlier:':<16}{summary}")
 
         if len(lines) == 1:
@@ -823,6 +869,13 @@ class Optimization:
             )
             return None
 
+        def gain(column: str) -> tuple[float, ...]:
+            return tuple(
+                self.state_manager.extend_forecast(
+                    zone[column].dropna().to_dict(), times, 0.0
+                )
+            )
+
         inputs = dict(
             zone_temperature=float(planned["air"].iloc[0]),
             zone_mass_temperature=float(planned["mass"].iloc[0]),
@@ -837,9 +890,10 @@ class Optimization:
                 for point in self.state_manager.resolve_schedule(maximum, times)
             ),
             zone_comfort_tolerance_c=config.building.comfort_tolerance,
-            # No gain assumed where the estimate does not reach - the same
-            # "assume none" align_predictions makes for any missing forecast.
-            zone_internal_gain_w=tuple(planned["internal_gain_w"].fillna(0.0)),
+            # Extended where the weather forecast behind the estimate does not
+            # reach; no gain assumed without any. The sun through the glazing
+            # is not: as for the solar forecast, none where none is forecast.
+            zone_internal_gain_w=gain("internal_gain_w"),
             zone_solar_gain_w=tuple(planned["solar_gain_w"].fillna(0.0)),
             zone_cooling=cooling,
             zone_mass_minimum_c=(
@@ -892,8 +946,8 @@ class Optimization:
 
         From the one measured now, carried along the outdoor forecast by the
         identified moisture balance (see features.dew_point) - Open-Meteo's dew
-        point, or its temperature and humidity where it has none. Held at the
-        measured one without that model or forecast, as before there was one.
+        point. Held at the measured one without that model or forecast, as
+        before there was one.
         Stored as a prediction, so the dashboard draws what the plan used.
         """
 
@@ -905,27 +959,19 @@ class Optimization:
         now_c = float(measured[-1].value)
         identifier = DewPointIdentifier()
         identifier.load(self.models_path)
-        weather = state.forecast.open_meteo
-
-        def aligned(points: list[SeriesPoint]) -> pd.Series:
-            return pd.Series(
-                self.state_manager.align_predictions(points, times, default=np.nan)
-            )
-
-        outdoor_c = aligned(weather.dew_point).fillna(
-            dew_point_from_humidity_c(
-                aligned(weather.temperature), aligned(weather.relative_humidity)
+        outdoor_c = pd.Series(
+            self.state_manager.extend_forecast(
+                {p.time: p.value for p in state.forecast.open_meteo.dew_point}, times
             )
         )
 
         if identifier.model is None or outdoor_c.isna().all():
             forecast_c = [now_c] * len(times)
         else:
-            # A gap in the forecast holds its neighbour's value.
             forecast_c = indoor_dew_point_c(
                 identifier.model,
                 now_c,
-                outdoor_c.ffill().bfill().to_numpy(),
+                outdoor_c.to_numpy(),
                 mpc_config.step_hours,
             ).tolist()
 

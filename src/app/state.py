@@ -2,7 +2,7 @@ import logging
 import math
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import pandas as pd
 
@@ -237,21 +237,22 @@ class StateManager:
     def baseload_forecast(
         self, state: State, times: list[datetime], now: datetime
     ) -> list[float]:
-        """Baseload forecast aligned to `times`, 0.0 where there is none (see
-        align_predictions). The quarter hour running at `now` - the step the
-        optimizer acts on - takes the measurement so far instead: load that is on
-        right now is real. On real data, for the rest of that quarter hour over
-        28 days, that cut the error from 105.6 to 95.0 W. It does expect more load
-        that then isn't drawn (21.9 -> 47.1 W, an appliance run ending within the
-        quarter hour), but that only delays heating until the next replan minutes
-        later, while missing load that is on (83.8 -> 47.9 W) starts a run that
-        imports from the grid for at least its minimum runtime. The lower of
-        forecast and measurement was tried first: least phantom load (8.9 W), but
-        the most missed load (92.5 W) - the costlier error.
+        """Baseload forecast at `times`, extended where it does not reach (see
+        extend_forecast), 0.0 without any. The quarter hour running at `now` -
+        the step the optimizer acts on - takes the measurement so far instead:
+        load that is on right now is real. On real data, for the rest of that
+        quarter hour over 28 days, that cut the error from 105.6 to 95.0 W. It
+        does expect more load that then isn't drawn (21.9 -> 47.1 W, an
+        appliance run ending within the quarter hour), but that only delays
+        heating until the next replan minutes later, while missing load that is
+        on (83.8 -> 47.9 W) starts a run that imports from the grid for at least
+        its minimum runtime. The lower of forecast and measurement was tried
+        first: least phantom load (8.9 W), but the most missed load (92.5 W) -
+        the costlier error.
         """
 
-        forecast = self.align_predictions(
-            state.predictions.baseload, times, default=math.nan
+        forecast = self.extend_forecast(
+            {p.time: p.value for p in state.predictions.baseload}, times
         )
         latest = self._latest_measurement(state.measurements.baseload, now)
 
@@ -495,6 +496,40 @@ class StateManager:
 
         return [by_time.get(t, default) for t in times]
 
+    @staticmethod
+    def extend_forecast(
+        values: Mapping[datetime, float],
+        times: list[datetime],
+        fallback: float | None = None,
+    ) -> list[float]:
+        """A forecast at `times`, also beyond where it reaches. A step it has
+        no value for takes the same quarter hour a day earlier, as far back as
+        needed: sun, load, tap draws and temperature all follow the day's
+        rhythm, which holding the last value would lose - the afternoon sun
+        held through the night. 24 hours in UTC, so on a DST change day the
+        local time it repeats is off by an hour. Where a day earlier is
+        missing too, `fallback`, or None to hold the nearest value; NaN for an
+        empty forecast."""
+
+        day = timedelta(days=1)
+        known = {t: v for t, v in values.items() if not math.isnan(v)}
+        extended = []
+
+        for t in times:
+            value = known.get(t, known.get(t - day))
+
+            if value is not None:
+                known[t] = value
+
+            extended.append(math.nan if value is None else value)
+
+        series = pd.Series(extended, dtype=float)
+
+        if fallback is None:
+            return series.ffill().bfill().tolist()
+
+        return series.fillna(fallback).tolist()
+
     def resolve_schedule(
         self,
         target: float | list[tuple[time, float]],
@@ -524,9 +559,9 @@ class StateManager:
             .attribute_series(
                 "open_meteo",
                 config.forecast.open_meteo,
-                # Humidity for the indoor dew point's forecast (see
-                # features.dew_point), either as stored.
-                attributes=["temperature", "dew_point", "relative_humidity"],
+                # The outdoor dew point for the indoor one's forecast (see
+                # features.dew_point).
+                attributes=["temperature", "dew_point"],
             )
             # Powers and flows over time (see Aggregation's "time_mean"):
             # the heat pump's power reports every few seconds while running

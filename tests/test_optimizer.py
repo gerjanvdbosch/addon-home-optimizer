@@ -44,7 +44,7 @@ COP_MODEL = HeatPumpCOPModel(
 _SOLAR_MIDDAY_W = [500, 1000, 2000, 3000, 3500, 3000, 2000, 1000, 500, 0.0]
 # Own sun is only cheaper than the grid where exporting it earns less than
 # importing costs; the tests about following the sun are about that case.
-NO_FEED_IN = MPCConfig(feed_in_price_eur_per_kwh=0.0)
+NO_EXPORT = MPCConfig(export_price_eur_per_kwh=0.0)
 
 
 SOLAR_FORECAST_W = [0.0] * 8 + _SOLAR_MIDDAY_W + [0.0] * 6
@@ -358,7 +358,7 @@ def test_uncertain_solar_window_loses_to_a_certain_one_with_less_p50():
     target = [10.0] * horizon
     target[20] = 45.0
 
-    optimizer = MPCOptimizer(THERMAL_MODEL, NO_FEED_IN)
+    optimizer = MPCOptimizer(THERMAL_MODEL, NO_EXPORT)
     common = dict(solar_forecast_w=p50, target_temperature_top=tuple(target))
 
     on_p50 = optimizer.solve(_make_input(**common))
@@ -485,7 +485,7 @@ def test_the_solve_starts_from_the_previous_plan_and_still_finds_the_best():
     target[18] = 45.0
     previous = tuple(int(k in (2, 3, 4)) for k in range(len(SOLAR_FORECAST_W)))
     data = _make_input(target_temperature_top=tuple(target), previous_tank_on=previous)
-    optimizer = MPCOptimizer(THERMAL_MODEL, NO_FEED_IN)
+    optimizer = MPCOptimizer(THERMAL_MODEL, NO_EXPORT)
 
     model = optimizer._build_model(data)
     assert optimizer._warm_start(model, data, Highs())
@@ -1338,7 +1338,7 @@ def test_a_higher_ceiling_buffers_the_sun_in_the_floor_and_the_ceiling_holds():
         zone_internal_gain_w=(150.0,) * steps,
     )
     optimizer = MPCOptimizer(
-        THERMAL_MODEL, NO_FEED_IN, cop_model=COP_MODEL, building_model=model
+        THERMAL_MODEL, NO_EXPORT, cop_model=COP_MODEL, building_model=model
     )
 
     def sunny_heat(ceiling_c: float):
@@ -1492,7 +1492,7 @@ def test_net_metering_does_not_heat_today_for_a_cloudy_tomorrow():
         on = [k for k, value in enumerate(result.schedule[:96]) if value]
         return result.temperatures[on[-1] + 1]
 
-    assert run_end(MPCConfig()) < run_end(NO_FEED_IN) - 0.5
+    assert run_end(MPCConfig()) < run_end(NO_EXPORT) - 0.5
 
 
 def test_a_measured_supply_margin_does_not_depend_on_the_targets():
@@ -1550,8 +1550,8 @@ def test_the_reported_energy_is_what_the_objective_priced(thermal_model, cop_mod
         if on and (k == 0 or not result.schedule[k - 1])
     )
     energy_eur = (
-        config.price_eur_per_kwh - config.feed_in_price_eur_per_kwh
-    ) * result.grid_kwh + config.feed_in_price_eur_per_kwh * result.electricity_kwh
+        config.import_price_eur_per_kwh - config.export_price_eur_per_kwh
+    ) * result.grid_kwh + config.export_price_eur_per_kwh * result.electricity_kwh
 
     assert result.electricity_kwh > 0.0
     assert energy_eur + config.weight_switching * starts == pytest.approx(
@@ -1949,3 +1949,28 @@ def test_a_run_the_zone_opens_is_not_charged_the_tanks_ramp():
 
     assert any(result.space_schedule), "expected the zone to be heated"
     assert not any(result.schedule)
+
+
+def test_without_sun_the_run_goes_to_the_low_tariff():
+    """No sun, a 45 degC target at the end, and a low tariff for the first
+    three hours: heating then and holding the heat is cheaper than heating
+    just in time at the high one."""
+
+    horizon = len(SOLAR_FORECAST_W)
+    target = [10.0] * horizon
+    target[-1] = 45.0
+    low_steps = horizon // 2
+
+    result = MPCOptimizer(THERMAL_MODEL, NO_EXPORT).solve(
+        _make_input(
+            solar_forecast_w=[0.0] * horizon,
+            target_temperature_top=tuple(target),
+            import_price_eur_per_kwh=(0.10,) * low_steps
+            + (0.40,) * (horizon - low_steps),
+        )
+    )
+
+    on_steps = [k for k, on in enumerate(result.schedule) if on]
+
+    assert on_steps
+    assert max(on_steps) < low_steps

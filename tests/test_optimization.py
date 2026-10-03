@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import pandas as pd
 
 from app.optimization import Optimization
-from domain.config import BoilerConfig, LegionellaConfig
+from app.state import StateManager
+from domain.config import BoilerConfig, LegionellaConfig, PricesConfig
 from domain.models import BoilerThermalModel
 from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.sensors import SensorReference
@@ -227,6 +228,14 @@ def test_one_sensor_at_temperature_does_not_count_as_disinfected():
     assert 60.0 in _targets_with_legionella(1, 61.0, 58.0)
 
 
+# The optimizer and input a four-step plan log is priced by: MPCConfig's flat
+# prices.
+LOG_PLANNER = (
+    MPCOptimizer(TANK, MPCConfig()),
+    replace(DATA, solar_forecast_w=[0.0] * 4, target_temperature_top=(45.0,) * 4),
+)
+
+
 def test_the_plan_log_reports_the_objective_s_own_energy_per_day(caplog):
     """1.00 kWh of which 0.50 from the grid, as the optimizer counted them:
     the import at the price, the sun at the export it forgoes - per day, and
@@ -247,7 +256,7 @@ def test_the_plan_log_reports_the_objective_s_own_energy_per_day(caplog):
     )
 
     with caplog.at_level("INFO", logger="app.optimization"):
-        Optimization.log_dhw_plan(result, TIMES, MPCConfig())
+        Optimization.log_dhw_plan(result, TIMES, *LOG_PLANNER)
 
     assert "to 48.2 degC: 1.00 kWh, of which sun 0.50 and grid 0.50" in caplog.text
     assert "(expected), EUR 0.150 | total 1.00 kWh, EUR 0.150" in caplog.text
@@ -272,7 +281,7 @@ def test_the_plan_log_splits_its_energy_by_day(caplog):
     )
 
     with caplog.at_level("INFO", logger="app.optimization"):
-        Optimization.log_dhw_plan(result, times, MPCConfig())
+        Optimization.log_dhw_plan(result, times, *LOG_PLANNER)
 
     assert ": 0.50 kWh, of which sun 0.50 and grid 0.00" in caplog.text
     assert ": 1.00 kWh, of which sun 0.00 and grid 1.00" in caplog.text
@@ -425,3 +434,34 @@ def test_a_run_is_under_way_since_its_change_into_the_mode():
     )
     assert Optimization.running_since(changes, "Verwarmen") is None
     assert Optimization.running_since(changes[:1], "Koelen") is None
+
+
+def test_the_weekend_tariff_holds_all_saturday():
+    """A high and low tariff on weekdays and the low one all weekend: Friday
+    noon is high, Saturday noon low."""
+
+    prices = PricesConfig.model_validate(
+        {"import": {"weekdays": [["07:00", 0.25], ["23:00", 0.21]], "weekend": 0.21}}
+    )
+    optimization = Optimization(
+        loader=None,  # type: ignore[arg-type]
+        state_manager=StateManager(
+            loader=None,  # type: ignore[arg-type]
+            state_repository=None,  # type: ignore[arg-type]
+            config_repository=None,  # type: ignore[arg-type]
+            models_path=Path("."),
+            latitude=52.0,
+            longitude=5.0,
+        ),
+        config_repository=None,  # type: ignore[arg-type]
+        models_path=Path("."),
+        home_assistant=None,  # type: ignore[arg-type]
+    )
+    # Friday 2 October 2026, local noon, and the day after.
+    friday_noon = local_day_start(datetime(2026, 10, 2, 12, tzinfo=UTC)) + timedelta(
+        hours=12
+    )
+
+    assert optimization._price(
+        prices.import_, [friday_noon, friday_noon + timedelta(days=1)]
+    ) == (0.25, 0.21)

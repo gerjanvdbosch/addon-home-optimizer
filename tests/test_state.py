@@ -1,3 +1,4 @@
+import math
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -188,3 +189,28 @@ def test_the_floors_plan_joins_the_heat_pumps(tmp_path):
     plan = manager.load().schedule.heat_pump
     assert [p.value for p in plan.power] == [1500.0, 800.0, 820.0]
     assert [p.value for p in plan.heat] == [6000.0, 3571.0, 3571.0]
+
+
+def test_a_forecast_is_extended_with_the_day_before():
+    """Beyond its end a forecast repeats its own day, however far: the
+    afternoon sun comes back in the afternoon rather than held into the night."""
+
+    day = [QUARTER + timedelta(hours=6 * i) for i in range(4)]
+    forecast = dict(zip(day, [0.0, 2000.0, 500.0, 0.0], strict=True))
+    times = [t + timedelta(days=d) for d in range(3) for t in day]
+
+    extended = StateManager.extend_forecast(forecast, times, 0.0)
+
+    assert extended == [0.0, 2000.0, 500.0, 0.0] * 3
+
+
+def test_beyond_the_day_before_a_forecast_falls_back():
+    """Neither the step nor a day before it: the fallback, or the nearest
+    value when there is none; NaN for no forecast at all."""
+
+    forecast = {QUARTER: 12.0}
+    times = [QUARTER - timedelta(minutes=15), QUARTER, QUARTER + timedelta(hours=1)]
+
+    assert StateManager.extend_forecast(forecast, times, 0.0) == [0.0, 12.0, 0.0]
+    assert StateManager.extend_forecast(forecast, times) == [12.0, 12.0, 12.0]
+    assert all(math.isnan(v) for v in StateManager.extend_forecast({}, times))

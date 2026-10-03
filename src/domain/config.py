@@ -7,8 +7,9 @@ physical constants and its own target schedule.
 from datetime import time
 from pathlib import Path
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from domain.mpc import MPCConfig
 from domain.sensors import SensorAttributesReference, SensorReference
 
 
@@ -322,6 +323,37 @@ class ForecastConfig(BaseModel):
     open_meteo: OpenMeteoConfig = Field()
 
 
+class Tariff(BaseModel):
+    """A price that differs between weekdays and the weekend: the Dutch double
+    tariff runs low all Saturday and Sunday. Each is a flat price or a daily
+    schedule, by the local day a step lies in."""
+
+    weekdays: float | list[tuple[time, float]] = Field()
+    weekend: float | list[tuple[time, float]] = Field()
+
+
+# A price (EUR/kWh): flat, a daily schedule, one per weekdays and weekend, or a
+# sensor carrying dynamic prices.
+Price = float | list[tuple[time, float]] | Tariff | SensorReference
+
+
+class PricesConfig(BaseModel):
+    """What a kWh costs from the grid and brings in exported (EUR/kWh).
+
+    Each is one flat price, a daily schedule for a high and low tariff (e.g.
+    [["07:00", 0.25], ["23:00", 0.21]]), a Tariff with its own for the
+    weekend, or a sensor carrying dynamic prices. See
+    MPCConfig.export_price_eur_per_kwh for why the export price matters.
+    """
+
+    # "import" is a Python keyword, so the field carries it as an alias, also
+    # when the config is saved.
+    model_config = ConfigDict(serialize_by_alias=True)
+
+    import_: Price = Field(default=MPCConfig.import_price_eur_per_kwh, alias="import")
+    export: Price = Field(default=MPCConfig.export_price_eur_per_kwh)
+
+
 class Config(BaseModel):
     solar: SensorReference = Field()
     baseload: SensorReference = Field()
@@ -329,3 +361,4 @@ class Config(BaseModel):
     building: BuildingConfig = Field()
     forecast: ForecastConfig = Field()
     presence: list[SensorReference] = Field(default_factory=list)
+    prices: PricesConfig = Field(default_factory=PricesConfig)

@@ -194,6 +194,7 @@ actions:
             "flow": "sensor.ecodan_heatpump_ca09ec_flow_waarde",
             "compressor_frequency": "sensor.ecodan_heatpump_compressor_frequentie",
             "booster": "binary_sensor.ecodan_heatpump_ca09ec_status_booster_heater", 
+            "defrost": "binary_sensor.ecodan_heatpump_ca09ec_status_defrost", 
             "boiler": {
               "setpoint": "sensor.ecodan_heatpump_ca09ec_sww_setpoint_waarde",
               "top_temperature": "sensor.ecodan_heatpump_ca09ec_sww_2e_temp_sensor",
@@ -226,7 +227,7 @@ actions:
               ["22:00", 19.0]
             ],
             "maximum_temperature": 21.5,
-            "comfort_tolerance": 0.2,
+            "comfort_tolerance": 0.3,
             "rooms": [
               [6.0, "sensor.danfoss_0_temperature"],
               [10.0, "sensor.danfoss_1_temperature"],
@@ -248,6 +249,22 @@ actions:
               "sensor.xiaomi_sensor_1_condensatie_temperatuur", 
               "sensor.xiaomi_sensor_2_condensatie_temperatuur"
             ]
+          },
+          "prices": {
+            "import": {
+              "weekdays": [
+                ["07:00", 0.213], 
+                ["23:00", 0.225]
+              ],
+              "weekend": 0.225
+            },
+            "export": {
+              "weekdays": [
+                ["07:00", 0.077], 
+                ["23:00", 0.089]
+              ],
+              "weekend": 0.089
+            }
           },
           "forecast": {
             "solcast": "sensor.solcast_pv_forecast",
