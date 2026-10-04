@@ -274,22 +274,10 @@ def dashboard_chart(
         decimal=1,
     )
 
+    # The thermostat's room, which comfort is set in and the plan is judged
+    # on: measured, then where the plan takes it (see zone_observation).
     series(
-        "Climate temp",
-        read_at(state.measurements.building.temperature, state.updated),
-        row=2,
-        col=1,
-        line=dict(width=1.5, color="#FECB52", shape="spline"),
-        unit="°C",
-        decimal=2,
-    )
-
-    # The zone average the model actually predicts - `Climate temp` above is
-    # the single thermostat the setpoint refers to, which is a different
-    # quantity and would make the model look biased against it - measured, then
-    # where the plan takes it: the plan predicts the same reading.
-    series(
-        "Zone temp",
+        "Living room",
         joined(
             state.measurements.building.zone_temperature,
             state.schedule.building.temperatures,
@@ -301,10 +289,10 @@ def dashboard_chart(
         decimal=2,
     )
 
-    # The building's thermal mass - screed and internal walls - as the filter
-    # infers it. No sensor measures this, so unlike the air trace it shows
-    # something the other lines cannot: it lags the air by hours and swings
-    # about a third less, which is the storage an MPC would be charging.
+    # The slab under the thermostat's room, as the filter infers it. No sensor
+    # measures this, so unlike the room it shows something the other lines
+    # cannot: it lags the room by hours and swings less, which is the storage
+    # an MPC would be charging.
     series(
         "Thermal mass",
         state.predictions.thermal_mass,

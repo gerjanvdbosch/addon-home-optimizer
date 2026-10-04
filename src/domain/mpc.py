@@ -136,14 +136,15 @@ class MPCInput:
     # exactly the domestic-hot-water one it was before - the heat pump serves
     # one demand at a time, so adding the second only ever constrains it.
     #
-    # The zone's own temperature now, which the plan starts from.
-    zone_temperature: float | None = None
-    # The thermal mass's temperature now (deg C). Nothing measures it, so it
-    # comes from the Kalman filter's estimate (see building.kalman_states). A
-    # plan needs it: starting the screed at the air temperature would claim a
-    # cold floor is as ready to heat as a charged one.
-    zone_mass_temperature: float | None = None
-    # Comfort floor per step, as a schedule rather than one number.
+    # The zone's state now, which the plan starts from (deg C, see
+    # physics.zone_state_space): the two rooms and their slabs. The slabs are
+    # not measured, so it is the Kalman filter's estimate (see
+    # building.kalman_states). A plan needs them: starting a screed at its
+    # room's temperature would claim a cold floor is as ready to heat as a
+    # charged one. Empty plans no zone.
+    zone_state: tuple[float, ...] = ()
+    # Comfort floor per step for the thermostat's room, as a schedule rather
+    # than one number.
     zone_target_temperature: tuple[float, ...] = ()
     # Comfort ceiling per step: how warm buffering heat may make the zone.
     # Empty means none.
@@ -154,7 +155,9 @@ class MPCInput:
     # lighting and people, and the sun through the glazing. Both warm the room
     # node (see physics.zone_state_space), but they are forecast apart.
     zone_internal_gain_w: tuple[float, ...] = ()
+    # The sun through the thermostat's room's glazing, and through the rest's.
     zone_solar_gain_w: tuple[float, ...] = ()
+    zone_solar_gain_rest_w: tuple[float, ...] = ()
     # Whether the heat pump is serving the zone right now, the space-heating
     # counterpart of boiler_on_current.
     space_on_current: bool = False
@@ -176,6 +179,8 @@ class MPCInput:
     # MPCOptimizer._add_space_heating). Empty orders nothing.
     zone_local_day: tuple[int, ...] = ()
     dhw_earlier_today: bool = False
+    # How long the compressor run under way has lasted (hours); 0 without one,
+    # also while the booster finishes the tank with the compressor off.
     compressor_elapsed_hours: float = 0.0
     # The tank's two sensors just before the DHW run under way began (deg C),
     # None without one: while it heats, the sensors lag the heat already in

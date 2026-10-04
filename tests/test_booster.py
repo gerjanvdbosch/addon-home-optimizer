@@ -266,6 +266,10 @@ def test_heat_pump_limit_and_booster_heat_are_identified_from_booster_runs():
             + [nan] * 3
             + [3000.0, 2000.0, 2000.0]
             + [nan] * 2,
+            "power": [1500.0, 900.0, 2200.0, 2190.0, 2190.0, 2190.0]
+            + [nan] * 3
+            + [1200.0, 2190.0, 2200.0]
+            + [nan] * 2,
         }
     )
     identifier = BoilerThermalIdentifier()
@@ -273,8 +277,9 @@ def test_heat_pump_limit_and_booster_heat_are_identified_from_booster_runs():
     # Both runs hand over at 55 degC (heat pump limit). The full run keeps warming
     # after the booster is cut out, to 61 degC - the tank's maximum, whatever the
     # early-stopped run reached.
-    assert identifier._identify_booster(df) == (55.0, 61.0, 2000.0)
+    assert identifier._identify_booster(df) == (55.0, 61.0, 2000.0, 2190.0)
     assert identifier._identify_booster(df.assign(booster_on=False)) == (
+        None,
         None,
         None,
         None,
@@ -313,6 +318,7 @@ BOOSTER_MODEL = BoilerThermalModel(
     heat_pump_max_tank_temperature_c=55.0,
     max_tank_temperature_c=60.0,
     booster_heat_w=2000.0,
+    booster_electrical_w=2400.0,
 )
 HORIZON = 24
 
@@ -396,6 +402,37 @@ def test_a_tank_near_the_limit_still_starts_and_hands_over():
 
     assert any(result.schedule), "expected the tank to be heated at all"
     assert result.temperatures[20] >= 60.0 - 1e-6
+
+
+@pytest.mark.parametrize("compressor_elapsed_hours", [0.0, 0.1])
+def test_a_run_above_the_heat_pump_limit_is_not_held_to_the_minimum_runtime(
+    compressor_elapsed_hours,
+):
+    """5 October 2026: a run set to 60 degC by hand, at 59.5 degC - the booster
+    finishing it with the compressor off (0 h), or the compressor reported
+    running. Above its limit the compressor has nothing to give, and the
+    booster cannot heat a minimum runtime long below its cut-out: the plan was
+    infeasible. The booster heating the tank draws its own power, not its
+    heat."""
+
+    target = [10.0] * HORIZON
+    target[1] = 59.9
+    data = MPCInput(
+        solar_forecast_w=[0.0] * HORIZON,
+        ambient_temperature=20.0,
+        current_temp_top=59.5,
+        current_temp_bottom=59.5,
+        boiler_on_current=True,
+        compressor_elapsed_hours=compressor_elapsed_hours,
+        target_temperature_top=tuple(target),
+    )
+
+    result = MPCOptimizer(BOOSTER_MODEL, MPCConfig()).solve(data)
+
+    assert result.temperatures[1] >= 59.9 - 1e-6
+    assert max(result.temperatures) <= BOOSTER_MODEL.max_tank_temperature_c + 1e-6
+    assert result.heat_w[0] > 0.0
+    assert result.electrical_power_w[0] == pytest.approx(1.2 * result.heat_w[0])
 
 
 def test_a_tank_at_rest_keeps_its_cold_layer_when_its_top_steps_down():

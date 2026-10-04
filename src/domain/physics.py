@@ -180,66 +180,84 @@ def zone_state_space(
     model: BuildingThermalModel,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Continuous state-space of the zone for dx/dt = A x + B u - what the
-    Kalman filter, a rollout and the MPC all drive.
+    Kalman filter, a rollout and the MPC all drive (see BuildingThermalModel).
 
-    x = [T_air, T_mass], u = [T_outdoor, Q_internal, Q_solar, Q_floor]:
+    x = [T_living, T_rest, T_slab_living, T_slab_rest],
+    u = [T_outdoor, Q_internal, Q_solar_living, Q_solar_rest, Q_floor].
 
-        C_air  dT_air/dt  = UA_env (T_out - T_air) + UA_am (T_mass - T_air)
-                            + Q_int + Q_sol
-        C_mass dT_mass/dt = UA_am  (T_air - T_mass) + Q_floor
-
-    The air node is the room - air, furnishings and internal walls - and the
-    mass node the floor slab (see BuildingThermalModel). Q_floor drives the
-    slab: the circuit runs inside the screed, which is what produces the
-    observed lag between compressor and room temperature without any added
-    delay term. Q_solar drives the room: the sun through the glazing lands on
-    furnishings, rugs and internal walls - light surfaces that pass it to the
-    air within the hour - far more than on the bare slab (real data, 4 Oct: the
-    living room 1.65 K warmer in three hours of sun). Cross-validated on two
-    halves of 55 days, all of it to the room against all to the slab: held-out
-    error 0.190 -> 0.168 and 0.210 -> 0.197 K, and the fitted aperture and
-    envelope agreeing between the halves (4.8/4.4 m2, 82/85 W/K) where they
-    had not (0.2/1.8 m2, 97/84 W/K).
+    Q_internal and Q_floor are the dwelling's, divided by floor area; each
+    room's sun is its own glazing's.
     """
 
-    ua_env = model.ua_envelope_w_per_k
-    ua_am = model.ua_air_mass_w_per_k
-    c_air = model.c_air_j_per_k
-    c_mass = model.c_mass_j_per_k
-
-    a = np.array(
-        [
-            [-(ua_env + ua_am) / c_air, ua_am / c_air],
-            [ua_am / c_mass, -ua_am / c_mass],
-        ]
+    share = model.living_area_fraction
+    shares = np.array([share, 1.0 - share])
+    c_room = model.c_air_j_per_k * shares
+    c_slab = model.c_mass_j_per_k * shares
+    ua_slab = model.ua_air_mass_w_per_k * shares
+    ua_env = model.ua_envelope_w_per_k * np.array(
+        [model.living_envelope_fraction, 1.0 - model.living_envelope_fraction]
     )
+    ua_rooms = model.ua_rooms_w_per_k
 
-    b = np.array(
-        [
-            [ua_env / c_air, 1.0 / c_air, 1.0 / c_air, 0.0],
-            [0.0, 0.0, 0.0, 1.0 / c_mass],
-        ]
-    )
+    a = np.zeros((4, 4))
+    b = np.zeros((4, 5))
+
+    for room, other in ((0, 1), (1, 0)):
+        slab = room + 2
+        a[room, room] = -(ua_env[room] + ua_rooms + ua_slab[room]) / c_room[room]
+        a[room, other] = ua_rooms / c_room[room]
+        a[room, slab] = ua_slab[room] / c_room[room]
+        a[slab, room] = ua_slab[room] / c_slab[room]
+        a[slab, slab] = -ua_slab[room] / c_slab[room]
+
+        b[room, 0] = ua_env[room] / c_room[room]
+        b[room, 1] = shares[room] / c_room[room]
+        b[room, 2 + room] = 1.0 / c_room[room]
+        b[slab, 4] = shares[room] / c_slab[room]
 
     return a, b
 
 
-def zone_observation(
-    model: BuildingThermalModel,
-) -> np.ndarray:
-    """Row vector h with T_measured = h x: what a thermostat reads from the
-    zone's states.
+def zone_observations(model: BuildingThermalModel) -> np.ndarray:
+    """What the zone's thermometers read of its state, one row each: the
+    living room's thermostat and the rest of the house's sensors averaged by
+    floor area.
 
-    An operative temperature: a wall-mounted sensor exchanges longwave
-    radiation with the surfaces around it, so it follows the mass node as well
-    as the air (see BuildingThermalModel.sensor_mass_fraction). This is a measurement
-    equation, not a heat balance - it moves no energy, and dropping it would
-    only mean claiming the sensor reads pure air.
+    Operative temperatures: a wall-mounted sensor exchanges longwave radiation
+    with the floor as well as the room, so it follows its slab in part (see
+    BuildingThermalModel.sensor_mass_fraction). A measurement equation, not a
+    heat balance: it moves no energy.
     """
 
     fraction = model.sensor_mass_fraction
 
-    return np.array([1.0 - fraction, fraction])
+    return np.array(
+        [
+            [1.0 - fraction, 0.0, fraction, 0.0],
+            [0.0, 1.0 - fraction, 0.0, fraction],
+        ]
+    )
+
+
+def zone_observation(model: BuildingThermalModel) -> np.ndarray:
+    """Row vector h with T = h x: what the thermostat reads, the temperature
+    comfort is set in and judged on."""
+
+    return zone_observations(model)[0]
+
+
+def zone_slab(model: BuildingThermalModel) -> np.ndarray:
+    """Row vector of the slabs' mean temperature, by floor area: what the
+    floor circuit delivers its heat against, the one water runs through both."""
+
+    share = model.living_area_fraction
+
+    return np.array([0.0, 0.0, share, 1.0 - share])
+
+
+# The zone's slab states (see zone_state_space): each must stay above the dew
+# point while cooling, since each has a floor surface the air touches.
+ZONE_SLAB_STATES = (2, 3)
 
 
 def floor_heat_w(

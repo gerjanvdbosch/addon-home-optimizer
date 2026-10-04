@@ -35,6 +35,8 @@ from domain.physics import (
     internal_gain_w,
     solar_gain_w,
     zone_observation,
+    zone_observations,
+    zone_slab,
     zone_state_space,
 )
 from domain.sensors import Aggregation, FillMethod, SensorReference
@@ -272,12 +274,21 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     MAX_SENSOR_MASS_FRACTION = 0.5
     INITIAL_SENSOR_MASS_FRACTION = 0.25
 
-    # An unmodelled heat flow can enter either node: the room through
-    # ventilation, a stove or a visitor, the slab through a calorimeter that
-    # reads somewhat off. Q_internal and Q_floor are the input channels that
-    # land there, so the filter carries one disturbance per node instead of
-    # claiming the slab is driven exactly as measured.
-    DISTURBANCE_INPUTS = (1, 3)
+    # An unmodelled heat flow can enter any node: a room through ventilation,
+    # a stove or a visitor - one room's window, not the other's - the slabs
+    # through a calorimeter that reads somewhat off. Each room's sun and the
+    # floor's heat are the input channels that land there, so the filter
+    # carries a disturbance per room and one for the slabs instead of claiming
+    # either is driven exactly as measured.
+    DISTURBANCE_INPUTS = (2, 3, 4)
+
+    # Between the two rooms (W/K): at least what a closed door and an
+    # insulated floor between them still pass; at most an open stairwell and
+    # an uninsulated concrete ceiling, some 2.5 W/m2K over its whole area, with
+    # room to spare.
+    MIN_UA_ROOMS_W_PER_K = 1.0
+    MAX_UA_ROOMS_W_PER_K = 1000.0
+    INITIAL_UA_ROOMS_W_PER_K = 100.0
 
     # Share of the house-wide baseload dissipated inside the modelled zone.
     # Physically a fraction, hence [0, 1]; the living zone is a substantial but
@@ -294,9 +305,16 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         self.glazing_areas_m2: list[float] = []
         self.facade_azimuth_deg = 180.0
         self.shutter_areas_m2: list[float] = []
+        self.shutter_closed_positions: list[float] = []
         self.room_temperature_columns: list[str] = []
         self.room_areas_m2: list[float] = []
         self.shutter_columns: list[str] = []
+        # Which glazing, and which shutter, is in the thermostat's room
+        # (SouthGlazing.thermostat_room), aligned with the lists above.
+        self.glazing_in_thermostat_room: list[bool] = []
+        self.shutter_in_thermostat_room: list[bool] = []
+        # The room the thermostat is in, as a room_temperature_columns index.
+        self.thermostat_room_index: int = 0
         self.presence_columns: list[str] = []
         self.states = HeatPumpStates()
         self.parameter_std_errors: dict[str, float] | None = None
@@ -324,6 +342,16 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # Home Assistant cover convention: current_position is a percentage with
     # 100 meaning fully open.
     FULLY_OPEN_POSITION = 100.0
+
+    # A shut external shutter in front of glazing passes roughly 0.05-0.15 of
+    # the glazing's own solar gain - the darker the slats, the more they absorb
+    # and pass on. Twice the top of that range bounds it. Real data, Jul-Oct
+    # 2026 with cover.woonkamer down at 18-20: 0.17, and 0.12-0.20 over 8
+    # cross-validated splits. Without the term the rest's aperture sat at all
+    # its glass, standing in for the heat its shut shutters pass, and read as
+    # 18% open the living room's shutter did the same.
+    MAX_CLOSED_SHUTTER_GAIN_FRACTION = 0.3
+    INITIAL_CLOSED_SHUTTER_GAIN_FRACTION = 0.1
 
     # a_eff_m2 = glass area * g-value * frame factor * soiling. The geometric
     # angle of incidence is NOT in there - the transposition to the facade
@@ -385,6 +413,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         "a_eff_m2",
         "sensor_mass_fraction",
         "internal_gain_fraction",
+        "a_eff_rest_m2",
+        "ua_rooms_w_per_k",
+        "living_envelope_fraction",
+        "closed_shutter_gain_fraction",
     )
 
     @staticmethod
@@ -398,8 +430,23 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 model.a_eff_m2,
                 model.sensor_mass_fraction,
                 model.internal_gain_fraction,
+                model.a_eff_rest_m2,
+                model.ua_rooms_w_per_k,
+                model.living_envelope_fraction,
+                model.closed_shutter_gain_fraction,
             ]
         )
+
+    @property
+    def living_area_fraction(self) -> float:
+        """The thermostat's room's share of the zone's floor area."""
+
+        total = sum(self.room_areas_m2)
+
+        if total <= 0.0:
+            return 1.0
+
+        return self.room_areas_m2[self.thermostat_room_index] / total
 
     def _model_from_parameters(self, x: np.ndarray) -> BuildingThermalModel:
         return BuildingThermalModel(
@@ -410,10 +457,29 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             a_eff_m2=float(x[4]),
             sensor_mass_fraction=float(x[5]),
             internal_gain_fraction=float(x[6]),
+            a_eff_rest_m2=float(x[7]),
+            ua_rooms_w_per_k=float(x[8]),
+            living_envelope_fraction=float(x[9]),
+            living_area_fraction=self.living_area_fraction,
+            closed_shutter_gain_fraction=float(x[10]),
         )
 
-    def _shutter_open_fraction(self, df: pd.DataFrame) -> pd.Series:
-        """Area-weighted unshaded fraction of the zone's south glazing.
+    def load(self, path) -> None:
+        super().load(path)
+
+        # A model saved before the zone had two rooms, or before shut shutters
+        # passed heat, lacks parameters: as good as none until recalibrated.
+        if self.model is not None and "closed_shutter_gain_fraction" not in vars(
+            self.model
+        ):
+            logger.warning("Building model is out of date - recalibrate it")
+            self.model = None
+
+    def _shutter_open_fraction(
+        self, df: pd.DataFrame, thermostat_room: bool | None = None
+    ) -> pd.Series:
+        """Area-weighted unshaded fraction of the zone's south glazing - of
+        the thermostat's room's alone, or the rest's, with `thermostat_room`.
 
         sum(area_i * open_i) / sum(area_i): shading is an area effect, so a
         small bedroom window may not carry the same weight as a large living
@@ -426,22 +492,43 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         that a_eff_m2 is bounded by.
         """
 
-        total_area = sum(self.glazing_areas_m2)
+        def chosen(flags: list[bool], count: int) -> list[bool]:
+            if thermostat_room is None:
+                return [True] * count
+
+            return [f == thermostat_room for f in flags or [True] * count]
+
+        glazing = chosen(self.glazing_in_thermostat_room, len(self.glazing_areas_m2))
+        shutters = chosen(self.shutter_in_thermostat_room, len(self.shutter_columns))
+        total_area = sum(
+            a for a, c in zip(self.glazing_areas_m2, glazing, strict=True) if c
+        )
 
         if total_area <= 0.0:
             return pd.Series(1.0, index=df.index)
 
-        unshaded_area = total_area - sum(self.shutter_areas_m2)
+        unshaded_area = total_area - sum(
+            a for a, c in zip(self.shutter_areas_m2, shutters, strict=True) if c
+        )
         weighted = pd.Series(unshaded_area, index=df.index)
 
-        for column, area in zip(
-            self.shutter_columns, self.shutter_areas_m2, strict=True
+        for column, area, closed, included in zip(
+            self.shutter_columns,
+            self.shutter_areas_m2,
+            self.shutter_closed_positions or [0.0] * len(self.shutter_columns),
+            shutters,
+            strict=True,
         ):
+            if not included:
+                continue
+
             position = pd.to_numeric(df[column], errors="coerce")
             # A missing position reading must not silently mean "shut": an
             # absent cover reading says nothing about the glass, and assuming
             # full shading would attribute real solar gain to the envelope.
-            open_fraction = (position / self.FULLY_OPEN_POSITION).fillna(1.0)
+            open_fraction = (
+                (position - closed) / (self.FULLY_OPEN_POSITION - closed)
+            ).fillna(1.0)
             weighted = weighted + area * open_fraction.clip(0.0, 1.0)
 
         return (weighted / total_area).clip(0.0, 1.0)
@@ -481,8 +568,20 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 pd.to_numeric, errors="coerce"
             )
             weights = pd.Series(self.room_areas_m2, index=self.room_temperature_columns)
-            available = rooms.notna() * weights
-            df["T_air"] = (rooms * weights).sum(axis=1) / available.sum(axis=1)
+
+            def mean(columns: list[str]) -> pd.Series:
+                available = rooms[columns].notna() * weights[columns]
+                return (rooms[columns] * weights[columns]).sum(axis=1) / available.sum(
+                    axis=1
+                )
+
+            # The model's two rooms (see BuildingThermalModel): the thermostat's,
+            # and the rest averaged the same way.
+            living = self.room_temperature_columns[self.thermostat_room_index]
+            rest = [c for c in self.room_temperature_columns if c != living]
+            df["T_air"] = mean(self.room_temperature_columns)
+            df["T_living"] = rooms[living]
+            df["T_rest"] = mean(rest)
 
         # Without a configured outdoor sensor, Open-Meteo's own temperature is
         # the only outdoor air temperature available (see
@@ -535,7 +634,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # forward, so nothing here is missing. Which rows those are cannot be
         # read off the frame for the same reason - forecast() is told where now
         # is instead of guessing.
-        df = df.dropna(subset=["T_air", "T_out"]).reset_index(drop=True)
+        # The rest of the house may go unmeasured for a while - a sensor that
+        # has dropped out - which the filter and the fit simply skip; the
+        # thermostat's room is what the zone is about.
+        df = df.dropna(subset=["T_living", "T_out"]).reset_index(drop=True)
 
         if df.empty:
             raise ValueError(
@@ -545,6 +647,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         numeric_columns = [
             "T_air",
+            "T_living",
+            "T_rest",
             "T_out",
             "flow_lpm",
             "T_supply",
@@ -603,6 +707,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         )
 
         df["shutter_open_fraction"] = self._shutter_open_fraction(df)
+        df["open_living"] = self._shutter_open_fraction(df, thermostat_room=True)
+        df["open_rest"] = self._shutter_open_fraction(df, thermostat_room=False)
         df["occupants"] = self._occupants(df)
         df["baseload_w"] = df["baseload_w"].fillna(0.0)
 
@@ -614,18 +720,30 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         return df
 
     def _inputs(self, model, df: pd.DataFrame) -> np.ndarray:
-        """u = [T_outdoor, Q_internal, Q_solar, Q_floor] per sample.
+        """u = [T_outdoor, Q_internal, Q_solar_living, Q_solar_rest, Q_floor]
+        per sample (see physics.zone_state_space).
 
-        Rebuilt per fit iteration because two of the four depend on identified
-        parameters (the effective aperture and the in-zone baseload fraction).
-        Takes the model rather than the raw parameter vector.
+        Rebuilt per fit iteration because three of the five depend on
+        identified parameters (the effective apertures and the in-zone
+        baseload fraction). Takes the model rather than the raw parameter
+        vector.
         """
 
-        q_solar = solar_gain_w(
-            a_eff_m2=model.a_eff_m2,
-            shutter_open_fraction=df["shutter_open_fraction"].to_numpy(dtype=float),
-            facade_irradiance=df["I_facade_w_per_m2"].to_numpy(dtype=float),
-        )
+        irradiance = df["I_facade_w_per_m2"].to_numpy(dtype=float)
+        closed_gain = model.closed_shutter_gain_fraction
+        q_solar = [
+            solar_gain_w(
+                a_eff_m2=aperture,
+                # The open glass passes its full gain, the shut part a share.
+                shutter_open_fraction=closed_gain
+                + (1.0 - closed_gain) * df[column].to_numpy(dtype=float),
+                facade_irradiance=irradiance,
+            )
+            for aperture, column in (
+                (model.a_eff_m2, "open_living"),
+                (model.a_eff_rest_m2, "open_rest"),
+            )
+        ]
 
         q_internal = internal_gain_w(
             baseload_w=df["baseload_w"].to_numpy(dtype=float),
@@ -637,7 +755,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             [
                 df["T_out"].to_numpy(dtype=float),
                 q_internal,
-                q_solar,
+                *q_solar,
                 df["Q_floor_w"].to_numpy(dtype=float),
             ]
         )
@@ -697,7 +815,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         include_partial: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Forward-simulate every scored window; returns (predicted, measured,
-        active, row indices).
+        active, row indices), predicted and measured with a column per
+        thermometer (see physics.zone_observations): the thermostat's room
+        first, the rest of the house second.
 
         `active` marks the samples where the floor circuit was actually serving
         the space, so calibration diagnostics and validation can report the
@@ -717,7 +837,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         inputs = self._inputs(model, df)
         a, b = zone_state_space(model)
 
-        measured = df["T_air"].to_numpy(dtype=float)
+        measured = df[["T_living", "T_rest"]].to_numpy(dtype=float)
         dt_seconds = df["dt_seconds"].to_numpy(dtype=float)
         floor_heat = df["Q_floor_w"].to_numpy(dtype=float)
 
@@ -727,7 +847,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         index_parts: list[np.ndarray] = []
 
         measurement_variance = self.SENSOR_RESOLUTION_K**2 / 12.0
-        observation = zone_observation(model)
+        observation = zone_observations(model)
 
         for run_start, run_end in runs:
             # Every window starts from the filter's estimate of the WHOLE state
@@ -766,7 +886,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 if window_start - run_start >= warmup_samples:
                     # What the thermostat would have read, which is what the
                     # residual is measured against.
-                    predicted_parts.append(simulated @ observation)
+                    predicted_parts.append(simulated @ observation.T)
                     measured_parts.append(measured[window_start:window_end])
                     active_parts.append(floor_heat[window_start:window_end] != 0.0)
                     index_parts.append(np.arange(window_start, window_end))
@@ -794,7 +914,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     ) -> np.ndarray:
         predicted, measured, _, _ = self._simulate_windows(x, df, plan)
 
-        return predicted - measured
+        # Both thermometers, each in its own right: the rest of the house is
+        # what pins down how the rooms share the dwelling's heat. A reading
+        # that is missing has nothing to say.
+        return np.nan_to_num((predicted - measured).ravel())
 
     def _bounds(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """(lower, initial, upper) for the parameter vector.
@@ -819,7 +942,15 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # least_squares needs a strictly positive bound width, so a zone with no
         # configured south glass gets a numerically-zero aperture rather than a
         # degenerate bound - solar gain is then simply absent from the model.
-        max_aperture = max(sum(self.glazing_areas_m2), self.MIN_F_SCALE)
+        flags = self.glazing_in_thermostat_room or [True] * len(self.glazing_areas_m2)
+        living_glass = sum(
+            a for a, f in zip(self.glazing_areas_m2, flags, strict=True) if f
+        )
+        rest_glass = sum(
+            a for a, f in zip(self.glazing_areas_m2, flags, strict=True) if not f
+        )
+        max_aperture = max(living_glass, self.MIN_F_SCALE)
+        max_rest_aperture = max(rest_glass, self.MIN_F_SCALE)
 
         lower = np.array(
             [
@@ -828,6 +959,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 air_capacity,
                 self.MIN_C_MASS_J_PER_M2_K * floor_m2,
                 0.0,
+                0.0,
+                0.0,
+                0.0,
+                self.MIN_UA_ROOMS_W_PER_K,
                 0.0,
                 0.0,
             ]
@@ -842,6 +977,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 max_aperture,
                 self.MAX_SENSOR_MASS_FRACTION,
                 1.0,
+                max_rest_aperture,
+                self.MAX_UA_ROOMS_W_PER_K,
+                1.0,
+                self.MAX_CLOSED_SHUTTER_GAIN_FRACTION,
             ]
         )
 
@@ -854,6 +993,11 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.INITIAL_APERTURE_FRACTION * max_aperture,
                 self.INITIAL_SENSOR_MASS_FRACTION,
                 self.INITIAL_INTERNAL_GAIN_FRACTION,
+                self.INITIAL_APERTURE_FRACTION * max_rest_aperture,
+                self.INITIAL_UA_ROOMS_W_PER_K,
+                # The envelope by floor area to start: the share it is the room's.
+                self.living_area_fraction,
+                self.INITIAL_CLOSED_SHUTTER_GAIN_FRACTION,
             ]
         )
 
@@ -1030,9 +1174,16 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         x = self._parameters(model)
 
-        predicted, measured, active, positions = self._simulate_windows(x, df, plan)
+        predicted_both, measured_both, active, positions = self._simulate_windows(
+            x, df, plan
+        )
+        # Headline: the thermostat's room, where comfort is set and judged.
+        predicted, measured = predicted_both[:, 0], measured_both[:, 0]
 
         metrics = {
+            "mae_rest": float(
+                np.nanmean(np.abs(measured_both[:, 1] - predicted_both[:, 1]))
+            ),
             "scored_samples": float(len(predicted)),
             "r2": float(r2_score(measured, predicted)),
             "mae": float(mean_absolute_error(measured, predicted)),
@@ -1140,20 +1291,20 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         total_glass_m2 = sum(self.glazing_areas_m2)
 
         if total_glass_m2 > 0.0:
-            aperture_fraction = model.a_eff_m2 / total_glass_m2
+            aperture_fraction = (model.a_eff_m2 + model.a_eff_rest_m2) / total_glass_m2
             metrics["aperture_fraction"] = aperture_fraction
             implausible = aperture_fraction < self.MIN_PLAUSIBLE_APERTURE_FRACTION
             metrics["implausible_aperture"] = float(implausible)
 
             if implausible:
                 logger.warning(
-                    "Building thermal validation: a_eff_m2 = %.2f m2 is only "
-                    "%.3f of the %.1f m2 of configured south glass, which "
+                    "Building thermal validation: the apertures (%.2f m2) are "
+                    "only %.3f of the %.1f m2 of configured south glass, which "
                     "would need a g-value no real glazing has. The fit may be "
                     "statistically converged and still not describe this "
                     "window - most likely the data covers too little sunlit "
                     "time with the shutters open.",
-                    model.a_eff_m2,
+                    model.a_eff_m2 + model.a_eff_rest_m2,
                     aperture_fraction,
                     total_glass_m2,
                 )
@@ -1165,13 +1316,21 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # season and the time of day. A slope of zero is what a correctly
         # identified envelope looks like; anything else is structural, and
         # invisible to a mean absolute error.
+        # The envelope is the whole dwelling's, so these trends are read off the
+        # zone's area-weighted average - both rooms, the rest's own error where
+        # it was measured.
         drive = (df["T_out"] - df["T_air"]).to_numpy(dtype=float)[positions]
+        share = model.living_area_fraction
+        room_error = predicted_both - measured_both
+        zone_error = share * room_error[:, 0] + (1.0 - share) * np.where(
+            np.isnan(room_error[:, 1]), room_error[:, 0], room_error[:, 1]
+        )
         sunlit = (df["shutter_open_fraction"] * df["I_facade_w_per_m2"]).to_numpy(
             dtype=float
         )[positions]
 
         window_drive = drive.reshape(windows, horizon_samples).mean(axis=1)
-        window_error = (predicted - measured).reshape(windows, horizon_samples)[:, -1]
+        window_error = zone_error.reshape(windows, horizon_samples)[:, -1]
 
         # Dark windows only. Solar gain and the indoor-outdoor difference both
         # peak in the afternoon - on this installation they correlate about
@@ -1303,12 +1462,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         return metrics
 
     def simulate(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Predicted and measured zone temperature over a window, by time.
-
-        Returns both, because the measured column is the zone average over
-        config.building.rooms - not any single room's thermostat -
-        and comparing the prediction against anything else would compare two
-        different quantities.
+        """Predicted and measured temperature of the thermostat's room over a
+        window, by time.
 
         Exactly the view validate() scores - the room temperature is re-anchored
         to the measurement every ROLLOUT_HORIZON_HOURS while the unmeasured mass
@@ -1332,7 +1487,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         )
 
         return pd.DataFrame(
-            {"predicted": predicted, "measured": measured},
+            {"predicted": predicted[:, 0], "measured": measured[:, 0]},
             index=prepared["time"].to_numpy()[positions],
         ).sort_index()
 
@@ -1357,22 +1512,30 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         estimates = kalman_states(
             a,
             b,
-            prepared["T_air"].to_numpy(dtype=float),
+            prepared[["T_living", "T_rest"]].to_numpy(dtype=float),
             self._inputs(model, prepared),
             prepared["dt_seconds"].to_numpy(dtype=float),
             self.PROCESS_NOISE_W,
             self.SENSOR_RESOLUTION_K**2 / 12.0,
-            zone_observation(model),
+            zone_observations(model),
             self.DISTURBANCE_INPUTS,
         )
 
-        names = ["air", "mass"][: estimates.shape[1]]
+        return self._states_frame(model, estimates, prepared["time"].to_numpy())
 
-        return pd.DataFrame(
-            estimates[:, : len(names)],
-            columns=names,
-            index=prepared["time"].to_numpy(),
-        )
+    STATE_NAMES = ("living", "rest", "slab_living", "slab_rest")
+
+    @classmethod
+    def _states_frame(
+        cls, model: BuildingThermalModel, states: np.ndarray, index: np.ndarray
+    ) -> pd.DataFrame:
+        """The states by name, with `mass` the slabs' mean the floor circuit
+        delivers against (see physics.zone_slab)."""
+
+        frame = pd.DataFrame(states, columns=list(cls.STATE_NAMES), index=index)
+        frame["mass"] = states @ zone_slab(model)
+
+        return frame
 
     def forecast(
         self,
@@ -1461,6 +1624,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 usual.reindex(quarter[~known]).fillna(last).to_numpy()
             )
             prepared["shutter_open_fraction"] = self._shutter_open_fraction(prepared)
+            prepared["open_living"] = self._shutter_open_fraction(prepared, True)
+            prepared["open_rest"] = self._shutter_open_fraction(prepared, False)
 
         if baseload_w is not None:
             aligned = baseload_w.reindex(prepared["time"]).to_numpy(dtype=float)
@@ -1477,19 +1642,19 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         estimates = kalman_states(
             a,
             b,
-            prepared["T_air"].to_numpy(dtype=float)[: last + 1],
+            prepared[["T_living", "T_rest"]].to_numpy(dtype=float)[: last + 1],
             inputs[: last + 1],
             dt_seconds[: last + 1],
             self.PROCESS_NOISE_W,
             self.SENSOR_RESOLUTION_K**2 / 12.0,
-            zone_observation(model),
+            zone_observations(model),
             self.DISTURBANCE_INPUTS,
         )
 
         # Nothing is delivered to the zone: this is what happens if the heat
         # pump is left out of it.
         inputs = inputs.copy()
-        inputs[last:, 3] = 0.0
+        inputs[last:, 4] = 0.0
 
         simulated = _rollout(
             a,
@@ -1502,25 +1667,20 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # The rollout starts from the filter's last estimate, so the two join
         # without a seam.
         states = np.vstack([estimates[:last], simulated])
-        names = ["air", "mass"][: states.shape[1]]
+        zone = self._states_frame(model, states, prepared["time"].to_numpy())
 
-        zone = pd.DataFrame(
-            states[:, : len(names)],
-            columns=names,
-            index=prepared["time"].to_numpy(),
-        )
-
-        # What a thermostat would read of it, which is the only column that
-        # can be drawn against - or scored on - the measurement (see
+        # What the thermostat would read of it, which is the only column that
+        # can be drawn against - or scored on - its measurement (see
         # zone_observation).
         zone["reading"] = states @ zone_observation(model)
         zone["measured"] = np.where(
-            known, prepared["T_air"].to_numpy(dtype=float), np.nan
+            known, prepared["T_living"].to_numpy(dtype=float), np.nan
         )
         # The heat no decision changes, split by where it lands, for a plan to
         # start from: the same gains the rollout was driven by.
         zone["internal_gain_w"] = inputs[:, 1]
         zone["solar_gain_w"] = inputs[:, 2]
+        zone["solar_gain_rest_w"] = inputs[:, 3]
 
         return zone, last
 
@@ -1539,6 +1699,28 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             if glazing.cover is not None
         ]
         self.shutter_areas_m2 = [glazing.glass_m2 for glazing in shaded]
+        self.shutter_closed_positions = [glazing.closed_position for glazing in shaded]
+        self.glazing_in_thermostat_room = [
+            glazing.thermostat_room for glazing in config.building.south_glazing
+        ]
+        self.shutter_in_thermostat_room = [
+            glazing.thermostat_room for glazing in shaded
+        ]
+        thermostat = config.building.thermostat.temperature
+        matching = [
+            i
+            for i, room in enumerate(config.building.rooms)
+            if room.temperature.entity_id == thermostat.entity_id
+        ]
+
+        if not matching or len(config.building.rooms) < 2:
+            raise ValueError(
+                "building.rooms must include the thermostat's own room and at "
+                "least one more: the zone is modelled as that room and the rest "
+                "of the house."
+            )
+
+        self.thermostat_room_index = matching[0]
         self.room_temperature_columns = [
             f"room_temperature_{i}" for i in range(len(self.room_areas_m2))
         ]

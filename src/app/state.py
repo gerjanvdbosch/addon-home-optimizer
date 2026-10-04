@@ -435,9 +435,6 @@ class StateManager:
             state.measurements.heat_pump.boiler.stratification = self._parse_series(
                 df, "boiler_stratification"
             )
-        state.measurements.building.temperature = self._parse_series(
-            df, "thermostat_temperature"
-        )
         state.measurements.building.setpoint = self._parse_series(
             df, "thermostat_setpoint"
         )
@@ -629,13 +626,6 @@ class StateManager:
                 config.heat_pump.flow,
                 interval="15m",
                 aggregation="time_mean",
-            )
-            .timeseries(
-                "thermostat_temperature",
-                config.building.thermostat.temperature,
-                aggregation="last",
-                interval="15m",
-                fill="previous",
             )
             .timeseries(
                 "thermostat_setpoint",

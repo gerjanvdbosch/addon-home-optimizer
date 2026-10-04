@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 from pvlib import irradiance, solarposition
 
-from domain.config import Config
+from domain.config import Config, SouthGlazing
 from domain.dynamics import discretize_zoh, kalman_states
 from domain.models import BuildingThermalModel
 from domain.physics import (
@@ -17,6 +17,7 @@ from domain.physics import (
     floor_heat_w,
     solar_gain_w,
     zone_observation,
+    zone_observations,
     zone_state_space,
 )
 from features.building import BuildingThermalIdentifier, facade_irradiance_w_per_m2
@@ -24,17 +25,25 @@ from features.building import BuildingThermalIdentifier, facade_irradiance_w_per
 TRUE_VOLUME_M3 = 120.0
 TRUE_ZONE_AREA_M2 = 46.0
 TRUE_SOUTH_GLASS_M2 = 14.0
+# The thermostat's room and its glazing (see _config).
+TRUE_LIVING_AREA_M2 = 30.0
+TRUE_LIVING_GLASS_M2 = 10.0
 
 TRUE_MODEL = BuildingThermalModel(
     ua_envelope_w_per_k=180.0,
     ua_air_mass_w_per_k=450.0,
     c_air_j_per_k=3.0 * RHO_AIR_KG_PER_M3 * TRUE_VOLUME_M3 * CP_AIR_J_PER_KG_K,
     c_mass_j_per_k=18.0e6,
-    a_eff_m2=6.0,
-    # A pure air sensor, so these tests keep measuring the air node itself;
-    # the operative-temperature reading has its own test below.
+    a_eff_m2=4.5,
+    # A pure air sensor, so these tests keep measuring the room nodes
+    # themselves; the operative-temperature reading has its own test below.
     sensor_mass_fraction=0.0,
     internal_gain_fraction=0.6,
+    a_eff_rest_m2=1.5,
+    ua_rooms_w_per_k=60.0,
+    living_envelope_fraction=0.6,
+    living_area_fraction=TRUE_LIVING_AREA_M2 / TRUE_ZONE_AREA_M2,
+    closed_shutter_gain_fraction=0.0,
 )
 
 
@@ -78,15 +87,19 @@ def _config() -> Config:
             # temperature both rest on. The second uses the compact
             # [area, sensor] form, which must keep working.
             "rooms": [
-                {"area_m2": 30.0, "temperature": "sensor.living_room"},
-                [TRUE_ZONE_AREA_M2 - 30.0, "sensor.bedroom"],
+                {"area_m2": TRUE_LIVING_AREA_M2, "temperature": "sensor.living_room"},
+                [TRUE_ZONE_AREA_M2 - TRUE_LIVING_AREA_M2, "sensor.bedroom"],
             ],
             "ceiling_height": TRUE_VOLUME_M3 / TRUE_ZONE_AREA_M2,
             # One shaded group and one that is never covered, which is the
             # combination the unshaded-fraction weighting has to handle.
             "south_glazing": [
-                {"glass_m2": 10.0, "cover": "cover.living_room"},
-                TRUE_SOUTH_GLASS_M2 - 10.0,
+                {
+                    "glass_m2": TRUE_LIVING_GLASS_M2,
+                    "cover": "cover.living_room",
+                    "thermostat_room": True,
+                },
+                TRUE_SOUTH_GLASS_M2 - TRUE_LIVING_GLASS_M2,
             ],
         },
         forecast={"solcast": "sensor.solcast", "open_meteo": "sensor.open_meteo"},
@@ -160,17 +173,30 @@ def _raw_frame() -> pd.DataFrame:
             "shutter_0": shutter,
             "presence_0": np.where((hour >= 17.0) | (hour < 8.0), "home", "not_home"),
             "T_air": 21.0,
+            "room_temperature_0": 21.0,
+            "room_temperature_1": 21.0,
         }
     )
 
 
 def _identifier() -> BuildingThermalIdentifier:
     identifier = BuildingThermalIdentifier(latitude=52.39, longitude=5.79)
-    identifier.room_areas_m2 = [TRUE_ZONE_AREA_M2]
+    identifier.room_areas_m2 = [
+        TRUE_LIVING_AREA_M2,
+        TRUE_ZONE_AREA_M2 - TRUE_LIVING_AREA_M2,
+    ]
+    identifier.room_temperature_columns = ["room_temperature_0", "room_temperature_1"]
+    identifier.thermostat_room_index = 0
     identifier.volume_m3 = TRUE_VOLUME_M3
-    identifier.glazing_areas_m2 = [TRUE_SOUTH_GLASS_M2]
-    identifier.shutter_areas_m2 = [TRUE_SOUTH_GLASS_M2]
+    # The living room's glass behind its shutter, the rest's never covered.
+    identifier.glazing_areas_m2 = [
+        TRUE_LIVING_GLASS_M2,
+        TRUE_SOUTH_GLASS_M2 - TRUE_LIVING_GLASS_M2,
+    ]
+    identifier.glazing_in_thermostat_room = [True, False]
+    identifier.shutter_areas_m2 = [TRUE_LIVING_GLASS_M2]
     identifier.shutter_columns = ["shutter_0"]
+    identifier.shutter_in_thermostat_room = [True]
     identifier.presence_columns = ["presence_0"]
     return identifier
 
@@ -199,25 +225,29 @@ def _simulate(
     inputs = identifier._inputs(TRUE_MODEL, prepared)
 
     a_d, b_d = discretize_zoh(*zone_state_space(TRUE_MODEL), DT_SECONDS)
-    observation = zone_observation(TRUE_MODEL)
+    observations = zone_observations(TRUE_MODEL)
+    share = TRUE_MODEL.living_area_fraction
 
-    state = np.array([21.0, 21.0])
-    air = np.empty(len(prepared))
+    state = np.full(4, 21.0)
+    rooms = np.empty((len(prepared), 2))
 
     wind = prepared.get("wind_m_per_s", pd.Series(0.0, index=prepared.index))
 
     for i in range(len(prepared)):
-        # What the thermostat reads of the state, which for TRUE_MODEL is the
-        # air node alone.
-        air[i] = observation @ state
+        # What the thermometers read of the state, which for TRUE_MODEL is
+        # each room node alone.
+        rooms[i] = observations @ state
         forcing = inputs[i].copy()
-        # Into the air node, like the other internal flows (index 1).
-        forcing[1] -= INFILTRATION_W_PER_K_M_S * wind.iloc[i] * (state[0] - forcing[0])
+        # Into the rooms, like the other internal flows (index 1).
+        zone = share * state[0] + (1.0 - share) * state[1]
+        forcing[1] -= INFILTRATION_W_PER_K_M_S * wind.iloc[i] * (zone - forcing[0])
         state = a_d @ state + b_d @ forcing
 
-    noisy = air + rng.normal(0.0, MEASUREMENT_NOISE_STD_C, len(air))
+    noisy = rooms + rng.normal(0.0, MEASUREMENT_NOISE_STD_C, rooms.shape)
+    read = np.round(noisy / SENSOR_RESOLUTION_C) * SENSOR_RESOLUTION_C
 
-    raw["T_air"] = np.round(noisy / SENSOR_RESOLUTION_C) * SENSOR_RESOLUTION_C
+    raw["room_temperature_0"] = read[:, 0]
+    raw["room_temperature_1"] = read[:, 1]
 
     return raw
 
@@ -326,6 +356,30 @@ def test_closed_shutter_blocks_solar_gain():
     assert gain[1] == 0.0
 
 
+def test_a_shut_shutter_still_passes_part_of_the_sun():
+    """A cover reading its closed position is shut, and the glass behind it
+    gets the closed-shutter share of the open gain - not none."""
+
+    identifier = _identifier()
+    identifier.shutter_closed_positions = [18.0] * len(identifier.shutter_columns)
+    frame = _raw_frame()
+    frame[identifier.shutter_columns] = 18.0
+    shut = identifier.prepare(frame)
+    frame[identifier.shutter_columns] = 100.0
+    open_ = identifier.prepare(frame)
+
+    assert (shut["open_living"] == 0.0).all()
+
+    sunny = open_["I_facade_w_per_m2"].to_numpy() > 100.0
+    model = replace(TRUE_MODEL, closed_shutter_gain_fraction=0.1)
+    ratio = (
+        identifier._inputs(model, shut)[sunny, 2]
+        / identifier._inputs(model, open_)[sunny, 2]
+    )
+
+    assert ratio == pytest.approx(0.1)
+
+
 def test_occupancy_adds_metabolic_heat_to_the_air_node():
     identifier = _identifier()
     prepared = identifier.prepare(_raw_frame())
@@ -358,7 +412,8 @@ def test_validate_flags_a_physically_impossible_aperture(caplog):
 
     identifier, df, _ = _calibrated()
 
-    identifier.model.a_eff_m2 = 0.05 * TRUE_SOUTH_GLASS_M2
+    identifier.model.a_eff_m2 = 0.05 * TRUE_LIVING_GLASS_M2
+    identifier.model.a_eff_rest_m2 = 0.05 * (TRUE_SOUTH_GLASS_M2 - TRUE_LIVING_GLASS_M2)
 
     with caplog.at_level("WARNING"):
         metrics = identifier.validate(df)
@@ -440,7 +495,7 @@ def test_simulate_tracks_the_measured_temperature():
     identifier, df, _ = _calibrated()
 
     simulated = identifier.simulate(df)["predicted"]
-    measured = identifier.prepare(df).set_index("time")["T_air"]
+    measured = identifier.prepare(df).set_index("time")["T_living"]
 
     aligned = measured.reindex(simulated.index)
 
@@ -605,8 +660,11 @@ def test_a_dropped_out_sensor_drops_its_weight_too():
 
     prepared = identifier.prepare(df)
 
-    # The remaining sensor stands for the whole zone rather than being diluted.
+    # The remaining sensor stands for the whole zone rather than being diluted,
+    # and the rest of the house going unmeasured does not void the step.
     assert prepared["T_air"].iloc[0] == pytest.approx(20.0)
+    assert prepared["T_living"].iloc[0] == pytest.approx(20.0)
+    assert prepared["T_rest"].isna().all()
 
 
 def test_volume_is_derived_from_the_zone_areas_and_ceiling_height():
@@ -629,10 +687,10 @@ def test_volume_is_derived_from_the_zone_areas_and_ceiling_height():
 def test_filter_infers_the_unmeasured_mass_node():
     """The point of the filter: a state nothing measures still gets corrected.
 
-    Hard-resetting the measured state while letting the unmeasured one
-    free-run leaves the two inconsistent, which is neither simulation nor
-    estimation. The filter has to pull an initial mass temperature towards
-    something the measured air temperature supports.
+    Hard-resetting the measured states while letting the unmeasured ones
+    free-run leaves them inconsistent, which is neither simulation nor
+    estimation. The filter has to pull the slabs towards something the
+    measured rooms support.
     """
 
     identifier, df, _ = _calibrated()
@@ -641,7 +699,7 @@ def test_filter_infers_the_unmeasured_mass_node():
     model = identifier.model
     a, b = zone_state_space(model)
 
-    measured = prepared["T_air"].to_numpy(dtype=float)
+    measured = prepared[["T_living", "T_rest"]].to_numpy(dtype=float)
     estimates = kalman_states(
         a,
         b,
@@ -650,14 +708,16 @@ def test_filter_infers_the_unmeasured_mass_node():
         prepared["dt_seconds"].to_numpy(dtype=float),
         identifier.PROCESS_NOISE_W,
         identifier.SENSOR_RESOLUTION_K**2 / 12.0,
+        zone_observations(model),
+        identifier.DISTURBANCE_INPUTS,
     )
 
-    assert estimates.shape == (len(prepared), 2)
-    # The measured state tracks its measurement closely...
-    assert np.abs(estimates[100:, 0] - measured[100:]).mean() < 0.1
-    # ...while the mass node is a distinct, inferred quantity rather than a
-    # copy of it.
-    assert np.abs(estimates[100:, 1] - estimates[100:, 0]).mean() > 0.0
+    assert estimates.shape == (len(prepared), 4)
+    # The measured states track their measurements closely...
+    assert np.abs(estimates[100:, :2] - measured[100:]).mean() < 0.1
+    # ...while each slab is a distinct, inferred quantity rather than a copy
+    # of its room.
+    assert np.abs(estimates[100:, 2] - estimates[100:, 0]).mean() > 0.0
 
 
 def test_filter_result_does_not_hinge_on_the_process_noise():
@@ -753,6 +813,15 @@ def _windy_days() -> np.ndarray:
 
 
 def test_validate_flags_heat_lost_to_wind_the_model_lacks(caplog):
+    """Wind takes heat the model has no term for, and validation says so.
+
+    Whether as wind or as envelope is the data's to settle: the loss scales
+    with wind times the indoor-outdoor difference, which over these days
+    correlates 0.85 with the difference alone, so most of it - the mean wind's
+    share - reads as an envelope conducting more than the model, and only the
+    day-to-day variation as wind. Both mean the zone loses heat the model
+    keeps."""
+
     identifier, _, _ = _calibrated()
     windy = _simulate(np.random.default_rng(14), wind_kmh=_windy_days())
 
@@ -760,7 +829,11 @@ def test_validate_flags_heat_lost_to_wind_the_model_lacks(caplog):
         metrics = identifier.validate(windy)
 
     assert metrics["wind_bias_slope_k_per_k_m_s"] < 0.0
-    assert "loses more heat with the wind" in caplog.text
+    assert metrics["envelope_bias_slope_k_per_k"] < 0.0
+    assert (
+        "loses more heat with the wind" in caplog.text
+        or "the envelope response is too weak" in caplog.text
+    )
 
 
 def test_validate_reports_no_wind_trend_where_wind_changes_nothing(caplog):
@@ -797,7 +870,9 @@ def test_forecast_starts_where_the_measurements_stop():
     assert forecast.index.max() > now
     # It picks up from the filter, so the first value is what the filter had.
     estimated = identifier.estimate(df[df["target_time"] <= now])
-    assert forecast["air"].iloc[0] == pytest.approx(estimated["air"].iloc[-1], abs=1e-6)
+    assert forecast["living"].iloc[0] == pytest.approx(
+        estimated["living"].iloc[-1], abs=1e-6
+    )
 
 
 def test_trajectory_is_the_filter_until_now_and_the_forecast_after():
@@ -819,7 +894,7 @@ def test_trajectory_is_the_filter_until_now_and_the_forecast_after():
 
 def test_two_node_forecast_carries_the_thermostat_reading():
     """The curve drawn against the measurement has to be the same quantity:
-    with two nodes the thermostat reads part of the mass as well."""
+    the thermostat reads part of its room's slab as well."""
 
     identifier, df, now = _calibrated(with_future=True)
     identifier.model = replace(identifier.model, sensor_mass_fraction=0.4)
@@ -827,7 +902,7 @@ def test_two_node_forecast_carries_the_thermostat_reading():
     forecast = identifier.forecast(df, now)
 
     assert forecast["reading"].to_numpy() == pytest.approx(
-        0.6 * forecast["air"].to_numpy() + 0.4 * forecast["mass"].to_numpy()
+        0.6 * forecast["living"].to_numpy() + 0.4 * forecast["slab_living"].to_numpy()
     )
 
 
@@ -875,7 +950,7 @@ def test_forecast_uses_a_supplied_baseload_curve():
     boosted = identifier.forecast(df, now, baseload_w=high)
 
     # More appliance heat means a warmer house, and it has to reach the model.
-    assert boosted["air"].iloc[-1] > plain["air"].iloc[-1]
+    assert boosted["living"].iloc[-1] > plain["living"].iloc[-1]
 
 
 def test_forecast_shutters_follow_the_time_of_day_not_the_last_position():
@@ -883,32 +958,68 @@ def test_forecast_shutters_follow_the_time_of_day_not_the_last_position():
     stands as it did at that time of day before."""
 
     identifier, df, now = _calibrated(with_future=True)
+    identifier.model = replace(identifier.model, closed_shutter_gain_fraction=0.1)
     df = df.copy()
+    df["shutter_0"] = 0.0
+    shut = identifier.forecast(df, now)
     # Shut throughout, opened only in the reading at now.
     df["shutter_0"] = np.where(df["target_time"] >= now, 100.0, 0.0)
 
     forecast = identifier.forecast(df, now)
     ahead = forecast.index > now
 
-    assert forecast.loc[ahead, "solar_gain_w"].max() == pytest.approx(0.0)
+    np.testing.assert_allclose(
+        forecast.loc[ahead, "solar_gain_w"], shut.loc[ahead, "solar_gain_w"]
+    )
+
+
+def test_a_rooms_sun_warms_that_room_before_the_rest():
+    """Each room's glazing warms its own room: the house only follows through
+    the coupling between them, so for the first hour the thermostat's room
+    runs ahead."""
+
+    a_d, b_d = discretize_zoh(*zone_state_space(TRUE_MODEL), 3600.0)
+    sun_in_living = np.array([20.0, 0.0, 2000.0, 0.0, 0.0])
+
+    state = a_d @ np.full(4, 20.0) + b_d @ sun_in_living
+
+    assert state[0] - 20.0 > 2.0 * (state[1] - 20.0) > 0.0
+
+
+def test_glazing_takes_its_room_in_the_compact_form():
+    glazing = SouthGlazing.model_validate(
+        [12.0, ["cover.woonkamer", "current_position"], 18.0, True]
+    )
+
+    assert glazing.thermostat_room is True
+    assert glazing.closed_position == 18.0
+    assert SouthGlazing.model_validate([2.0, "cover.bedroom"]).thermostat_room is False
+
+
+def test_the_zone_needs_the_thermostats_own_room():
+    config = _config()
+    config.building.rooms = config.building.rooms[1:]
+
+    with pytest.raises(ValueError, match="thermostat's own room"):
+        BuildingThermalIdentifier(latitude=52.39, longitude=5.79).dataset(config)
 
 
 def test_observation_is_air_alone_without_a_radiant_share():
-    assert zone_observation(TRUE_MODEL).tolist() == [1.0, 0.0]
+    assert zone_observation(TRUE_MODEL).tolist() == [1.0, 0.0, 0.0, 0.0]
 
 
 def test_observation_weighs_air_against_mass():
-    """A wall thermostat reads an operative temperature: part air, part the
-    surfaces around it, and the two shares are one reading."""
+    """A wall thermostat reads an operative temperature: part its room, part
+    the surfaces around it, and the two shares are one reading."""
 
     model = replace(TRUE_MODEL, sensor_mass_fraction=0.3)
 
-    assert zone_observation(model).tolist() == pytest.approx([0.7, 0.3])
+    assert zone_observation(model).tolist() == pytest.approx([0.7, 0.0, 0.3, 0.0])
     assert zone_observation(model).sum() == pytest.approx(1.0)
 
 
 def _simulate_operative(rng: np.random.Generator, fraction: float) -> pd.DataFrame:
-    """The same house, read by a thermostat that also sees the surfaces."""
+    """The same house, read by thermometers that also see the surfaces."""
 
     identifier = _identifier()
     prepared = identifier.prepare(_raw_frame())
@@ -916,19 +1027,21 @@ def _simulate_operative(rng: np.random.Generator, fraction: float) -> pd.DataFra
     inputs = identifier._inputs(true_model, prepared)
 
     a_d, b_d = discretize_zoh(*zone_state_space(true_model), DT_SECONDS)
-    observation = zone_observation(true_model)
+    observations = zone_observations(true_model)
 
-    state = np.array([21.0, 21.0])
-    reading = np.empty(len(prepared))
+    state = np.full(4, 21.0)
+    readings = np.empty((len(prepared), 2))
 
     for i in range(len(prepared)):
-        reading[i] = observation @ state
+        readings[i] = observations @ state
         state = a_d @ state + b_d @ inputs[i]
 
-    noisy = reading + rng.normal(0.0, MEASUREMENT_NOISE_STD_C, len(reading))
+    noisy = readings + rng.normal(0.0, MEASUREMENT_NOISE_STD_C, readings.shape)
+    read = np.round(noisy / SENSOR_RESOLUTION_C) * SENSOR_RESOLUTION_C
 
     raw = _raw_frame()
-    raw["T_air"] = np.round(noisy / SENSOR_RESOLUTION_C) * SENSOR_RESOLUTION_C
+    raw["room_temperature_0"] = read[:, 0]
+    raw["room_temperature_1"] = read[:, 1]
 
     return raw
 
@@ -949,8 +1062,8 @@ def test_calibrate_recovers_the_radiant_share_of_the_reading():
 
 
 def test_filter_corrects_the_mass_node_through_a_mixed_reading():
-    """With the reading carrying part of the mass, the filter can correct a
-    state nothing measures directly - air alone leaves it free-running."""
+    """With the readings carrying part of the slabs, the filter can correct a
+    state nothing measures directly - the rooms alone leave it free-running."""
 
     rng = np.random.default_rng(5)
     identifier = _identifier()
@@ -959,17 +1072,17 @@ def test_filter_corrects_the_mass_node_through_a_mixed_reading():
     inputs = identifier._inputs(true_model, prepared)
     a, b = zone_state_space(true_model)
     a_d, b_d = discretize_zoh(a, b, DT_SECONDS)
-    observation = zone_observation(true_model)
+    observations = zone_observations(true_model)
 
-    state = np.array([21.0, 24.0])
-    states = np.empty((len(prepared), 2))
+    state = np.array([21.0, 21.0, 24.0, 24.0])
+    states = np.empty((len(prepared), 4))
 
     for i in range(len(prepared)):
         states[i] = state
         state = a_d @ state + b_d @ inputs[i]
 
-    measured = states @ observation + rng.normal(
-        0.0, MEASUREMENT_NOISE_STD_C, len(states)
+    measured = states @ observations.T + rng.normal(
+        0.0, MEASUREMENT_NOISE_STD_C, (len(states), 2)
     )
     dt_seconds = prepared["dt_seconds"].to_numpy(dtype=float)
 
@@ -985,16 +1098,18 @@ def test_filter_corrects_the_mass_node_through_a_mixed_reading():
             obs,
             identifier.DISTURBANCE_INPUTS,
         )
-        return float(np.abs(estimates[50:, 1] - states[50:, 1]).mean())
+        return float(np.abs(estimates[50:, 2] - states[50:, 2]).mean())
 
-    assert mass_error(observation) < mass_error(np.array([1.0, 0.0]))
+    rooms_alone = zone_observations(replace(true_model, sensor_mass_fraction=0.0))
+
+    assert mass_error(observations) < mass_error(rooms_alone)
 
 
 def test_filter_lets_an_unmodelled_floor_flow_disturb_the_mass():
     """The pipe run to this heat pump's shed loses part of what was measured
-    into the floor circuit, so the mass is not driven exactly as measured. A
-    disturbance on that channel lets the filter correct for it; one on the air
-    channel alone has to push the whole error through the air node."""
+    into the floor circuit, so the slabs are not driven exactly as measured. A
+    disturbance on that channel lets the filter correct for it; one on the
+    rooms' channel alone has to push the whole error through the rooms."""
 
     rng = np.random.default_rng(7)
     identifier = _identifier()
@@ -1005,16 +1120,18 @@ def test_filter_lets_an_unmodelled_floor_flow_disturb_the_mass():
 
     # The house receives four fifths of the floor heat the meter reports.
     delivered = inputs.copy()
-    delivered[:, 3] *= 0.8
+    delivered[:, 4] *= 0.8
 
-    state = np.array([21.0, 21.0])
-    states = np.empty((len(prepared), 2))
+    state = np.full(4, 21.0)
+    states = np.empty((len(prepared), 4))
 
     for i in range(len(prepared)):
         states[i] = state
         state = a_d @ state + b_d @ delivered[i]
 
-    measured = states[:, 0] + rng.normal(0.0, MEASUREMENT_NOISE_STD_C, len(states))
+    measured = states[:, :2] + rng.normal(
+        0.0, MEASUREMENT_NOISE_STD_C, (len(states), 2)
+    )
     dt_seconds = prepared["dt_seconds"].to_numpy(dtype=float)
 
     def mass_error(channels: tuple[int, ...]) -> float:
@@ -1026,10 +1143,10 @@ def test_filter_lets_an_unmodelled_floor_flow_disturb_the_mass():
             dt_seconds,
             identifier.PROCESS_NOISE_W,
             identifier.SENSOR_RESOLUTION_K**2 / 12.0,
-            None,
+            zone_observations(TRUE_MODEL),
             channels,
         )
-        return float(np.abs(estimates[50:, 1] - states[50:, 1]).mean())
+        return float(np.abs(estimates[50:, 2] - states[50:, 2]).mean())
 
     assert mass_error(identifier.DISTURBANCE_INPUTS) < mass_error((1,))
 

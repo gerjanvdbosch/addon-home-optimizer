@@ -20,8 +20,10 @@ from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.physics import (
     CP_WATER_J_PER_KG_K,
     RHO_WATER_KG_PER_L,
+    ZONE_SLAB_STATES,
     lumped_tank_state_space,
     zone_observation,
+    zone_slab,
     zone_state_space,
 )
 
@@ -869,20 +871,27 @@ class MPCOptimizer:
         # A run already heating keeps heating until its minimum runtime has
         # passed. Otherwise the next replan, minutes after the start, can plan it
         # off at step 0 while the heat pump finishes the run anyway - the plan,
-        # and anything acting on it, would flip for nothing. Skipped where the
-        # model cannot represent that run: a tank above the heat pump's limit
-        # with no booster to plan with.
+        # and anything acting on it, would flip for nothing. Only a compressor
+        # run below the heat pump's limit: once the booster has taken over (no
+        # compressor time, see MPCInput.compressor_elapsed_hours), or the tank
+        # is at that limit - a setpoint set by hand above it - the compressor
+        # has nothing left to give and the booster's thermostat ends the run.
+        # Forcing it on for a whole minimum runtime pushed a tank near its
+        # maximum past the cut-out: no plan at all (real data, 5 Oct: a run set
+        # to 60 degC by hand, at 59.5 degC).
         remaining = steps_within(
             min_runtime * self.config.step_hours - data.compressor_elapsed_hours
         )
-        unrepresentable = (
-            heat_pump_max_c is not None
-            and booster_heat_w is None
-            and initial_temperature >= heat_pump_max_c
+        at_limit = (
+            heat_pump_max_c is not None and initial_temperature >= heat_pump_max_c
         )
         model.running_run = pyo.ConstraintList()
 
-        if data.boiler_on_current and not unrepresentable:
+        if (
+            data.boiler_on_current
+            and data.compressor_elapsed_hours > 0.0
+            and not at_limit
+        ):
             for k in remaining:
                 model.running_run.add(heating(model, k) >= 1)
 
@@ -1221,8 +1230,8 @@ class MPCOptimizer:
                     * model.tank_start[k]
                 )
 
-            # The booster is a resistive element: its electrical power equals its
-            # heat (COP 1 - real data: 1.37 kWh heat for 1.38 kWh electrical).
+            # The booster draws more than it heats the tank (see
+            # BoilerThermalModel.booster_electrical_w).
             #
             # For a real plan the grid draw is max(0, power - sun) of whichever
             # source runs (never both), for the part of the step it runs, 0 while
@@ -1237,7 +1246,9 @@ class MPCOptimizer:
             # source against the whole sun separately let a few percent of both
             # run on it for free there, and the relaxation's bound stayed so far
             # below any real plan that a booster day took up to a minute.
-            electrical_w = heat_pump_power_w + model.q_booster_w[k]
+            electrical_w = (
+                heat_pump_power_w + self._booster_draw_per_heat * model.q_booster_w[k]
+            )
             running = model.q_heat_pump_w[k] / heat_w[k]
             if booster_heat_w:
                 running = running + model.q_booster_w[k] / booster_heat_w
@@ -1297,6 +1308,18 @@ class MPCOptimizer:
         model.mpc_scenario_weights = [weight for weight, _ in solar_scenarios]
 
         return model
+
+    @property
+    def _booster_draw_per_heat(self) -> float:
+        """Electrical W drawn per W of booster heat: its identified draw over
+        its heat (see BoilerThermalModel.booster_electrical_w), 1 without it."""
+
+        model = self.thermal_model
+
+        if not model.booster_electrical_w or not model.booster_heat_w:
+            return 1.0
+
+        return model.booster_electrical_w / model.booster_heat_w
 
     @property
     def _heat_w(self) -> float:
@@ -1596,17 +1619,16 @@ class MPCOptimizer:
         num_steps = plan.num_steps
         building = self.building_model
 
-        # The unmeasured mass temperature is as much a required initial
-        # condition as the measured air one: a two-node plan started with a
-        # cold screed is a different plan from one started with a charged one.
-        # Missing it means the filter has not run, which is not something to
-        # paper over with a guess - the zone is simply not planned, exactly as
-        # when no model has been calibrated.
+        # The unmeasured slabs are as much a required initial condition as the
+        # measured rooms: a plan started with a cold screed is a different plan
+        # from one started with a charged one. Missing them means the filter
+        # has not run, which is not something to paper over with a guess - the
+        # zone is simply not planned, exactly as when no model has been
+        # calibrated.
         planned = (
             building is not None
-            and data.zone_temperature is not None
+            and bool(data.zone_state)
             and bool(data.zone_target_temperature)
-            and data.zone_mass_temperature is not None
         )
 
         if not planned:
@@ -1636,6 +1658,7 @@ class MPCOptimizer:
 
         internal_gain_w = gains(data.zone_internal_gain_w)
         solar_gain_w = gains(data.zone_solar_gain_w)
+        solar_gain_rest_w = gains(data.zone_solar_gain_rest_w)
 
         # The same compressor serves both, so its output is the tank's nominal
         # heat. A space-heating-specific figure would come from the heating COP
@@ -1648,10 +1671,11 @@ class MPCOptimizer:
 
         a, b = zone_state_space(building)
         observation = zone_observation(building)
+        slab = zone_slab(building)
         num_states = a.shape[0]
 
-        # State 0 is the room - air, furnishings, internal walls - and state 1
-        # the floor slab the floor's heat lands in (see BuildingThermalModel).
+        # The rooms - air, furnishings, internal walls - and the slabs the
+        # floor's heat lands in (see BuildingThermalModel).
         model.ZONE_STATES = pyo.RangeSet(0, num_states - 1)
         model.zone_state = pyo.Var(model.K, model.ZONE_STATES)
         model.q_space_w = pyo.Var(
@@ -1661,12 +1685,11 @@ class MPCOptimizer:
         model.zone_excess = pyo.Var(model.K, domain=pyo.NonNegativeReals)
 
         model.zone_constraints = pyo.ConstraintList()
-        model.zone_constraints.add(
-            model.zone_state[0, 0] == float(data.zone_temperature)
-        )
-        model.zone_constraints.add(
-            model.zone_state[0, 1] == float(data.zone_mass_temperature)
-        )
+
+        for i in model.ZONE_STATES:
+            model.zone_constraints.add(
+                model.zone_state[0, i] == float(data.zone_state[i])
+            )
 
         # Evaluated at a representative floor-circuit supply temperature and
         # the outdoor temperature of each step, so a cold day costs what a cold
@@ -1810,11 +1833,11 @@ class MPCOptimizer:
             a_d, b_d = discretized[dt_hours]
             outdoor = zone_outdoor_c[k]
 
-            # u = [T_outdoor, Q_internal, Q_solar, Q_floor], the same input
-            # vector the zone is identified with. Each state advances
-            # by its own row of the discrete matrices, so where a gain lands -
-            # the air node or the mass node - is the model's to decide, not
-            # this block's.
+            # u = [T_outdoor, Q_internal, Q_solar_living, Q_solar_rest,
+            # Q_floor], the same input vector the zone is identified with. Each
+            # state advances by its own row of the discrete matrices, so where
+            # a gain lands - which room, or the slabs - is the model's to
+            # decide, not this block's.
             for i in model.ZONE_STATES:
                 model.zone_constraints.add(
                     model.zone_state[k + 1, i]
@@ -1824,7 +1847,8 @@ class MPCOptimizer:
                     + b_d[i, 0] * outdoor
                     + b_d[i, 1] * float(internal_gain_w[k])
                     + b_d[i, 2] * float(solar_gain_w[k])
-                    + b_d[i, 3] * floor_w(k)
+                    + b_d[i, 3] * float(solar_gain_rest_w[k])
+                    + b_d[i, 4] * floor_w(k)
                 )
 
         # What a thermostat reads of the plan: an operative temperature, part
@@ -1849,9 +1873,7 @@ class MPCOptimizer:
         # weight_temperature_slack, an unavoidable shortfall of a few
         # hundredths of a degree had the solver proving plans to a millionth
         # of one: over a minute for a plan it had found in seconds.
-        initial = np.array(
-            [float(data.zone_temperature), float(data.zone_mass_temperature)]
-        )
+        initial = np.array([float(t) for t in data.zone_state])
 
         def states_with(heat_w: float) -> list[np.ndarray]:
             state = initial
@@ -1864,6 +1886,7 @@ class MPCOptimizer:
                         zone_outdoor_c[k],
                         float(internal_gain_w[k]),
                         float(solar_gain_w[k]),
+                        float(solar_gain_rest_w[k]),
                         heat_w,
                     ]
                 )
@@ -1915,12 +1938,9 @@ class MPCOptimizer:
                     <= max(float(maximum_c[k]), unheated_c[k + 1])
                 )
 
-        sink = num_states - 1
-
         # Water condenses on a floor below the dew point of the air above it.
-        # The floor's surface lies between the slab and the room, so while
-        # cooling the slab may not be cooled below the dew point (plus a
-        # margin, see
+        # The floor's surface lies between a slab and its room, so while
+        # cooling no slab may be cooled below the dew point (plus a margin, see
         # BuildingConfig.dew_point_margin). Hard, unlike comfort: a wet floor
         # is not traded against a warm room. Always feasible, since cooling
         # only lowers the mass - where the zone alone would sit below the
@@ -1930,10 +1950,21 @@ class MPCOptimizer:
             mass_minimum_c = self._aggregate(data.zone_mass_minimum_c, plan, max)
 
             for k in range(num_steps):
-                model.zone_constraints.add(
-                    model.zone_state[k, sink]
-                    >= min(mass_minimum_c[k], float(unheated[k][sink]))
-                )
+                for i in ZONE_SLAB_STATES:
+                    model.zone_constraints.add(
+                        model.zone_state[k, i]
+                        >= min(mass_minimum_c[k], float(unheated[k][i]))
+                    )
+
+        # The temperature the floor's water delivers against: the slabs' mean,
+        # one circuit running through both (see zone_slab).
+        def sink_c(state: np.ndarray) -> float:
+            return float(slab @ state)
+
+        def sink(k: int):
+            return sum(
+                float(slab[i]) * model.zone_state[k, i] for i in model.ZONE_STATES
+            )
 
         # How the heat pump runs the floor by itself, once heating runs have
         # shown it (see features.floor). It picks its supply temperature
@@ -1949,7 +1980,8 @@ class MPCOptimizer:
             return
 
         # The product T_sink * space_on, exact for a binary decision within the
-        # sink's range, which the unheated and flat-out rollouts bound.
+        # sink's range, which the unheated and flat-out rollouts bound - the
+        # slabs' mean being monotone in the heat like each slab.
         model.space_sink_on = pyo.Var(model.K)
         conductance = operating.conductance_w_per_k
         # The cooling EER model, where runs have shown one: without it the
@@ -1980,16 +2012,16 @@ class MPCOptimizer:
         model.space_supply_c = []
 
         for k in range(num_steps):
-            low = float(coolest[k][sink])
-            high = float(warmest[k][sink])
+            low = sink_c(coolest[k])
+            high = sink_c(warmest[k])
             on = model.space_on[k]
             sink_on = model.space_sink_on[k]
 
             for bound in (
                 sink_on <= high * on,
                 sink_on >= low * on,
-                sink_on <= model.zone_state[k, sink] - low * (1 - on),
-                sink_on >= model.zone_state[k, sink] - high * (1 - on),
+                sink_on <= sink(k) - low * (1 - on),
+                sink_on >= sink(k) - high * (1 - on),
             ):
                 model.zone_constraints.add(bound)
 
@@ -1997,9 +2029,7 @@ class MPCOptimizer:
                 # The supply is the plan's to choose - the setpoint is given to
                 # the heat pump - so the heat is too, and the supply follows
                 # from it: T_supply = T_sink + Q / G.
-                model.space_supply_c.append(
-                    model.zone_state[k, sink] + model.q_space_w[k] / conductance
-                )
+                model.space_supply_c.append(sink(k) + model.q_space_w[k] / conductance)
 
                 # No less than the compressor at its lowest speed: asked for
                 # less it overshoots the setpoint rather than turn down.
@@ -2022,7 +2052,7 @@ class MPCOptimizer:
                 # hot day's run - where planning twice, the second time against
                 # the mass the first planned, doubled the solve.
                 if efficiency is not None:
-                    reference_c = float(unheated[k][sink])
+                    reference_c = sink_c(unheated[k])
 
                     for point_w in np.linspace(0.0, max_heat_w, 7):
                         draw_w = cooling_draw_w(point_w, zone_outdoor_c[k], reference_c)
@@ -2083,7 +2113,7 @@ class MPCOptimizer:
         # itself, with a big-M on both steps, the solver ran into its time
         # limit on a single day's plan.
         if cooling:
-            warmest_supply_c = max(float(state[sink]) for state in warmest)
+            warmest_supply_c = max(sink_c(state) for state in warmest)
 
             def supply_on(k: int):
                 return model.space_sink_on[k] + model.q_space_w[k] / conductance
@@ -2298,7 +2328,6 @@ class MPCOptimizer:
             T_outdoor = outdoor_at(i)
             alpha, beta = self._power_line_coefficients(T_outdoor, overall_target_max)
             # For the part of the step the heat pump runs (see active_power_w).
-            # The booster is resistive: electrical power equals its heat (COP 1).
             used = heat_pump_w[i] / self._heat_at(T_outdoor)
             start_power_w = self.cop_model.start_step_power_w if self.cop_model else 0.0
             heat_pump_power_w = (
@@ -2306,7 +2335,9 @@ class MPCOptimizer:
                 if i in start_slots and used and start_power_w
                 else (alpha + beta * temperatures[i]) * used
             )
-            electrical_power_w.append(heat_pump_power_w + booster_w[i])
+            electrical_power_w.append(
+                heat_pump_power_w + self._booster_draw_per_heat * booster_w[i]
+            )
 
         # Empty when no space heating was planned, so a caller can tell "the
         # zone was left alone" from "the zone was planned to coast".

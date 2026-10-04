@@ -49,6 +49,13 @@ class BoilerThermalModel:
     heat_pump_max_tank_temperature_c: float | None = None
     max_tank_temperature_c: float | None = None
     booster_heat_w: float | None = None
+    # The heat pump's electrical draw while the booster runs (W), identified
+    # alongside it. More than its calorimetric heat: the meter also counts the
+    # circulation pump and controls, and heat lost before the loop's sensors
+    # never shows in it - the data does not separate the two (real data: 2.19
+    # kW drawn against 1.85 kW of heat, 0.76-0.93 kWh heat per kWh over 7
+    # runs). None counts the booster's heat as its draw.
+    booster_electrical_w: float | None = None
     # How far the settled tank ends above the SWW setpoint of a heat pump run
     # that stopped by itself on it (K; see
     # BoilerThermalIdentifier._identify_setpoint_overshoot): the heat the run
@@ -131,64 +138,83 @@ class DewPointModel:
 
 @dataclass
 class BuildingThermalModel:
-    """Two-node (2R2C) grey-box model of one thermal zone.
+    """Grey-box model of the dwelling as two rooms, each over its own floor
+    slab: the room the thermostat is in (the living room) and the rest of the
+    house.
 
-    x = [T_air, T_mass]:
+    x = [T_living, T_rest, T_slab_living, T_slab_rest], each room
 
-        C_air  dT_air/dt  = UA_env (T_out - T_air) + UA_am (T_mass - T_air)
-                            + Q_int + Q_sol
-        C_mass dT_mass/dt = UA_am  (T_air - T_mass) + Q_floor
+        C_room  dT_room/dt  = UA_env,room (T_out - T_room)
+                              + UA_rooms (T_other - T_room)
+                              + UA_am,room (T_slab - T_room) + Q_int,room + Q_sol,room
+        C_slab  dT_slab/dt  = UA_am,room (T_room - T_slab) + Q_floor,room
 
-    The air node is the room: its air, furnishings and internal walls, which
-    follow one another closely. The mass node is the floor slab - screed and
-    the concrete floor it lies on - with the floor circuit in it, coupled to
-    the room only through its surface. Q_floor enters the slab because the
-    pipes run in the screed. Q_int (metabolic and appliance heat) is released
-    into the air, and so is Q_sol: the sun lands on furnishings and internal
-    walls, which pass it to the room within the hour, more than on the slab
-    (see physics.zone_state_space for the cross-validation that settled it).
+    A room node is its air, furnishings and internal walls, which follow one
+    another closely; a slab node is the screed and the floor it lies on, with
+    the floor circuit in it, coupled to its room only through its surface.
+    Q_floor enters the slabs because the pipes run in the screed; Q_int and the
+    sun the room's glazing lets in warm the room: the sun lands on furnishings
+    and internal walls, which pass it to the air within the hour.
 
-    All of the measured floor heat enters the slab: every room is in the zone,
-    the pipe run from the shed is insulated and buried, and the run through the
-    attic exchanges too little with it to matter (real data: the attic 9 K
-    warmer than the water, against some 2 kW missing). With the internal walls
-    lumped with the slab instead, a fit had to discard half of the measured
-    cooling to match the rooms. The slab takes it: a floor at 4-5 K below the
-    room passes 1.5-2 kW through its surface (EN 1264), the rest of a 4.4 kW
-    run cools the slab and returns to the room hours later (real data,
-    cross-validated on 19 cooling runs: -0.37 K per 10 kWh of cooling before,
-    +0.03 to +0.04 after).
+    Two rooms because the one the thermostat is in is the one comfort is set
+    in, and it does not follow the house's average: in the sun it warms within
+    the hour (real data, 4 Oct 2026: the living room 1.65 K in three hours, the
+    bedrooms above it hardly), and it lies on the ground floor with a slab of
+    its own, the bedrooms on another. Cross-validated on two halves of 55 days
+    (6 h rollouts), the living room was predicted to 0.144 and 0.112 K against
+    0.257 and 0.208 K taking the house's average for it, the average as well as
+    before (0.110/0.130 K against 0.111/0.131 K). One slab shared by both
+    instead let the ground floor's heat reach the bedrooms through it, and the
+    coupling between the rooms fell to its bound.
 
-    One model serves both heating and cooling: none of these parameters
-    describes the heat pump. Q_floor is a measured calorimetric input carrying
-    its own sign, so cooling is simply a negative Q. Mode-dependence lives in
-    the COP model and in the condensation limit, not in this balance.
+    The capacities, the slab coupling and the gains are the dwelling's totals,
+    divided over the two by floor area (living_area_fraction): the same
+    construction throughout, and the floor circuit's heat by area too - its
+    split between the floors is not measured. The envelope is split by a
+    fitted share: the living room has the front and back facades, the rest the
+    roof.
 
-    Simplification, stated explicitly: the mass node has no direct path to
-    outdoors, so envelope mass is lumped with the air node rather than given a
-    third node. With a single measured zone temperature a third capacity is not
-    identifiable, and inventing one would be a fit term without evidence.
+    All of the measured floor heat enters the slabs: every room is in the
+    zone, the pipe run from the shed is insulated and buried, and the run
+    through the attic exchanges too little with it to matter. One model serves
+    both heating and cooling: Q_floor is a measured calorimetric input carrying
+    its own sign. Mode-dependence lives in the COP model and in the
+    condensation limit, not in this balance.
     """
 
+    # The dwelling's envelope conductance, both rooms together (W/K).
     ua_envelope_w_per_k: float
+    # Slab surface to room, both rooms together (W/K).
     ua_air_mass_w_per_k: float
+    # Room nodes, both together (J/K).
     c_air_j_per_k: float
+    # Slabs, both together (J/K).
     c_mass_j_per_k: float
-    # Effective solar aperture of the zone's south glazing (m2): glass area
-    # times g-value times an incidence/soiling factor. Identified as one
-    # lumped parameter because those three factors only ever appear as their
-    # product in the heat balance, and the g-value is not separately measured.
+    # Effective solar aperture of the living room's south glazing (m2): glass
+    # area times g-value times an incidence/soiling factor, identified as one
+    # lumped parameter because those factors only ever appear as their product.
     a_eff_m2: float
-    # Share of the thermostat's reading that follows the slab rather than the
-    # room. A wall-mounted sensor exchanges longwave radiation with the floor
-    # as well as the walls, so what it reports is an operative temperature -
-    # 0 reads the room node alone, 0.5 the floor as much as the room. It
-    # belongs to the sensor, not to the balance: no heat flows because of it.
+    # Share of each thermostat's reading that follows its slab rather than its
+    # room: an operative temperature, 0 the room alone. It belongs to the
+    # sensor, not to the balance: no heat flows because of it.
     sensor_mass_fraction: float
-    # Fraction of the house-wide baseload electrical power that is released as
-    # heat inside this zone. The baseload sensor measures the whole house; the
-    # modelled zone is only part of it.
+    # Fraction of the house-wide baseload electrical power released as heat in
+    # the zone. The baseload sensor measures the whole house.
     internal_gain_fraction: float
+    # The same aperture for the rest of the house's south glazing (m2).
+    a_eff_rest_m2: float
+    # Between the two rooms: the ceiling between the floors, the stairs and
+    # the doors (W/K).
+    ua_rooms_w_per_k: float
+    # Share of the envelope conductance that is the living room's.
+    living_envelope_fraction: float
+    # The living room's share of the zone's floor area: configured, not fitted.
+    living_area_fraction: float
+    # Share of the open glazing's solar gain that still reaches the room behind
+    # a lowered external shutter: the dark slats absorb the sun and part of
+    # that heat crosses the window inward, with what the light slits between
+    # them let through.
+    closed_shutter_gain_fraction: float
 
 
 # Exact by definition of the Kelvin scale (0 degC = 273.15 K) - used

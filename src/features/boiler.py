@@ -1222,10 +1222,13 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             else f"{self.model.supply_margin_k:.1f} K",
         )
 
-        heat_pump_max_c, max_tank_c, booster_heat_w = self._identify_booster(df)
+        heat_pump_max_c, max_tank_c, booster_heat_w, booster_electrical_w = (
+            self._identify_booster(df)
+        )
         self.model.heat_pump_max_tank_temperature_c = heat_pump_max_c
         self.model.max_tank_temperature_c = max_tank_c
         self.model.booster_heat_w = booster_heat_w
+        self.model.booster_electrical_w = booster_electrical_w
         self.model.setpoint_overshoot_k = self._identify_setpoint_overshoot(df)
 
         if self.model.setpoint_overshoot_k is not None:
@@ -1245,10 +1248,14 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             logger.info(
                 "Boiler thermal calibration: booster took over at a median tank "
                 "temperature of %.1f degC (the heat pump's own limit), heated the "
-                "tank to a median %.1f degC (its maximum), delivering %s W.",
+                "tank to a median %.1f degC (its maximum), delivering %s W for %s W "
+                "drawn.",
                 heat_pump_max_c,
                 max_tank_c,
                 "unknown" if booster_heat_w is None else f"{booster_heat_w:.0f}",
+                "unknown"
+                if booster_electrical_w is None
+                else f"{booster_electrical_w:.0f}",
             )
 
         return self.model
@@ -1701,10 +1708,10 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
     def _identify_booster(
         self, df: pd.DataFrame
-    ) -> tuple[float | None, float | None, float | None]:
+    ) -> tuple[float | None, float | None, float | None, float | None]:
         """(heat pump max tank temperature degC, max tank temperature degC,
-        booster heat W) from the heating runs where the booster took over; None
-        for what the data cannot show.
+        booster heat W, electrical W drawn meanwhile) from the heating runs where
+        the booster took over; None for what the data cannot show.
 
         The booster engages because the compressor cannot lift the tank any
         further (its supply temperature limit minus the coil's approach), so
@@ -1722,13 +1729,13 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         shown to reach, not necessarily the most the boiler could take. The
         booster is a resistive element with a fixed rating, so its heat is the
         median calorimetric heat over its rows - robust to the partial first and
-        last rows.
+        last rows - and its draw the median measured power over them.
         """
 
         booster = df["booster_on"] & df["boiler_on"]
 
         if not booster.any():
-            return None, None, None
+            return None, None, None, None
 
         onset = booster & ~booster.shift(fill_value=False)
         last = booster & ~booster.shift(-1, fill_value=False)
@@ -1748,11 +1755,15 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             peaks.append(float(T_average.loc[start:end].max()))
 
         booster_heat_w = df.loc[booster, "q_in_override_w"].median()
+        booster_electrical_w = (
+            df.loc[booster, "power"].median() if "power" in df.columns else np.nan
+        )
 
         return (
             float(T_average[onset].median()),
             float(np.max(peaks)),
             None if np.isnan(booster_heat_w) else float(booster_heat_w),
+            None if np.isnan(booster_electrical_w) else float(booster_electrical_w),
         )
 
     # validate() compares the planning model with the tank this long after a run
@@ -2356,6 +2367,17 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
                 aggregation="mean",
                 fill="previous",
             )
+        )
+
+        # What the booster draws (see _identify_booster), only read on its rows.
+        # Like the COP fit's P_el: the meter stops reporting while idle, so no
+        # fill.
+        builder = builder.timeseries(
+            "power",
+            config.heat_pump.power,
+            interval="5m",
+            aggregation="mean",
+            fill="none",
         )
 
         # Optional booster sensor, an event-driven on/off state like "state".

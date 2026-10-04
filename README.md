@@ -237,7 +237,7 @@ actions:
             ],
             "ceiling_height": 2.6,
             "south_glazing": [
-              [12.0, ["cover.woonkamer", "current_position"]],
+              [12.0, ["cover.woonkamer", "current_position"], 20.0, true],
               [2.0, ["cover.slaapkamer_groot_1", "current_position"]],
               [2.0, ["cover.slaapkamer_groot_2", "current_position"]],
               [2.0, ["cover.slaapkamer_achter_3", "current_position"]]

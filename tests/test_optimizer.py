@@ -925,7 +925,21 @@ BUILDING_MODEL = BuildingThermalModel(
     # node exactly; the operative reading has its own test.
     sensor_mass_fraction=0.0,
     internal_gain_fraction=1.0,
+    # Both rooms alike and closely coupled: these tests are about the plan,
+    # not how the zone divides.
+    a_eff_rest_m2=0.0,
+    ua_rooms_w_per_k=500.0,
+    living_envelope_fraction=0.5,
+    living_area_fraction=0.5,
+    closed_shutter_gain_fraction=0.0,
 )
+
+
+def _zone_state(room_c: float, slab_c: float) -> tuple[float, ...]:
+    """Both rooms at one temperature and both slabs at another (see
+    physics.zone_state_space)."""
+
+    return (room_c, room_c, slab_c, slab_c)
 
 
 def _zone_input(**overrides) -> MPCInput:
@@ -937,8 +951,7 @@ def _zone_input(**overrides) -> MPCInput:
         target[k] = 20.0
 
     defaults = dict(
-        zone_temperature=19.5,
-        zone_mass_temperature=19.5,
+        zone_state=_zone_state(19.5, 19.5),
         zone_target_temperature=tuple(target),
         zone_internal_gain_w=(0.0,) * len(SOLAR_FORECAST_W),
     )
@@ -1139,7 +1152,7 @@ def test_the_two_node_zone_is_brought_to_its_target():
     rather than forbidden.
     """
 
-    data = _zone_input(zone_mass_temperature=19.5)
+    data = _zone_input(zone_state=_zone_state(19.5, 19.5))
 
     result = MPCOptimizer(
         THERMAL_MODEL,
@@ -1172,7 +1185,7 @@ def test_a_two_node_zone_is_not_planned_without_its_mass_temperature():
         MPCConfig(),
         cop_model=COP_MODEL,
         building_model=BUILDING_MODEL,
-    ).solve(_zone_input(zone_mass_temperature=None))
+    ).solve(_zone_input(zone_state=()))
 
     assert result.space_schedule == ()
     assert result.zone_temperatures == ()
@@ -1191,8 +1204,8 @@ def test_a_charged_screed_needs_less_heating_than_a_cold_one():
         building_model=BUILDING_MODEL,
     )
 
-    cold = optimizer.solve(_zone_input(zone_mass_temperature=18.0))
-    charged = optimizer.solve(_zone_input(zone_mass_temperature=24.0))
+    cold = optimizer.solve(_zone_input(zone_state=_zone_state(19.5, 18.0)))
+    charged = optimizer.solve(_zone_input(zone_state=_zone_state(19.5, 24.0)))
 
     assert sum(charged.space_heat_w) < sum(cold.space_heat_w)
 
@@ -1209,10 +1222,10 @@ def test_solar_gain_displaces_heating_in_the_two_node_zone():
     )
 
     steps = len(SOLAR_FORECAST_W)
-    dark = optimizer.solve(_zone_input(zone_mass_temperature=19.5))
+    dark = optimizer.solve(_zone_input(zone_state=_zone_state(19.5, 19.5)))
     sunny = optimizer.solve(
         _zone_input(
-            zone_mass_temperature=19.5,
+            zone_state=_zone_state(19.5, 19.5),
             zone_solar_gain_w=(2000.0,) * steps,
         )
     )
@@ -1227,8 +1240,7 @@ def test_comfort_is_judged_on_what_the_thermostat_reads():
     """
 
     data = _zone_input(
-        zone_temperature=22.0,
-        zone_mass_temperature=16.0,
+        zone_state=_zone_state(22.0, 16.0),
         zone_target_temperature=(20.0,) * len(SOLAR_FORECAST_W),
     )
 
@@ -1347,13 +1359,17 @@ def test_a_higher_ceiling_buffers_the_sun_in_the_floor_and_the_ceiling_holds():
         a_eff_m2=3.0,
         sensor_mass_fraction=0.5,
         internal_gain_fraction=0.6,
+        a_eff_rest_m2=0.0,
+        ua_rooms_w_per_k=500.0,
+        living_envelope_fraction=0.5,
+        living_area_fraction=0.5,
+        closed_shutter_gain_fraction=0.0,
     )
     data = _make_input(
         solar_forecast_w=list(sun),
         target_temperature_top=(10.0,) * steps,
         outdoor_temperature_forecast=(5.0,) * steps,
-        zone_temperature=20.1,
-        zone_mass_temperature=20.4,
+        zone_state=_zone_state(20.1, 20.4),
         zone_target_temperature=tuple(np.where(hour < 22.0, 20.0, 18.0)),
         zone_internal_gain_w=(150.0,) * steps,
     )
@@ -1379,8 +1395,7 @@ def _cold_day(**overrides):
         solar_forecast_w=[0.0] * steps,
         target_temperature_top=(10.0,) * steps,
         outdoor_temperature_forecast=(5.0,) * steps,
-        zone_temperature=20.1,
-        zone_mass_temperature=20.2,
+        zone_state=_zone_state(20.1, 20.2),
         zone_target_temperature=tuple(np.where(hour < 22.0, 20.0, 18.0)),
         zone_maximum_temperature=(21.5,) * steps,
         zone_internal_gain_w=(150.0,) * steps,
@@ -1398,6 +1413,13 @@ TWO_NODE = BuildingThermalModel(
     a_eff_m2=3.0,
     sensor_mass_fraction=0.5,
     internal_gain_fraction=0.6,
+    # Both rooms alike and closely coupled: these tests are about the plan,
+    # not how the zone divides.
+    a_eff_rest_m2=0.0,
+    ua_rooms_w_per_k=500.0,
+    living_envelope_fraction=0.5,
+    living_area_fraction=0.5,
+    closed_shutter_gain_fraction=0.0,
 )
 
 
@@ -1774,8 +1796,7 @@ def _hot_day(**overrides):
         solar_forecast_w=[0.0] * steps,
         target_temperature_top=(10.0,) * steps,
         outdoor_temperature_forecast=(30.0,) * steps,
-        zone_temperature=24.0,
-        zone_mass_temperature=23.5,
+        zone_state=_zone_state(24.0, 23.5),
         zone_target_temperature=(18.0,) * steps,
         zone_maximum_temperature=(22.5,) * steps,
         zone_internal_gain_w=(150.0,) * steps,
@@ -1854,9 +1875,9 @@ def test_a_cooling_run_takes_its_ramp_from_the_floor_in_the_step_it_starts():
     a_d, b_d = discretize_zoh(*zone_state_space(TWO_NODE), 900.0)
 
     def zone_after(floor_w: float) -> float:
-        state = a_d @ np.array(
-            [data.zone_temperature, data.zone_mass_temperature]
-        ) + b_d @ np.array([30.0, 150.0, 0.0, floor_w])
+        state = a_d @ np.array(data.zone_state) + b_d @ np.array(
+            [30.0, 150.0, 0.0, 0.0, floor_w]
+        )
 
         return float(zone_observation(TWO_NODE) @ state)
 

@@ -70,22 +70,29 @@ def kalman_states(
     `observation` is the row vector the thermometer sees, defaulting to the
     first state alone. A sensor reading a mixture of states (an operative
     temperature, say) makes the others partly observable, which is the only
-    way the filter can correct a state nothing measures directly.
+    way the filter can correct a state nothing measures directly. Several
+    thermometers are a matrix of such rows, with `measured` holding a column
+    each; a reading that is missing (NaN) simply corrects nothing that step.
     """
 
     n = a.shape[0]
     # Default: the first state alone, the one a thermometer normally reads.
-    h = np.eye(1, n)[0] if observation is None else np.asarray(observation, float)
+    h = np.atleast_2d(np.eye(1, n)[0] if observation is None else observation)
+    readings = np.asarray(measured, float).reshape(len(measured), -1)
 
-    state = np.concatenate(([measured[0]], np.full(n - 1, measured[0])))
+    # Unmeasured parts start where the readings put them on average, and each
+    # reading's departure from that is spread over the states it sees.
+    first = readings[0]
+    level = float(np.nanmean(first))
+    state = np.full(n, level) + np.linalg.pinv(h) @ np.nan_to_num(first - level)
     covariance = np.eye(n) * measurement_variance
 
-    estimates = np.empty((len(measured), n))
+    estimates = np.empty((len(readings), n))
     estimates[0] = state
 
     cache: dict[float, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
-    for i in range(1, len(measured)):
+    for i in range(1, len(readings)):
         dt = float(dt_seconds[i])
         key = round(dt, 3)
 
@@ -110,15 +117,19 @@ def kalman_states(
         state = a_d @ state + b_d @ inputs[i - 1]
         covariance = a_d @ covariance @ a_d.T + process_covariance
 
-        # One scalar measurement, so the usual matrix products reduce to
-        # vector ones: h is what the thermometer sees of the state.
-        innovation = measured[i] - h @ state
-        innovation_covariance = h @ covariance @ h + measurement_variance
+        seen = ~np.isnan(readings[i])
 
-        gain = covariance @ h / innovation_covariance
+        if seen.any():
+            h_seen = h[seen]
+            innovation = readings[i][seen] - h_seen @ state
+            innovation_covariance = (
+                h_seen @ covariance @ h_seen.T
+                + np.eye(int(seen.sum())) * measurement_variance
+            )
+            gain = covariance @ h_seen.T @ np.linalg.inv(innovation_covariance)
 
-        state = state + gain * innovation
-        covariance = covariance - np.outer(gain, h @ covariance)
+            state = state + gain @ innovation
+            covariance = covariance - gain @ h_seen @ covariance
 
         estimates[i] = state
 

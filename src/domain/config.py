@@ -142,6 +142,17 @@ class SouthGlazing(BaseModel):
     # The cover entity in front of this glazing, reporting current_position
     # (100 = fully open). None means the glass is never shaded.
     cover: SensorReference | None = Field(default=None)
+    # Whether this glazing is in the room the thermostat is in (see
+    # BuildingConfig.thermostat): its sun warms that room, the rest's warms
+    # the rest of the house (see BuildingThermalModel).
+    thermostat_room: bool = Field(default=False)
+    # The cover's current_position at which its bottom slat reaches the sill:
+    # above it the uncovered glass grows with the position; below it the glass
+    # is covered and the travel only closes the light slits between the slats,
+    # heat the closed-shutter gain covers (see BuildingThermalModel), not open
+    # glass. A cover pressed shut reads its lowest value (cover.woonkamer
+    # 10-11); this is the higher position where the slats start to part.
+    closed_position: float = Field(default=0.0, ge=0.0, lt=100.0)
 
     @model_validator(mode="before")
     @classmethod
@@ -149,8 +160,12 @@ class SouthGlazing(BaseModel):
         if isinstance(value, (int, float)):
             return {"glass_m2": value, "cover": None}
 
+        # [glass_m2, cover, closed_position, thermostat_room], the last two
+        # optional.
         if isinstance(value, (list, tuple)):
-            return {"glass_m2": value[0], "cover": value[1]}
+            names = ("glass_m2", "cover", "closed_position", "thermostat_room")
+
+            return dict(zip(names, value, strict=False))
 
         return value
 
@@ -218,7 +233,9 @@ class BuildingConfig(BaseModel):
     # attic runs 3.5 K warmer and tracks outdoor temperature, and so must be
     # left out. Averaging also suppresses the sensors' 0.1 K reporting
     # quantisation, which is a real limit on identifying a building whose daily
-    # indoor swing is around 1 K. Empty falls back to the thermostat.
+    # indoor swing is around 1 K. Must include the thermostat's own room and
+    # at least one more: the zone is modelled as that room and the rest of the
+    # house (see BuildingThermalModel).
     rooms: list[Room] = Field(default_factory=list)
     # Net floor-to-ceiling height of the conditioned zone. The air volume is
     # derived from it and the room areas, rather than configured separately:

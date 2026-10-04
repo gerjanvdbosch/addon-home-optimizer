@@ -41,12 +41,9 @@ class HeatPumpMeasurement(BaseModel):
 
 
 class BuildingMeasurement(BaseModel):
-    temperature: list[SeriesPoint[float]] = Field(default_factory=list)
     setpoint: list[SeriesPoint[float]] = Field(default_factory=list)
-    # The average over config.building.rooms - what the building model
-    # predicts, as opposed to `temperature`, which is the single thermostat the
-    # setpoint refers to. Kept apart so the dashboard compares the model
-    # against the quantity it actually models.
+    # The thermostat's room, which the setpoint refers to and the building
+    # model plans (see Optimization._zone).
     zone_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
     # The highest of config.building.dew_points: the air most likely to
     # condense on a cooled surface.

@@ -839,8 +839,9 @@ class Optimization:
             return None
 
         zone.index = pd.to_datetime(zone.index, utc=True)
+        # The thermostat's room, which comfort is set in, and the slab under it.
         self.state_manager.update_zone(
-            temperature=zone["measured"].dropna(), thermal_mass=zone["mass"]
+            temperature=zone["measured"].dropna(), thermal_mass=zone["slab_living"]
         )
 
         maximum = config.building.maximum_temperature
@@ -849,10 +850,11 @@ class Optimization:
             return None
 
         # The plan starts where the filter's estimate of the whole zone state
-        # stands at its first step: the air node, and the mass.
+        # stands at its first step: both rooms and their slabs.
         planned = zone.reindex(pd.DatetimeIndex(times))
+        state_names = list(BuildingThermalIdentifier.STATE_NAMES)
 
-        if planned[["air", "mass"]].iloc[0].isna().any():
+        if planned[state_names].iloc[0].isna().any():
             logger.info("Zone not planned: no zone estimate at %s", times[0])
             return None
 
@@ -879,8 +881,7 @@ class Optimization:
             )
 
         inputs = dict(
-            zone_temperature=float(planned["air"].iloc[0]),
-            zone_mass_temperature=float(planned["mass"].iloc[0]),
+            zone_state=tuple(float(c) for c in planned[state_names].iloc[0]),
             zone_target_temperature=tuple(
                 point.value
                 for point in self.state_manager.resolve_schedule(
@@ -897,6 +898,7 @@ class Optimization:
             # is not: as for the solar forecast, none where none is forecast.
             zone_internal_gain_w=gain("internal_gain_w"),
             zone_solar_gain_w=tuple(planned["solar_gain_w"].fillna(0.0)),
+            zone_solar_gain_rest_w=tuple(planned["solar_gain_rest_w"].fillna(0.0)),
             zone_cooling=cooling,
             zone_mass_minimum_c=(
                 tuple(c + config.building.dew_point_margin for c in dew_point_c)
