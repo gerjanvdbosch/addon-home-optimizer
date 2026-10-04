@@ -20,7 +20,7 @@ from domain.physics import (
     zone_observation,
     zone_state_space,
 )
-from features.optimizer import MIP_ABSOLUTE_GAP_EUR, MPCOptimizer
+from features.optimizer import MIP_ABSOLUTE_GAP_EUR, MPCOptimizer, surplus_scenarios
 
 THERMAL_MODEL = BoilerThermalModel(
     volume_l=200.0,
@@ -1107,6 +1107,28 @@ def test_the_zone_may_still_be_served_before_and_after_the_tank():
     assert _blocks(result.space_schedule) >= 1
 
 
+@pytest.mark.parametrize("tank_steps, feasible", [(1, False), (2, True)])
+def test_the_tank_part_of_a_zone_run_lasts_the_minimum_runtime(tank_steps, feasible):
+    """The zone made up the compressor's minimum runtime, so a single quarter of
+    hot water followed by a quarter of zone was a valid plan (real data, 4 Oct:
+    one quarter at 20:45 from a solve stopped at its time limit)."""
+
+    optimizer = MPCOptimizer(
+        THERMAL_MODEL, MPCConfig(), cop_model=COP_MODEL, building_model=BUILDING_MODEL
+    )
+    model = optimizer._build_model(_zone_input())
+    first = 8
+
+    for k in range(first - 1, first + tank_steps + 1):
+        model.boiler_on[k].fix(int(first <= k < first + tank_steps))
+
+    solver = Highs()
+    solver.config.load_solution = False
+    results = solver.solve(model)
+
+    assert (results.best_feasible_objective is not None) == feasible
+
+
 def test_the_two_node_zone_is_brought_to_its_target():
     """The MPC plans against whichever structure it was handed.
 
@@ -1175,11 +1197,9 @@ def test_a_charged_screed_needs_less_heating_than_a_cold_one():
     assert sum(charged.space_heat_w) < sum(cold.space_heat_w)
 
 
-def test_solar_gain_warms_the_two_node_zone_through_its_mass():
-    """Shortwave through the glazing lands on floor and furnishings, not in the
-    air, so it reaches the air node only via the coupling - but it does reach
-    it, and it displaces heating the compressor would otherwise have to deliver.
-    """
+def test_solar_gain_displaces_heating_in_the_two_node_zone():
+    """The sun warms the room node, and so displaces heating the compressor
+    would otherwise have to deliver."""
 
     optimizer = MPCOptimizer(
         THERMAL_MODEL,
@@ -1974,3 +1994,34 @@ def test_without_sun_the_run_goes_to_the_low_tariff():
 
     assert on_steps
     assert max(on_steps) < low_steps
+
+
+def test_the_surplus_scenarios_combine_the_solar_and_baseload_bands():
+    """Little sun meeting much load sets the low end, the spreads of the two
+    independent errors adding in quadrature per side; without a band there is
+    one scenario."""
+
+    data = _make_input(
+        solar_forecast_w=[1000.0, 100.0],
+        solar_p10_w=(800.0, 50.0),
+        solar_p90_w=(1200.0, 150.0),
+        baseload_forecast_w=(200.0, 200.0),
+        baseload_p10_w=(150.0, 150.0),
+        baseload_p90_w=(500.0, 500.0),
+        target_temperature_top=(10.0, 10.0),
+    )
+
+    (w_low, low), (w_mid, mid), (w_high, high) = surplus_scenarios(data)
+
+    assert (w_low, w_mid, w_high) == (0.3, 0.4, 0.3)
+    assert mid == pytest.approx([800.0, 0.0])
+    assert low == pytest.approx([800.0 - np.hypot(200.0, 300.0), 0.0])
+    assert high == pytest.approx([800.0 + np.hypot(200.0, 50.0), 0.0])
+
+    [(weight, only)] = surplus_scenarios(
+        replace(
+            data, solar_p10_w=(), solar_p90_w=(), baseload_p10_w=(), baseload_p90_w=()
+        )
+    )
+
+    assert weight == 1.0 and only == pytest.approx([800.0, 0.0])

@@ -26,7 +26,7 @@ from features.cop import HeatPumpCOPIdentifier
 from features.dataset import DatasetBuilder, DatasetLoader
 from features.dew_point import DewPointIdentifier
 from features.floor import FloorCircuitIdentifier
-from features.optimizer import SOLAR_SCENARIO_WEIGHTS, MPCOptimizer
+from features.optimizer import MPCOptimizer, surplus_scenarios
 from infrastructure.home_assistant import HomeAssistant
 from infrastructure.repositories import ConfigRepository
 
@@ -117,6 +117,18 @@ class Optimization:
         else:
             solar_p10 = solar(predictions.solar_p10)
             solar_p90 = solar(predictions.solar_p90)
+
+        if not predictions.baseload_p10 or not predictions.baseload_p90:
+            baseload_p10, baseload_p90 = (), ()
+        else:
+            baseload_p10, baseload_p90 = (
+                tuple(
+                    self.state_manager.baseload_forecast(
+                        state, forecast_times, now, points
+                    )
+                )
+                for points in (predictions.baseload_p10, predictions.baseload_p90)
+            )
 
         # The stored state.schedule.heat_pump.boiler.target_temperature is
         # resolved against *today's* timestamps (see StateManager.update()) - not
@@ -231,6 +243,8 @@ class Optimization:
             baseload_forecast_w=tuple(
                 self.state_manager.baseload_forecast(state, forecast_times, now)
             ),
+            baseload_p10_w=baseload_p10,
+            baseload_p90_w=baseload_p90,
             previous_tank_on=tuple(
                 int(on)
                 for on in self.state_manager.align_predictions(
@@ -721,7 +735,7 @@ class Optimization:
         """The step before `deadline` the tank should be at `temperature` by:
         the one whose run leading up to it the expected solar surplus over the
         baseload covers most (over the calibrated scenarios, see
-        SOLAR_SCENARIO_WEIGHTS). The run lasts as long as the heat pump takes to
+        surplus_scenarios). The run lasts as long as the heat pump takes to
         lift the tank to its own limit and the booster from there. Surplus beyond
         what the run draws is counted too, though it would be exported anyway: a
         simplification that only matters between two stretches that are both
@@ -753,19 +767,7 @@ class Optimization:
             )
 
         run_steps = max(1, math.ceil(seconds / (mpc_config.step_hours * 3600.0)))
-        scenarios, weights = (
-            (
-                (data.solar_p10_w, data.solar_forecast_w, data.solar_p90_w),
-                SOLAR_SCENARIO_WEIGHTS,
-            )
-            if data.solar_p10_w
-            else ((data.solar_forecast_w,), (1.0,))
-        )
-        baseload = np.asarray(data.baseload_forecast_w or [0.0] * len(times))
-        surplus = sum(
-            weight * np.clip(np.asarray(solar) - baseload, 0.0, None)
-            for weight, solar in zip(weights, scenarios, strict=True)
-        )
+        surplus = sum(weight * surplus for weight, surplus in surplus_scenarios(data))
         covered = np.concatenate(([0.0], np.cumsum(surplus)))
         candidates = [k for k in range(1, len(times)) if times[k] <= deadline] or [1]
 

@@ -198,7 +198,7 @@ def dashboard_chart(
         "Solcast",
         state.forecast.solcast.p50,
         line=dict(
-            width=1, color="rgba(255, 161, 90, 0.45)", dash="dash", shape="spline"
+            width=1, color="rgba(255, 161, 90, 0.45)", dash="dot", shape="spline"
         ),
         legendgroup="solar",
         showlegend=False,
@@ -217,24 +217,6 @@ def dashboard_chart(
         col=1,
     )
 
-    # Calibrated band the optimizer plans with, drawn as edges rather than a
-    # second fill: beyond the calibrated lead times it coincides with the raw
-    # Solcast band above, where a second fill would just double its shade.
-    for name, points in (
-        ("Solar p10", state.predictions.solar_p10),
-        ("Solar p90", state.predictions.solar_p90),
-    ):
-        series(
-            name,
-            points,
-            line=dict(width=1, color="rgba(255, 161, 90, 0.7)", dash="dot"),
-            legendgroup="solar",
-            showlegend=False,
-            unit="W",
-            row=1,
-            col=1,
-        )
-
     series(
         "Baseload",
         joined(state.measurements.baseload, state.predictions.baseload),
@@ -242,6 +224,20 @@ def dashboard_chart(
         row=1,
         col=1,
         line=dict(width=1, color="rgba(239, 85, 59, 0.5)", shape="spline"),
+        legendgroup="baseload",
+    )
+
+    # The upper edge of the band the optimizer plans the surplus with (see
+    # MPCInput.baseload_p10_w): where the load may run up to.
+    series(
+        "Baseload p90",
+        state.predictions.baseload_p90,
+        line=dict(width=0.8, color="rgba(239, 85, 59, 0.45)", dash="dot"),
+        legendgroup="baseload",
+        showlegend=False,
+        unit="W",
+        row=1,
+        col=1,
     )
 
     series(
@@ -290,10 +286,14 @@ def dashboard_chart(
 
     # The zone average the model actually predicts - `Climate temp` above is
     # the single thermostat the setpoint refers to, which is a different
-    # quantity and would make the model look biased against it.
+    # quantity and would make the model look biased against it - measured, then
+    # where the plan takes it: the plan predicts the same reading.
     series(
         "Zone temp",
-        state.measurements.building.zone_temperature,
+        joined(
+            state.measurements.building.zone_temperature,
+            state.schedule.building.temperatures,
+        ),
         row=2,
         col=1,
         line=dict(width=1, color="#00CC96", shape="spline"),
@@ -311,22 +311,6 @@ def dashboard_chart(
         row=2,
         col=1,
         line=dict(width=1, color="#FFA15A", shape="spline"),
-        unit="°C",
-        decimal=2,
-    )
-
-    # Where the zone goes under the plan, drawn against what the thermostats
-    # actually do - and where it goes left alone whenever the plan heats
-    # nothing. Its zone part is not acted on yet, hence "shadow".
-    series(
-        "Zone plan (shadow)",
-        continued(
-            state.measurements.building.zone_temperature,
-            state.schedule.building.temperatures,
-        ),
-        row=2,
-        col=1,
-        line=dict(width=1, color="#EF553B", shape="spline", dash="dot"),
         unit="°C",
         decimal=2,
     )

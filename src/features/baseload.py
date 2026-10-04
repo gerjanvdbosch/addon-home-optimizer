@@ -15,6 +15,17 @@ from features.forecasters import SkforecastForecaster
 
 
 class BaseloadForecaster(SkforecastForecaster):
+    # The MPC's low and high baseload scenarios (see MPCInput.baseload_p10_w).
+    # The error is skewed by appliance spikes no forecast can time (real data,
+    # 9-17h: p10 -57, p90 +363 W around the median), and the heat pump's grid
+    # draw is convex in it, so the median alone understated a run's import.
+    # Walk-forward over 98 days, the band by hour of day (see
+    # SkforecastForecaster.fit) held 12.2% above p90 and 9.8% below p10, and
+    # planning that replans with it chose runs with 26-30% less import above
+    # the best hour in hindsight than with the band grouped by forecast level
+    # (actual sun, 1-2 kW).
+    band_quantiles = (0.1, 0.9)
+
     @property
     def name(self) -> ForecasterType:
         return "baseload"

@@ -76,6 +76,14 @@ class Forecasting:
 
             self.state_manager.update_prediction(forecaster.name, result)
 
+            band = forecaster.predict_band(df=df, steps=config.steps)
+
+            if band is not None:
+                for suffix, series in zip(("p10", "p90"), band, strict=True):
+                    self.state_manager.update_prediction(
+                        f"{forecaster.name}_{suffix}", series
+                    )
+
     def backtest(self, config: BacktestConfig) -> None:
         forecaster, df = self._prepare(config.target, config.days)
 

@@ -135,16 +135,18 @@ class BuildingThermalModel:
 
     x = [T_air, T_mass]:
 
-        C_air  dT_air/dt  = UA_env (T_out - T_air) + UA_am (T_mass - T_air) + Q_int
-        C_mass dT_mass/dt = UA_am  (T_air - T_mass) + Q_sol + Q_floor
+        C_air  dT_air/dt  = UA_env (T_out - T_air) + UA_am (T_mass - T_air)
+                            + Q_int + Q_sol
+        C_mass dT_mass/dt = UA_am  (T_air - T_mass) + Q_floor
 
     The air node is the room: its air, furnishings and internal walls, which
     follow one another closely. The mass node is the floor slab - screed and
     the concrete floor it lies on - with the floor circuit in it, coupled to
-    the room only through its surface. Q_floor and Q_sol enter the slab because
-    that is where the physics puts them: the pipes run in the screed, and air is
-    effectively transparent to shortwave radiation, which the floor absorbs.
-    Q_int (metabolic and appliance heat) is released convectively into the air.
+    the room only through its surface. Q_floor enters the slab because the
+    pipes run in the screed. Q_int (metabolic and appliance heat) is released
+    into the air, and so is Q_sol: the sun lands on furnishings and internal
+    walls, which pass it to the room within the hour, more than on the slab
+    (see physics.zone_state_space for the cross-validation that settled it).
 
     All of the measured floor heat enters the slab: every room is in the zone,
     the pipe run from the shed is insulated and buried, and the run through the

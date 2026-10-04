@@ -110,6 +110,10 @@ class Predictions(BaseModel):
     solar_p10: list[SeriesPoint[float]] = Field(default_factory=list)
     solar_p90: list[SeriesPoint[float]] = Field(default_factory=list)
     baseload: list[SeriesPoint[float]] = Field(default_factory=list)
+    # The band around `baseload` (see BaseloadForecaster.band_quantiles), the
+    # MPC's low and high baseload scenarios.
+    baseload_p10: list[SeriesPoint[float]] = Field(default_factory=list)
+    baseload_p90: list[SeriesPoint[float]] = Field(default_factory=list)
     tap: list[SeriesPoint[float]] = Field(default_factory=list)
     boiler: list[SeriesPoint[float]] = Field(default_factory=list)
     # The filter's estimate of the building's thermal mass - screed and

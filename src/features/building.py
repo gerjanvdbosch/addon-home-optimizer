@@ -38,15 +38,14 @@ from domain.physics import (
     zone_state_space,
 )
 from domain.sensors import Aggregation, FillMethod, SensorReference
+from domain.time import to_local_time
 from features.dataset import DatasetBuilder
 from features.identifier import SystemIdentifier
 
 logger = logging.getLogger(__name__)
 
-# The modelled glazing faces due south on a vertical facade. Both are geometry
-# of this installation, expressed in pvlib's convention (azimuth clockwise from
-# north, tilt from horizontal).
-SOUTH_FACADE_AZIMUTH_DEG = 180.0
+# The modelled glazing sits in a vertical facade (pvlib's tilt from horizontal);
+# which way it faces is configured (BuildingConfig.facade_azimuth).
 VERTICAL_FACADE_TILT_DEG = 90.0
 
 
@@ -56,8 +55,10 @@ def facade_irradiance_w_per_m2(
     diffuse_horizontal: np.ndarray,
     latitude: float,
     longitude: float,
+    azimuth_deg: float,
 ) -> np.ndarray:
-    """Plane-of-array irradiance on the vertical south facade (W/m2).
+    """Plane-of-array irradiance on the vertical facade facing azimuth_deg
+    (degrees clockwise from north), in W/m2.
 
     The Open-Meteo `global_tilted_irradiance` attribute already in the config is
     computed for the PV array's own tilt and azimuth, so it does not describe
@@ -96,7 +97,7 @@ def facade_irradiance_w_per_m2(
     )
     total = irradiance.get_total_irradiance(
         surface_tilt=VERTICAL_FACADE_TILT_DEG,
-        surface_azimuth=SOUTH_FACADE_AZIMUTH_DEG,
+        surface_azimuth=azimuth_deg,
         solar_zenith=zenith,
         solar_azimuth=position["azimuth"].to_numpy(),
         dni=irradiance.dni(global_horizontal, diffuse_horizontal, zenith),
@@ -291,6 +292,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # defaults only keep prepare()/calibrate() callable on their own.
         self.volume_m3: float = 0.0
         self.glazing_areas_m2: list[float] = []
+        self.facade_azimuth_deg = 180.0
         self.shutter_areas_m2: list[float] = []
         self.room_temperature_columns: list[str] = []
         self.room_areas_m2: list[float] = []
@@ -597,6 +599,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             diffuse_horizontal=df["diffuse_radiation"].to_numpy(dtype=float),
             latitude=self.latitude,
             longitude=self.longitude,
+            azimuth_deg=self.facade_azimuth_deg,
         )
 
         df["shutter_open_fraction"] = self._shutter_open_fraction(df)
@@ -1391,13 +1394,13 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         Two of the inputs are genuine forecasts - irradiance and outdoor
         temperature both come from Open-Meteo - and `baseload_w` takes the
-        baseload forecaster's own curve when given. The rest is each sensor's
-        last reading carried forward, chiefly the shutter position. Measured
-        over 160 rolling 24 hour forecasts on this installation, perfect
-        knowledge of all three inputs would improve the result by 0.055 K
-        against a forecast error of 0.288 K: the model is what limits this, not
-        the inputs, so a shutter or occupancy forecaster would be solving the
-        wrong problem.
+        baseload forecaster's own curve when given. The shutters stand as they
+        did at the same time of day over the frame's past, not as they last
+        were: a shutter opened at six in the evening says nothing about noon
+        the next day. Over 208 rolling 24 hour forecasts (4 Oct 2026) that put
+        the zone 0.263 K out against 0.286 K holding the last position, and
+        the real future position 0.241 K: the model, not the shutters, limits
+        this. The rest is each sensor's last reading carried forward.
         """
 
         zone, last = self._trajectory(df, now, baseload_w)
@@ -1441,6 +1444,23 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 "No future rows to forecast: the frame must reach past the last "
                 "measurement, and must contain measurements to start from."
             )
+
+        # The shutters ahead as they stood at the same time of day before, not
+        # as they last were: they follow the household's day (see forecast()).
+        if self.shutter_columns:
+            local = prepared["time"].map(to_local_time)
+            quarter = local.map(lambda t: t.hour * 60 + t.minute)
+            usual = (
+                prepared.loc[known, self.shutter_columns]
+                .apply(pd.to_numeric, errors="coerce")
+                .groupby(quarter[known])
+                .median()
+            )
+            last = prepared.loc[known, self.shutter_columns].iloc[-1]
+            prepared.loc[~known, self.shutter_columns] = (
+                usual.reindex(quarter[~known]).fillna(last).to_numpy()
+            )
+            prepared["shutter_open_fraction"] = self._shutter_open_fraction(prepared)
 
         if baseload_w is not None:
             aligned = baseload_w.reindex(prepared["time"]).to_numpy(dtype=float)
@@ -1512,6 +1532,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         self.glazing_areas_m2 = [
             glazing.glass_m2 for glazing in config.building.south_glazing
         ]
+        self.facade_azimuth_deg = config.building.facade_azimuth
         shaded = [
             glazing
             for glazing in config.building.south_glazing

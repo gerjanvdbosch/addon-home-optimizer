@@ -558,11 +558,11 @@ def test_validate_flags_a_model_that_cannot_predict_the_forced_response(caplog):
     identifier, df, _ = _calibrated()
 
     identifier.MIN_ACTIVE_WINDOWS = 1
-    # Break only the coupling to delivered heat: free drift stays fine, the
-    # response to the floor circuit does not.
-    identifier.model.c_mass_j_per_k = identifier.MIN_C_MASS_J_PER_M2_K * sum(
-        identifier.room_areas_m2
-    )
+    # Break the balance delivered heat enters: with five times the envelope
+    # loss it leaks out far faster than it does. Breaking the slab alone no
+    # longer does it, since the sun warms the room node and is still predicted
+    # in the same windows.
+    identifier.model.ua_envelope_w_per_k *= 5.0
 
     with caplog.at_level("WARNING"):
         metrics = identifier.validate(df)
@@ -878,6 +878,21 @@ def test_forecast_uses_a_supplied_baseload_curve():
     assert boosted["air"].iloc[-1] > plain["air"].iloc[-1]
 
 
+def test_forecast_shutters_follow_the_time_of_day_not_the_last_position():
+    """A shutter opened just now says nothing about noon tomorrow: ahead it
+    stands as it did at that time of day before."""
+
+    identifier, df, now = _calibrated(with_future=True)
+    df = df.copy()
+    # Shut throughout, opened only in the reading at now.
+    df["shutter_0"] = np.where(df["target_time"] >= now, 100.0, 0.0)
+
+    forecast = identifier.forecast(df, now)
+    ahead = forecast.index > now
+
+    assert forecast.loc[ahead, "solar_gain_w"].max() == pytest.approx(0.0)
+
+
 def test_observation_is_air_alone_without_a_radiant_share():
     assert zone_observation(TRUE_MODEL).tolist() == [1.0, 0.0]
 
@@ -1029,7 +1044,7 @@ def test_facade_irradiance_follows_from_the_horizontal_components():
     )["apparent_zenith"].to_numpy()
     expected = irradiance.get_total_irradiance(
         surface_tilt=90.0,
-        surface_azimuth=180.0,
+        surface_azimuth=155.0,
         solar_zenith=zenith,
         solar_azimuth=solarposition.get_solarposition(
             pd.DatetimeIndex(noon), latitude=52.39, longitude=5.79
@@ -1046,6 +1061,7 @@ def test_facade_irradiance_follows_from_the_horizontal_components():
         diffuse_horizontal=np.array([200.0]),
         latitude=52.39,
         longitude=5.79,
+        azimuth_deg=155.0,
     )
 
     assert facade[0] > 300.0

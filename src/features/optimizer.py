@@ -44,10 +44,53 @@ MIP_ABSOLUTE_GAP_EUR = 0.001
 # Swanson's rule: the standard three-point weights for a distribution's
 # expectation from its P10/P50/P90 (exact for a symmetric distribution, close
 # for moderately skewed ones). Grid import is costed as this expectation over
-# solar outcomes: import cost is convex in solar (max(0, P_el - solar)), so
-# costing at P50 alone systematically understates the expected cost of
-# relying on uncertain sun.
+# outcomes of the solar surplus, solar less baseload: import cost is convex in
+# it (max(0, P_el - surplus)), so costing at P50 alone systematically
+# understates the expected cost of relying on uncertain sun and load.
 SOLAR_SCENARIO_WEIGHTS = (0.3, 0.4, 0.3)
+
+
+def surplus_scenarios(data: MPCInput) -> list[tuple[float, np.ndarray]]:
+    """The solar surplus the heat pump may use per step (W), as weighted
+    scenarios: one, or three with SOLAR_SCENARIO_WEIGHTS where there is a band.
+    """
+
+    # Only solar beyond the rest of the house's own draw (the baseload) is
+    # available to the heat pump, so the scenarios are of that surplus, solar
+    # less baseload: its low end where little sun meets much load. The two
+    # forecast errors are taken as independent, so per side the spreads add
+    # in quadrature - exact for normal errors, and kept per side because
+    # both are skewed.
+    solar_p50 = np.asarray(data.solar_forecast_w, dtype=float)
+    baseload_p50 = np.asarray(
+        data.baseload_forecast_w or (0.0,) * len(data.solar_forecast_w), dtype=float
+    )
+    surplus_p50 = solar_p50 - baseload_p50
+
+    if data.solar_p10_w or data.baseload_p10_w:
+        solar_p10, solar_p90 = (
+            np.asarray(band, dtype=float) if band else solar_p50
+            for band in (data.solar_p10_w, data.solar_p90_w)
+        )
+        baseload_p10, baseload_p90 = (
+            np.asarray(band, dtype=float) if band else baseload_p50
+            for band in (data.baseload_p10_w, data.baseload_p90_w)
+        )
+        scenarios = zip(
+            SOLAR_SCENARIO_WEIGHTS,
+            (
+                surplus_p50
+                - np.hypot(solar_p50 - solar_p10, baseload_p90 - baseload_p50),
+                surplus_p50,
+                surplus_p50
+                + np.hypot(solar_p90 - solar_p50, baseload_p50 - baseload_p10),
+            ),
+            strict=True,
+        )
+    else:
+        scenarios = [(1.0, surplus_p50)]
+
+    return [(weight, np.clip(surplus, 0.0, None)) for weight, surplus in scenarios]
 
 
 @dataclass
@@ -286,6 +329,15 @@ class MPCOptimizer:
                 f"solar_forecast_w ({horizon}), got {len(data.baseload_forecast_w)}."
             )
 
+        if len(data.baseload_p10_w) != len(data.baseload_p90_w) or (
+            data.baseload_p10_w and len(data.baseload_p10_w) != horizon
+        ):
+            raise ValueError(
+                "baseload_p10_w and baseload_p90_w must both be empty or both have "
+                f"the same length as solar_forecast_w ({horizon}), got "
+                f"{len(data.baseload_p10_w)} and {len(data.baseload_p90_w)}."
+            )
+
         if self.config.step_hours <= 0:
             raise ValueError("step_hours must be greater than zero.")
 
@@ -387,32 +439,11 @@ class MPCOptimizer:
         def mean(values: list[float]) -> float:
             return sum(values) / len(values)
 
-        scenarios = (
-            zip(
-                SOLAR_SCENARIO_WEIGHTS,
-                (data.solar_p10_w, data.solar_forecast_w, data.solar_p90_w),
-                strict=True,
-            )
-            if data.solar_p10_w
-            else [(1.0, data.solar_forecast_w)]
-        )
-        # Only solar beyond the rest of the house's own draw (the baseload) is
-        # available to the heat pump - taken per fine step, before a coarse block
-        # is averaged, since the surplus is not linear in solar.
-        baseload_w = data.baseload_forecast_w or (0.0,) * horizon
+        # Per fine step, before a coarse block is averaged, since the surplus
+        # is not linear in solar or load.
         solar_scenarios = [
-            (
-                weight,
-                self._aggregate(
-                    [
-                        max(0.0, float(solar) - float(baseload))
-                        for solar, baseload in zip(values, baseload_w, strict=True)
-                    ],
-                    plan,
-                    mean,
-                ),
-            )
-            for weight, values in scenarios
+            (weight, self._aggregate(list(surplus), plan, mean))
+            for weight, surplus in surplus_scenarios(data)
         ]
         tap_w = self._aggregate(data.tap_forecast_w or (0.0,) * horizon, plan, mean)
         outdoor_c = (
@@ -816,6 +847,23 @@ class MPCOptimizer:
                 model.minimum_runtime.add(
                     compressor(model, k) + model.booster_on[k]
                     >= model.compressor_start[start]
+                )
+
+            # The tank's own part of a run lasts as long, also where the zone
+            # makes up the rest of the compressor's time: turning the valve to
+            # the tank first reheats loop and coil to tank temperature (an
+            # estimated 0.4-0.5 kWh), a hand-over the plan does not price.
+            # Without this, one quarter of hot water tacked onto a zone run met
+            # the rule above. The booster counts for the same reason as there.
+            previous_tank = (
+                int(data.boiler_on_current)
+                if start == 0
+                else model.boiler_on[start - 1]
+            )
+
+            for k in steps_within(min_runtime * self.config.step_hours, start):
+                model.minimum_runtime.add(
+                    heating(model, k) >= model.boiler_on[start] - previous_tank
                 )
 
         # A run already heating keeps heating until its minimum runtime has

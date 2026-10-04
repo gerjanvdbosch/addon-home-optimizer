@@ -242,6 +242,7 @@ actions:
               [2.0, ["cover.slaapkamer_groot_2", "current_position"]],
               [2.0, ["cover.slaapkamer_achter_3", "current_position"]]
             ],
+            "facade_azimuth": 155.0,
             "insulated_pipes": false,
             "dhw_after_cooling": true,
             "dew_point_margin": 1.0,

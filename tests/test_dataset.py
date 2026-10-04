@@ -2,9 +2,13 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from domain.dataset import AttributeSeriesDefinition
-from domain.sensors import InfluxSensor, SensorAttributesReference
-from infrastructure.loaders import AttributeSeriesLoader, time_weighted_means
+from domain.dataset import AttributeSeriesDefinition, TimeSeriesDefinition
+from domain.sensors import InfluxSensor, SensorAttributesReference, SensorReference
+from infrastructure.loaders import (
+    AttributeSeriesLoader,
+    TimeSeriesLoader,
+    time_weighted_means,
+)
 
 # A forecast covering whole UTC days, published twice: yesterday's covers the
 # hours before 00:00 UTC that the local day already asks for.
@@ -126,3 +130,64 @@ def test_nothing_is_known_before_the_first_reading():
 
     assert [p["value"] for p in means] == [None, pytest.approx(100.0)]
     assert time_weighted_means([], start, start + timedelta(minutes=30), "15m") == []
+
+
+def test_a_state_held_from_before_the_window_fills_its_empty_start():
+    """fill(previous) leaves the buckets before the window's first reading
+    empty; a state stored only on change still holds its earlier value there."""
+
+    start = datetime(2026, 10, 3, tzinfo=UTC)
+    times = [(start + timedelta(minutes=15 * i)).isoformat() for i in range(4)]
+
+    class _Shutter:
+        def find(self, measurement, entity_id, field, before=None):
+            assert before == start
+            return {"time": (start - timedelta(days=60)).isoformat(), "value": 18.0}
+
+        def find_series(self, measurement, entity_id, field, start, end, **kwargs):
+            return [
+                {"time": t, "value": v}
+                for t, v in zip(times, [None, None, 75.0, 75.0], strict=True)
+            ]
+
+    frame = TimeSeriesLoader(_Shutter(), _Resolver()).load(
+        TimeSeriesDefinition(
+            name="shutter",
+            sensor=SensorReference(entity_id="cover.x", attribute="current_position"),
+            interval="15m",
+            aggregation="last",
+            fill="previous",
+        ),
+        start,
+        start + timedelta(hours=1),
+    )
+
+    assert list(frame["shutter"]) == [18.0, 18.0, 75.0, 75.0]
+
+
+def test_a_state_unchanged_through_the_window_holds_in_every_bucket():
+    """A shutter that did not move in the window has no reading in it at all."""
+
+    start = datetime(2026, 10, 3, tzinfo=UTC)
+
+    class _IdleShutter:
+        def find(self, measurement, entity_id, field, before=None):
+            return {"time": (start - timedelta(days=60)).isoformat(), "value": 0.0}
+
+        def find_series(self, *args, **kwargs):
+            return []
+
+    frame = TimeSeriesLoader(_IdleShutter(), _Resolver()).load(
+        TimeSeriesDefinition(
+            name="shutter",
+            sensor=SensorReference(entity_id="cover.x", attribute="current_position"),
+            interval="15m",
+            aggregation="last",
+            fill="previous",
+        ),
+        start,
+        start + timedelta(hours=1),
+    )
+
+    assert list(frame["shutter"]) == [0.0] * 4
+    assert frame["time"].iloc[-1] == start + timedelta(minutes=45)

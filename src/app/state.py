@@ -235,7 +235,11 @@ class StateManager:
         return None if value is None else (quarter, value)
 
     def baseload_forecast(
-        self, state: State, times: list[datetime], now: datetime
+        self,
+        state: State,
+        times: list[datetime],
+        now: datetime,
+        points: list[SeriesPoint[float]] | None = None,
     ) -> list[float]:
         """Baseload forecast at `times`, extended where it does not reach (see
         extend_forecast), 0.0 without any. The quarter hour running at `now` -
@@ -249,11 +253,14 @@ class StateManager:
         its minimum runtime. The lower of forecast and measurement was tried
         first: least phantom load (8.9 W), but the most missed load (92.5 W) -
         the costlier error.
+
+        `points` is the forecast to align, the median by default; a band
+        quantile takes the measurement as well, since load that is on is
+        certain.
         """
 
-        forecast = self.extend_forecast(
-            {p.time: p.value for p in state.predictions.baseload}, times
-        )
+        points = state.predictions.baseload if points is None else points
+        forecast = self.extend_forecast({p.time: p.value for p in points}, times)
         latest = self._latest_measurement(state.measurements.baseload, now)
 
         if latest is not None and times and pd.Timestamp(times[0]) == latest[0]:

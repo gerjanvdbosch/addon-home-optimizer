@@ -1,5 +1,6 @@
 import logging
 from abc import abstractmethod
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -21,6 +22,7 @@ from domain.config import Config
 from domain.dataset import DatasetDefinition
 from domain.jobs import ForecasterType
 from domain.state import BacktestPoint, BacktestResult
+from domain.time import to_local_time
 
 
 class Forecaster(Protocol):
@@ -44,6 +46,10 @@ class Forecaster(Protocol):
     def fit(self, df: pd.DataFrame): ...
 
     def predict(self, df: pd.DataFrame, steps: int = 48) -> pd.Series: ...
+
+    def predict_band(
+        self, df: pd.DataFrame, steps: int = 48
+    ) -> tuple[pd.Series, pd.Series] | None: ...
 
     def backtest(self, df: pd.DataFrame, steps: int = 24) -> BacktestResult: ...
 
@@ -83,6 +89,9 @@ def _best_params(name: str, storage: str) -> dict[str, Any]:
 
 
 class SkforecastForecaster(Forecaster):
+    # The lower and upper quantile predict_band() gives, None for none.
+    band_quantiles: tuple[float, float] | None = None
+
     def __init__(self):
         self.forecaster = self.create()
         self.best_params: dict[str, Any] = {}
@@ -125,6 +134,49 @@ class SkforecastForecaster(Forecaster):
 
         self.forecaster.fit(y=y, exog=exog)
 
+        cv = self.create_cv(df, 96)
+
+        # The band comes from out-of-sample errors: a walk-forward over the last
+        # 30% of this data, as backtest() does. In-sample errors of a boosted
+        # model are too small to bound what it gets wrong ahead. History too
+        # short to train on before that part leaves the model without a band.
+        # Taken per local hour of the day, not per forecast level: appliances
+        # follow the clock. Grouped by the level the median forecast took
+        # instead (skforecast's binned residuals), the dinner peak's spread
+        # carried into a quiet late evening - p90 932 W at 22 h against 393 W
+        # measured - and the morning's washing into nothing (real data, 98
+        # days walk-forward: per-hour coverage 4.8 points off its 10% on
+        # average, 2.2 per hour of the day).
+        if (
+            self.band_quantiles is not None
+            and cv.initial_train_size > self.forecaster.window_size
+        ):
+            _, result = backtesting_forecaster(
+                n_jobs=1,
+                metric="mean_absolute_error",
+                forecaster=deepcopy(self.forecaster),
+                cv=cv,
+                y=y,
+                exog=exog,
+                show_progress=False,
+            )
+            error = y.loc[result.index] - result["pred"]
+            # Kept on the model itself, so it is saved and loaded with it.
+            self.forecaster.band_by_hour_ = (
+                error.groupby(self._local_hours(error.index))
+                .quantile(list(self.band_quantiles))
+                .unstack()
+            )
+
+    @staticmethod
+    def _local_hours(index: pd.Index) -> np.ndarray:
+        return np.array([to_local_time(time).hour for time in index])
+
+    def _last_window(self, df: pd.DataFrame) -> pd.Series | None:
+        y = df[self.target_column].dropna()
+
+        return y if not y.empty else None
+
     def predict(
         self,
         df: pd.DataFrame,
@@ -132,12 +184,35 @@ class SkforecastForecaster(Forecaster):
     ) -> pd.Series:
         df = self.prepare(df)
 
-        exog = self.predict_arguments(df=df, steps=steps)
+        return self.forecaster.predict(
+            steps=steps,
+            last_window=self._last_window(df),
+            exog=self.predict_arguments(df=df, steps=steps),
+        )
 
-        y = df[self.target_column].dropna()
-        last_window = y if not y.empty else None
+    def predict_band(
+        self,
+        df: pd.DataFrame,
+        steps: int = 48,
+    ) -> tuple[pd.Series, pd.Series] | None:
+        """The band_quantiles of the forecast: the median and fit()'s
+        out-of-sample error at each quantile for that hour of the day. Empty for
+        a model fitted without them."""
 
-        return self.forecaster.predict(steps=steps, last_window=last_window, exog=exog)
+        if self.band_quantiles is None:
+            return None
+
+        band_by_hour = getattr(self.forecaster, "band_by_hour_", None)
+
+        if band_by_hour is None:
+            return pd.Series(dtype=float), pd.Series(dtype=float)
+
+        median = self.predict(df, steps)
+        error = band_by_hour.reindex(self._local_hours(median.index))
+        error = error.fillna(band_by_hour.median())
+        low, high = (error[q].to_numpy() for q in self.band_quantiles)
+
+        return (median + low).clip(lower=0.0), median + high
 
     def backtest(
         self,
@@ -313,6 +388,11 @@ class SklearnForecaster(Forecaster):
 
     def predict_result(self, prediction: np.ndarray, df: pd.DataFrame) -> pd.Series:
         return pd.Series(prediction, index=df.index)
+
+    def predict_band(
+        self, df: pd.DataFrame, steps: int = 48
+    ) -> tuple[pd.Series, pd.Series] | None:
+        return None
 
     def backtest(self, df: pd.DataFrame, steps: int = 24) -> BacktestResult:
         raise NotImplementedError()

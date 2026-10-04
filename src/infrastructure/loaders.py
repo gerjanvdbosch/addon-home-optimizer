@@ -176,14 +176,42 @@ class TimeSeriesLoader(DataLoader):
                 ([before] if before else []) + points, start, end, definition.interval
             )
 
-        if not points and definition.fill == "previous":
-            last_point = self.influx.find(
+        # fill(previous) only carries readings within the window: the buckets
+        # before its first one stay empty. A state sensor is stored only when it
+        # changes, so there the reading in force at the start holds - a shutter
+        # shut for months read as missing, and so as fully open.
+        if (
+            definition.fill == "previous"
+            and not time_mean
+            and (not points or points[0]["value"] is None)
+        ):
+            before = self.influx.find(
                 measurement=sensor.measurement,
                 entity_id=sensor.entity_id,
                 field=sensor.field,
+                before=start,
             )
-            if last_point and parse_datetime(last_point["time"]) < start:
-                points = [{"time": start.isoformat(), "value": last_point["value"]}]
+
+            if before is not None:
+                # No reading in the window at all: every bucket, as fill(previous)
+                # gives once there is one.
+                if not points:
+                    step = pd.Timedelta(definition.interval)
+                    points = [
+                        {"time": time.isoformat(), "value": None}
+                        for time in pd.date_range(
+                            pd.Timestamp(start).floor(step),
+                            end,
+                            freq=step,
+                            inclusive="left",
+                        )
+                    ]
+
+                for point in points:
+                    if point["value"] is not None:
+                        break
+
+                    point["value"] = before["value"]
 
         rows = [
             {

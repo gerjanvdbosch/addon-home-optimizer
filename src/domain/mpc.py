@@ -61,8 +61,11 @@ class MPCConfig:
     coarse_step_hours: float = 1.0
     # A fallback, not the usual case (s): on real data a plan is proven optimal
     # in 1-8 s. Should a harder one come up, the best plan found by then is
-    # used - better than a plan that never comes.
-    solve_time_limit_s: float = 30.0
+    # used - better than a plan that never comes. 60 rather than 30: the Home
+    # Assistant host is some four times slower, and on 4 Oct stopped at 30 s
+    # with the optimal plan already found but not yet proven (replayed: proven
+    # in 6.8 s here).
+    solve_time_limit_s: float = 60.0
     # The most the solve's starting point may take (s; see
     # MPCOptimizer._warm_start): with all but the first step's decisions
     # fixed it took 0.2 s on real data, where the whole solve took 10 s - a
@@ -119,6 +122,11 @@ class MPCInput:
     # this first, so only solar beyond it is available to the heat pump. Empty
     # means no forecast - all solar counts as available.
     baseload_forecast_w: tuple[float, ...] = ()
+    # The band around baseload_forecast_w (W), aligned to the horizon: with the
+    # solar band it sets the low and high scenarios of the surplus the heat
+    # pump can use (see MPCOptimizer). Both empty means none.
+    baseload_p10_w: tuple[float, ...] = ()
+    baseload_p90_w: tuple[float, ...] = ()
     # How long the COMPRESSOR in the run in progress has been running (hours),
     # 0 when it is not - the run keeps going until its minimum runtime has
     # passed (see MPCOptimizer). Compressor time, not run time: the resistive
@@ -142,10 +150,9 @@ class MPCInput:
     zone_maximum_temperature: tuple[float, ...] = ()
     # How far below the target the zone may dip before it counts (K).
     zone_comfort_tolerance_c: float = 0.0
-    # Heat entering the zone that no decision can change (W), split by where it
-    # physically lands: appliances, lighting and people warm the air directly,
-    # while shortwave through the glazing is absorbed by floor and furnishings,
-    # so the split has to be carried rather than summed away.
+    # Heat entering the zone that no decision can change (W): appliances,
+    # lighting and people, and the sun through the glazing. Both warm the room
+    # node (see physics.zone_state_space), but they are forecast apart.
     zone_internal_gain_w: tuple[float, ...] = ()
     zone_solar_gain_w: tuple[float, ...] = ()
     # Whether the heat pump is serving the zone right now, the space-heating

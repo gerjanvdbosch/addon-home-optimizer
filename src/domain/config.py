@@ -234,6 +234,12 @@ class BuildingConfig(BaseModel):
     # incidence/soiling factor, all of which are <= 1 (see
     # BuildingThermalIdentifier.calibrate).
     south_glazing: list[SouthGlazing] = Field(default_factory=list)
+    # The compass bearing that glazing faces (degrees clockwise from north, 180
+    # due south): when the sun shines on it. The same orientation PV services
+    # take - Open-Meteo's azimuth a (0 south, negative east) is 180 + a here,
+    # Solcast's (0 north, negative east) its negation. On a terraced house the
+    # roof faces the way the facades do.
+    facade_azimuth: float = Field(default=180.0, ge=0.0, lt=360.0)
     # Dew point (deg C) of the air above every cooled floor, the highest of
     # which bounds how cold the floor may be cooled: water condenses on a
     # surface below the dew point of the air touching it. A dew point rather
