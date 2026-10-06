@@ -973,6 +973,24 @@ def test_forecast_shutters_follow_the_time_of_day_not_the_last_position():
     )
 
 
+def test_forecast_presence_follows_the_time_of_day_not_the_last_reading():
+    """Home just now says nothing about tomorrow's afternoon: ahead the
+    household is in as it was at that time of day before."""
+
+    identifier, df, now = _calibrated(with_future=True)
+    usual = identifier.forecast(df, now)
+    df = df.copy()
+    # Home in the reading at now and all of the carried-forward rows after it.
+    df["presence_0"] = np.where(df["target_time"] >= now, "home", df["presence_0"])
+
+    forecast = identifier.forecast(df, now)
+    ahead = forecast.index > now
+
+    np.testing.assert_allclose(
+        forecast.loc[ahead, "internal_gain_w"], usual.loc[ahead, "internal_gain_w"]
+    )
+
+
 def test_a_rooms_sun_warms_that_room_before_the_rest():
     """Each room's glazing warms its own room: the house only follows through
     the coupling between them, so for the first hour the thermostat's room
@@ -1183,3 +1201,27 @@ def test_facade_irradiance_follows_from_the_horizontal_components():
 
     assert facade[0] > 300.0
     assert facade[0] == pytest.approx(float(np.asarray(expected)[0]), rel=1e-6)
+
+
+def test_the_facade_sun_follows_what_the_pv_array_measured():
+    """An array of 1.8 W per W/m2 measuring 900 W under a forecast 250 W/m2
+    on its plane had twice the forecast's sun; without a measurement, or under
+    too little forecast light to divide by, the forecast stands."""
+
+    identifier = BuildingThermalIdentifier(latitude=52.0, longitude=5.0)
+    frame = pd.DataFrame(
+        {
+            "global_tilted_irradiance": [250.0, 250.0, 20.0, 400.0],
+            "pv_w": [900.0, np.nan, 100.0, 720.0],
+        }
+    )
+
+    identifier.pv_power_per_irradiance_m2 = identifier._pv_power_per_irradiance(frame)
+
+    assert identifier.pv_power_per_irradiance_m2 == pytest.approx(
+        np.median([900.0 / 250.0, 720.0 / 400.0])
+    )
+
+    identifier.pv_power_per_irradiance_m2 = 1.8
+
+    assert identifier._measured_sky(frame) == pytest.approx([2.0, 1.0, 1.0, 1.0])

@@ -237,10 +237,10 @@ actions:
             ],
             "ceiling_height": 2.6,
             "south_glazing": [
-              [12.0, ["cover.woonkamer", "current_position"], 20.0, true],
-              [2.0, ["cover.slaapkamer_groot_1", "current_position"]],
-              [2.0, ["cover.slaapkamer_groot_2", "current_position"]],
-              [2.0, ["cover.slaapkamer_achter_3", "current_position"]]
+              [6.5, ["cover.woonkamer", "current_position"], 20.0, true],
+              [0.9, ["cover.slaapkamer_groot_1", "current_position"]],
+              [0.9, ["cover.slaapkamer_groot_2", "current_position"]],
+              [0.9, ["cover.slaapkamer_achter_3", "current_position"]]
             ],
             "facade_azimuth": 155.0,
             "insulated_pipes": false,

@@ -261,8 +261,24 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # Fraction of the configured south glass area used as the starting guess
     # for the effective aperture: a typical double-glazing g-value times a
     # yearly-average incidence/soiling factor lands near half the geometric
-    # area. The bounds themselves are [0, glass area] - see calibrate().
+    # area. The bounds themselves are [0, MAX_APERTURE_FRACTION] of it.
     INITIAL_APERTURE_FRACTION = 0.5
+
+    # The most of its glass area an aperture can be: clear double glazing's
+    # g-value of about 0.75 times a frame factor of 0.8 (HR++ and triple
+    # glazing pass less). Bounded at the glass area itself, the rest's aperture
+    # sat at 0.6-0.65 of it (Jul-Oct 2026), standing in for heat that reaches
+    # the bedrooms some other way. It now sits on this bound, which validation
+    # reports as pinned: the missing heat shows instead of being absorbed, and
+    # October's prediction changed by under 0.01 K.
+    #
+    # The neighbours' extensions beside the living room's glazing were tried
+    # as side walls shading its direct sun (Oct 2026), with a fitted depth per
+    # side: not identified. The west depth went from 0.8 of the glazing's width
+    # to its bound of 4 with three more days of data, and a fitted wall height
+    # to its bound as well. Worth retrying once sunny hours with the shutter
+    # open are many more than the ~170 quarters there were.
+    MAX_APERTURE_FRACTION = 0.6
 
     # A wall thermostat exchanges longwave radiation with the surfaces around
     # it, so it reads an operative temperature between the room and the floor
@@ -270,7 +286,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # 0.5 is the textbook average in still air, and the ceiling here: the sensor
     # sits in moving room air, so it cannot follow a surface more closely than
     # evenly. Not yet settled by the data: 0 on either half of July-October,
-    # the 0.5 ceiling on August-September alone.
+    # the 0.5 ceiling on August-September alone, 0.28 on July-September. Held
+    # at 0 instead (Oct 2026), the room capacity went to its bound to make up
+    # for it, so it stays fitted.
     MAX_SENSOR_MASS_FRACTION = 0.5
     INITIAL_SENSOR_MASS_FRACTION = 0.25
 
@@ -290,9 +308,14 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     MAX_UA_ROOMS_W_PER_K = 1000.0
     INITIAL_UA_ROOMS_W_PER_K = 100.0
 
-    # Share of the house-wide baseload dissipated inside the modelled zone.
-    # Physically a fraction, hence [0, 1]; the living zone is a substantial but
-    # not dominant part of the house, so the fit starts mid-range.
+    # Share of the baseload dissipated inside the zone. The zone is the whole
+    # dwelling and the baseload every appliance but the heat pump, so nearly
+    # all of it: only hot water down the drain and appliances outside leave.
+    # Yet it fits at 0.4 (Jul-Oct 2026), and bounded at 0.8 it sat on that
+    # bound while the envelope, the slab and the sensor fraction all moved:
+    # something the baseload goes with - plausibly the cooker hood and the
+    # bathroom's ventilation boost - carries heat out that the model lacks.
+    # Left at [0, 1] until that is modelled, rather than hide it elsewhere.
     INITIAL_INTERNAL_GAIN_FRACTION = 0.5
 
     def __init__(self, latitude: float, longitude: float) -> None:
@@ -318,6 +341,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         self.presence_columns: list[str] = []
         self.states = HeatPumpStates()
         self.parameter_std_errors: dict[str, float] | None = None
+        # See BuildingThermalModel.pv_power_per_irradiance_m2: set by
+        # calibrate(), taken from the model by load().
+        self.pv_power_per_irradiance_m2 = 0.0
 
     @property
     def name(self) -> str:
@@ -401,6 +427,16 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # the fitted slope rather than to a single measurement.
     SIGNIFICANT_SLOPE_STD_ERRORS = 2.0
 
+    # The PV array measures the sun the weather forecast only predicts. Above
+    # this irradiance on its plane its output is proportional to the light,
+    # clear of its inverter's start-up and low-light losses: the hours its
+    # output per W/m2 is taken from.
+    PV_CALIBRATION_MIN_IRRADIANCE_W_PER_M2 = 200.0
+    # Below this the forecast's plane irradiance is twilight or deep overcast,
+    # and measured over forecast is a ratio of two small numbers that would
+    # multiply a few watts of error many times: the forecast stands there.
+    PV_CORRECTION_MIN_IRRADIANCE_W_PER_M2 = 50.0
+
     # Open-Meteo reports wind speed in km/h unless asked otherwise; exact by
     # definition of both units.
     KMH_PER_M_PER_S = 3.6
@@ -462,6 +498,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             living_envelope_fraction=float(x[9]),
             living_area_fraction=self.living_area_fraction,
             closed_shutter_gain_fraction=float(x[10]),
+            pv_power_per_irradiance_m2=self.pv_power_per_irradiance_m2,
         )
 
     def load(self, path) -> None:
@@ -474,6 +511,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         ):
             logger.warning("Building model is out of date - recalibrate it")
             self.model = None
+
+        if self.model is not None:
+            self.pv_power_per_irradiance_m2 = self.model.pv_power_per_irradiance_m2
 
     def _shutter_open_fraction(
         self, df: pd.DataFrame, thermostat_room: bool | None = None
@@ -532,6 +572,53 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             weighted = weighted + area * open_fraction.clip(0.0, 1.0)
 
         return (weighted / total_area).clip(0.0, 1.0)
+
+    def _measured_sky(self, df: pd.DataFrame) -> np.ndarray:
+        """The sky the PV array measured over the one the forecast predicted:
+        its output over what it gives at the forecast's irradiance on its
+        plane, where it was measured. The array and the facade share the sky
+        (and, on this terraced house, their bearing), so the facade's forecast
+        irradiance is scaled by it: on 4 Oct 2026 the morning sun was 2-4
+        times the forecast's, and the zone was fitted to forecast sun.
+
+        One where there is no measurement - ahead of now, a reporting gap, no
+        plane irradiance before Open-Meteo reported it - or too little forecast
+        light to divide by (see PV_CORRECTION_MIN_IRRADIANCE_W_PER_M2). Carrying
+        the last measured sky on into the forecast, fading to it over 0.5-2
+        hours, did worse at every fade (105 forecasts, Sep-Oct 2026: 0.128 K
+        over the first two hours against 0.131-0.138): the hourly forecast has
+        already moved on with the clouds the measurement saw.
+        """
+
+        plane = df["global_tilted_irradiance"].to_numpy(dtype=float)
+        measured = df["pv_w"].to_numpy(dtype=float)
+        valid = (
+            (self.pv_power_per_irradiance_m2 > 0.0)
+            & (plane >= self.PV_CORRECTION_MIN_IRRADIANCE_W_PER_M2)
+            & np.isfinite(measured)
+        )
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = measured / (self.pv_power_per_irradiance_m2 * plane)
+
+        return np.where(valid, ratio, 1.0)
+
+    def _pv_power_per_irradiance(self, df: pd.DataFrame) -> float:
+        """The array's output per W/m2 on its plane over the frame's sunny
+        hours (see PV_CALIBRATION_MIN_IRRADIANCE_W_PER_M2): a median, since
+        the forecast those hours are measured against is itself off at times.
+        Zero without any."""
+
+        plane = df["global_tilted_irradiance"].to_numpy(dtype=float)
+        measured = df["pv_w"].to_numpy(dtype=float)
+        sunny = (plane >= self.PV_CALIBRATION_MIN_IRRADIANCE_W_PER_M2) & np.isfinite(
+            measured
+        )
+
+        if not sunny.any():
+            return 0.0
+
+        return float(np.median(measured[sunny] / plane[sunny]))
 
     def _occupants(self, df: pd.DataFrame) -> pd.Series:
         if not self.presence_columns:
@@ -661,6 +748,11 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         for column in numeric_columns:
             df[column] = pd.to_numeric(df[column], errors="coerce")
 
+        # Optional: Open-Meteo's plane irradiance only from August 2026 on, and
+        # a frame need not carry the array at all (see _measured_sky).
+        for column in ("global_tilted_irradiance", "pv_w"):
+            df[column] = pd.to_numeric(df.get(column, np.nan), errors="coerce")
+
         # flow_lpm is rate-like and fetched without an InfluxDB fill, so a
         # reporting gap arrives as NaN. The compressor's own state settles what
         # a gap means - identical reasoning to
@@ -705,6 +797,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             longitude=self.longitude,
             azimuth_deg=self.facade_azimuth_deg,
         )
+
+        df["I_facade_w_per_m2"] *= self._measured_sky(df)
 
         df["shutter_open_fraction"] = self._shutter_open_fraction(df)
         df["open_living"] = self._shutter_open_fraction(df, thermostat_room=True)
@@ -924,9 +1018,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         The capacity and coupling bounds are derived from configuration rather
         than asserted: per m2 of the configured floor, and the room node never
-        less than the zone's own air. The effective solar aperture cannot exceed
-        the geometric glass area because it is that area times a g-value and an
-        incidence factor, both at most one.
+        less than the zone's own air. The effective solar aperture is the
+        glass area times a g-value, a frame factor and an incidence factor, so
+        at most MAX_APERTURE_FRACTION of that area.
         """
 
         if self.volume_m3 <= 0.0:
@@ -949,8 +1043,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         rest_glass = sum(
             a for a, f in zip(self.glazing_areas_m2, flags, strict=True) if not f
         )
-        max_aperture = max(living_glass, self.MIN_F_SCALE)
-        max_rest_aperture = max(rest_glass, self.MIN_F_SCALE)
+        max_aperture = max(self.MAX_APERTURE_FRACTION * living_glass, self.MIN_F_SCALE)
+        max_rest_aperture = max(
+            self.MAX_APERTURE_FRACTION * rest_glass, self.MIN_F_SCALE
+        )
 
         lower = np.array(
             [
@@ -1042,7 +1138,12 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         )
 
     def calibrate(self, df: pd.DataFrame) -> BuildingThermalModel:
+        # The array's output per W/m2 from this data, uncorrected, and then the
+        # facade's sun corrected by it (see _measured_sky).
+        self.pv_power_per_irradiance_m2 = 0.0
         df = self.prepare(df)
+        self.pv_power_per_irradiance_m2 = self._pv_power_per_irradiance(df)
+        df["I_facade_w_per_m2"] *= self._measured_sky(df)
 
         median_dt = float(df["dt_seconds"].median())
 
@@ -1563,7 +1664,12 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         the next day. Over 208 rolling 24 hour forecasts (4 Oct 2026) that put
         the zone 0.263 K out against 0.286 K holding the last position, and
         the real future position 0.241 K: the model, not the shutters, limits
-        this. The rest is each sensor's last reading carried forward.
+        this. Who is home is taken the same way, on average: over 70 forecasts
+        issued at 7:00 and 18:00 (Sep-Oct 2026) it put 0.44 people wrong
+        against 0.61 carrying the last reading on - the zone 0.352 against
+        0.357 K, 75 W a person being little; 18:00's forecasts gained, a
+        weekend morning's lost, the frame's past being weekdays then. The rest
+        is each sensor's last reading carried forward.
         """
 
         zone, last = self._trajectory(df, now, baseload_w)
@@ -1608,11 +1714,12 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 "measurement, and must contain measurements to start from."
             )
 
+        local = prepared["time"].map(to_local_time)
+        quarter = local.map(lambda t: t.hour * 60 + t.minute)
+
         # The shutters ahead as they stood at the same time of day before, not
         # as they last were: they follow the household's day (see forecast()).
         if self.shutter_columns:
-            local = prepared["time"].map(to_local_time)
-            quarter = local.map(lambda t: t.hour * 60 + t.minute)
             usual = (
                 prepared.loc[known, self.shutter_columns]
                 .apply(pd.to_numeric, errors="coerce")
@@ -1626,6 +1733,21 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             prepared["shutter_open_fraction"] = self._shutter_open_fraction(prepared)
             prepared["open_living"] = self._shutter_open_fraction(prepared, True)
             prepared["open_rest"] = self._shutter_open_fraction(prepared, False)
+
+        # Who is home ahead, the same way and for the same reason: on average at
+        # that time of day, not the last reading carried on - an evening at
+        # home put everyone in all the next day. From the frame's own past, a
+        # day or two, so a day away is in it and the forecast follows.
+        if self.presence_columns:
+            occupants = prepared["occupants"]
+            prepared.loc[~known, "occupants"] = (
+                occupants[known]
+                .groupby(quarter[known])
+                .mean()
+                .reindex(quarter[~known])
+                .fillna(occupants[known].iloc[-1])
+                .to_numpy()
+            )
 
         if baseload_w is not None:
             aligned = baseload_w.reindex(prepared["time"]).to_numpy(dtype=float)
@@ -1745,6 +1867,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             attributes=[
                 "direct_radiation",
                 "diffuse_radiation",
+                # On the PV array's plane, which Open-Meteo is configured with:
+                # what its measured output is compared against (see prepare).
+                "global_tilted_irradiance",
                 "temperature",
                 # Instantaneous like temperature, so not shifted either. Read
                 # by validate()'s wind diagnostic only - the model has no
@@ -1757,6 +1882,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             target_shift=[
                 "direct_radiation",
                 "diffuse_radiation",
+                "global_tilted_irradiance",
             ],
         )
 
@@ -1784,6 +1910,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             ("T_return", config.heat_pump.return_temperature, "mean", "previous"),
             ("flow_lpm", config.heat_pump.flow, "mean", "none"),
             ("baseload_w", config.baseload, "mean", "previous"),
+            # Rate-like and unfilled: a gap - and every row ahead of now - is
+            # no measurement, and leaves the forecast's sun as it is.
+            ("pv_w", config.solar, "mean", "none"),
         ]
 
         if config.heat_pump.outdoor_temperature is not None:

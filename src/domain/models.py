@@ -198,8 +198,8 @@ class BuildingThermalModel:
     # room: an operative temperature, 0 the room alone. It belongs to the
     # sensor, not to the balance: no heat flows because of it.
     sensor_mass_fraction: float
-    # Fraction of the house-wide baseload electrical power released as heat in
-    # the zone. The baseload sensor measures the whole house.
+    # Fraction of the baseload electrical power - every appliance but the heat
+    # pump - released as heat in the zone, the whole dwelling.
     internal_gain_fraction: float
     # The same aperture for the rest of the house's south glazing (m2).
     a_eff_rest_m2: float
@@ -215,6 +215,11 @@ class BuildingThermalModel:
     # that heat crosses the window inward, with what the light slits between
     # them let through.
     closed_shutter_gain_fraction: float
+    # The PV array's output per W/m2 on its own plane (an area times its
+    # efficiency, m2), from the calibration's sunny hours: what turns its
+    # measured output back into the light it had (see
+    # BuildingThermalIdentifier.prepare). Zero corrects nothing.
+    pv_power_per_irradiance_m2: float = 0.0
 
 
 # Exact by definition of the Kelvin scale (0 degC = 273.15 K) - used
