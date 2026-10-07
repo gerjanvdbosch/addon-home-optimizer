@@ -220,6 +220,13 @@ class BuildingThermalModel:
     # measured output back into the light it had (see
     # BuildingThermalIdentifier.prepare). Zero corrects nothing.
     pv_power_per_irradiance_m2: float = 0.0
+    # The neighbours' extensions on either side of the thermostat's room's
+    # glazing, on a terraced house's ground floor: each one's depth over that
+    # glazing's width, how fast its side wall shades the glass as the sun moves
+    # off the facade's normal (see physics.extension_shaded_fraction). Zero is
+    # no extension there; fitted, so nothing needs configuring.
+    extension_east_depth_ratio: float = 0.0
+    extension_west_depth_ratio: float = 0.0
 
 
 # Exact by definition of the Kelvin scale (0 degC = 273.15 K) - used

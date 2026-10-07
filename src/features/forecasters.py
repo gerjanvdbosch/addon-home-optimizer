@@ -22,7 +22,7 @@ from domain.config import Config
 from domain.dataset import DatasetDefinition
 from domain.jobs import ForecasterType
 from domain.state import BacktestPoint, BacktestResult
-from domain.time import to_local_time
+from domain.time import LOCAL_TIMEZONE, to_local_time
 
 
 class Forecaster(Protocol):
@@ -116,7 +116,19 @@ class SkforecastForecaster(Forecaster):
     def search_space(self, trial: Trial) -> dict[str, Any]: ...
 
     def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
-        return df.copy().set_index("time").sort_index().asfreq("15min")
+        """The series on a regular 15 minute grid, indexed in local time: the
+        calendar features are read off the index, and a household's day follows
+        the local clock - dinner at 17:45 is 15:45 UTC in summer and 16:45 in
+        winter, an hour the forecast would otherwise get wrong for weeks after
+        every DST change. The grid itself stays regular in absolute time."""
+
+        return (
+            df.copy()
+            .set_index("time")
+            .sort_index()
+            .asfreq("15min")
+            .tz_convert(LOCAL_TIMEZONE)
+        )
 
     def fit(self, df: pd.DataFrame):
         df = self.prepare(df)
@@ -184,11 +196,13 @@ class SkforecastForecaster(Forecaster):
     ) -> pd.Series:
         df = self.prepare(df)
 
-        return self.forecaster.predict(
+        forecast = self.forecaster.predict(
             steps=steps,
             last_window=self._last_window(df),
             exog=self.predict_arguments(df=df, steps=steps),
         )
+
+        return forecast.tz_convert("UTC")
 
     def predict_band(
         self,

@@ -1,8 +1,10 @@
 import numpy as np
 import pandas as pd
 import pytest
+from skforecast.preprocessing import CalendarFeatures
 from sklearn.ensemble import HistGradientBoostingRegressor
 
+from domain.time import LOCAL_TIMEZONE
 from features.baseload import BaseloadForecaster
 
 
@@ -64,3 +66,28 @@ def test_the_band_from_out_of_sample_errors_holds_four_in_five_of_a_new_day(
     p10, p90 = forecaster.predict_band(history, steps=96)
 
     assert p10.empty and p90.empty
+
+
+def test_the_calendar_keeps_the_local_clock_across_a_dst_change():
+    """The calendar features are the household's clock: an hour of the day is
+    the same local hour in summer and winter time, an hour apart in UTC - and
+    the forecast itself comes back in UTC."""
+
+    time = pd.date_range("2026-10-15", "2026-10-28", freq="15min", tz="UTC")
+    history = pd.DataFrame({"time": time, "P_baseload": 150.0})
+    forecaster = BaseloadForecaster()
+
+    hours = CalendarFeatures(features=["hour"], encoding=None).fit_transform(
+        forecaster.prepare(history).index
+    )["hour"]
+    # Dinner at 17:45 in Amsterdam, either side of 25 October; the same local
+    # hour twice wherever the system's zone has that change.
+    for instant in ("2026-10-24 15:45Z", "2026-10-26 16:45Z"):
+        local = pd.Timestamp(instant).tz_convert(LOCAL_TIMEZONE)
+
+        assert hours[local] == local.hour
+
+    forecaster.best_params = {"max_iter": 10}
+    forecaster.fit(history)
+
+    assert str(forecaster.predict(history, steps=4).index.tz) == "UTC"

@@ -1967,8 +1967,8 @@ class MPCOptimizer:
             )
 
         # How the heat pump runs the floor by itself, once heating runs have
-        # shown it (see features.floor). It picks its supply temperature
-        # from its own curve, so the heat a run delivers is not the plan's to
+        # shown it (see features.floor). On its curve it picks its supply
+        # temperature itself, so the heat a run delivers is not the plan's to
         # choose: Q = G * (supply - T_mass), with T_mass the node the floor's
         # heat lands in. The plan decides when; the physics decides how much -
         # and a quarter hour at full power into a floor at room temperature is
@@ -1984,25 +1984,31 @@ class MPCOptimizer:
         # slabs' mean being monotone in the heat like each slab.
         model.space_sink_on = pyo.Var(model.K)
         conductance = operating.conductance_w_per_k
-        # The cooling EER model, where runs have shown one: without it the
-        # flat per-step COP above prices the zone.
+        # The mode's own COP (EER) model, where runs have shown one. The heat
+        # pump holds the supply it is given (its flow mode), so the plan
+        # chooses it - heating only with that model: on a flat COP a warmer
+        # supply would cost the plan nothing, while it costs the heat pump
+        # lift. Without it heating keeps to the curve the heating runs showed,
+        # and cooling is priced at the flat per-step COP above.
         efficiency = (
             self.space_cop_model
-            if cooling
-            and self.space_cop_model is not None
-            and self.space_cop_model.cooling
+            if self.space_cop_model is not None
+            and self.space_cop_model.cooling == cooling
             else None
         )
+        # Whether the supply is the plan's to choose rather than the curve's.
+        chosen = cooling or efficiency is not None
 
         if efficiency is not None:
             model.space_power_w = pyo.Var(model.K, domain=pyo.NonNegativeReals)
 
-        def cooling_draw_w(cooling_w: float, outdoor: float, sink_c: float) -> float:
-            """The electricity (W) for this cooling from a mass at sink_c."""
+        def draw_w(moved_w: float, outdoor: float, sink_c: float) -> float:
+            """The electricity (W) to move this heat into (or, cooling, out of)
+            a mass at sink_c, at the supply that takes: sink_c +- Q / G."""
 
-            supply_c = sink_c - cooling_w / conductance
+            supply_c = sink_c + sign * moved_w / conductance
 
-            return cooling_w / float(efficiency.clamped_cop(outdoor, supply_c))
+            return moved_w / float(efficiency.clamped_cop(outdoor, supply_c))
 
         supply_minimum_c = (
             self._aggregate(data.zone_supply_minimum_c, plan, max)
@@ -2025,7 +2031,7 @@ class MPCOptimizer:
             ):
                 model.zone_constraints.add(bound)
 
-            if cooling:
+            if chosen:
                 # The supply is the plan's to choose - the setpoint is given to
                 # the heat pump - so the heat is too, and the supply follows
                 # from it: T_supply = T_sink + Q / G.
@@ -2034,44 +2040,44 @@ class MPCOptimizer:
                 # No less than the compressor at its lowest speed: asked for
                 # less it overshoots the setpoint rather than turn down.
                 model.zone_constraints.add(
-                    -model.q_space_w[k] >= operating.min_heat_w * on
+                    sign * model.q_space_w[k] >= operating.min_heat_w * on
                 )
 
-                # What that cooling draws: the heat over the EER at the supply
-                # it takes, T_sink - Q / G - so colder water for more cooling,
-                # a higher lift and a lower EER (real data: 5.3 at the least
-                # cooling, 5.0 at 4.5 kW, from a 21 degC floor on a 25 degC
-                # day). Convex in the cooling for a given mass, so the tangents
-                # at a few points bound it from below and the plan, paying
-                # for it, sits on the curve. The mass it is cooled from enters
-                # to first order around the uncooled one, on the exact product
-                # T_sink * on (so nothing while off): across mass and cooling
-                # together the draw is not convex, and priced against the
-                # uncooled mass alone it read the supply too warm by the run's
-                # own cooling of the mass - some 3.5% per kelvin, 5.6% on a
-                # hot day's run - where planning twice, the second time against
-                # the mass the first planned, doubled the solve.
+                # What that heat draws: the heat over the COP (EER) at the
+                # supply it takes, T_sink +- Q / G - so more heat moved means a
+                # higher lift and a lower COP (real cooling data: an EER of 5.3
+                # at the least cooling, 5.0 at 4.5 kW, from a 21 degC floor on
+                # a 25 degC day). Convex in the heat for a given mass, heating
+                # as cooling: Q / COP grows as Q times a lift term that grows
+                # with Q, its curvature only turning at a lift of the absolute
+                # condensing temperature. So the tangents at a few points bound
+                # it from below and the plan, paying for it, sits on the curve.
+                # The mass the heat goes into enters to first order around the
+                # unheated one, on the exact product T_sink * on (so nothing
+                # while off): across mass and heat together the draw is not
+                # convex, and priced against the unheated mass alone it read
+                # the cooling supply too warm by the run's own cooling of the
+                # mass - some 3.5% per kelvin, 5.6% on a hot day's run - where
+                # planning twice, the second time against the mass the first
+                # planned, doubled the solve.
                 if efficiency is not None:
                     reference_c = sink_c(unheated[k])
 
                     for point_w in np.linspace(0.0, max_heat_w, 7):
-                        draw_w = cooling_draw_w(point_w, zone_outdoor_c[k], reference_c)
+                        at_w = draw_w(point_w, zone_outdoor_c[k], reference_c)
                         per_w = (
-                            cooling_draw_w(
-                                point_w + 1.0, zone_outdoor_c[k], reference_c
-                            )
-                            - draw_w
+                            draw_w(point_w + 1.0, zone_outdoor_c[k], reference_c) - at_w
                         )
                         per_k = (
-                            cooling_draw_w(
-                                point_w, zone_outdoor_c[k], reference_c + 0.1
-                            )
-                            - draw_w
+                            draw_w(point_w, zone_outdoor_c[k], reference_c + 0.1) - at_w
                         ) / 0.1
+                        # Each tangent in its perspective, scaled by on: the
+                        # same bound on or off, but a tighter relaxation for a
+                        # step partly on (a heating day's solve 8.3 -> 6.1 s).
                         model.zone_constraints.add(
                             model.space_power_w[k]
-                            >= draw_w
-                            + per_w * (-model.q_space_w[k] - point_w)
+                            >= at_w * on
+                            + per_w * (sign * model.q_space_w[k] - point_w * on)
                             + per_k * (sink_on - reference_c * on)
                         )
 
@@ -2079,7 +2085,7 @@ class MPCOptimizer:
                 # than the floor takes from water at that temperature. Together
                 # with the bound above, a humid day may leave no supply that
                 # does both: the zone is then not cooled.
-                if supply_minimum_c is not None:
+                if cooling and supply_minimum_c is not None:
                     model.zone_constraints.add(
                         -model.q_space_w[k]
                         <= conductance * (sink_on - supply_minimum_c[k] * on)
@@ -2101,28 +2107,65 @@ class MPCOptimizer:
             if conductance * (supply - low) <= max_heat_w:
                 model.zone_constraints.add(model.q_space_w[k] >= floor_w)
 
-        # Within a cooling run the supply only falls. Raised above the water
-        # already in the loop, the setpoint asks for less cooling than the
+        # Within a cooling run the supply only falls, within a heating run it
+        # only rises. Set past the water already in the loop - warmer while
+        # cooling, colder while heating - the setpoint asks for less than the
         # compressor gives at its lowest speed: it stops, and starts again later
-        # - a start the plan would not see. Colder is always possible, and a
-        # run whose dew point bound rises past it has to stop.
+        # - a start the plan would not see (real cooling data; the Ecodan
+        # firmware keeps a heating setpoint within 1 K under the supply for the
+        # same reason). The other way is always possible, and a cooling run
+        # whose dew point bound rises past it has to stop.
         #
         # Stated on supply * on = sink * on + Q / G, exact through the product
         # above and 0 while off: a step that stops is then free, and one after
-        # a stop free up to the warmest supply there is. Stated on the supply
-        # itself, with a big-M on both steps, the solver ran into its time
-        # limit on a single day's plan.
-        if cooling:
-            warmest_supply_c = max(sink_c(state) for state in warmest)
+        # a stop free. Stated on the supply itself, with a big-M on both steps,
+        # the solver ran into its time limit on a single day's plan.
+        #
+        # With each step's supply while on between lo and hi (the sink's range
+        # and the compressor's least and most heat), the bound for a pair of
+        # steps is the convex hull of its four on/off cases, heating
+        #   s[k+1] >= s[k] - (hi[k] - lo[k+1]) - lo[k+1] on[k] + hi[k] on[k+1],
+        # tight in each case: s[k+1] >= s[k] when both run, nothing beyond lo
+        # and hi otherwise - cooling its mirror. A single big-M from the warmest
+        # supply bounded the same integer plans more loosely: a heating day's
+        # solve 6.1 -> 5.2 s.
+        if chosen:
+            least_c = operating.min_heat_w / conductance
+            most_c = max_heat_w / conductance
+
+            def supply_range(k: int) -> tuple[float, float]:
+                low_c, high_c = sink_c(coolest[k]), sink_c(warmest[k])
+
+                if cooling:
+                    return low_c - most_c, high_c - least_c
+
+                return low_c + least_c, high_c + most_c
 
             def supply_on(k: int):
                 return model.space_sink_on[k] + model.q_space_w[k] / conductance
 
             for k in range(num_steps - 1):
-                model.zone_constraints.add(
-                    supply_on(k + 1)
-                    <= supply_on(k) + warmest_supply_c * (1 - model.space_on[k])
-                )
+                lo_k, hi_k = supply_range(k)
+                lo_next, hi_next = supply_range(k + 1)
+                on_k, on_next = model.space_on[k], model.space_on[k + 1]
+
+                # Where the ranges do not overlap the order holds by itself.
+                if cooling and hi_next >= lo_k:
+                    model.zone_constraints.add(
+                        supply_on(k + 1)
+                        <= supply_on(k)
+                        + (hi_next - lo_k)
+                        - hi_next * on_k
+                        + lo_k * on_next
+                    )
+                elif not cooling and hi_k >= lo_next:
+                    model.zone_constraints.add(
+                        supply_on(k + 1)
+                        >= supply_on(k)
+                        - (hi_k - lo_next)
+                        - lo_next * on_k
+                        + hi_k * on_next
+                    )
 
     def _build_objective(
         self,

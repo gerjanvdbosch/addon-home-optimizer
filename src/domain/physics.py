@@ -299,6 +299,32 @@ def solar_gain_w(
     return a_eff_m2 * shutter_open_fraction * facade_irradiance
 
 
+def extension_shaded_fraction(
+    sun_from_normal_deg: np.ndarray,
+    east_depth_ratio: float,
+    west_depth_ratio: float,
+) -> np.ndarray:
+    """Share of a glazing's width in the shadow of the side walls of the
+    neighbours' extensions on either side of it, for the direct sun only.
+
+    A wall perpendicular to the facade at the glazing's edge, at least as
+    tall as the glazing (a single-storey extension beside ground-floor glass),
+    casts a shadow depth * tan(gamma) wide across it, gamma the sun's
+    horizontal angle from the facade's normal (positive towards the west):
+    the east wall shades in the morning, the west wall in the afternoon. The
+    sky the walls hide takes a fixed share of the diffuse light, which the
+    effective aperture already absorbs.
+    """
+
+    gamma = np.radians(np.asarray(sun_from_normal_deg, dtype=float))
+    ratio = np.where(gamma > 0.0, west_depth_ratio, east_depth_ratio)
+    # From 90 degrees the sun is behind the facade, which has no direct sun
+    # left to shade.
+    shadow = np.where(np.abs(gamma) < np.pi / 2.0, ratio * np.tan(np.abs(gamma)), 1.0)
+
+    return np.clip(shadow, 0.0, 1.0)
+
+
 def internal_gain_w(
     baseload_w: np.ndarray,
     internal_gain_fraction: float,

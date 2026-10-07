@@ -403,23 +403,54 @@ def test_a_settled_cooling_run_is_set_the_planned_heat_below_its_return():
     """4 kW taken from 20 L/min (1393 W/K) is 2.9 K under an 18.4 degC
     return: 15.5 degC, to the half degree."""
 
-    assert Optimization.zone_setpoint_c(16.8, 4000.0, 18.4, 20.0, None, None) == 15.5
+    assert (
+        Optimization.zone_setpoint_c(16.8, -4000.0, 18.4, 20.0, None, None, True)
+        == 15.5
+    )
 
 
 def test_a_cooling_setpoint_without_a_return_is_the_planned_supply():
-    assert Optimization.zone_setpoint_c(16.8, 4000.0, None, None, None, None) == 17.0
-    assert Optimization.zone_setpoint_c(16.8, 4000.0, 18.4, 0.0, None, None) == 17.0
+    assert (
+        Optimization.zone_setpoint_c(16.8, -4000.0, None, None, None, None, True)
+        == 17.0
+    )
+    assert (
+        Optimization.zone_setpoint_c(16.8, -4000.0, 18.4, 0.0, None, None, True) == 17.0
+    )
 
 
 def test_a_cooling_setpoint_never_rises_within_its_run():
-    assert Optimization.zone_setpoint_c(16.8, 4000.0, 19.4, 20.0, None, 15.5) == 15.5
+    assert (
+        Optimization.zone_setpoint_c(16.8, -4000.0, 19.4, 20.0, None, 15.5, True)
+        == 15.5
+    )
 
 
 def test_a_cooling_setpoint_never_goes_under_its_minimum():
     """Rounded up to the half degree at or above a 15.2 degC dew point, even
     past an earlier setpoint of the run."""
 
-    assert Optimization.zone_setpoint_c(16.8, 4000.0, 18.4, 20.0, 15.2, 15.0) == 15.5
+    assert (
+        Optimization.zone_setpoint_c(16.8, -4000.0, 18.4, 20.0, 15.2, 15.0, True)
+        == 15.5
+    )
+
+
+def test_a_settled_heating_run_is_set_the_planned_heat_above_its_return():
+    """4 kW into the floor from 20 L/min (1393 W/K) is 2.9 K over a 26.1 degC
+    return: 29.0 degC, to the half degree."""
+
+    assert (
+        Optimization.zone_setpoint_c(30.0, 4000.0, 26.1, 20.0, None, None, False)
+        == 29.0
+    )
+
+
+def test_a_heating_setpoint_never_falls_within_its_run():
+    assert (
+        Optimization.zone_setpoint_c(30.0, 4000.0, 25.1, 20.0, None, 29.0, False)
+        == 29.0
+    )
 
 
 def test_a_run_is_under_way_since_its_change_into_the_mode():

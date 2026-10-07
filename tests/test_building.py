@@ -14,6 +14,7 @@ from domain.physics import (
     CP_AIR_J_PER_KG_K,
     Q_PERSON_SENSIBLE_W,
     RHO_AIR_KG_PER_M3,
+    extension_shaded_fraction,
     floor_heat_w,
     solar_gain_w,
     zone_observation,
@@ -1190,7 +1191,7 @@ def test_facade_irradiance_follows_from_the_horizontal_components():
         model="isotropic",
     )["poa_global"]
 
-    facade = facade_irradiance_w_per_m2(
+    facade, _, _ = facade_irradiance_w_per_m2(
         noon,
         direct_horizontal=np.array([500.0]),
         diffuse_horizontal=np.array([200.0]),
@@ -1225,3 +1226,17 @@ def test_the_facade_sun_follows_what_the_pv_array_measured():
     identifier.pv_power_per_irradiance_m2 = 1.8
 
     assert identifier._measured_sky(frame) == pytest.approx([2.0, 1.0, 1.0, 1.0])
+
+
+def test_an_extension_shades_its_side_of_the_day_by_its_depth():
+    """A west extension half as deep as the glazing is wide covers it fully
+    once the sun is 63.4 degrees west of the facade's normal (tan = 2), half of
+    it at 45, and none of it with the sun on the facade or in the east."""
+
+    shaded = extension_shaded_fraction(
+        np.array([-45.0, 0.0, 45.0, np.degrees(np.arctan(2.0)), 80.0, 120.0]),
+        east_depth_ratio=0.0,
+        west_depth_ratio=0.5,
+    )
+
+    assert shaded == pytest.approx([0.0, 0.0, 0.5, 1.0, 1.0, 1.0])

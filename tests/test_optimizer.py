@@ -1388,8 +1388,7 @@ def test_a_higher_ceiling_buffers_the_sun_in_the_floor_and_the_ceiling_holds():
     assert sunny_heat(22.0) > 1.5 * sunny_heat(20.3)
 
 
-def _cold_day(**overrides):
-    steps = 96
+def _cold_day(steps: int = 96, **overrides):
     hour = (np.arange(steps) * 0.25 + 6.0) % 24.0
     defaults = dict(
         solar_forecast_w=[0.0] * steps,
@@ -1462,6 +1461,60 @@ def test_space_runs_are_as_long_and_as_strong_as_the_heat_pump_makes_them():
     assert all(
         length >= MPCConfig().compressor_min_runtime_steps for length in runs[:-1]
     )
+
+
+HEATING = FloorCircuitModel(
+    supply_at_zero_outdoor_c=28.0,
+    supply_per_outdoor_k=-0.4,
+    conductance_w_per_k=400.0,
+    min_heat_w=1500.0,
+)
+
+
+def _heat(space_cop_model=COP_MODEL):
+    return MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE,
+        floor_circuit_model=HEATING,
+        space_cop_model=space_cop_model,
+    ).solve(_cold_day(steps=48))
+
+
+def test_the_plan_chooses_the_heating_supply():
+    """Holding the supply it is given, the heat pump heats the floor as the plan
+    chooses: never less than its least, drawing the heat over the COP at the
+    supply that takes, T_mass + Q / G - and a run's supply never falls, which
+    would stop the compressor."""
+
+    result = _heat()
+    heat = np.asarray(result.space_heat_w)
+    on = np.asarray(result.space_schedule, dtype=bool)
+    supply = np.asarray(result.space_supply_c)
+
+    assert on.any(), "expected the zone to be heated"
+    assert (heat[on] >= HEATING.min_heat_w - 1e-3).all()
+    assert heat[~on] == pytest.approx(0.0, abs=1e-6)
+
+    power = np.asarray(result.space_electrical_w)
+    cop = COP_MODEL.clamped_cop(5.0, supply[on])
+    assert power[on] == pytest.approx(heat[on] / cop, rel=0.01)
+
+    for k in range(len(on) - 1):
+        if on[k] and on[k + 1]:
+            assert supply[k + 1] >= supply[k] - 1e-6
+
+
+def test_without_a_heating_cop_model_the_plan_keeps_to_the_curve():
+    """A flat COP would price a warmer supply the same as a cooler one, so
+    without the heating model the plan heats on the curve's supply."""
+
+    result = _heat(space_cop_model=None)
+    on = np.asarray(result.space_schedule, dtype=bool)
+
+    assert on.any(), "expected the zone to be heated"
+    assert np.asarray(result.space_supply_c)[on] == pytest.approx(HEATING.supply_c(5.0))
 
 
 def test_a_comfort_tolerance_lets_small_predicted_dips_go():

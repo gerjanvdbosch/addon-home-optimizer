@@ -26,7 +26,7 @@ from features.cop import HeatPumpCOPIdentifier
 from features.dataset import DatasetBuilder, DatasetLoader
 from features.dew_point import DewPointIdentifier
 from features.floor import FloorCircuitIdentifier
-from features.optimizer import MPCOptimizer, surplus_scenarios
+from features.optimizer import SOLAR_SCENARIO_WEIGHTS, MPCOptimizer, surplus_scenarios
 from infrastructure.home_assistant import HomeAssistant
 from infrastructure.repositories import ConfigRepository
 
@@ -318,8 +318,8 @@ class Optimization:
             self.explain_dhw_plan(optimizer, planned, result, forecast_times)
 
         if zone is not None:
-            # While cooling, the supply of the first planned run: the setpoint
-            # the plan would give the heat pump.
+            # The supply of the first planned run: the setpoint the plan would
+            # give the heat pump.
             supply_c = next(
                 (c for c in result.space_supply_c if not math.isnan(c)), None
             )
@@ -822,8 +822,25 @@ class Optimization:
             hours=identifier.MASS_WARMUP_HOURS
         )
         end = times[-1] + timedelta(hours=mpc_config.step_hours)
-        baseload = pd.Series(
-            {point.time: point.value for point in state.predictions.baseload}
+        # Heat adds up, so the zone needs the load to expect, not the median the
+        # energy plan works with: an evening's cooking falls on either side of
+        # it, and the median picks the side without (backtest over 27 days,
+        # 17-19 h: median 254 W against 578 W measured on average, the band's
+        # expectation by Swanson's weights 551 W; all day 174 and 257 against
+        # 257 W). The median alone where there is no band.
+        predictions = state.predictions
+        bands = [
+            pd.Series({point.time: point.value for point in points}, dtype=float)
+            for points in (
+                predictions.baseload_p10,
+                predictions.baseload,
+                predictions.baseload_p90,
+            )
+        ]
+        baseload = (
+            sum(w * band for w, band in zip(SOLAR_SCENARIO_WEIGHTS, bands, strict=True))
+            if all(not band.empty for band in bands)
+            else bands[1]
         )
 
         try:
@@ -1005,36 +1022,39 @@ class Optimization:
     @staticmethod
     def zone_setpoint_c(
         planned_c: float,
-        cooling_w: float,
+        heat_w: float,
         return_c: float | None,
         flow_lpm: float | None,
         minimum_c: float | None,
         previous_c: float | None,
+        cooling: bool,
     ) -> float:
-        """The supply setpoint for a cooling run under way (deg C), to the heat
-        pump's half degree.
+        """The supply setpoint for a run under way (deg C), to the heat pump's
+        half degree: heat_w the planned heat into the floor, negative while
+        cooling.
 
-        From the water the floor sends back, return - Q / (m_dot c_p): the
-        supply that takes the planned cooling from it, set on what the floor
+        From the water the floor sends back, return + Q / (m_dot c_p): the
+        supply that brings the planned heat into it, set on what the floor
         does rather than on the plan's estimate of a mass no sensor measures
-        (0.5-1 K off, enough to put the heat pump under its least cooling or
-        the supply under the dew point). The plan's own supply without a
+        (0.5-1 K off, enough to put the heat pump under its least heat or a
+        cooling supply under the dew point). The plan's own supply without a
         return to go on - a run's first quarter hour, while the loop still
         holds the still water it stood with. Never above an earlier setpoint of
-        the same run: raised over the water in the loop, the heat pump turns
-        down past its least and stops. Never below the supply minimum (the dew
-        point uninsulated pipes carry), which comes first - a run whose dew
-        point rose past it is for the plan to stop.
+        the same cooling run, nor below one of the same heating run: set past
+        the water in the loop, the heat pump turns down past its least and
+        stops. Never below the supply minimum (the dew point uninsulated pipes
+        carry), which comes first - a run whose dew point rose past it is for
+        the plan to stop.
         """
 
         setpoint_c = planned_c
 
         if return_c is not None and flow_lpm:
             water_w_per_k = flow_lpm / 60.0 * RHO_WATER_KG_PER_L * CP_WATER_J_PER_KG_K
-            setpoint_c = return_c - cooling_w / water_w_per_k
+            setpoint_c = return_c + heat_w / water_w_per_k
 
         if previous_c is not None:
-            setpoint_c = min(setpoint_c, previous_c)
+            setpoint_c = (min if cooling else max)(setpoint_c, previous_c)
 
         # The nearest half degree, as for the hot water setpoint - but never
         # rounded under the minimum.
@@ -1057,13 +1077,12 @@ class Optimization:
     ) -> None:
         """Writes the plan's floor decision to Home Assistant, as publish_dhw
         does the hot water's: on/off for the quarter hour running now, the
-        start of the run under way or the next one planned, and - cooling - the
-        supply setpoint while a run is under way (see zone_setpoint_c).
+        start of the run under way or the next one planned, and the supply
+        setpoint while a run is under way (see zone_setpoint_c).
 
         All three 'unknown' where the zone cannot be planned at all: nothing
         then for an automation to act on.
-        The setpoint 'unknown' outside a run too, and always while heating,
-        where the heat pump takes its supply from its own curve.
+        The setpoint 'unknown' outside a run too.
         """
 
         status = start = setpoint = "unknown"
@@ -1085,14 +1104,14 @@ class Optimization:
                     since if running and since is not None else times[first]
                 ).isoformat()
 
-            if data.zone_cooling and running and result.space_supply_c:
+            if running and result.space_supply_c:
                 measured = state.measurements.heat_pump
                 step = timedelta(hours=MPCConfig().step_hours)
                 settled = since is not None and now - since >= step
                 previous = state.schedule.building.supply_setpoint
                 published = self.zone_setpoint_c(
                     planned_c=result.space_supply_c[0],
-                    cooling_w=-result.space_heat_w[0],
+                    heat_w=result.space_heat_w[0],
                     return_c=(
                         measured.return_temperature[-1].value
                         if settled and measured.return_temperature
@@ -1113,6 +1132,7 @@ class Optimization:
                         and previous.time >= since
                         else None
                     ),
+                    cooling=data.zone_cooling,
                 )
                 setpoint = str(published)
 

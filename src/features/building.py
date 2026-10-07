@@ -31,6 +31,7 @@ from domain.models import BuildingThermalModel
 from domain.physics import (
     CP_AIR_J_PER_KG_K,
     RHO_AIR_KG_PER_M3,
+    extension_shaded_fraction,
     floor_heat_w,
     internal_gain_w,
     solar_gain_w,
@@ -58,9 +59,12 @@ def facade_irradiance_w_per_m2(
     latitude: float,
     longitude: float,
     azimuth_deg: float,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Plane-of-array irradiance on the vertical facade facing azimuth_deg
-    (degrees clockwise from north), in W/m2.
+    (degrees clockwise from north), in W/m2: the total and its direct part,
+    with the sun's horizontal angle from the facade's normal (degrees, positive
+    towards the west) - what side walls shade the direct part by (see
+    physics.extension_shaded_fraction).
 
     The Open-Meteo `global_tilted_irradiance` attribute already in the config is
     computed for the PV array's own tilt and azimuth, so it does not describe
@@ -108,7 +112,16 @@ def facade_irradiance_w_per_m2(
         model="isotropic",
     )
 
-    return np.nan_to_num(np.asarray(total["poa_global"], dtype=float), nan=0.0)
+    # Wrapped into -180..180, so east of the normal is negative on any facade.
+    sun_from_normal_deg = (
+        position["azimuth"].to_numpy() - azimuth_deg + 180.0
+    ) % 360.0 - 180.0
+
+    return (
+        np.nan_to_num(np.asarray(total["poa_global"], dtype=float), nan=0.0),
+        np.nan_to_num(np.asarray(total["poa_direct"], dtype=float), nan=0.0),
+        sun_from_normal_deg,
+    )
 
 
 def _rollout(
@@ -272,12 +285,16 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # reports as pinned: the missing heat shows instead of being absorbed, and
     # October's prediction changed by under 0.01 K.
     #
-    # The neighbours' extensions beside the living room's glazing were tried
-    # as side walls shading its direct sun (Oct 2026), with a fitted depth per
-    # side: not identified. The west depth went from 0.8 of the glazing's width
-    # to its bound of 4 with three more days of data, and a fitted wall height
-    # to its bound as well. Worth retrying once sunny hours with the shutter
-    # open are many more than the ~170 quarters there were.
+    # The neighbours' extensions shade the thermostat's room's glazing (see
+    # extension_east_depth_ratio). Fitted before the glass areas were measured
+    # and the sun was corrected by the PV array, the west depth went from 0.8
+    # to its bound with three more days of data; since, it fits at 1.6, 2.1 and
+    # 2.8 of the glazing's width on three windows (Jul-Oct 2026, each within
+    # the others' standard error) and east at 0. Shutter moves agree: closed
+    # with the sun over 30 degrees west, the room did not cool. It makes the
+    # afternoon right (+0.31 to -0.01 K at 17:00 on sunny October days) and
+    # midday colder, the room's quick warming in the sun that it no longer
+    # hides (0.214 to 0.221 K over the week): another cause, not this one.
     MAX_APERTURE_FRACTION = 0.6
 
     # A wall thermostat exchanges longwave radiation with the surfaces around
@@ -379,6 +396,15 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     MAX_CLOSED_SHUTTER_GAIN_FRACTION = 0.3
     INITIAL_CLOSED_SHUTTER_GAIN_FRACTION = 0.1
 
+    # An extension's depth over the width of the glazing beside it. A Dutch
+    # extension built without a permit reaches 4 m deep (Bbl), a ground-floor
+    # window or sliding door is some 2-5 m wide: a ratio up to 2, and the
+    # glazing set back in its reveal deepens it a little. Twice that bounds it.
+    # Started at 0.5, the wall's shadow across the glazing at 63 degrees off
+    # the facade; zero, no extension there, is a result the fit can reach.
+    MAX_EXTENSION_DEPTH_RATIO = 4.0
+    INITIAL_EXTENSION_DEPTH_RATIO = 0.5
+
     # a_eff_m2 = glass area * g-value * frame factor * soiling. The geometric
     # angle of incidence is NOT in there - the transposition to the facade
     # already accounts for it - so from the glazing alone the product has a
@@ -453,6 +479,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         "ua_rooms_w_per_k",
         "living_envelope_fraction",
         "closed_shutter_gain_fraction",
+        "extension_east_depth_ratio",
+        "extension_west_depth_ratio",
     )
 
     @staticmethod
@@ -470,6 +498,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 model.ua_rooms_w_per_k,
                 model.living_envelope_fraction,
                 model.closed_shutter_gain_fraction,
+                model.extension_east_depth_ratio,
+                model.extension_west_depth_ratio,
             ]
         )
 
@@ -499,6 +529,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             living_area_fraction=self.living_area_fraction,
             closed_shutter_gain_fraction=float(x[10]),
             pv_power_per_irradiance_m2=self.pv_power_per_irradiance_m2,
+            extension_east_depth_ratio=float(x[11]),
+            extension_west_depth_ratio=float(x[12]),
         )
 
     def load(self, path) -> None:
@@ -789,7 +821,11 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         forward_dt = df["dt_seconds"].shift(-1)
         forward_dt = forward_dt.fillna(df["dt_seconds"].median())
 
-        df["I_facade_w_per_m2"] = facade_irradiance_w_per_m2(
+        (
+            df["I_facade_w_per_m2"],
+            df["I_facade_direct_w_per_m2"],
+            df["sun_from_normal_deg"],
+        ) = facade_irradiance_w_per_m2(
             df["time"] + pd.to_timedelta(forward_dt / 2.0, unit="s"),
             direct_horizontal=df["direct_radiation"].to_numpy(dtype=float),
             diffuse_horizontal=df["diffuse_radiation"].to_numpy(dtype=float),
@@ -798,7 +834,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             azimuth_deg=self.facade_azimuth_deg,
         )
 
-        df["I_facade_w_per_m2"] *= self._measured_sky(df)
+        sky = self._measured_sky(df)
+        df["I_facade_w_per_m2"] *= sky
+        df["I_facade_direct_w_per_m2"] *= sky
 
         df["shutter_open_fraction"] = self._shutter_open_fraction(df)
         df["open_living"] = self._shutter_open_fraction(df, thermostat_room=True)
@@ -824,6 +862,15 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         """
 
         irradiance = df["I_facade_w_per_m2"].to_numpy(dtype=float)
+        # The direct sun the extensions' side walls take off the thermostat's
+        # room's glazing; the rest's, upstairs, looks over them.
+        shaded = df["I_facade_direct_w_per_m2"].to_numpy(
+            dtype=float
+        ) * extension_shaded_fraction(
+            df["sun_from_normal_deg"].to_numpy(dtype=float),
+            model.extension_east_depth_ratio,
+            model.extension_west_depth_ratio,
+        )
         closed_gain = model.closed_shutter_gain_fraction
         q_solar = [
             solar_gain_w(
@@ -831,11 +878,11 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 # The open glass passes its full gain, the shut part a share.
                 shutter_open_fraction=closed_gain
                 + (1.0 - closed_gain) * df[column].to_numpy(dtype=float),
-                facade_irradiance=irradiance,
+                facade_irradiance=facade,
             )
-            for aperture, column in (
-                (model.a_eff_m2, "open_living"),
-                (model.a_eff_rest_m2, "open_rest"),
+            for aperture, column, facade in (
+                (model.a_eff_m2, "open_living", irradiance - shaded),
+                (model.a_eff_rest_m2, "open_rest", irradiance),
             )
         ]
 
@@ -1044,6 +1091,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             a for a, f in zip(self.glazing_areas_m2, flags, strict=True) if not f
         )
         max_aperture = max(self.MAX_APERTURE_FRACTION * living_glass, self.MIN_F_SCALE)
+        # No glazing in the thermostat's room, nothing for an extension to shade.
+        max_extension = (
+            self.MAX_EXTENSION_DEPTH_RATIO if living_glass > 0.0 else self.MIN_F_SCALE
+        )
         max_rest_aperture = max(
             self.MAX_APERTURE_FRACTION * rest_glass, self.MIN_F_SCALE
         )
@@ -1059,6 +1110,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 0.0,
                 0.0,
                 self.MIN_UA_ROOMS_W_PER_K,
+                0.0,
+                0.0,
                 0.0,
                 0.0,
             ]
@@ -1077,6 +1130,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.MAX_UA_ROOMS_W_PER_K,
                 1.0,
                 self.MAX_CLOSED_SHUTTER_GAIN_FRACTION,
+                max_extension,
+                max_extension,
             ]
         )
 
@@ -1094,6 +1149,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 # The envelope by floor area to start: the share it is the room's.
                 self.living_area_fraction,
                 self.INITIAL_CLOSED_SHUTTER_GAIN_FRACTION,
+                self.INITIAL_EXTENSION_DEPTH_RATIO,
+                self.INITIAL_EXTENSION_DEPTH_RATIO,
             ]
         )
 
@@ -1143,7 +1200,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         self.pv_power_per_irradiance_m2 = 0.0
         df = self.prepare(df)
         self.pv_power_per_irradiance_m2 = self._pv_power_per_irradiance(df)
-        df["I_facade_w_per_m2"] *= self._measured_sky(df)
+        sky = self._measured_sky(df)
+        df["I_facade_w_per_m2"] *= sky
+        df["I_facade_direct_w_per_m2"] *= sky
 
         median_dt = float(df["dt_seconds"].median())
 

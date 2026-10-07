@@ -1,6 +1,12 @@
 from datetime import UTC, datetime, time, timedelta
 
 import pandas as pd
+from dateutil.tz import tzlocal
+
+# The system's own zone, with its DST rules: what to_local_time() applies to a
+# single instant, for a whole index at once. datetime.now().astimezone().tzinfo
+# is not it - that is today's fixed offset, an hour off past a DST change.
+LOCAL_TIMEZONE = tzlocal()
 
 
 def parse_datetime(value: str) -> datetime:
