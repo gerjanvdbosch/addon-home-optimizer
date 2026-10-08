@@ -1139,6 +1139,28 @@ class MPCOptimizer:
                     )
                     break
 
+        # The same from the tank as it is now, the strongest of them: a tank
+        # that cannot hold the first target it would miss from its present
+        # temperature needs a start before it, unless the compressor runs now
+        # and goes on (the booster only takes over a run). The rule above starts
+        # from the hottest the tank could be, so it only asks for heating
+        # shortly before the target, and the relaxation met it with a little of
+        # 'on' spread over many steps (real data, 8 Oct 2026: 0.34 starts
+        # against the 1 the plan makes, a lower bound of 0.48 EUR against 0.70).
+        if not initial_compressor_on:
+            cooled = unheated(initial_temperature)
+
+            for k in range(1, num_steps):
+                target = min(float(target_c[k]), t_ceiling[k])
+
+                if target > t_floor[k] and cooled[k] < target:
+                    model.run_needed.add(
+                        sum(model.compressor_start[j] for j in range(k))
+                        + model.slack[k] / (target - cooled[k])
+                        >= 1
+                    )
+                    break
+
         # active_power_w[k, s] is the grid draw at step k if solar scenario s
         # comes true: max(0, electrical power - solar). One schedule is shared by
         # all scenarios (the plan cannot know which one will happen; replanning

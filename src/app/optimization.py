@@ -44,7 +44,7 @@ class Optimization:
     # publish_zone).
     ZONE_STATUS_ENTITY = "binary_sensor.home_optimizer_zone_status"
     ZONE_START_ENTITY = "sensor.home_optimizer_zone_start"
-    ZONE_SETPOINT_ENTITY = "sensor.home_optimizer_zone_setpoint"
+    ZONE_SUPPLY_ENTITY = "sensor.home_optimizer_zone_supply"
 
     def __init__(
         self,
@@ -287,6 +287,17 @@ class Optimization:
 
         try:
             result = optimizer.solve(planned)
+
+            # Stopped at its time limit, a plan with the zone is the best found
+            # by then, and that was at times no plan at all: hot water at
+            # 22:15 and a floor run after it for no comfort the zone lacked,
+            # held there by every warm start after (real data, 8 Oct 2026:
+            # 0.751 EUR against an optimum of 0.672). Hot water alone is
+            # proven in seconds.
+            if zone is not None and result.termination_condition.endswith(
+                "maxTimeLimit"
+            ):
+                raise RuntimeError("stopped at its time limit")
         except RuntimeError as error:
             if zone is None:
                 raise
@@ -696,7 +707,7 @@ class Optimization:
         disinfected = daily_max["time"][
             daily_max[["top", "bottom"]].min(axis=1) >= legionella.temperature
         ]
-        window = timedelta(hours=mpc_config.fine_horizon_hours)
+        window = timedelta(hours=mpc_config.legionella_overdue_hours)
         # To the end of the local day the interval ends on: the daily maxima are
         # UTC days, and a deadline at their midnight fell in the night, leaving
         # only night hours - grid power - to choose from.
@@ -1020,7 +1031,7 @@ class Optimization:
         return since
 
     @staticmethod
-    def zone_setpoint_c(
+    def zone_supply_c(
         planned_c: float,
         heat_w: float,
         return_c: float | None,
@@ -1078,7 +1089,7 @@ class Optimization:
         """Writes the plan's floor decision to Home Assistant, as publish_dhw
         does the hot water's: on/off for the quarter hour running now, the
         start of the run under way or the next one planned, and the supply
-        setpoint while a run is under way (see zone_setpoint_c).
+        setpoint while a run is under way (see zone_supply_c).
 
         All three 'unknown' where the zone cannot be planned at all: nothing
         then for an automation to act on.
@@ -1109,7 +1120,7 @@ class Optimization:
                 step = timedelta(hours=MPCConfig().step_hours)
                 settled = since is not None and now - since >= step
                 previous = state.schedule.building.supply_setpoint
-                published = self.zone_setpoint_c(
+                published = self.zone_supply_c(
                     planned_c=result.space_supply_c[0],
                     heat_w=result.space_heat_w[0],
                     return_c=(
@@ -1151,10 +1162,10 @@ class Optimization:
             {"friendly_name": "Home Optimizer zone start", "device_class": "timestamp"},
         )
         self.home_assistant.set_state(
-            self.ZONE_SETPOINT_ENTITY,
+            self.ZONE_SUPPLY_ENTITY,
             setpoint,
             {
-                "friendly_name": "Home Optimizer zone setpoint",
+                "friendly_name": "Home Optimizer zone supply",
                 "device_class": "temperature",
                 "unit_of_measurement": "°C",
             },

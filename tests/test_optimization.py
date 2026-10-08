@@ -404,25 +404,22 @@ def test_a_settled_cooling_run_is_set_the_planned_heat_below_its_return():
     return: 15.5 degC, to the half degree."""
 
     assert (
-        Optimization.zone_setpoint_c(16.8, -4000.0, 18.4, 20.0, None, None, True)
-        == 15.5
+        Optimization.zone_supply_c(16.8, -4000.0, 18.4, 20.0, None, None, True) == 15.5
     )
 
 
 def test_a_cooling_setpoint_without_a_return_is_the_planned_supply():
     assert (
-        Optimization.zone_setpoint_c(16.8, -4000.0, None, None, None, None, True)
-        == 17.0
+        Optimization.zone_supply_c(16.8, -4000.0, None, None, None, None, True) == 17.0
     )
     assert (
-        Optimization.zone_setpoint_c(16.8, -4000.0, 18.4, 0.0, None, None, True) == 17.0
+        Optimization.zone_supply_c(16.8, -4000.0, 18.4, 0.0, None, None, True) == 17.0
     )
 
 
 def test_a_cooling_setpoint_never_rises_within_its_run():
     assert (
-        Optimization.zone_setpoint_c(16.8, -4000.0, 19.4, 20.0, None, 15.5, True)
-        == 15.5
+        Optimization.zone_supply_c(16.8, -4000.0, 19.4, 20.0, None, 15.5, True) == 15.5
     )
 
 
@@ -431,8 +428,7 @@ def test_a_cooling_setpoint_never_goes_under_its_minimum():
     past an earlier setpoint of the run."""
 
     assert (
-        Optimization.zone_setpoint_c(16.8, -4000.0, 18.4, 20.0, 15.2, 15.0, True)
-        == 15.5
+        Optimization.zone_supply_c(16.8, -4000.0, 18.4, 20.0, 15.2, 15.0, True) == 15.5
     )
 
 
@@ -441,15 +437,13 @@ def test_a_settled_heating_run_is_set_the_planned_heat_above_its_return():
     return: 29.0 degC, to the half degree."""
 
     assert (
-        Optimization.zone_setpoint_c(30.0, 4000.0, 26.1, 20.0, None, None, False)
-        == 29.0
+        Optimization.zone_supply_c(30.0, 4000.0, 26.1, 20.0, None, None, False) == 29.0
     )
 
 
 def test_a_heating_setpoint_never_falls_within_its_run():
     assert (
-        Optimization.zone_setpoint_c(30.0, 4000.0, 25.1, 20.0, None, 29.0, False)
-        == 29.0
+        Optimization.zone_supply_c(30.0, 4000.0, 25.1, 20.0, None, 29.0, False) == 29.0
     )
 
 

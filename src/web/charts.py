@@ -284,7 +284,7 @@ def dashboard_chart(
         ),
         row=2,
         col=1,
-        line=dict(width=1, color="#00CC96", shape="spline"),
+        line=dict(width=2, color="#00CC96", shape="spline"),
         unit="°C",
         decimal=2,
     )

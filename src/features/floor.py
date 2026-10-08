@@ -28,6 +28,7 @@ import pandas as pd
 from domain.config import Config, HeatPumpStates
 from domain.dataset import DatasetDefinition
 from domain.models import FloorCircuitModel
+from domain.physics import floor_pipe_conductance_w_per_k
 from features.building import BuildingThermalIdentifier
 from features.cop import HeatPumpCOPIdentifier
 from features.identifier import SystemIdentifier
@@ -44,6 +45,15 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
     # single reading caught mid-defrost or mid-stop is not the compressor's
     # lowest speed.
     MIN_HEAT_QUANTILE = 0.10
+
+    # How long the screed between the pipes takes to settle against the water:
+    # lateral conduction over half a pipe spacing, (7.5 cm)^2 / 6e-7 m2/s, some
+    # 2.5 hours at a usual 15 cm spacing - assumed, this floor's is not known.
+    # Before it the water sees screed nearer its own temperature than the mass
+    # node's mean, so the conductance a run implies is higher early on (real
+    # data, Aug-Oct 2026: about 1300 W/K in the first half hour, 950-1000 W/K
+    # after two hours).
+    SCREED_SETTLE = pd.Timedelta(hours=2)
 
     def __init__(
         self,
@@ -225,14 +235,57 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
             "mae_w": float(np.mean(np.abs(error))),
             "bias_w": float(np.mean(error)),
             "runs": float(test["run"].nunique()),
+            **self._pipe_conductance(rows),
         }
 
         logger.info(
-            "%s validation: MAE %.0f W, bias %+.0f W over %d runs",
+            "%s validation: MAE %.0f W, bias %+.0f W over %d runs; the water "
+            "implies %.0f W/K to the mass (%.0f before the screed settles, %.0f "
+            "after) over %d runs",
             self.label,
             metrics["mae_w"],
             metrics["bias_w"],
             int(metrics["runs"]),
+            metrics["pipe_ua_w_per_k"],
+            metrics["pipe_ua_early_w_per_k"],
+            metrics["pipe_ua_late_w_per_k"],
+            int(metrics["pipe_ua_runs"]),
         )
 
         return metrics
+
+    def _pipe_conductance(self, rows: pd.DataFrame) -> dict[str, float]:
+        """The building model's mass checked against the return, the one sensor
+        that sees the floor: the conductance from the water to the mass every
+        settled run implies (see physics.floor_pipe_conductance_w_per_k), by
+        median, over all runs - a check of the mass estimate, not of this
+        model's fit.
+
+        The pipes are the same either way, so heating and cooling should
+        agree; a mass estimate off by d K moves them apart, by about
+        m_dot c_p (1 / (return - mass) - 1 / (supply - mass)) d each - some
+        300 W/K per K in either direction here. Within a run it falls until
+        the screed settles (see SCREED_SETTLE): what the mass node, one
+        temperature for the whole slab, cannot show, and why the return is
+        not an observation of it.
+        """
+
+        settled = rows[rows["settled"] & (self.sign * rows["Q_floor_w"] > 0.0)]
+        conductance = pd.Series(
+            floor_pipe_conductance_w_per_k(
+                settled["flow_lpm"].to_numpy(dtype=float),
+                settled["T_supply"].to_numpy(dtype=float),
+                settled["T_return"].to_numpy(dtype=float),
+                settled["T_mass"].to_numpy(dtype=float),
+            ),
+            index=settled.index,
+        )
+        start = rows["time"].groupby(rows["run"]).transform("min")
+        early = (settled["time"] - start[settled.index]) < self.SCREED_SETTLE
+
+        return {
+            "pipe_ua_w_per_k": float(conductance.median()),
+            "pipe_ua_early_w_per_k": float(conductance[early].median()),
+            "pipe_ua_late_w_per_k": float(conductance[~early].median()),
+            "pipe_ua_runs": float(settled.loc[conductance.notna(), "run"].nunique()),
+        }

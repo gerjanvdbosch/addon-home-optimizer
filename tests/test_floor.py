@@ -4,6 +4,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from domain.physics import (
+    CP_WATER_J_PER_KG_K,
+    RHO_WATER_KG_PER_L,
+    floor_pipe_conductance_w_per_k,
+)
 from features.floor import FloorCircuitIdentifier
 
 SUPPLY_AT_ZERO_C = 34.0
@@ -95,3 +100,21 @@ def test_cooling_fit_reads_runs_that_take_heat_from_the_floor():
     assert model.supply_per_outdoor_k == pytest.approx(SUPPLY_PER_OUTDOOR_K, abs=0.05)
     assert model.conductance_w_per_k == pytest.approx(CONDUCTANCE_W_PER_K, rel=0.05)
     assert model.heat_w(30.0, 20.0) < 0.0
+
+
+def test_the_water_implies_the_conductance_it_was_given_either_way():
+    """A return set by a known conductance gives that conductance back, while
+    heating and while cooling; one beyond the supply or the mass, none."""
+
+    flow = np.array([18.0, 18.0, 18.0])
+    capacity = RHO_WATER_KG_PER_L * 18.0 / 60.0 * CP_WATER_J_PER_KG_K
+    supply = np.array([25.0, 14.0, 25.0])
+    mass = np.array([20.5, 19.5, 20.5])
+    remaining = np.exp(-1100.0 / capacity)
+    ret = mass + (supply - mass) * remaining
+    ret[2] = 26.0
+
+    conductance = floor_pipe_conductance_w_per_k(flow, supply, ret, mass)
+
+    assert conductance[:2] == pytest.approx([1100.0, 1100.0])
+    assert np.isnan(conductance[2])

@@ -153,7 +153,7 @@ class BuildingSchedule(BaseModel):
     # Whether the plan serves the zone (1/0), as BoilerSchedule.on.
     on: list[SeriesPoint[int]] = Field(default_factory=list)
     # The supply setpoint last published during a cooling run, which a later
-    # one in the same run may not exceed (see Optimization.zone_setpoint_c).
+    # one in the same run may not exceed (see Optimization.zone_supply_c).
     supply_setpoint: SeriesPoint[float] | None = None
 
 

@@ -611,7 +611,7 @@ class StateManager:
                 aggregation="time_mean",
             )
             # What the floor sends back and how fast, which a cooling run's
-            # supply setpoint follows (see Optimization.zone_setpoint_c). The
+            # supply setpoint follows (see Optimization.zone_supply_c). The
             # return a state, so its last reading; flow rate-like, stopping
             # when the pump does.
             .timeseries(

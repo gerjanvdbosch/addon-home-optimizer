@@ -281,6 +281,32 @@ def floor_heat_w(
     )
 
 
+def floor_pipe_conductance_w_per_k(
+    flow_lpm: np.ndarray,
+    supply_temperature_c: np.ndarray,
+    return_temperature_c: np.ndarray,
+    mass_temperature_c: np.ndarray,
+) -> np.ndarray:
+    """The conductance from the water to the mass that a run's temperatures
+    imply (W/K), the loop taken as a heat exchanger against one temperature:
+    return = mass + (supply - mass) * exp(-UA / (m_dot * cp)) (effectiveness-
+    NTU). Either sign of heat. NaN where the return does not lie between the
+    supply and the mass, which no conductance explains.
+    """
+
+    capacity_w_per_k = RHO_WATER_KG_PER_L * flow_lpm / 60.0 * CP_WATER_J_PER_KG_K
+    remaining = (return_temperature_c - mass_temperature_c) / (
+        supply_temperature_c - mass_temperature_c
+    )
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(
+            (remaining > 0.0) & (remaining < 1.0),
+            -capacity_w_per_k * np.log(remaining),
+            np.nan,
+        )
+
+
 def solar_gain_w(
     a_eff_m2: float,
     shutter_open_fraction: np.ndarray,

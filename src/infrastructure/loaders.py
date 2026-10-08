@@ -66,6 +66,7 @@ def resample_dataframe(
     label: Literal["right", "left"] | None = None,
     resample_method: str | None = None,
     shift: bool | list[str] = False,
+    sample_interval: str | None = None,
 ) -> pd.DataFrame:
     if interval is None or df.empty:
         return df
@@ -75,6 +76,25 @@ def resample_dataframe(
         return df[[time_col]]
 
     df_sorted = df.sort_values(time_col)
+
+    # Each interval's samples side by side rather than combined - `name_k` the
+    # k-th sample_interval within it, NaN where there is none - for a quantity
+    # that has to be formed per sample before it is averaged: a product of
+    # sensors, or one that only counts in some state.
+    if resample_method == "samples":
+        times = df_sorted[time_col]
+        start = times.dt.floor(interval)
+        step = pd.Timedelta(sample_interval)
+        count = int(pd.Timedelta(interval) / step)
+        wide = df_sorted.assign(
+            **{time_col: start, "sample": ((times - start) / step).astype(int)}
+        ).pivot_table(index=time_col, columns="sample", values=val_cols, aggfunc="last")
+        wide = wide.reindex(
+            pd.MultiIndex.from_product([val_cols, range(count)]), axis=1
+        )
+        wide.columns = [f"{col}_{k}" for col, k in wide.columns]
+
+        return wide.reset_index()
 
     resampler = df_sorted.set_index(time_col)[val_cols].resample(
         interval,
@@ -240,6 +260,7 @@ class TimeSeriesLoader(DataLoader):
             label=definition.target_label,
             resample_method=definition.target_resample,
             shift=definition.target_shift,
+            sample_interval=definition.interval,
         )
 
 

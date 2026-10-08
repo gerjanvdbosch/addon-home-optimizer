@@ -51,12 +51,11 @@ class MPCConfig:
     # dominated by proving optimality across many binaries, not by finding a
     # good solution, so halving the variable count for the *look-ahead-only*
     # portion of the horizon (re-solved at full precision before it is ever
-    # acted on) is a real, low-risk speedup. 12h covers a run and the
-    # target it serves at full precision; a deadline further away is only
-    # planned coarsely until it comes within reach, by which time it is
-    # re-solved finely. Measured on real data against 24h: median solve
-    # 6.5 -> 2.9 s, worst 24 -> 9 s, the first decision the same in 59 of 60
-    # solves.
+    # acted on) is a real, low-risk speedup. 24h keeps the next day's runs at
+    # full precision. Shorter is faster but not neutral: a run is dearer to fit
+    # in coarse blocks than in fine steps, so the plan pulls runs into the
+    # fine window (8 Oct 2026, 12h: hot water and floor at 02:15 for EUR 0.754
+    # against 12:30 for EUR 0.698 at 24h, by the shorter plan's own cost).
     fine_horizon_hours: float = 24.0
     coarse_step_hours: float = 1.0
     # A fallback, not the usual case (s): on real data a plan is proven optimal
@@ -73,6 +72,9 @@ class MPCConfig:
     # many times over. Should it fail, the solve starts cold with its full
     # time, so a job takes at most the two limits together.
     warm_start_time_limit_s: float = 5.0
+    # How soon an overdue legionella cycle must be done (h; see
+    # Optimization._with_legionella): within a day, so it can wait for sun.
+    legionella_overdue_hours: float = 24.0
 
 
 @dataclass(frozen=True)

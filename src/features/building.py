@@ -702,6 +702,15 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             df["T_living"] = rooms[living]
             df["T_rest"] = mean(rest)
 
+        # A step's state is the one at its end and its readings their mean, as
+        # they were before the samples were loaded (see dataset).
+        df["state"] = self._samples(df, "state").ffill(axis=1).iloc[:, -1]
+
+        for name in ("T_supply", "T_return", "flow_lpm"):
+            df[name] = (
+                self._samples(df, name).apply(pd.to_numeric, errors="coerce").mean(1)
+            )
+
         # Without a configured outdoor sensor, Open-Meteo's own temperature is
         # the only outdoor air temperature available (see
         # HeatPumpConfig.outdoor_temperature for why the measurement is
@@ -785,31 +794,31 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         for column in ("global_tilted_irradiance", "pv_w"):
             df[column] = pd.to_numeric(df.get(column, np.nan), errors="coerce")
 
-        # flow_lpm is rate-like and fetched without an InfluxDB fill, so a
-        # reporting gap arrives as NaN. The compressor's own state settles what
-        # a gap means - identical reasoning to
-        # BoilerThermalIdentifier._bridge_flow_reporting_gaps.
-        flow = df["flow_lpm"].ffill()
-        df["flow_lpm"] = flow.where(df["state"] != self.states.off, 0.0).fillna(0.0)
+        # Per sample (see dataset). The flow sensor stops reporting while the
+        # pump stands, so its last reading holds into the stop: the state
+        # settles that it is none.
+        state = self._samples(df, "state").to_numpy()
+        supply, ret, flow = (
+            self._samples(df, name)
+            .apply(pd.to_numeric, errors="coerce")
+            .to_numpy(dtype=float)
+            for name in ("T_supply", "T_return", "flow_lpm")
+        )
+        flow = np.nan_to_num(np.where(state != self.states.off, flow, 0.0))
 
         # Heat only reaches the floor circuit while the heat pump is actually
         # serving the space; during SWW the same flow goes to the tank instead.
         measurable = (
-            df["state"].isin((self.states.heating, self.states.cooling))
-            & (df["flow_lpm"] > self.MIN_FLOW_LPM)
-            & df["T_supply"].notna()
-            & df["T_return"].notna()
+            np.isin(state, (self.states.heating, self.states.cooling))
+            & (flow > self.MIN_FLOW_LPM)
+            & ~np.isnan(supply)
+            & ~np.isnan(ret)
         )
 
+        df["flow_lpm"] = flow.mean(axis=1)
         df["Q_floor_w"] = np.where(
-            measurable,
-            floor_heat_w(
-                df["flow_lpm"].to_numpy(dtype=float),
-                df["T_supply"].to_numpy(dtype=float),
-                df["T_return"].to_numpy(dtype=float),
-            ),
-            0.0,
-        )
+            measurable, floor_heat_w(flow, supply, ret), 0.0
+        ).mean(axis=1)
 
         # dt_seconds[i] is the step ENDING at row i, matching _rollout, which
         # advances from i-1 to i over it.
@@ -850,6 +859,19 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             )
 
         return df
+
+    @staticmethod
+    def _samples(df: pd.DataFrame, name: str) -> pd.DataFrame:
+        """A step's samples of `name` in time order (see dataset), or the step
+        as its own one sample in a frame that has none."""
+
+        columns = [
+            column
+            for column in df.columns
+            if column.startswith(f"{name}_") and column[len(name) + 1 :].isdigit()
+        ]
+
+        return df[columns or [name]]
 
     def _inputs(self, model, df: pd.DataFrame) -> np.ndarray:
         """u = [T_outdoor, Q_internal, Q_solar_living, Q_solar_rest, Q_floor]
@@ -1952,9 +1974,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # land in the step.
         #
         # Temperatures are continuous and only reported on change, so the
-        # previous reading is the current one; flow is rate-like and physically
-        # drops to zero when the pump stops, so a reporting gap must stay a gap
-        # for prepare() to resolve against the compressor state.
+        # previous reading is the current one.
         numeric: list[tuple[str, SensorReference, Aggregation, FillMethod]] = [
             ("T_air", config.building.thermostat.temperature, "mean", "previous"),
             *[
@@ -1965,9 +1985,6 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                     strict=True,
                 )
             ],
-            ("T_supply", config.heat_pump.supply_temperature, "mean", "previous"),
-            ("T_return", config.heat_pump.return_temperature, "mean", "previous"),
-            ("flow_lpm", config.heat_pump.flow, "mean", "none"),
             ("baseload_w", config.baseload, "mean", "previous"),
             # Rate-like and unfilled: a gap - and every row ahead of now - is
             # no measurement, and leaves the forecast's sun as it is.
@@ -1988,13 +2005,41 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         ]
         numeric += shutters
 
-        # The compressor state and the device trackers arrive as strings, which
-        # cannot be resampled by averaging: they are taken directly on the model
-        # grid, keeping the value in force at the step's end.
-        textual: list[tuple[str, SensorReference]] = [
-            ("state", config.heat_pump.state),
-            *zip(self.presence_columns, config.presence, strict=True),
+        # The device trackers arrive as strings, which cannot be resampled by
+        # averaging: they are taken directly on the model grid, keeping the
+        # value in force at the step's end.
+        textual: list[tuple[str, SensorReference]] = list(
+            zip(self.presence_columns, config.presence, strict=True)
+        )
+
+        # The floor's heat is a product of three sensors that only counts while
+        # the heat pump serves the space, and a run often turns from hot water
+        # to the floor within a step: its four sensors arrive per 5 minute
+        # sample (see prepare), so a step's heat is formed per sample. Averaged
+        # first, a step that began on hot water put the tank's heat in the
+        # floor (real data, 8 Oct 2026: 8.0 kW for a step that was 6 minutes
+        # SWW, against 3-4 kW in the steps after it; 4.2 kW per sample).
+        # Over time, not over readings: the Ecodan reports every few seconds
+        # while the valve turns, so a reading mean is mostly the turn (that
+        # step 6.1 kW). Flow holds its last reading too, which the state
+        # zeroes once the pump stops.
+        hydronic: list[tuple[str, SensorReference, Aggregation, FillMethod]] = [
+            ("state", config.heat_pump.state, "last", "previous"),
+            ("T_supply", config.heat_pump.supply_temperature, "time_mean", "none"),
+            ("T_return", config.heat_pump.return_temperature, "time_mean", "none"),
+            ("flow_lpm", config.heat_pump.flow, "time_mean", "none"),
         ]
+
+        for name, sensor, aggregation, fill in hydronic:
+            builder = builder.timeseries(
+                name,
+                sensor,
+                interval="5m",
+                aggregation=aggregation,
+                fill=fill,
+                target_interval="15min",
+                target_resample="samples",
+            )
 
         for name, sensor, aggregation, fill in numeric:
             builder = builder.timeseries(
@@ -2015,7 +2060,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 fill="previous",
             )
 
-        for name in [entry[0] for entry in numeric + textual]:
+        for name in [entry[0] for entry in hydronic + numeric + textual]:
             builder = builder.join(
                 left="weather",
                 right=name,

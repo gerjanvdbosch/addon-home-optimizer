@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 
+import pandas as pd
 import pytest
 
 from domain.dataset import AttributeSeriesDefinition, TimeSeriesDefinition
@@ -7,6 +8,7 @@ from domain.sensors import InfluxSensor, SensorAttributesReference, SensorRefere
 from infrastructure.loaders import (
     AttributeSeriesLoader,
     TimeSeriesLoader,
+    resample_dataframe,
     time_weighted_means,
 )
 
@@ -191,3 +193,26 @@ def test_a_state_unchanged_through_the_window_holds_in_every_bucket():
 
     assert list(frame["shutter"]) == [0.0] * 4
     assert frame["time"].iloc[-1] == start + timedelta(minutes=45)
+
+
+def test_samples_stand_side_by_side_by_their_place_in_the_interval():
+    """A missing sample leaves its own place empty rather than shifting the
+    later ones into it, and strings are kept as they are."""
+
+    start = pd.Timestamp("2026-10-08 11:15", tz="UTC")
+    frame = pd.DataFrame(
+        {
+            "time": [start + pd.Timedelta(minutes=m) for m in (0, 10, 15, 20, 25)],
+            "state": ["SWW", "Verwarmen", "Verwarmen", "Verwarmen", "Uit"],
+        }
+    )
+
+    wide = resample_dataframe(
+        frame, "time", "15min", resample_method="samples", sample_interval="5m"
+    )
+
+    assert list(wide["time"]) == [start, start + pd.Timedelta(minutes=15)]
+    assert list(wide.columns) == ["time", "state_0", "state_1", "state_2"]
+    assert wide.iloc[0, 1:].tolist()[0::2] == ["SWW", "Verwarmen"]
+    assert pd.isna(wide.loc[0, "state_1"])
+    assert wide.iloc[1, 1:].tolist() == ["Verwarmen", "Verwarmen", "Uit"]

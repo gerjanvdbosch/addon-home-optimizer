@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 from pvlib import irradiance, solarposition
 
-from domain.config import Config, SouthGlazing
+from domain.config import Config, HeatPumpStates, SouthGlazing
 from domain.dynamics import discretize_zoh, kalman_states
 from domain.models import BuildingThermalModel
 from domain.physics import (
@@ -347,6 +347,35 @@ def test_floor_heat_sign_follows_the_mode():
     # Energy balance: the same flow and the same temperature difference must
     # move the same amount of heat, only in the other direction.
     assert heating[0] == pytest.approx(-floor_heat_w(flow, 30.0, 35.0)[0])
+
+
+def test_a_step_that_began_on_hot_water_brings_the_floor_only_its_own_heat():
+    """The floor's heat is formed per sample (see dataset): a step whose first
+    five minutes still heated the tank brings the floor the other two samples'
+    heat, not the tank's with it."""
+
+    states = HeatPumpStates()
+    frame = _raw_frame().head(4)
+    samples = {
+        "state": [states.dhw, states.heating, states.heating],
+        "flow_lpm": [18.0, 18.0, 18.0],
+        "T_supply": [54.0, 25.0, 25.0],
+        "T_return": [49.0, 22.0, 22.0],
+    }
+
+    for name, values in samples.items():
+        frame = frame.drop(columns=name)
+
+        for k, value in enumerate(values):
+            frame[f"{name}_{k}"] = value
+
+    prepared = _identifier().prepare(frame)
+    heating = floor_heat_w(np.array([18.0]), np.array([25.0]), np.array([22.0]))[0]
+
+    assert prepared["Q_floor_w"].to_numpy() == pytest.approx(2.0 / 3.0 * heating)
+    # The step itself as before: the state at its end, its readings' mean.
+    assert (prepared["state"] == states.heating).all()
+    assert prepared["T_supply"].to_numpy() == pytest.approx(104.0 / 3.0)
 
 
 def test_closed_shutter_blocks_solar_gain():
