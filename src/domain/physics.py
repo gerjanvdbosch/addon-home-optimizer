@@ -186,7 +186,8 @@ def zone_state_space(
     u = [T_outdoor, Q_internal, Q_solar_living, Q_solar_rest, Q_floor].
 
     Q_internal and Q_floor are the dwelling's, divided by floor area; each
-    room's sun is its own glazing's.
+    room's sun is its own glazing's. The rest's slab exchanges with the living
+    room below it too, through its ceiling.
     """
 
     share = model.living_area_fraction
@@ -214,6 +215,12 @@ def zone_state_space(
         b[room, 1] = shares[room] / c_room[room]
         b[room, 2 + room] = 1.0 / c_room[room]
         b[slab, 4] = shares[room] / c_slab[room]
+
+    ceiling = model.ua_ceiling_w_per_k
+    a[0, 0] -= ceiling / c_room[0]
+    a[0, 3] += ceiling / c_room[0]
+    a[3, 3] -= ceiling / c_slab[1]
+    a[3, 0] += ceiling / c_slab[1]
 
     return a, b
 

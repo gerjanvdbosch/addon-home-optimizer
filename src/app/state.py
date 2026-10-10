@@ -345,10 +345,14 @@ class StateManager:
         supply_c: Sequence[float] = (),
         power_w: Sequence[float] = (),
         on: Sequence[int] = (),
+        thermal_mass: Sequence[float] = (),
     ) -> None:
         """The zone's part of the plan, not acted on yet. Its heat and power go
         into the heat pump's plan beside the tank's (see update_schedule, which
-        rewrote those this same run): one plan, one machine serving both."""
+        rewrote those this same run): one plan, one machine serving both. The
+        thermal mass ahead is the plan's: update_zone stored the zone left
+        alone from now on, and beside a planned floor run that showed the slab
+        cooling while the run heated the room."""
 
         state = self.load()
         heat_pump = state.schedule.heat_pump
@@ -376,6 +380,16 @@ class StateManager:
             SeriesPoint(time=t, value=int(value))
             for t, value in zip(times, on, strict=False)
         ]
+
+        if thermal_mass:
+            state.predictions.thermal_mass = [
+                point
+                for point in state.predictions.thermal_mass
+                if point.time < times[0]
+            ] + [
+                SeriesPoint(time=t, value=float(value))
+                for t, value in zip(times, thermal_mass, strict=False)
+            ]
 
         self.state_repository.save(state)
 

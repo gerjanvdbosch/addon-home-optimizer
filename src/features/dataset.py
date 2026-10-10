@@ -42,6 +42,9 @@ class DatasetLoader:
     ) -> pd.DataFrame:
         frames: dict[str, pd.DataFrame] = {}
 
+        for loader in self.loaders:
+            loader.prepare(dataset.definitions, start, end)
+
         for definition in dataset.definitions:
             loader = self._find(definition)
 

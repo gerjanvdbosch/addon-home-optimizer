@@ -17,16 +17,18 @@ from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
+from influxdb.resultset import ResultSet
 
 from domain.dataset import (
     AttributeSeriesDefinition,
     AttributeTimeSeriesDefinition,
+    DataDefinition,
     DataLoader,
     TimeSeriesDefinition,
 )
 from domain.sensors import InfluxSensor, SensorReference
 from domain.time import parse_datetime
-from infrastructure.influx import InfluxDatabase, InfluxSensorResolver
+from infrastructure.influx import InfluxDatabase, InfluxSensorResolver, first_point
 
 logger = logging.getLogger(__name__)
 
@@ -157,15 +159,124 @@ def time_weighted_means(
     ]
 
 
-class TimeSeriesLoader(DataLoader):
-    """The series of one sensor over time."""
+class InfluxLoader(DataLoader):
+    """What the loaders below share: the database, where its sensors are
+    stored, and the queries a dataset's load will ask, sent ahead in one
+    request - each is a round trip to Home Assistant otherwise. A query is
+    answered from what was sent ahead only where its text is the same, so
+    the data is the same; any other goes to the database as it comes."""
 
     def __init__(self, influx: InfluxDatabase, resolver: InfluxSensorResolver):
         self.influx = influx
         self.resolver = resolver
+        self.prefetched: dict[str, ResultSet] = {}
+
+    def prepare(
+        self, definitions: list[DataDefinition], start: datetime, end: datetime
+    ) -> None:
+        mine = [definition for definition in definitions if self.supports(definition)]
+        self.resolver.resolve_many(
+            sensor for definition in mine for sensor in self._sensors(definition)
+        )
+        queries = list(
+            dict.fromkeys(
+                query
+                for definition in mine
+                for query in self._queries(definition, start, end)
+            )
+        )
+        self.prefetched = dict(
+            zip(queries, self.influx.query_many(queries), strict=True)
+        )
+
+    def _sensors(self, definition: Any) -> list[SensorReference]:
+        """The sensors a definition reads."""
+
+        if isinstance(definition, TimeSeriesDefinition):
+            return [definition.sensor]
+
+        attributes = dict(definition.sensor.attributes.items())
+
+        return [
+            SensorReference(entity_id=definition.sensor.entity_id, attribute=attribute)
+            for attribute in [
+                *(attributes[name] for name in definition.attributes),
+                definition.time_attribute,
+            ]
+        ]
+
+    def _queries(self, definition: Any, start: datetime, end: datetime) -> list[str]:
+        """The queries loading a definition will ask, as far as they are
+        known before it: those that depend on what an earlier one returned are
+        left to the load."""
+
+        return []
+
+    def _stored(self, definition: Any) -> list[InfluxSensor]:
+        """Where a definition's sensors are stored, those found."""
+
+        stored = []
+
+        for sensor in self._sensors(definition):
+            try:
+                stored.append(self.resolver.resolve(sensor))
+            except ValueError:
+                continue
+
+        return stored
+
+    def find(self, **query: Any) -> dict[str, Any] | None:
+        text = InfluxDatabase.find_query(**query)
+
+        if text in self.prefetched:
+            return first_point(self.prefetched.pop(text))
+
+        return self.influx.find(**query)
+
+    def find_series(self, **query: Any) -> list[dict[str, Any]]:
+        text = InfluxDatabase.series_query(**query)
+
+        if text in self.prefetched:
+            return list(self.prefetched.pop(text).get_points())
+
+        return self.influx.find_series(**query)
+
+
+class TimeSeriesLoader(InfluxLoader):
+    """The series of one sensor over time."""
 
     def supports(self, definition) -> bool:
         return type(definition) is TimeSeriesDefinition
+
+    def _queries(
+        self, definition: TimeSeriesDefinition, start: datetime, end: datetime
+    ) -> list[str]:
+        time_mean = definition.aggregation == "time_mean"
+        queries = []
+
+        for sensor in self._stored(definition):
+            stored = {
+                "measurement": sensor.measurement,
+                "entity_id": sensor.entity_id,
+                "field": sensor.field,
+            }
+            queries.append(
+                InfluxDatabase.series_query(
+                    **stored,
+                    start=start,
+                    end=end,
+                    aggregation=None if time_mean else definition.aggregation,
+                    interval=definition.interval,
+                    fill=definition.fill,
+                )
+            )
+
+            # The reading in force at the start, asked for below only where
+            # the window has none of its own - sent ahead regardless.
+            if time_mean or definition.fill == "previous":
+                queries.append(InfluxDatabase.find_query(**stored, before=start))
+
+        return queries
 
     def load(
         self, definition: TimeSeriesDefinition, start: datetime, end: datetime
@@ -173,7 +284,7 @@ class TimeSeriesLoader(DataLoader):
         sensor = self.resolver.resolve(definition.sensor)
         time_mean = definition.aggregation == "time_mean"
 
-        points = self.influx.find_series(
+        points = self.find_series(
             measurement=sensor.measurement,
             entity_id=sensor.entity_id,
             field=sensor.field,
@@ -186,7 +297,7 @@ class TimeSeriesLoader(DataLoader):
 
         if time_mean:
             # The reading in force at the start holds into the window.
-            before = self.influx.find(
+            before = self.find(
                 measurement=sensor.measurement,
                 entity_id=sensor.entity_id,
                 field=sensor.field,
@@ -205,7 +316,7 @@ class TimeSeriesLoader(DataLoader):
             and not time_mean
             and (not points or points[0]["value"] is None)
         ):
-            before = self.influx.find(
+            before = self.find(
                 measurement=sensor.measurement,
                 entity_id=sensor.entity_id,
                 field=sensor.field,
@@ -264,22 +375,26 @@ class TimeSeriesLoader(DataLoader):
         )
 
 
-class AttributeSeriesLoader(DataLoader):
+class AttributeSeriesLoader(InfluxLoader):
     """The attributes an entity publishes right now - one forecast, as it
     stands. All of a forecast's attributes share a single reading, so they
     share its timestamp.
     """
 
-    def __init__(
-        self,
-        influx: InfluxDatabase,
-        resolver: InfluxSensorResolver,
-    ):
-        self.influx = influx
-        self.resolver = resolver
-
     def supports(self, definition: Any) -> bool:
         return type(definition) is AttributeSeriesDefinition
+
+    def _queries(
+        self, definition: AttributeSeriesDefinition, start: datetime, end: datetime
+    ) -> list[str]:
+        return [
+            InfluxDatabase.find_query(
+                measurement=sensor.measurement,
+                entity_id=sensor.entity_id,
+                field=sensor.field,
+            )
+            for sensor in self._stored(definition)
+        ]
 
     def load(
         self,
@@ -365,13 +480,13 @@ class AttributeSeriesLoader(DataLoader):
 
         for name, sensor in {definition.time_attribute: time_sensor, **sensors}.items():
             if start is None or end is None:
-                point = self.influx.find(
+                point = self.find(
                     measurement=sensor.measurement,
                     entity_id=sensor.entity_id,
                     field=sensor.field,
                 )
             else:
-                points = self.influx.find_series(
+                points = self.find_series(
                     measurement=sensor.measurement,
                     entity_id=sensor.entity_id,
                     field=sensor.field,
@@ -418,22 +533,34 @@ class AttributeSeriesLoader(DataLoader):
         return frame
 
 
-class AttributeTimeSeriesLoader(DataLoader):
+class AttributeTimeSeriesLoader(InfluxLoader):
     """Every forecast an entity has published, not just the current one: the
     history of its attributes, regrouped into one snapshot per publication.
     That is what lets a model be scored against what was known at the time.
     """
 
-    def __init__(
-        self,
-        influx: InfluxDatabase,
-        resolver: InfluxSensorResolver,
-    ):
-        self.influx = influx
-        self.resolver = resolver
-
     def supports(self, definition: Any) -> bool:
         return type(definition) is AttributeTimeSeriesDefinition
+
+    def _queries(
+        self,
+        definition: AttributeTimeSeriesDefinition,
+        start: datetime,
+        end: datetime,
+    ) -> list[str]:
+        return [
+            InfluxDatabase.series_query(
+                measurement=sensor.measurement,
+                entity_id=sensor.entity_id,
+                field=sensor.field,
+                start=start,
+                end=end,
+                aggregation=definition.aggregation,
+                interval=definition.interval,
+                fill=definition.fill,
+            )
+            for sensor in self._stored(definition)
+        ]
 
     def load(
         self,
@@ -452,7 +579,7 @@ class AttributeTimeSeriesLoader(DataLoader):
             )
         )
 
-        points = self.influx.find_series(
+        points = self.find_series(
             measurement=time_sensor.measurement,
             entity_id=time_sensor.entity_id,
             field=time_sensor.field,
@@ -477,7 +604,7 @@ class AttributeTimeSeriesLoader(DataLoader):
             snapshots[snapshot_time][definition.time_attribute] = values
 
         for name, sensor in sensors.items():
-            points = self.influx.find_series(
+            points = self.find_series(
                 measurement=sensor.measurement,
                 entity_id=sensor.entity_id,
                 field=sensor.field,

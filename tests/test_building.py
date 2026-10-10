@@ -1044,12 +1044,77 @@ def test_glazing_takes_its_room_in_the_compact_form():
     assert SouthGlazing.model_validate([2.0, "cover.bedroom"]).thermostat_room is False
 
 
+def test_extensions_are_depths_over_the_glazings_width():
+    """Each side's depth over the glazing's width, the glazing floor to
+    ceiling; configured, they are held rather than fitted."""
+
+    config = _config()
+    config.building.south_glazing[0] = SouthGlazing.model_validate(
+        [TRUE_LIVING_GLASS_M2, "cover.living_room", 0.0, True, [2.4, 0.0]]
+    )
+    identifier = BuildingThermalIdentifier(latitude=52.39, longitude=5.79)
+    identifier.dataset(config)
+    width_m = TRUE_LIVING_GLASS_M2 / config.building.ceiling_height
+
+    assert identifier.extensions == {
+        "east": pytest.approx(2.4 / width_m),
+        "west": 0.0,
+    }
+    lower, _, upper = identifier._bounds()
+    assert lower[11] == upper[11] == pytest.approx(2.4 / width_m)
+    assert lower[12] == upper[12] == 0.0
+
+
+def test_extensions_belong_to_the_thermostats_room():
+    config = _config()
+    config.building.south_glazing[1] = SouthGlazing.model_validate(
+        {"glass_m2": 2.0, "extensions": [2.4, 2.4]}
+    )
+
+    with pytest.raises(ValueError, match="thermostat's room"):
+        BuildingThermalIdentifier(latitude=52.39, longitude=5.79).dataset(config)
+
+
+def test_configured_extensions_are_held_through_the_fit():
+    identifier = _identifier()
+    identifier.extensions = {"east": 0.4, "west": 0.7}
+    model = identifier.calibrate(_simulate(np.random.default_rng(14)))
+
+    assert model.extension_east_depth_ratio == 0.4
+    assert model.extension_west_depth_ratio == 0.7
+    assert identifier.parameter_std_errors["extension_west_depth_ratio"] == 0.0
+
+
 def test_the_zone_needs_the_thermostats_own_room():
     config = _config()
     config.building.rooms = config.building.rooms[1:]
 
     with pytest.raises(ValueError, match="thermostat's own room"):
         BuildingThermalIdentifier(latitude=52.39, longitude=5.79).dataset(config)
+
+
+def test_the_upper_slab_warms_the_living_room_through_its_ceiling():
+    """What the rest's slab gives off through the ceiling, the living room
+    takes up - and nothing else changes."""
+
+    model = replace(TRUE_MODEL, ua_ceiling_w_per_k=120.0)
+    a, b = zone_state_space(model)
+    without, _ = zone_state_space(replace(model, ua_ceiling_w_per_k=0.0))
+    share = model.living_area_fraction
+    c_living = model.c_air_j_per_k * share
+    c_slab_rest = model.c_mass_j_per_k * (1.0 - share)
+
+    assert c_living * a[0, 3] == pytest.approx(120.0)
+    assert c_slab_rest * a[3, 0] == pytest.approx(120.0)
+    assert c_living * (without[0, 0] - a[0, 0]) == pytest.approx(120.0)
+    assert c_slab_rest * (without[3, 3] - a[3, 3]) == pytest.approx(120.0)
+    changed = ~np.isclose(a, without)
+    assert {(i, j) for i, j in zip(*np.nonzero(changed), strict=True)} == {
+        (0, 0),
+        (0, 3),
+        (3, 0),
+        (3, 3),
+    }
 
 
 def test_observation_is_air_alone_without_a_radiant_share():

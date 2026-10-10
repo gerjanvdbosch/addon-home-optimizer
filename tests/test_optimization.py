@@ -288,6 +288,33 @@ def test_the_plan_log_splits_its_energy_by_day(caplog):
     assert "| total 1.50 kWh" in caplog.text
 
 
+def test_the_plan_log_counts_only_the_tank_s_electricity(caplog):
+    """The plan's electricity is the whole heat pump's: a floor run after the
+    tank's must not be reported as hot water."""
+
+    result = MPCResult(
+        schedule=(0, 1, 0, 0),
+        temperatures=TEMPERATURES,
+        electrical_power_w=(0.0, 2000.0, 0.0, 0.0),
+        heat_w=(0.0,) * 4,
+        objective_value=0.0,
+        solver_status="optimal",
+        termination_condition="optimal",
+        space_schedule=(0, 0, 1, 1),
+        space_electrical_w=(0.0, 0.0, 1000.0, 1000.0),
+        electricity_kwh=1.0,
+        grid_kwh=0.5,
+        electricity_step_kwh=(0.0, 0.5, 0.25, 0.25),
+        grid_step_kwh=(0.0, 0.25, 0.25, 0.0),
+    )
+
+    with caplog.at_level("INFO", logger="app.optimization"):
+        Optimization.log_dhw_plan(result, TIMES, *LOG_PLANNER)
+
+    assert ": 0.50 kWh, of which sun 0.25 and grid 0.25" in caplog.text
+    assert "| total 0.50 kWh" in caplog.text
+
+
 def test_explain_logs_the_plan_beside_earlier_finishes(caplog):
     """A 45 degC target at the end of six hours with sun only in the last
     hour and a half: the plan heats in it, and each earlier finish is solved and
@@ -459,6 +486,19 @@ def test_a_run_is_under_way_since_its_change_into_the_mode():
     )
     assert Optimization.running_since(changes, "Verwarmen") is None
     assert Optimization.running_since(changes[:1], "Koelen") is None
+
+
+def test_a_floor_run_is_under_way_only_with_the_compressor_running():
+    """The state stays on heating at 0 Hz between runs (real data, 11 Oct)."""
+
+    heating = [SeriesPoint(time=START, value="Verwarmen")]
+    running = [SeriesPoint(time=START, value=34.0)]
+    stopped = [SeriesPoint(time=START, value=0.0)]
+
+    assert Optimization.zone_running(heating, running, "Verwarmen")
+    assert not Optimization.zone_running(heating, stopped, "Verwarmen")
+    assert not Optimization.zone_running(heating, running, "Koelen")
+    assert not Optimization.zone_running([], running, "Verwarmen")
 
 
 def test_the_weekend_tariff_holds_all_saturday():

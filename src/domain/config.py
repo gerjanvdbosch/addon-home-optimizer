@@ -7,7 +7,7 @@ physical constants and its own target schedule.
 from datetime import time
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, NonNegativeFloat, model_validator
 
 from domain.mpc import MPCConfig
 from domain.sensors import SensorAttributesReference, SensorReference
@@ -153,6 +153,17 @@ class SouthGlazing(BaseModel):
     # glass. A cover pressed shut reads its lowest value (cover.woonkamer
     # 10-11); this is the higher position where the slats start to part.
     closed_position: float = Field(default=0.0, ge=0.0, lt=100.0)
+    # How far the neighbours' extensions east and west of this glazing reach
+    # out from the facade (m): set, they fix the shade their side walls cast
+    # on it, which data alone does not (fitted on two halves of 90 days,
+    # Jul-Oct 2026: the west one at 0.8 and 1.5 times the glazing's width).
+    # Assumed: the glazing runs floor to ceiling, so it is glass_m2 over
+    # building.ceiling_height wide, between the extensions' walls. Fixed so on
+    # this house, the same 90 days were predicted as well as fitted or better
+    # (2.4 m: 0.129 and 0.114 K against 0.129 and 0.115 K). Unset, it is
+    # fitted. For the thermostat's room's glazing only: the rest's, upstairs,
+    # looks over them.
+    extensions: tuple[NonNegativeFloat, NonNegativeFloat] | None = Field(default=None)
 
     @model_validator(mode="before")
     @classmethod
@@ -160,10 +171,16 @@ class SouthGlazing(BaseModel):
         if isinstance(value, (int, float)):
             return {"glass_m2": value, "cover": None}
 
-        # [glass_m2, cover, closed_position, thermostat_room], the last two
-        # optional.
+        # [glass_m2, cover, closed_position, thermostat_room, extensions], all
+        # after the cover optional.
         if isinstance(value, (list, tuple)):
-            names = ("glass_m2", "cover", "closed_position", "thermostat_room")
+            names = (
+                "glass_m2",
+                "cover",
+                "closed_position",
+                "thermostat_room",
+                "extensions",
+            )
 
             return dict(zip(names, value, strict=False))
 

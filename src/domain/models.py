@@ -149,6 +149,10 @@ class BuildingThermalModel:
                               + UA_am,room (T_slab - T_room) + Q_int,room + Q_sol,room
         C_slab  dT_slab/dt  = UA_am,room (T_room - T_slab) + Q_floor,room
 
+    and the rest's slab is the living room's ceiling as well:
+    UA_ceiling (T_slab_rest - T_living) warms the living room and cools that
+    slab by as much.
+
     A room node is its air, furnishings and internal walls, which follow one
     another closely; a slab node is the screed and the floor it lies on, with
     the floor circuit in it, coupled to its room only through its surface.
@@ -203,8 +207,7 @@ class BuildingThermalModel:
     internal_gain_fraction: float
     # The same aperture for the rest of the house's south glazing (m2).
     a_eff_rest_m2: float
-    # Between the two rooms: the ceiling between the floors, the stairs and
-    # the doors (W/K).
+    # Between the two rooms' air: the stairs and the doors (W/K).
     ua_rooms_w_per_k: float
     # Share of the envelope conductance that is the living room's.
     living_envelope_fraction: float
@@ -224,9 +227,15 @@ class BuildingThermalModel:
     # glazing, on a terraced house's ground floor: each one's depth over that
     # glazing's width, how fast its side wall shades the glass as the sun moves
     # off the facade's normal (see physics.extension_shaded_fraction). Zero is
-    # no extension there; fitted, so nothing needs configuring.
+    # no extension there. Fitted unless configured (see
+    # SouthGlazing.extensions).
     extension_east_depth_ratio: float = 0.0
     extension_west_depth_ratio: float = 0.0
+    # From the rest's slab down to the living room through its ceiling (W/K):
+    # the upper floor's screed, with the floor heating in it, lies on the
+    # concrete floor that is the living room's ceiling. Zero is no floor of
+    # the rest's above the living room - and a model saved before it.
+    ua_ceiling_w_per_k: float = 0.0
 
 
 # Exact by definition of the Kelvin scale (0 degC = 273.15 K) - used

@@ -1,10 +1,13 @@
 from datetime import UTC, datetime, timedelta
+from urllib.parse import quote_plus
 
 import pandas as pd
 import pytest
+from influxdb.resultset import ResultSet
 
 from domain.dataset import AttributeSeriesDefinition, TimeSeriesDefinition
 from domain.sensors import InfluxSensor, SensorAttributesReference, SensorReference
+from infrastructure.influx import InfluxDatabase
 from infrastructure.loaders import (
     AttributeSeriesLoader,
     TimeSeriesLoader,
@@ -193,6 +196,97 @@ def test_a_state_unchanged_through_the_window_holds_in_every_bucket():
 
     assert list(frame["shutter"]) == [0.0] * 4
     assert frame["time"].iloc[-1] == start + timedelta(minutes=45)
+
+
+def test_a_prepared_load_is_answered_from_one_request():
+    """Prepared for its window, a load asks the database nothing more: its
+    queries went ahead in one request, and it reads the same data from it -
+    the series and the state held from before the window."""
+
+    start = datetime(2026, 10, 3, tzinfo=UTC)
+    times = [(start + timedelta(minutes=15 * i)).isoformat() for i in range(4)]
+
+    def result(points):
+        return ResultSet(
+            {"series": [{"name": "%", "columns": ["time", "value"], "values": points}]}
+        )
+
+    class _Batched:
+        requests = 0
+
+        def query_many(self, queries):
+            self.requests += 1
+
+            return [
+                result([[(start - timedelta(days=60)).isoformat(), 18.0]])
+                if "LIMIT 1" in query
+                else result(
+                    [
+                        [t, v]
+                        for t, v in zip(times, [None, None, 75.0, 75.0], strict=True)
+                    ]
+                )
+                for query in queries
+            ]
+
+        def find(self, *args, **kwargs):
+            raise AssertionError("asked again")
+
+        find_series = find
+
+    class _Resolving(_Resolver):
+        def resolve_many(self, sensors):
+            list(sensors)
+
+    influx = _Batched()
+    loader = TimeSeriesLoader(influx, _Resolving())
+    definition = TimeSeriesDefinition(
+        name="shutter",
+        sensor=SensorReference(entity_id="cover.x", attribute="current_position"),
+        interval="15m",
+        aggregation="last",
+        fill="previous",
+    )
+
+    loader.prepare([definition], start, start + timedelta(hours=1))
+    frame = loader.load(definition, start, start + timedelta(hours=1))
+
+    assert influx.requests == 1
+    assert list(frame["shutter"]) == [18.0, 18.0, 75.0, 75.0]
+
+
+def test_many_statements_go_in_few_requests_and_come_back_in_order():
+    """As many statements to a request as its URL takes, the answers in the
+    order asked - one statement alone comes back unwrapped from the client."""
+
+    class _Client:
+        def __init__(self):
+            self.requests = []
+
+        def query(self, text):
+            self.requests.append(text)
+            answers = [
+                ResultSet(
+                    {"series": [{"name": "x", "columns": ["value"], "values": [[q]]}]}
+                )
+                for q in text.split(";\n")
+            ]
+            return answers if len(answers) > 1 else answers[0]
+
+    influx = object.__new__(InfluxDatabase)
+    influx.client = _Client()
+    queries = [f"SELECT '{i:03d} {'°' * 40}'" for i in range(200)]
+
+    answers = influx.query_many(queries)
+
+    assert [next(a.get_points())["value"] for a in answers] == queries
+    assert 1 < len(influx.client.requests) < len(queries)
+    assert all(
+        len(quote_plus(r)) <= InfluxDatabase.MAX_ENCODED_QUERY_CHARS
+        for r in influx.client.requests
+    )
+    assert len(influx.query_many(queries[:1])) == 1
+    assert influx.query_many([]) == []
 
 
 def test_samples_stand_side_by_side_by_their_place_in_the_interval():

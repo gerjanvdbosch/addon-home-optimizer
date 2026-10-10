@@ -1,5 +1,7 @@
+from collections.abc import Iterable
 from datetime import datetime
 from typing import Any, cast
+from urllib.parse import quote_plus
 
 from influxdb import InfluxDBClient
 from influxdb.resultset import ResultSet
@@ -23,8 +25,49 @@ class InfluxDatabase:
             database=settings.influx_database,
         )
 
+    # The most query one request carries, as it stands in the URL (characters,
+    # URL-encoded): the client sends the statements there, and a proxy before
+    # InfluxDB commonly takes no request line past 8 KiB - InfluxDB itself
+    # takes a megabyte. Room left for the rest of the line and the database.
+    MAX_ENCODED_QUERY_CHARS = 7000
+
     def query(self, query: str) -> ResultSet:
         return cast(ResultSet, self.client.query(query))
+
+    def query_many(self, queries: list[str]) -> list[ResultSet]:
+        """Several statements in as few requests as fit, their results in the
+        same order: each request is a round trip to Home Assistant, and a
+        sensor's resolution alone took two or three of them."""
+
+        separator = ";\n"
+        results: list[ResultSet] = []
+        batch: list[str] = []
+        size = 0
+
+        def send() -> None:
+            answer = self.client.query(separator.join(batch))
+            results.extend(answer if isinstance(answer, list) else [answer])
+            batch.clear()
+
+        for query in queries:
+            encoded = len(quote_plus(separator + query))
+
+            if batch and size + encoded > self.MAX_ENCODED_QUERY_CHARS:
+                send()
+                size = 0
+
+            batch.append(query)
+            size += encoded
+
+        if batch:
+            send()
+
+        if len(results) != len(queries):
+            raise RuntimeError(
+                f"{len(queries)} statements returned {len(results)} results."
+            )
+
+        return results
 
     def find(
         self,
@@ -35,22 +78,9 @@ class InfluxDatabase:
     ) -> dict[str, Any] | None:
         """The latest reading, or the latest before `before`."""
 
-        until = f"AND time < '{before.isoformat()}'" if before else ""
-        query = f"""
-        SELECT "{field}" AS value
-        FROM "{measurement}"
-        WHERE "entity_id" = '{entity_id}' {until}
-        ORDER BY time DESC
-        LIMIT 1
-        """
-
-        result = self.query(query)
-
-        points = list(result.get_points())
-        if not points:
-            return None
-
-        return points[0]
+        return first_point(
+            self.query(self.find_query(measurement, entity_id, field, before))
+        )
 
     def find_series(
         self,
@@ -63,6 +93,49 @@ class InfluxDatabase:
         aggregation: Aggregation | None = None,
         fill: FillMethod | int | float = "none",
     ) -> list[dict[str, Any]]:
+        return list(
+            self.query(
+                self.series_query(
+                    measurement,
+                    entity_id,
+                    field,
+                    start,
+                    end,
+                    interval,
+                    aggregation,
+                    fill,
+                )
+            ).get_points()
+        )
+
+    @staticmethod
+    def find_query(
+        measurement: str,
+        entity_id: str,
+        field: str,
+        before: datetime | None = None,
+    ) -> str:
+        until = f"AND time < '{before.isoformat()}'" if before else ""
+
+        return f"""
+        SELECT "{field}" AS value
+        FROM "{measurement}"
+        WHERE "entity_id" = '{entity_id}' {until}
+        ORDER BY time DESC
+        LIMIT 1
+        """
+
+    @staticmethod
+    def series_query(
+        measurement: str,
+        entity_id: str,
+        field: str,
+        start: datetime,
+        end: datetime,
+        interval: str | None = None,
+        aggregation: Aggregation | None = None,
+        fill: FillMethod | int | float = "none",
+    ) -> str:
         if interval and aggregation:
             select = f'{aggregation}("{field}")'
         else:
@@ -82,9 +155,13 @@ class InfluxDatabase:
         GROUP BY time({interval}) fill({fill})
         """
 
-        result = self.query(query)
+        return query
 
-        return list(result.get_points())
+
+def first_point(result: ResultSet) -> dict[str, Any] | None:
+    points = list(result.get_points())
+
+    return points[0] if points else None
 
 
 class InfluxSensorResolver:
@@ -115,64 +192,92 @@ class InfluxSensorResolver:
         self.schema_loaded = True
 
     def resolve(self, sensor: SensorReference) -> InfluxSensor:
-        return self._resolve(
-            entity_id=sensor.entity_id,
-            attribute=sensor.attribute,
-        )
+        self.resolve_many([sensor])
+        cache_key = self._cache_key(sensor)
 
-    def _resolve(
-        self,
-        entity_id: str,
-        attribute: str | None,
-    ) -> InfluxSensor:
+        if cache_key not in self.cache:
+            raise ValueError(f"Sensor not found: {cache_key}")
+
+        return self.cache[cache_key]
+
+    def resolve_many(self, sensors: Iterable[SensorReference]) -> None:
+        """Find where each sensor is stored, into the cache: in two requests
+        for all of them, the measurements each entity has series in and then
+        whether one holds the field - tried in the same order as one at a
+        time, so the same one is found. A sensor not found is left out."""
+
         self.load_schema()
 
-        entity_id = entity_id.split(".", 1)[-1]
-        cache_key = f"{entity_id}.{attribute}"
-
-        if cache_key in self.cache:
-            return self.cache[cache_key]
-
-        candidates = self._candidate_fields(attribute)
-        # Only the measurements this entity has series in, found from the index
-        # in one query. Trying every measurement with a matching field instead
-        # took one query each - ~70 for a plain "value" sensor, half a second
-        # per sensor and most of a state update's time.
-        measurements = {
-            point["name"]
-            for point in self.db.query(
-                f"SHOW MEASUREMENTS WHERE \"entity_id\" = '{entity_id}'"
-            ).get_points()
+        pending = {
+            self._cache_key(sensor): sensor
+            for sensor in sensors
+            if self._cache_key(sensor) not in self.cache
         }
 
-        for field_name in candidates:
-            for influx_sensor in self.schema:
-                if (
-                    influx_sensor.field != field_name
-                    or influx_sensor.measurement not in measurements
-                ):
-                    continue
+        if not pending:
+            return
 
-                query = f"""
-                SELECT "{field_name}"
-                FROM "{influx_sensor.measurement}"
-                WHERE "entity_id" = '{entity_id}'
-                LIMIT 1
-                """
+        entity_ids = list(
+            dict.fromkeys(self._entity_id(sensor) for sensor in pending.values())
+        )
+        # Only the measurements an entity has series in, from the index. Trying
+        # every measurement with a matching field instead took one query each -
+        # ~70 for a plain "value" sensor.
+        measurements = {
+            entity_id: {point["name"] for point in result.get_points()}
+            for entity_id, result in zip(
+                entity_ids,
+                self.db.query_many(
+                    [
+                        f"SHOW MEASUREMENTS WHERE \"entity_id\" = '{entity_id}'"
+                        for entity_id in entity_ids
+                    ]
+                ),
+                strict=True,
+            )
+        }
 
-                if list(self.db.query(query).get_points()):
-                    resolved = InfluxSensor(
-                        measurement=influx_sensor.measurement,
-                        entity_id=entity_id,
-                        field=field_name,
-                        value_type=influx_sensor.value_type,
-                    )
+        candidates: list[tuple[str, InfluxSensor]] = []
 
-                    self.cache[cache_key] = resolved
+        for cache_key, sensor in pending.items():
+            entity_id = self._entity_id(sensor)
 
-                    return resolved
+            for field_name in self._candidate_fields(sensor.attribute):
+                for stored in self.schema:
+                    if (
+                        stored.field == field_name
+                        and stored.measurement in measurements[entity_id]
+                    ):
+                        candidates.append(
+                            (
+                                cache_key,
+                                InfluxSensor(
+                                    measurement=stored.measurement,
+                                    entity_id=entity_id,
+                                    field=field_name,
+                                    value_type=stored.value_type,
+                                ),
+                            )
+                        )
 
-        raise ValueError(f"Sensor not found: {entity_id}.{attribute}")
+        holds = self.db.query_many(
+            [
+                f"""SELECT "{candidate.field}" FROM "{candidate.measurement}" """
+                f"""WHERE "entity_id" = '{candidate.entity_id}' LIMIT 1"""
+                for _, candidate in candidates
+            ]
+        )
+
+        for (cache_key, candidate), result in zip(candidates, holds, strict=True):
+            if cache_key not in self.cache and list(result.get_points()):
+                self.cache[cache_key] = candidate
+
+    @staticmethod
+    def _entity_id(sensor: SensorReference) -> str:
+        return sensor.entity_id.split(".", 1)[-1]
+
+    def _cache_key(self, sensor: SensorReference) -> str:
+        return f"{self._entity_id(sensor)}.{sensor.attribute}"
 
     def _candidate_fields(self, attribute: str | None) -> list[str]:
         if attribute is None:

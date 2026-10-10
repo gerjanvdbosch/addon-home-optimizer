@@ -325,6 +325,17 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     MAX_UA_ROOMS_W_PER_K = 1000.0
     INITIAL_UA_ROOMS_W_PER_K = 100.0
 
+    # The rest's slab to the living room below it, per m2 of the living room's
+    # ceiling: at most a bare concrete one, the surface resistance for heat
+    # flowing down (EN ISO 6946: 0.17 m2K/W) the whole of it - some 6 W/m2K;
+    # zero is no floor of the rest's above it. Fitted at 2.8-4.9 W/m2K on
+    # three thirds of June-October 2026, each within 0.4: the heat between
+    # the floors goes through it, the rooms' own coupling stays at its bound.
+    # With it the living room was predicted to 0.120 K against 0.123 K on the
+    # thirds left out, better on each.
+    MAX_UA_CEILING_W_PER_M2_K = 6.0
+    INITIAL_UA_CEILING_W_PER_M2_K = 3.0
+
     # Share of the baseload dissipated inside the zone. The zone is the whole
     # dwelling and the baseload every appliance but the heat pump, so nearly
     # all of it: only hot water down the drain and appliances outside leave.
@@ -361,6 +372,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # See BuildingThermalModel.pv_power_per_irradiance_m2: set by
         # calibrate(), taken from the model by load().
         self.pv_power_per_irradiance_m2 = 0.0
+        # The extensions configured beside the thermostat's room's glazing
+        # (see SouthGlazing.extensions): side -> depth over its width. Fixed,
+        # not fitted.
+        self.extensions: dict[str, float] = {}
 
     @property
     def name(self) -> str:
@@ -481,6 +496,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         "closed_shutter_gain_fraction",
         "extension_east_depth_ratio",
         "extension_west_depth_ratio",
+        "ua_ceiling_w_per_k",
     )
 
     @staticmethod
@@ -500,6 +516,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 model.closed_shutter_gain_fraction,
                 model.extension_east_depth_ratio,
                 model.extension_west_depth_ratio,
+                model.ua_ceiling_w_per_k,
             ]
         )
 
@@ -531,6 +548,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             pv_power_per_irradiance_m2=self.pv_power_per_irradiance_m2,
             extension_east_depth_ratio=float(x[11]),
             extension_west_depth_ratio=float(x[12]),
+            ua_ceiling_w_per_k=float(x[13]),
         )
 
     def load(self, path) -> None:
@@ -1101,6 +1119,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         air_capacity = RHO_AIR_KG_PER_M3 * self.volume_m3 * CP_AIR_J_PER_KG_K
         floor_m2 = sum(self.room_areas_m2)
+        ceiling_m2 = self.room_areas_m2[self.thermostat_room_index]
 
         # least_squares needs a strictly positive bound width, so a zone with no
         # configured south glass gets a numerically-zero aperture rather than a
@@ -1136,6 +1155,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 0.0,
                 0.0,
                 0.0,
+                0.0,
             ]
         )
 
@@ -1154,6 +1174,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.MAX_CLOSED_SHUTTER_GAIN_FRACTION,
                 max_extension,
                 max_extension,
+                max(self.MAX_UA_CEILING_W_PER_M2_K * ceiling_m2, self.MIN_F_SCALE),
             ]
         )
 
@@ -1173,8 +1194,14 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.INITIAL_CLOSED_SHUTTER_GAIN_FRACTION,
                 self.INITIAL_EXTENSION_DEPTH_RATIO,
                 self.INITIAL_EXTENSION_DEPTH_RATIO,
+                self.INITIAL_UA_CEILING_W_PER_M2_K * ceiling_m2,
             ]
         )
+
+        # Configured extensions are held (see self.extensions).
+        for index, side in ((11, "east"), (12, "west")):
+            if side in self.extensions:
+                lower[index] = upper[index] = self.extensions[side]
 
         return lower, np.clip(initial, lower, upper), upper
 
@@ -1238,6 +1265,15 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         plan = self._rollout_plan(train_df, median_dt)
         lower, initial, upper = self._bounds()
 
+        # Only what is not held by the configuration (see _bounds).
+        free = lower < upper
+
+        def full(x_free: np.ndarray) -> np.ndarray:
+            x = initial.copy()
+            x[free] = x_free
+
+            return x
+
         if sum(self.glazing_areas_m2) <= 0.0:
             logger.warning(
                 "Building thermal calibration: building.south_glazing is not "
@@ -1245,14 +1281,14 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 "gain will be absorbed by the envelope and capacity parameters."
             )
 
-        def residuals(x: np.ndarray) -> np.ndarray:
-            return self._window_residuals(x, train_df, plan)
+        def residuals(x_free: np.ndarray) -> np.ndarray:
+            return self._window_residuals(full(x_free), train_df, plan)
 
         # x_scale="jac": the parameters span conductances (10^2 W/K) and heat
         # capacities (10^7 J/K), so an unscaled trust region would step
         # meaninglessly in one or the other.
         ordinary = least_squares(
-            residuals, initial, bounds=(lower, upper), x_scale="jac"
+            residuals, initial[free], bounds=(lower[free], upper[free]), x_scale="jac"
         )
 
         # Robust loss scaled by the data's own residual spread, so a window
@@ -1264,20 +1300,23 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         result = least_squares(
             residuals,
             ordinary.x,
-            bounds=(lower, upper),
+            bounds=(lower[free], upper[free]),
             loss="soft_l1",
             f_scale=f_scale,
             x_scale="jac",
         )
 
-        std_errors = self._parameter_std_errors(result)
+        x = full(result.x)
+        # A configured parameter carries no error from this fit.
+        std_errors = np.zeros_like(x)
+        std_errors[free] = self._parameter_std_errors(result)
         self.parameter_std_errors = dict(
             zip(self.PARAMETER_NAMES, std_errors, strict=True)
         )
 
-        self.model = self._model_from_parameters(result.x)
+        self.model = self._model_from_parameters(x)
 
-        predicted, _, active, _ = self._simulate_windows(result.x, train_df, plan)
+        predicted, _, active, _ = self._simulate_windows(x, train_df, plan)
 
         logger.info(
             "Building thermal calibration: %d training points, %d validation "
@@ -1297,7 +1336,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             " ".join(
                 f"{name}={value:.4g}±{error:.4g}"
                 for name, value, error in zip(
-                    self.PARAMETER_NAMES, result.x, std_errors, strict=True
+                    self.PARAMETER_NAMES, x, std_errors, strict=True
                 )
             ),
         )
@@ -1446,6 +1485,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         for index, name in enumerate(self.PARAMETER_NAMES):
             value = float(x[index])
+
+            # Held by the configuration, not by the data (see _bounds).
+            if lower[index] >= upper[index]:
+                continue
 
             if np.isclose(value, lower[index]) or np.isclose(value, upper[index]):
                 pinned += 1
@@ -1628,6 +1671,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             for index, name in enumerate(self.PARAMETER_NAMES):
                 error = self.parameter_std_errors[name]
                 metrics[f"std_error_{name}"] = error
+
+                if lower[index] >= upper[index]:
+                    continue
 
                 if not np.isfinite(error) or error >= abs(float(x[index])):
                     weakly_identified += 1
@@ -1909,6 +1955,27 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         self.shutter_in_thermostat_room = [
             glazing.thermostat_room for glazing in shaded
         ]
+        configured = [
+            glazing
+            for glazing in config.building.south_glazing
+            if glazing.extensions is not None
+        ]
+
+        if any(not glazing.thermostat_room for glazing in configured) or (
+            len(configured) > 1
+        ):
+            raise ValueError(
+                "building.south_glazing: extensions belong to one glazing, the "
+                "thermostat's room's - the shade model has one opening between "
+                "two walls, and the rest's glazing looks over them."
+            )
+
+        # The glazing floor to ceiling (see SouthGlazing.extensions).
+        self.extensions = {
+            side: depth_m * config.building.ceiling_height / glazing.glass_m2
+            for glazing in configured
+            for side, depth_m in zip(("east", "west"), glazing.extensions, strict=True)
+        }
         thermostat = config.building.thermostat.temperature
         matching = [
             i

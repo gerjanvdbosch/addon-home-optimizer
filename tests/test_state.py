@@ -191,6 +191,35 @@ def test_the_floors_plan_joins_the_heat_pumps(tmp_path):
     assert [p.value for p in plan.heat] == [6000.0, 3571.0, 3571.0]
 
 
+def test_the_thermal_mass_ahead_is_the_plans(tmp_path):
+    """The building model's estimate holds up to now; from there the slab is
+    the one the plan heats, not the zone left alone - which showed the slab
+    cooling all through a planned floor run."""
+    manager = _state_manager()
+    manager.state_repository = StateRepository(JsonStorage(tmp_path / "state.json"))
+    times = [NOW + timedelta(minutes=15 * i) for i in range(3)]
+    past = NOW - timedelta(minutes=15)
+    manager.update_zone(
+        temperature=pd.Series([20.0], index=[past]),
+        thermal_mass=pd.Series(
+            [20.5, 20.4, 20.3, 20.2], index=[past, *times], dtype=float
+        ),
+    )
+
+    manager.update_building_schedule(
+        heat_w=[3000.0, 3000.0, 0.0],
+        temperatures=[20.0, 20.1, 20.2],
+        times=times,
+        thermal_mass=[20.4, 20.8, 21.1],
+    )
+
+    mass = manager.load().predictions.thermal_mass
+    assert [(p.time, p.value) for p in mass] == [
+        (past, 20.5),
+        *zip(times, [20.4, 20.8, 21.1], strict=True),
+    ]
+
+
 def test_a_forecast_is_extended_with_the_day_before():
     """Beyond its end a forecast repeats its own day, however far: the
     afternoon sun comes back in the afternoon rather than held into the night."""

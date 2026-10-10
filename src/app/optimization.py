@@ -265,8 +265,8 @@ class Optimization:
         )
 
         # One plan for the one heat pump: the tank and, where it can be
-        # planned, the zone, sharing the compressor. Only the hot water part is
-        # acted on (see publish_dhw); the zone is not ours to drive yet.
+        # planned, the zone, sharing the compressor (see publish_dhw and
+        # publish_zone).
         dhw_only = MPCOptimizer(
             thermal_model=thermal_model, config=mpc_config, cop_model=cop_model
         )
@@ -283,21 +283,27 @@ class Optimization:
                 cop_model=cop_model,
                 **models,
             )
-            planned = dataclasses.replace(data, **inputs)
+            states = config.heat_pump.states
+            planned = dataclasses.replace(
+                data,
+                **inputs,
+                space_on_current=self.zone_running(
+                    *heat_pump_changes,
+                    states.cooling if inputs["zone_cooling"] else states.heating,
+                ),
+            )
 
+        # Stopped at its time limit, a plan with the zone is the best found by
+        # then, and kept: proving a 48-hour plan with the zone takes minutes,
+        # finding it seconds (real data: within 0.008 EUR of the optimum at
+        # 60 s, proven only at 144 s), and the next quarter's solve starts from
+        # it. Such plans were once dropped for hot water alone, after one was
+        # held by every warm start after (8 Oct 2026: 0.751 EUR against
+        # 0.672) - likely HiGHS reusing the warm start's instance, which
+        # proved plans optimal that were not (see MPCOptimizer.solve), rather
+        # than the time limit.
         try:
             result = optimizer.solve(planned)
-
-            # Stopped at its time limit, a plan with the zone is the best found
-            # by then, and that was at times no plan at all: hot water at
-            # 22:15 and a floor run after it for no comfort the zone lacked,
-            # held there by every warm start after (real data, 8 Oct 2026:
-            # 0.751 EUR against an optimum of 0.672). Hot water alone is
-            # proven in seconds.
-            if zone is not None and result.termination_condition.endswith(
-                "maxTimeLimit"
-            ):
-                raise RuntimeError("stopped at its time limit")
         except RuntimeError as error:
             if zone is None:
                 raise
@@ -350,6 +356,7 @@ class Optimization:
             supply_c=result.space_supply_c,
             power_w=result.space_electrical_w,
             on=result.space_schedule,
+            thermal_mass=result.zone_mass_temperatures,
         )
         self.publish_zone(
             result,
@@ -545,18 +552,35 @@ class Optimization:
         of two plans here is the one the optimizer would choose - and the total.
         The cost is the import at the price and the own sun at the export it
         forgoes; not the whole objective, which also prices starts and
-        shortfalls and so is no amount of money."""
+        shortfalls and so is no amount of money. Only the tank's: the plan's
+        electricity is the whole heat pump's, the zone's included."""
 
         runs = cls.dhw_runs(result.schedule)
 
         if not runs:
             return "no run within the horizon"
 
+        # A step serves the tank or the zone, never both, so the tank's share
+        # of a step's draw is all of it or none (real plan, 10 Oct 2026: 4.20
+        # kWh reported for a run of 1.22, the floor's 2.98 after it counted).
+        zone_w = result.space_electrical_w or (0.0,) * len(result.electrical_power_w)
+        tank_share = [
+            tank / (tank + zone) if tank + zone > 0.0 else 0.0
+            for tank, zone in zip(result.electrical_power_w, zone_w, strict=True)
+        ]
+        electricity_step_kwh = [
+            kwh * share
+            for kwh, share in zip(result.electricity_step_kwh, tank_share, strict=False)
+        ]
+        grid_step_kwh = [
+            kwh * share
+            for kwh, share in zip(result.grid_step_kwh, tank_share, strict=False)
+        ]
         cost_step_eur = [
             grid * import_ + (electricity - grid) * export
             for electricity, grid, import_, export in zip(
-                result.electricity_step_kwh,
-                result.grid_step_kwh,
+                electricity_step_kwh,
+                grid_step_kwh,
                 *optimizer.prices(data),
                 strict=False,
             )
@@ -576,13 +600,11 @@ class Optimization:
             )
             electricity_kwh = sum(
                 kwh
-                for kwh, d in zip(result.electricity_step_kwh, day, strict=False)
+                for kwh, d in zip(electricity_step_kwh, day, strict=False)
                 if d == date
             )
             grid_kwh = sum(
-                kwh
-                for kwh, d in zip(result.grid_step_kwh, day, strict=False)
-                if d == date
+                kwh for kwh, d in zip(grid_step_kwh, day, strict=False) if d == date
             )
             cost_eur = sum(
                 eur for eur, d in zip(cost_step_eur, day, strict=False) if d == date
@@ -594,7 +616,8 @@ class Optimization:
             )
 
         return " | ".join(days) + (
-            f" | total {result.electricity_kwh:.2f} kWh, EUR {sum(cost_step_eur):.3f}"
+            f" | total {sum(electricity_step_kwh):.2f} kWh, "
+            f"EUR {sum(cost_step_eur):.3f}"
         )
 
     @classmethod
@@ -806,12 +829,12 @@ class Optimization:
         floor buffer is made of. Only planned with a comfort ceiling
         configured.
 
-        Published for Home Assistant (see publish_zone), but the floor is run
-        outside this app, so a floor run under way is not the plan's to hold:
-        it is left out (space_on_current), rather than keep the tank waiting on
-        a run the plan cannot stop. The Ecodan hands over to hot water when
-        asked; were it not to, hot water would wait for the floor exactly as it
-        did before the zone was planned at all.
+        Published for Home Assistant (see publish_zone). A floor run under way
+        is the plan's to continue or stop (space_on_current, set by the
+        caller): left out, the plan saw the compressor off, stopped a run it
+        needed again half an hour later and paid a start for nothing. The tank
+        then waits at most a step, as for any hand-over from the floor (see
+        MPCOptimizer._add_space_heating).
 
         Cooled rather than heated while the heat pump is set to cool (see
         HeatPumpConfig.mode), from the cooling runs' own models, and only with
@@ -1012,6 +1035,24 @@ class Optimization:
         )
 
         return forecast_c
+
+    @staticmethod
+    def zone_running(
+        heat_pump_state: list[SeriesPoint],
+        compressor_frequency: list[SeriesPoint],
+        mode_state: str,
+    ) -> bool:
+        """Whether a floor run is under way: the compressor running in the
+        zone's mode now, so a plan that goes on with it makes no start. The
+        state alone does not say so - it stays on heating at 0 Hz between
+        runs. Without a frequency the state is all there is, as in
+        dhw_timing."""
+
+        return (
+            bool(heat_pump_state)
+            and heat_pump_state[-1].value == mode_state
+            and (not compressor_frequency or compressor_frequency[-1].value > 0.0)
+        )
 
     @staticmethod
     def running_since(changes: list[SeriesPoint], mode_state: str) -> datetime | None:

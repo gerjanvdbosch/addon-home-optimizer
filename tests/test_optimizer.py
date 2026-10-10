@@ -1,6 +1,7 @@
 import dataclasses
 from dataclasses import replace
 
+import highspy
 import numpy as np
 import pytest
 from pyomo.contrib.appsi.solvers.highs import Highs
@@ -20,7 +21,12 @@ from domain.physics import (
     zone_observation,
     zone_state_space,
 )
-from features.optimizer import MIP_ABSOLUTE_GAP_EUR, MPCOptimizer, surplus_scenarios
+from features.optimizer import (
+    MIP_ABSOLUTE_GAP_EUR,
+    MPCOptimizer,
+    plan_tank,
+    surplus_scenarios,
+)
 
 THERMAL_MODEL = BoilerThermalModel(
     volume_l=200.0,
@@ -488,7 +494,9 @@ def test_the_solve_starts_from_the_previous_plan_and_still_finds_the_best():
     optimizer = MPCOptimizer(THERMAL_MODEL, NO_EXPORT)
 
     model = optimizer._build_model(data)
-    assert optimizer._warm_start(model, data, Highs())
+    solver = optimizer._solver()
+    solver.set_instance(model)
+    assert optimizer._warm_start(model, data, solver)
     assert [round(model.tank_heating[k].value) for k in model.K][1:] == list(
         previous[1:]
     )
@@ -498,6 +506,45 @@ def test_the_solve_starts_from_the_previous_plan_and_still_finds_the_best():
 
     assert warm.schedule == cold.schedule
     assert not any(warm.schedule[:8])
+
+
+def test_the_plan_is_solved_apart_from_its_warm_start(monkeypatch):
+    """The warm start runs on a HiGHS instance of its own, and the plan on one
+    that has run nothing before. On the instance a warm start had just run on
+    - its previous plan no longer held - HiGHS proved a plan optimal at the
+    root that was not, on a model identical to a fresh instance's (real data:
+    0.4674 EUR against an optimum of 0.4656). Not reproduced on a small model,
+    so what is guarded is that the instance is never shared again. With the
+    zone: the tank alone is not solved by HiGHS at all (see plan_tank)."""
+
+    runs = []
+    run = highspy.Highs.run
+
+    def recorded(highs):
+        runs.append(highs)
+        return run(highs)
+
+    monkeypatch.setattr(highspy.Highs, "run", recorded)
+
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[18] = 45.0
+    # One that holds and one that does not: a single step is shorter than
+    # the compressor's minimum runtime.
+    for previous in ((2, 3, 4), (5,)):
+        runs.clear()
+        MPCOptimizer(THERMAL_MODEL, NO_EXPORT, building_model=BUILDING_MODEL).solve(
+            _zone_input(
+                target_temperature_top=tuple(target),
+                previous_tank_on=tuple(
+                    int(k in previous) for k in range(len(SOLAR_FORECAST_W))
+                ),
+            )
+        )
+
+        # The relaxation that proposes the tank's plans runs first (see
+        # MPCOptimizer._relaxed_zone): the warm start and the plan are last.
+        *_, warm_start, plan = runs
+        assert warm_start is not plan
 
 
 def test_validate_input_rejects_mismatched_target_length():
@@ -762,134 +809,43 @@ def test_lumped_state_space_matches_full_tank_capacity():
     assert b[0, 2] == pytest.approx(-1.0 / c_expected)
 
 
-def test_build_step_plan_keeps_fine_resolution_within_fine_horizon_hours():
-    """The first fine_horizon_hours worth of steps must map 1:1 onto model
-    steps at the native step_hours resolution; only steps beyond that are
-    grouped into coarser coarse_step_hours blocks.
-    """
+def test_a_long_horizon_meets_a_late_target():
+    """A 48h horizon, the longest the app plans (192 quarter-hour steps), is
+    planned at full resolution and still meets a target late on its second
+    day."""
 
-    config = MPCConfig(fine_horizon_hours=1.0, coarse_step_hours=1.0)
-    optimizer = MPCOptimizer(THERMAL_MODEL, config)
-
-    # step_hours=0.25 (default) -> 4 fine steps for 1.0h, then coarse blocks
-    # of 4 fine steps each (coarse_step_hours=1.0 / step_hours=0.25 = 4).
-    horizon = 12
-    plan = optimizer._build_step_plan(horizon)
-
-    assert plan.fine_to_model[:4] == [0, 1, 2, 3]
-    assert plan.dt_hours[:4] == [0.25, 0.25, 0.25, 0.25]
-    # Remaining 8 fine steps become 2 coarse model steps of 4 each.
-    assert plan.fine_to_model[4:8] == [4, 4, 4, 4]
-    assert plan.fine_to_model[8:12] == [5, 5, 5, 5]
-    assert plan.dt_hours[4:] == [1.0, 1.0]
-    assert plan.num_steps == 6
-
-
-def test_build_step_plan_stays_fully_fine_when_horizon_is_short():
-    """A horizon shorter than fine_horizon_hours must not be coarsened at
-    all - every fine step gets its own model step.
-    """
-
-    config = MPCConfig(fine_horizon_hours=100.0, coarse_step_hours=1.0)
-    optimizer = MPCOptimizer(THERMAL_MODEL, config)
-
-    horizon = 8
-    plan = optimizer._build_step_plan(horizon)
-
-    assert plan.fine_to_model == list(range(horizon))
-    assert plan.dt_hours == [0.25] * horizon
-
-
-def test_build_step_plan_handles_a_partial_trailing_coarse_block():
-    """A final coarse block shorter than coarse_step_hours (not enough
-    remaining fine steps to fill it) must use however many fine steps
-    actually remain, not silently drop them or overrun the horizon.
-    """
-
-    config = MPCConfig(fine_horizon_hours=0.5, coarse_step_hours=1.0)
-    optimizer = MPCOptimizer(THERMAL_MODEL, config)
-
-    # 2 fine steps (0.5h / 0.25h), then 5 remaining fine steps: one full
-    # coarse block of 4, one partial trailing block of 1.
-    horizon = 7
-    plan = optimizer._build_step_plan(horizon)
-
-    assert plan.fine_to_model == [0, 1, 2, 2, 2, 2, 3]
-    assert plan.dt_hours == [0.25, 0.25, 1.0, 0.25]
-    assert sum(plan.dt_hours) == pytest.approx(horizon * 0.25)
-
-
-def test_aggregate_uses_mean_and_max_correctly():
-    config = MPCConfig(fine_horizon_hours=0.25, coarse_step_hours=0.5)
-    optimizer = MPCOptimizer(THERMAL_MODEL, config)
-
-    plan = optimizer._build_step_plan(horizon=5)  # 1 fine + 2 coarse of 2
-
-    values = [10.0, 20.0, 30.0, 90.0, 10.0]
-    mean_agg = optimizer._aggregate(values, plan, lambda b: sum(b) / len(b))
-    max_agg = optimizer._aggregate(values, plan, max)
-
-    assert mean_agg == pytest.approx([10.0, 25.0, 50.0])
-    assert max_agg == pytest.approx([10.0, 30.0, 90.0])
-
-
-def test_coarsened_long_horizon_still_meets_a_late_target_with_fewer_variables():
-    """A 48h horizon (192 quarter-hour steps) with the default
-    fine_horizon_hours/coarse_step_hours must (a) still find a feasible
-    schedule that meets a target near the end of the horizon, and (b)
-    actually reduce the solver's own variable count relative to the
-    uncoarsened case - the entire point of this feature (see real-world
-    finding: solve time on a Raspberry Pi 5 was impractically slow at full
-    resolution for a horizon this long).
-    """
-
-    horizon = 192  # 48h at 15-minute steps
-    solar = [0.0] * horizon
+    horizon = 192
     target = [10.0] * horizon
-    # A deadline late in the second day, on a coarse step's boundary: the
-    # model checks a coarse step's target where the step starts, so a deadline
-    # inside it would see the tank's cooling over the rest of that step.
     target[168] = 45.0
 
     data = _make_input(
-        solar_forecast_w=solar,
+        solar_forecast_w=[0.0] * horizon,
         target_temperature_top=tuple(target),
         current_temp_top=20.0,
         current_temp_bottom=20.0,
     )
 
-    config = MPCConfig()  # defaults: fine_horizon_hours=18, coarse_step_hours=1
-    optimizer = MPCOptimizer(THERMAL_MODEL, config)
-
-    coarse_model = optimizer._build_model(data)
-    coarse_variable_count = len(list(coarse_model.boiler_on))
-
-    result = optimizer.solve(data)
+    result = MPCOptimizer(THERMAL_MODEL, MPCConfig()).solve(data)
 
     assert result.temperatures[168] >= 45.0 - 1e-6
     assert len(result.schedule) == horizon
     assert len(result.temperatures) == horizon
 
-    # Fully fine resolution would need one boiler_on per fine step.
-    assert coarse_variable_count < horizon
 
-
-def test_target_holds_through_a_coarse_look_ahead_block():
+def test_target_holds_through_each_step():
     """A target must hold for the whole step, not just where it starts.
 
     T[k] is the temperature at the START of step k, so checking only that
-    leaves a coasting tank free to sag below the target before the step ends.
-    Over a quarter hour that is worth hundredths of a kelvin; over the one-hour
-    blocks the far end of the horizon is aggregated into it is around 0.25 K,
-    and a real plan met its 18:00 target while dropping under it by 18:45.
+    leaves a coasting tank free to sag below the target before the step ends
+    (a real plan with one-hour steps met its 18:00 target while dropping under
+    it by 18:45).
     """
 
-    # Long enough that the far half is aggregated into coarse blocks.
-    horizon = int((MPCConfig().fine_horizon_hours + 12.0) * 4)
+    horizon = 48
     solar = (0.0,) * horizon
 
-    # A deadline inside the coarse region, held for a few hours so the tank has
-    # to still be above it at the end of a block and not only at its start.
+    # A deadline held for a few hours so the tank has to still be above it at
+    # the end of a step and not only at its start.
     # Kept clear of the very last step, whose end the model deliberately does
     # not represent - see end_temperature_rule.
     target = [10.0] * horizon
@@ -975,6 +931,32 @@ def _compressor_starts(result) -> int:
     return sum(1 for k, value in enumerate(on) if value and (k == 0 or not on[k - 1]))
 
 
+def test_the_zone_waits_while_the_booster_finishes_the_tank():
+    """The booster finishes the tank with the heat pump in its hot water mode,
+    which then serves nothing else: no step both heats the tank, by either
+    source, and serves the zone."""
+
+    thermal_model = replace(
+        THERMAL_MODEL,
+        heat_pump_max_tank_temperature_c=55.0,
+        max_tank_temperature_c=60.0,
+        booster_heat_w=2000.0,
+        booster_electrical_w=2400.0,
+    )
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[20] = 59.0
+    result = MPCOptimizer(
+        thermal_model, MPCConfig(), building_model=BUILDING_MODEL
+    ).solve(_zone_input(target_temperature_top=tuple(target)))
+
+    assert max(result.temperatures) > 55.0
+    assert any(result.space_schedule)
+    assert not any(
+        tank and space
+        for tank, space in zip(result.schedule, result.space_schedule, strict=True)
+    )
+
+
 def test_without_a_building_model_nothing_about_the_tank_changes():
     """Space heating is opt-in: no model, no second demand, same plan."""
 
@@ -1026,6 +1008,25 @@ def test_both_demands_are_served_in_one_compressor_start():
     assert any(result.schedule), "expected the tank to be heated"
     assert any(result.space_schedule), "expected the zone to be heated"
     assert _compressor_starts(result) == 1
+
+
+def test_a_floor_run_under_way_goes_on_without_a_start():
+    """A zone that needs heat now is served by the run already under way:
+    stopping it to start again pays a start for nothing (real data, 11 Oct:
+    the floor planned off for half an hour in the middle of its run)."""
+
+    optimizer = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=BUILDING_MODEL,
+    )
+    data = _zone_input(zone_target_temperature=(20.0,) * len(SOLAR_FORECAST_W))
+    idle = optimizer.solve(data)
+    running = optimizer.solve(replace(data, space_on_current=True))
+
+    assert running.space_schedule[0] == 1
+    assert running.objective_value < idle.objective_value
 
 
 def test_the_zone_reaches_its_target():
@@ -1094,6 +1095,60 @@ def test_the_tank_does_not_get_a_second_turn_within_one_run():
     # Both demands still met, so the rule did not simply forbid one of them.
     assert max(result.temperatures) >= 45.0 - 1e-6
     assert result.zone_temperatures[-1] >= 20.0 - 1e-6
+
+
+def test_heating_hands_the_compressor_from_the_zone_to_the_tank():
+    """A heating run of the zone and the tank share one compressor run in
+    either order: the zone first, then the tank, with no stop in between - a
+    stop pays a start and brings up the same loop after it (real data, 11
+    Oct: tank, zone, a stop and then the tank again)."""
+
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[16] = 45.0
+    result = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=BUILDING_MODEL,
+    ).solve(
+        _zone_input(
+            zone_target_temperature=(20.0,) * len(SOLAR_FORECAST_W),
+            target_temperature_top=tuple(target),
+            space_on_current=True,
+        )
+    )
+    zone = [k for k, on in enumerate(result.space_schedule) if on]
+    tank = [k for k, on in enumerate(result.schedule) if on]
+
+    assert zone and tank and max(zone) < min(tank)
+    assert _compressor_starts(result) == 1, "the run under way stopped"
+
+
+def test_hot_water_is_heated_in_one_block_the_booster_finishing_it():
+    """The heat pump to its limit and the booster on from there, one block
+    before the target - not a block before a zone run and the booster's after
+    it, with a second start (real data, 11 Oct)."""
+
+    thermal_model = replace(
+        THERMAL_MODEL,
+        heat_pump_max_tank_temperature_c=55.0,
+        max_tank_temperature_c=60.0,
+        booster_heat_w=2000.0,
+        booster_electrical_w=2400.0,
+    )
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[20] = 59.0
+    result = MPCOptimizer(
+        thermal_model,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=BUILDING_MODEL,
+    ).solve(_zone_input(target_temperature_top=tuple(target)))
+
+    assert max(result.temperatures) > 55.0
+    assert any(result.space_schedule)
+    assert _blocks(result.schedule) == 1
+    assert _compressor_starts(result) == 1
 
 
 def test_the_zone_may_still_be_served_before_and_after_the_tank():
@@ -1304,44 +1359,6 @@ def test_without_an_identified_ramp_every_step_is_a_full_one():
     )
 
 
-def test_a_coarse_block_reports_a_real_run_not_an_averaged_one():
-    """Inside an hour-long look-ahead block the heat pump still runs the way it
-    does: at its own output until it stops, not for an hour at a fraction of
-    it. The block's energy is the same either way - only where it lands inside
-    the block changes, and with it the tank's shape and the power reported.
-    """
-
-    horizon = 192
-    target = [10.0] * horizon
-    target[168] = 45.0
-
-    data = _make_input(
-        solar_forecast_w=[0.0] * horizon,
-        target_temperature_top=tuple(target),
-        current_temp_top=20.0,
-        current_temp_bottom=20.0,
-    )
-
-    optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig(), cop_model=COP_MODEL)
-    result = optimizer.solve(data)
-
-    coarse_on = [
-        k
-        for k, on in enumerate(result.schedule)
-        if on and k >= MPCConfig().fine_horizon_hours / MPCConfig().step_hours
-    ]
-    assert coarse_on, "expected the plan to heat in the coarse region"
-
-    heats = [result.heat_w[k] for k in coarse_on]
-    # Its own output, until the run's last step which carries what is left.
-    assert heats[0] == pytest.approx(THERMAL_MODEL.q_in_nominal_w, rel=0.01)
-    assert all(
-        earlier >= later - 1e-6
-        for earlier, later in zip(heats, heats[1:], strict=False)
-    )
-    assert all(heat > 0.0 for heat in heats)
-
-
 def test_a_higher_ceiling_buffers_the_sun_in_the_floor_and_the_ceiling_holds():
     """Room above the target is what a floor buffer is charged into: with it the
     plan moves heat into the sunny hours, and never past the ceiling."""
@@ -1440,9 +1457,8 @@ def test_space_runs_are_as_long_and_as_strong_as_the_heat_pump_makes_them():
         floor_circuit_model=space,
     ).solve(_cold_day())
 
-    fine_steps = int(MPCConfig().fine_horizon_hours / MPCConfig().step_hours)
-    on = list(result.space_schedule[:fine_steps])
-    heat = np.asarray(result.space_heat_w[:fine_steps])
+    on = list(result.space_schedule)
+    heat = np.asarray(result.space_heat_w)
 
     assert any(on), "expected the zone to be heated"
     # What a floor near room temperature takes from the curve's 26 degC water
@@ -1457,7 +1473,7 @@ def test_space_runs_are_as_long_and_as_strong_as_the_heat_pump_makes_them():
         elif value:
             runs[-1] += 1
 
-    # A run cut off by the end of the fine region may be shorter.
+    # A run cut off by the end of the horizon may be shorter.
     assert all(
         length >= MPCConfig().compressor_min_runtime_steps for length in runs[:-1]
     )
@@ -1587,7 +1603,14 @@ def test_net_metering_does_not_heat_today_for_a_cloudy_tomorrow():
         on = [k for k, value in enumerate(result.schedule[:96]) if value]
         return result.temperatures[on[-1] + 1]
 
-    assert run_end(MPCConfig()) < run_end(NO_EXPORT) - 0.5
+    # Net metering: an exported kWh credited at the import price. At the
+    # default export price instead own sun costs less than a third of grid
+    # power, and storing today's sun for tomorrow is then really cheaper.
+    net_metering = MPCConfig(
+        export_price_eur_per_kwh=MPCConfig().import_price_eur_per_kwh
+    )
+
+    assert run_end(net_metering) < run_end(NO_EXPORT) - 0.5
 
 
 def test_a_measured_supply_margin_does_not_depend_on_the_targets():
@@ -2099,3 +2122,58 @@ def test_the_surplus_scenarios_combine_the_solar_and_baseload_bands():
     )
 
     assert weight == 1.0 and only == pytest.approx([800.0, 0.0])
+
+
+TANK_BOOSTER_MODEL = replace(
+    THERMAL_MODEL,
+    heat_pump_max_tank_temperature_c=55.0,
+    max_tank_temperature_c=60.0,
+    booster_heat_w=2000.0,
+    booster_electrical_w=2400.0,
+)
+
+
+def _program_cost(optimizer: MPCOptimizer, data, plan=None) -> float:
+    """The tank's plan as the mixed integer program costs it: its own optimum,
+    or with the heat pump's and the booster's on/off fixed to `plan`."""
+
+    model = optimizer._build_model(data)
+
+    if plan is not None:
+        for k in model.K:
+            model.boiler_on[k].fix(int(plan.heat_pump_w[k] > 0.0))
+
+            if not model.booster_on[k].fixed:
+                model.booster_on[k].fix(int(plan.booster_w[k] > 0.0))
+
+    solver = Highs()
+    solver.highs_options = {"mip_abs_gap": MIP_ABSOLUTE_GAP_EUR, "mip_rel_gap": 0.0}
+    solver.config.load_solution = False
+
+    return solver.solve(model).best_feasible_objective
+
+
+@pytest.mark.parametrize(
+    ("thermal_model", "target_c"),
+    [(THERMAL_MODEL, 45.0), (TANK_BOOSTER_MODEL, 59.0)],
+    ids=["heat pump", "booster"],
+)
+def test_the_tanks_own_plan_is_the_programs_optimum(thermal_model, target_c):
+    """Dynamic programming over the tank finds the plan the mixed integer
+    program proves optimal: the same runs, costed the same by the program -
+    with the sun, the power line and a start's ramp, and the booster finishing
+    a run above the heat pump's limit."""
+
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[20] = target_c
+    data = _make_input(
+        target_temperature_top=tuple(target),
+        outdoor_temperature_forecast=(5.0,) * len(SOLAR_FORECAST_W),
+    )
+    optimizer = MPCOptimizer(thermal_model, MPCConfig(), cop_model=COP_MODEL)
+    plan = plan_tank(optimizer._tank_setting(data))
+
+    assert any(plan.heat_pump_w)
+    assert _program_cost(optimizer, data, plan) == pytest.approx(
+        _program_cost(optimizer, data), abs=MIP_ABSOLUTE_GAP_EUR
+    )

@@ -199,7 +199,7 @@ actions:
               "setpoint": "sensor.ecodan_heatpump_ca09ec_sww_setpoint_waarde",
               "top_temperature": "sensor.ecodan_heatpump_ca09ec_sww_2e_temp_sensor",
               "bottom_temperature": "sensor.ecodan_heatpump_ca09ec_sww_huidige_temp",
-              "ambient_temperature": "sensor.xiaomi_sensor_3_temperatuur",
+              "ambient_temperature": "sensor.ecodan_heatpump_ca09ec_zone_1_ruimte_temp",
               "volume": 200,
               "target_temperature": [
                 ["18:00", 45.0],
@@ -237,7 +237,7 @@ actions:
             ],
             "ceiling_height": 2.6,
             "south_glazing": [
-              [6.5, ["cover.woonkamer", "current_position"], 20.0, true],
+              [6.5, ["cover.woonkamer", "current_position"], 20.0, true, [2.4, 2.4]],
               [0.9, ["cover.slaapkamer_groot_1", "current_position"]],
               [0.9, ["cover.slaapkamer_groot_2", "current_position"]],
               [0.9, ["cover.slaapkamer_achter_3", "current_position"]]
@@ -309,7 +309,7 @@ actions:
       payload: |
         {{ {
           "target": "baseload"
-          "days": 90,
+          "days": 365,
         } | to_json }}
 ```
 
@@ -347,7 +347,7 @@ actions:
       payload: |
         {{ {
           "target": "baseload",
-          "days": 90,
+          "days": 365,
           "steps": 192
         } | to_json }}
 ```
@@ -367,7 +367,7 @@ actions:
       payload: |
         {{ {
           "target": "baseload",
-          "days": 90,
+          "days": 365,
           "trails": 5
         } | to_json }}
 ```
@@ -387,7 +387,7 @@ actions:
       payload: |
         {{ {
           "target": "boiler"
-          "days": 90,
+          "days": 365,
         } | to_json }}
 ```
 
@@ -406,7 +406,7 @@ actions:
       payload: |
         {{ {
           "target": "boiler"
-          "days": 90,
+          "days": 365,
         } | to_json }}
 ```
 

@@ -70,4 +70,11 @@ D = TypeVar("D", bound=DataDefinition, contravariant=True)
 class DataLoader(Protocol[D]):
     def supports(self, definition: DataDefinition) -> bool: ...
 
+    def prepare(
+        self, definitions: list[DataDefinition], start: datetime, end: datetime
+    ) -> None:
+        """Ready what loading these definitions over [start, end) takes, all
+        at once: for a remote source, in as few round trips as it can. What it
+        readies holds until it is next asked. Nothing by default."""
+
     def load(self, definition: D, start: datetime, end: datetime) -> pd.DataFrame: ...

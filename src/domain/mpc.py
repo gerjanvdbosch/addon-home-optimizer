@@ -44,20 +44,6 @@ class MPCConfig:
     # saves about 1 kWh or keeps a promise.
     weight_switching: float = 0.25
     weight_temperature_slack: float = 1000.0
-    # Decisions within this many hours of now keep the full step_hours
-    # resolution; steps beyond that are aggregated into coarse_step_hours
-    # blocks purely to shrink the MILP's own binary-variable count (see
-    # MPCOptimizer._build_step_plan) - confirmed on real data: solve time is
-    # dominated by proving optimality across many binaries, not by finding a
-    # good solution, so halving the variable count for the *look-ahead-only*
-    # portion of the horizon (re-solved at full precision before it is ever
-    # acted on) is a real, low-risk speedup. 24h keeps the next day's runs at
-    # full precision. Shorter is faster but not neutral: a run is dearer to fit
-    # in coarse blocks than in fine steps, so the plan pulls runs into the
-    # fine window (8 Oct 2026, 12h: hot water and floor at 02:15 for EUR 0.754
-    # against 12:30 for EUR 0.698 at 24h, by the shorter plan's own cost).
-    fine_horizon_hours: float = 24.0
-    coarse_step_hours: float = 1.0
     # A fallback, not the usual case (s): on real data a plan is proven optimal
     # in 1-8 s. Should a harder one come up, the best plan found by then is
     # used - better than a plan that never comes. 60 rather than 30: the Home
@@ -236,6 +222,9 @@ class MPCResult:
     space_schedule: tuple[int, ...] = ()
     space_heat_w: tuple[float, ...] = ()
     zone_temperatures: tuple[float, ...] = ()
+    # The slab under the thermostat's room the plan heats (deg C): the thermal
+    # mass the floor's heat lands in, as planned rather than left alone.
+    zone_mass_temperatures: tuple[float, ...] = ()
     # The supply each step runs the floor at (deg C), NaN where it does not:
     # the heat pump's own curve while heating, the plan's choice while cooling
     # - the setpoint to give it. Empty without a space-heating model.
