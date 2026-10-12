@@ -14,8 +14,12 @@ Cooling is the same floor run the other way, identified the same way from
 cooling runs: the heat is negative, the supply below the mass, and the supply
 is the one the heat pump holds by itself (real data: 0.5 K below its zone
 flow setpoint once settled). The conductance is the same pipes in the same
-screed, so both fits estimate one physical quantity (real data: 768 W/K from
-heating runs, 674 W/K from three cooling runs).
+screed, so both fits estimate one physical quantity. It is to the screed the
+building model estimates where it has one (see
+BuildingThermalIdentifier._fit_screed), which warms within the hour: against
+the slabs instead, one conductance read too little heat at a run's start and
+too much later (real data, 33 runs: 424 W off on runs left out, 207 W with
+the screed).
 """
 
 import logging
@@ -119,7 +123,9 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
             )
 
         prepared = self.building.prepare(df).reset_index(drop=True)
-        prepared["T_mass"] = self.building.estimate(df)["mass"].to_numpy()
+        # What the water delivers against: the screed it lies in where the
+        # building has one, else its slabs (see physics.zone_floor).
+        prepared["T_mass"] = self.building.estimate(df)["floor"].to_numpy()
 
         running = prepared["state"] == self.mode
         prepared["run"] = (running & ~running.shift(fill_value=False)).cumsum()

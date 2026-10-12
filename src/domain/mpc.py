@@ -125,8 +125,9 @@ class MPCInput:
     # one demand at a time, so adding the second only ever constrains it.
     #
     # The zone's state now, which the plan starts from (deg C, see
-    # physics.zone_state_space): the two rooms and their slabs. The slabs are
-    # not measured, so it is the Kalman filter's estimate (see
+    # physics.zone_state_space): the two rooms and their slabs, and their
+    # screeds where the floor has them. Those are not measured, so it is the
+    # Kalman filter's estimate (see
     # building.kalman_states). A plan needs them: starting a screed at its
     # room's temperature would claim a cold floor is as ready to heat as a
     # charged one. Empty plans no zone.

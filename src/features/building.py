@@ -35,6 +35,7 @@ from domain.physics import (
     floor_heat_w,
     internal_gain_w,
     solar_gain_w,
+    zone_floor,
     zone_observation,
     zone_observations,
     zone_slab,
@@ -336,6 +337,27 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     MAX_UA_CEILING_W_PER_M2_K = 6.0
     INITIAL_UA_CEILING_W_PER_M2_K = 3.0
 
+    # The screed (see _fit_screed), per m2 of floor: 1 to 15 cm of it (some
+    # 2000 kg/m3 at 850 J/kgK), and at most half the slabs; from the water to
+    # it and from it down to the concrete, anything a floor's pipes and
+    # layers conduct. A loose physical range, not an expectation. With it the
+    # floor's heat held out of a run was predicted to 207 W against 424 W for
+    # one conductance to the slabs (33 runs, Jun-Oct 2026), which read too
+    # little at a run's start and too much later; and the building with the
+    # screed at the floor's surface predicted the living room as well
+    # (0.120 K) and its floor runs better (0.117 against 0.136 K) on thirds
+    # left out.
+    MIN_SCREED_J_PER_M2_K = 20.0e3
+    MAX_SCREED_J_PER_M2_K = 300.0e3
+    INITIAL_SCREED_J_PER_M2_K = 100.0e3
+    MIN_SCREED_W_PER_M2_K = 1.0
+    MAX_SCREED_W_PER_M2_K = 100.0
+    INITIAL_SCREED_WATER_W_PER_M2_K = 10.0
+    INITIAL_SCREED_DOWN_W_PER_M2_K = 20.0
+    # Three parameters, each read off a different part of a run - its start,
+    # how fast that falls, where it settles: a few runs before they separate.
+    MIN_SCREED_RUNS = 5
+
     # Share of the baseload dissipated inside the zone. The zone is the whole
     # dwelling and the baseload every appliance but the heat pump, so nearly
     # all of it: only hot water down the drain and appliances outside leave.
@@ -376,6 +398,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # (see SouthGlazing.extensions): side -> depth over its width. Fixed,
         # not fitted.
         self.extensions: dict[str, float] = {}
+        # The floor's screed, (capacity J/K, conductance to its slab W/K), read
+        # off the floor's runs before each fit (see _fit_screed) and held
+        # through it; none until a model to read it against has been saved.
+        self.screed: tuple[float, float] = (0.0, 0.0)
 
     @property
     def name(self) -> str:
@@ -549,6 +575,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             extension_east_depth_ratio=float(x[11]),
             extension_west_depth_ratio=float(x[12]),
             ua_ceiling_w_per_k=float(x[13]),
+            screed_capacity_j_per_k=self.screed[0],
+            screed_to_slab_w_per_k=self.screed[1],
         )
 
     def load(self, path) -> None:
@@ -564,6 +592,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         if self.model is not None:
             self.pv_power_per_irradiance_m2 = self.model.pv_power_per_irradiance_m2
+            self.screed = (
+                self.model.screed_capacity_j_per_k,
+                self.model.screed_to_slab_w_per_k,
+            )
 
     def _shutter_open_fraction(
         self, df: pd.DataFrame, thermostat_room: bool | None = None
@@ -1145,7 +1177,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.MIN_UA_ENVELOPE_W_PER_K,
                 self.MIN_UA_AIR_MASS_W_PER_M2_K * floor_m2,
                 air_capacity,
-                self.MIN_C_MASS_J_PER_M2_K * floor_m2,
+                # At least the screed and the least of a floor under it.
+                self.MIN_C_MASS_J_PER_M2_K * floor_m2 + self.screed[0],
                 0.0,
                 0.0,
                 0.0,
@@ -1252,6 +1285,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         sky = self._measured_sky(df)
         df["I_facade_w_per_m2"] *= sky
         df["I_facade_direct_w_per_m2"] *= sky
+        self.screed = self._fit_screed(df)
 
         median_dt = float(df["dt_seconds"].median())
 
@@ -1735,9 +1769,18 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         model = self.get_model()
         prepared = self.prepare(df)
 
+        return self._states_frame(
+            model, self._filtered(model, prepared), prepared["time"].to_numpy()
+        )
+
+    def _filtered(
+        self, model: BuildingThermalModel, prepared: pd.DataFrame
+    ) -> np.ndarray:
+        """The filter's estimate of every state over a prepared frame."""
+
         a, b = zone_state_space(model)
 
-        estimates = kalman_states(
+        return kalman_states(
             a,
             b,
             prepared[["T_living", "T_rest"]].to_numpy(dtype=float),
@@ -1749,19 +1792,160 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             self.DISTURBANCE_INPUTS,
         )
 
-        return self._states_frame(model, estimates, prepared["time"].to_numpy())
+    def _fit_screed(self, df: pd.DataFrame) -> tuple[float, float]:
+        """(screed J/K, its conductance down to the slabs W/K) from the
+        floor's runs in a prepared frame, either mode: what the rooms alone
+        hardly show - a layer that passes the heat on within the hour - the
+        water sees in full, as a run's heat falling as it warms (see
+        physics.zone_state_space). (0, 0) without a saved model to estimate
+        the slabs by, or too few runs.
+
+        Each run followed from its start with the screed at its slab's
+        temperature - nothing has heated it apart yet - its heat from the
+        water, Q = G (supply - screed), shared with the slabs below and the
+        rooms above through the floor's surface, at the saved model's
+        surface conductance: the slabs as that model estimates them, the
+        rooms as measured, both floors taken as one by floor area. Scored on
+        the heat where the compressor had settled. G is the floor circuit's
+        to identify (see features.floor), against the screed this fixes.
+        Bounded per m2 of floor (see MIN_SCREED_J_PER_M2_K) and below the
+        slabs' whole capacity, which holds it.
+        """
+
+        # Here, not at the top: see validate().
+        from features.cop import HeatPumpCOPIdentifier
+
+        saved = self.model
+
+        if saved is None:
+            return 0.0, 0.0
+
+        share = saved.living_area_fraction
+        slab = self._filtered(saved, df) @ zone_slab(saved)
+        room = share * df["T_living"] + (1.0 - share) * df["T_rest"]
+        running = df["state"].isin((self.states.heating, self.states.cooling))
+        begins = running & (
+            ~running.shift(fill_value=False) | (df["state"] != df["state"].shift())
+        )
+        frame = pd.DataFrame(
+            {
+                "time": df["time"],
+                "run": begins.cumsum(),
+                "supply": df["T_supply"],
+                "heat": df["Q_floor_w"],
+                "slab": slab,
+                "room": room,
+            }
+        )[running.to_numpy()].dropna()
+        start = frame["time"].groupby(frame["run"]).transform("min")
+        frame["settled"] = frame["time"] - start >= HeatPumpCOPIdentifier.STARTUP
+        runs = [run for _, run in frame.groupby("run") if len(run) >= 3]
+
+        if len(runs) < self.MIN_SCREED_RUNS:
+            return 0.0, 0.0
+
+        floor_m2 = sum(self.room_areas_m2)
+        dt_s = float(df["dt_seconds"].median())
+        surface = saved.ua_air_mass_w_per_k
+
+        def residuals(log_x: np.ndarray) -> np.ndarray:
+            water, capacity, down = np.exp(log_x)
+            errors = []
+
+            for run in runs:
+                supply, slab_c, room_c = (
+                    run[name].to_numpy(dtype=float)
+                    for name in ("supply", "slab", "room")
+                )
+                total = water + down + surface
+                decay = np.exp(-total / capacity * dt_s)
+                mean = (1.0 - decay) / (total / capacity * dt_s)
+                screed_c = slab_c[0]
+                heat = []
+
+                # Each step exactly: the screed relaxes to where the water's
+                # heat and its losses balance.
+                for k in range(len(run)):
+                    balance = (
+                        water * supply[k] + down * slab_c[k] + surface * room_c[k]
+                    ) / total
+                    heat.append(
+                        water * (supply[k] - balance - (screed_c - balance) * mean)
+                    )
+                    screed_c = balance + (screed_c - balance) * decay
+
+                errors.append(
+                    (np.array(heat) - run["heat"].to_numpy(dtype=float))[
+                        run["settled"].to_numpy(dtype=bool)
+                    ]
+                )
+
+            # In kW, so the residuals sit near 1.
+            return np.concatenate(errors) / 1000.0
+
+        lower = np.log(
+            [
+                self.MIN_SCREED_W_PER_M2_K * floor_m2,
+                self.MIN_SCREED_J_PER_M2_K * floor_m2,
+                self.MIN_SCREED_W_PER_M2_K * floor_m2,
+            ]
+        )
+        upper = np.log(
+            [
+                self.MAX_SCREED_W_PER_M2_K * floor_m2,
+                min(
+                    self.MAX_SCREED_J_PER_M2_K * floor_m2,
+                    0.5 * saved.c_mass_j_per_k,
+                ),
+                self.MAX_SCREED_W_PER_M2_K * floor_m2,
+            ]
+        )
+        initial = np.log(
+            [
+                self.INITIAL_SCREED_WATER_W_PER_M2_K * floor_m2,
+                self.INITIAL_SCREED_J_PER_M2_K * floor_m2,
+                self.INITIAL_SCREED_DOWN_W_PER_M2_K * floor_m2,
+            ]
+        )
+        fit = least_squares(
+            residuals, np.clip(initial, lower, upper), bounds=(lower, upper)
+        )
+        water, capacity, down = map(float, np.exp(fit.x))
+        logger.info(
+            "Building thermal calibration: screed %.1f MJ/K (%.0f kJ/m2K) on to "
+            "the slabs at %.0f W/K, the water to it at %.0f W/K, over %d runs",
+            capacity / 1e6,
+            capacity / floor_m2 / 1e3,
+            down,
+            water,
+            len(runs),
+        )
+
+        return capacity, down
 
     STATE_NAMES = ("living", "rest", "slab_living", "slab_rest")
+    SCREED_NAMES = ("screed_living", "screed_rest")
+
+    @classmethod
+    def state_names(cls, model: BuildingThermalModel) -> tuple[str, ...]:
+        """The zone's states by name (see physics.zone_state_space)."""
+
+        if model.screed_capacity_j_per_k:
+            return cls.STATE_NAMES + cls.SCREED_NAMES
+
+        return cls.STATE_NAMES
 
     @classmethod
     def _states_frame(
         cls, model: BuildingThermalModel, states: np.ndarray, index: np.ndarray
     ) -> pd.DataFrame:
-        """The states by name, with `mass` the slabs' mean the floor circuit
-        delivers against (see physics.zone_slab)."""
+        """The states by name, with `mass` the slabs' mean (see
+        physics.zone_slab) and `floor` what the floor circuit delivers against
+        (see physics.zone_floor)."""
 
-        frame = pd.DataFrame(states, columns=list(cls.STATE_NAMES), index=index)
+        frame = pd.DataFrame(states, columns=list(cls.state_names(model)), index=index)
         frame["mass"] = states @ zone_slab(model)
+        frame["floor"] = states @ zone_floor(model)
 
         return frame
 

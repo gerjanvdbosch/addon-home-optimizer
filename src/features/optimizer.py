@@ -22,10 +22,11 @@ from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.physics import (
     CP_WATER_J_PER_KG_K,
     RHO_WATER_KG_PER_L,
+    ZONE_SCREED_STATES,
     ZONE_SLAB_STATES,
     lumped_tank_state_space,
+    zone_floor,
     zone_observation,
-    zone_slab,
     zone_state_space,
 )
 
@@ -2760,8 +2761,14 @@ class MPCOptimizer:
 
         a, b = zone_state_space(building)
         observation = zone_observation(building)
-        slab = zone_slab(building)
         num_states = a.shape[0]
+        initial = np.array([float(t) for t in data.zone_state])
+
+        if len(initial) != num_states:
+            raise ValueError(
+                f"The zone's state has {len(initial)} values, the building "
+                f"model {num_states}: estimate it with this model."
+            )
 
         # The rooms - air, furnishings, internal walls - and the slabs the
         # floor's heat lands in (see BuildingThermalModel).
@@ -2776,9 +2783,7 @@ class MPCOptimizer:
         model.zone_constraints = pyo.ConstraintList()
 
         for i in model.ZONE_STATES:
-            model.zone_constraints.add(
-                model.zone_state[0, i] == float(data.zone_state[i])
-            )
+            model.zone_constraints.add(model.zone_state[0, i] == float(initial[i]))
 
         # Evaluated at a representative floor-circuit supply temperature and
         # the outdoor temperature of each step, so a cold day costs what a cold
@@ -2960,8 +2965,6 @@ class MPCOptimizer:
         # weight_temperature_slack, an unavoidable shortfall of a few
         # hundredths of a degree had the solver proving plans to a millionth
         # of one: over a minute for a plan it had found in seconds.
-        initial = np.array([float(t) for t in data.zone_state])
-
         def states_with(heat_w: float) -> list[np.ndarray]:
             state = initial
             states = [state]
@@ -3063,21 +3066,27 @@ class MPCOptimizer:
         if cooling and data.zone_mass_minimum_c:
             mass_minimum_c = data.zone_mass_minimum_c
 
+            # The screeds too, where the floor has them: its surface.
+            layers = ZONE_SLAB_STATES + (ZONE_SCREED_STATES if num_states > 4 else ())
+
             for k in range(num_steps):
-                for i in ZONE_SLAB_STATES:
+                for i in layers:
                     model.zone_constraints.add(
                         model.zone_state[k, i]
                         >= min(mass_minimum_c[k], float(unheated[k][i]))
                     )
 
-        # The temperature the floor's water delivers against: the slabs' mean,
-        # one circuit running through both (see zone_slab).
+        # The temperature the floor's water delivers against: the screeds it
+        # heats first where the floor has them, else the slabs' mean, one
+        # circuit running through both (see zone_floor).
+        against = zone_floor(building)
+
         def sink_c(state: np.ndarray) -> float:
-            return float(slab @ state)
+            return float(against @ state)
 
         def sink(k: int):
             return sum(
-                float(slab[i]) * model.zone_state[k, i] for i in model.ZONE_STATES
+                float(against[i]) * model.zone_state[k, i] for i in model.ZONE_STATES
             )
 
         # How the heat pump runs the floor by itself, once heating runs have
@@ -3258,6 +3267,21 @@ class MPCOptimizer:
                 lo_k, hi_k = supply_range(k)
                 lo_next, hi_next = supply_range(k + 1)
                 on_k, on_next = model.space_on[k], model.space_on[k + 1]
+
+                # Nor does a run's heat rise: held at its setpoint the floor
+                # takes less as its screed warms, and a setpoint raised within
+                # the run holds the heat, not more of it (real data, 11 Oct
+                # 2026: 4.6 kW falling to 3.0 kW at 24.8-25.5 degC). Per step
+                # the plan sat at the compressor's least heat and ended a run
+                # 50% higher - within a tenth of a cent of a steady run, the
+                # solver's own tolerance; on eight days this held runs steady
+                # for at most 0.23 cent, every solve as quick. Exact in the
+                # binaries' four cases: no bound beyond the most heat unless
+                # both steps run.
+                model.zone_constraints.add(
+                    sign * model.q_space_w[k + 1]
+                    <= sign * model.q_space_w[k] + max_heat_w * (2 - on_k - on_next)
+                )
 
                 # Where the ranges do not overlap the order holds by itself.
                 if cooling and hi_next >= lo_k:

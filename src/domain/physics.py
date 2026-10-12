@@ -182,39 +182,59 @@ def zone_state_space(
     """Continuous state-space of the zone for dx/dt = A x + B u - what the
     Kalman filter, a rollout and the MPC all drive (see BuildingThermalModel).
 
-    x = [T_living, T_rest, T_slab_living, T_slab_rest],
+    x = [T_living, T_rest, T_slab_living, T_slab_rest] and, where the floor
+    has a screed, [T_screed_living, T_screed_rest] after them;
     u = [T_outdoor, Q_internal, Q_solar_living, Q_solar_rest, Q_floor].
 
     Q_internal and Q_floor are the dwelling's, divided by floor area; each
-    room's sun is its own glazing's. The rest's slab exchanges with the living
-    room below it too, through its ceiling.
+    room's sun is its own glazing's. The floor's heat enters each floor's top
+    layer - its screed, or without one its slab - which is the surface its
+    room sees; a screed passes it on to the concrete below. The rest's slab
+    exchanges with the living room below it too, through its ceiling.
     """
 
     share = model.living_area_fraction
     shares = np.array([share, 1.0 - share])
     c_room = model.c_air_j_per_k * shares
-    c_slab = model.c_mass_j_per_k * shares
-    ua_slab = model.ua_air_mass_w_per_k * shares
+    c_screed = model.screed_capacity_j_per_k * shares
+    c_slab = model.c_mass_j_per_k * shares - c_screed
+
+    if np.any(c_slab <= 0.0):
+        raise ValueError("The screed holds more heat than the slabs it lies on.")
+
+    ua_surface = model.ua_air_mass_w_per_k * shares
+    ua_down = model.screed_to_slab_w_per_k * shares
     ua_env = model.ua_envelope_w_per_k * np.array(
         [model.living_envelope_fraction, 1.0 - model.living_envelope_fraction]
     )
     ua_rooms = model.ua_rooms_w_per_k
+    screed = bool(model.screed_capacity_j_per_k)
+    size = 6 if screed else 4
 
-    a = np.zeros((4, 4))
-    b = np.zeros((4, 5))
+    a = np.zeros((size, size))
+    b = np.zeros((size, 5))
 
     for room, other in ((0, 1), (1, 0)):
         slab = room + 2
-        a[room, room] = -(ua_env[room] + ua_rooms + ua_slab[room]) / c_room[room]
+        top = room + 4 if screed else slab
+        c_top = c_screed[room] if screed else c_slab[room]
+
+        a[room, room] = -(ua_env[room] + ua_rooms + ua_surface[room]) / c_room[room]
         a[room, other] = ua_rooms / c_room[room]
-        a[room, slab] = ua_slab[room] / c_room[room]
-        a[slab, room] = ua_slab[room] / c_slab[room]
-        a[slab, slab] = -ua_slab[room] / c_slab[room]
+        a[room, top] = ua_surface[room] / c_room[room]
+        a[top, room] = ua_surface[room] / c_top
+        a[top, top] = -ua_surface[room] / c_top
 
         b[room, 0] = ua_env[room] / c_room[room]
         b[room, 1] = shares[room] / c_room[room]
         b[room, 2 + room] = 1.0 / c_room[room]
-        b[slab, 4] = shares[room] / c_slab[room]
+        b[top, 4] = shares[room] / c_top
+
+        if screed:
+            a[top, top] -= ua_down[room] / c_top
+            a[top, slab] = ua_down[room] / c_top
+            a[slab, top] = ua_down[room] / c_slab[room]
+            a[slab, slab] = -ua_down[room] / c_slab[room]
 
     ceiling = model.ua_ceiling_w_per_k
     a[0, 0] -= ceiling / c_room[0]
@@ -225,25 +245,37 @@ def zone_state_space(
     return a, b
 
 
+def zone_size(model: BuildingThermalModel) -> int:
+    """How many states the zone has (see zone_state_space)."""
+
+    return 6 if model.screed_capacity_j_per_k else 4
+
+
+def _surfaces(model: BuildingThermalModel) -> tuple[int, int]:
+    """Each floor's top layer, the surface its room sees."""
+
+    return ZONE_SCREED_STATES if model.screed_capacity_j_per_k else ZONE_SLAB_STATES
+
+
 def zone_observations(model: BuildingThermalModel) -> np.ndarray:
     """What the zone's thermometers read of its state, one row each: the
     living room's thermostat and the rest of the house's sensors averaged by
     floor area.
 
     Operative temperatures: a wall-mounted sensor exchanges longwave radiation
-    with the floor as well as the room, so it follows its slab in part (see
-    BuildingThermalModel.sensor_mass_fraction). A measurement equation, not a
-    heat balance: it moves no energy.
+    with the floor as well as the room, so it follows the floor's surface in
+    part (see BuildingThermalModel.sensor_mass_fraction). A measurement
+    equation, not a heat balance: it moves no energy.
     """
 
     fraction = model.sensor_mass_fraction
+    rows = np.zeros((2, zone_size(model)))
 
-    return np.array(
-        [
-            [1.0 - fraction, 0.0, fraction, 0.0],
-            [0.0, 1.0 - fraction, 0.0, fraction],
-        ]
-    )
+    for room, surface in enumerate(_surfaces(model)):
+        rows[room, room] = 1.0 - fraction
+        rows[room, surface] = fraction
+
+    return rows
 
 
 def zone_observation(model: BuildingThermalModel) -> np.ndarray:
@@ -254,17 +286,33 @@ def zone_observation(model: BuildingThermalModel) -> np.ndarray:
 
 
 def zone_slab(model: BuildingThermalModel) -> np.ndarray:
-    """Row vector of the slabs' mean temperature, by floor area: what the
-    floor circuit delivers its heat against, the one water runs through both."""
+    """Row vector of the slabs' mean temperature, by floor area: the
+    building's thermal mass."""
 
     share = model.living_area_fraction
+    row = np.zeros(zone_size(model))
+    row[list(ZONE_SLAB_STATES)] = [share, 1.0 - share]
 
-    return np.array([0.0, 0.0, share, 1.0 - share])
+    return row
 
 
-# The zone's slab states (see zone_state_space): each must stay above the dew
-# point while cooling, since each has a floor surface the air touches.
+def zone_floor(model: BuildingThermalModel) -> np.ndarray:
+    """Row vector of the temperature the floor circuit delivers its heat
+    against, the one water running through both floors: their screeds' mean
+    by floor area, or without them their slabs'."""
+
+    share = model.living_area_fraction
+    row = np.zeros(zone_size(model))
+    row[list(_surfaces(model))] = [share, 1.0 - share]
+
+    return row
+
+
+# The zone's slab and screed states (see zone_state_space): each must stay
+# above the dew point while cooling - a screed is the floor's surface, the
+# rest's slab the living room's ceiling.
 ZONE_SLAB_STATES = (2, 3)
+ZONE_SCREED_STATES = (4, 5)
 
 
 def floor_heat_w(

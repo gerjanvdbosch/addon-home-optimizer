@@ -903,7 +903,7 @@ class Optimization:
         # The plan starts where the filter's estimate of the whole zone state
         # stands at its first step: both rooms and their slabs.
         planned = zone.reindex(pd.DatetimeIndex(times))
-        state_names = list(BuildingThermalIdentifier.STATE_NAMES)
+        state_names = list(identifier.state_names(identifier.model))
 
         if planned[state_names].iloc[0].isna().any():
             logger.info("Zone not planned: no zone estimate at %s", times[0])

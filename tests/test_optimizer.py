@@ -1479,6 +1479,44 @@ def test_space_runs_are_as_long_and_as_strong_as_the_heat_pump_makes_them():
     )
 
 
+def test_a_run_into_a_screed_falls_off_as_it_warms():
+    """On its own curve the heat pump holds its supply; the water heats the
+    screed first, so a run delivers less each step as that warms."""
+
+    building = replace(
+        TWO_NODE, screed_capacity_j_per_k=4.0e6, screed_to_slab_w_per_k=800.0
+    )
+    space = FloorCircuitModel(
+        supply_at_zero_outdoor_c=28.0,
+        supply_per_outdoor_k=0.0,
+        conductance_w_per_k=600.0,
+    )
+    day = _cold_day()
+    # The screeds at their slabs' temperature, nothing having heated them.
+    day = replace(day, zone_state=day.zone_state + day.zone_state[2:4])
+    result = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=building,
+        floor_circuit_model=space,
+    ).solve(day)
+
+    on = list(result.space_schedule)
+    heat = np.asarray(result.space_heat_w)
+    first = on.index(1)
+    last = first
+
+    while last + 1 < len(on) and on[last + 1] and heat[last + 1] > 0.0:
+        last += 1
+
+    # From its second step: the first is the horizon's first, a start part of
+    # a quarter hour.
+    assert last - first >= 3, "expected a run of several steps"
+    assert np.all(np.diff(heat[first + 1 : last + 1]) <= 1e-6)
+    assert heat[last] < heat[first + 1] - 300.0
+
+
 HEATING = FloorCircuitModel(
     supply_at_zero_outdoor_c=28.0,
     supply_per_outdoor_k=-0.4,
@@ -1496,6 +1534,21 @@ def _heat(space_cop_model=COP_MODEL):
         floor_circuit_model=HEATING,
         space_cop_model=space_cop_model,
     ).solve(_cold_day(steps=48))
+
+
+def test_a_runs_heat_never_rises():
+    """The plan chooses the supply, and with it the heat - but within a run
+    only ever holds or lowers it, as the heat pump at its setpoint does."""
+
+    result = _heat()
+    on = list(result.space_schedule)
+    heat = np.asarray(result.space_heat_w)
+
+    assert any(on), "expected the zone to be heated"
+
+    for k in range(len(on) - 1):
+        if on[k] and on[k + 1]:
+            assert heat[k + 1] <= heat[k] + 1e-6
 
 
 def test_the_plan_chooses_the_heating_supply():

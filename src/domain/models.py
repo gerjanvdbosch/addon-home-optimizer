@@ -231,6 +231,16 @@ class BuildingThermalModel:
     # SouthGlazing.extensions).
     extension_east_depth_ratio: float = 0.0
     extension_west_depth_ratio: float = 0.0
+    # The screed the floor's pipes lie in, each floor's top layer: its heat
+    # capacity (J/K), part of the slabs' c_mass_j_per_k, and its conductance
+    # down to the concrete below (W/K). The water heats it first and it
+    # passes the heat on within the hour, so a run's heat falls as it warms;
+    # its surface is the floor the rooms see (see physics.zone_state_space).
+    # Read off the floor's runs, not the rooms (see
+    # BuildingThermalIdentifier._fit_screed). 0.0 for none: the floor's heat
+    # then enters the slabs directly - and a model saved before it.
+    screed_capacity_j_per_k: float = 0.0
+    screed_to_slab_w_per_k: float = 0.0
     # From the rest's slab down to the living room through its ceiling (W/K):
     # the upper floor's screed, with the floor heating in it, lies on the
     # concrete floor that is the living room's ceiling. Zero is no floor of
@@ -253,8 +263,10 @@ class FloorCircuitModel:
     # Its heating curve, supply = a + b * T_outdoor (deg C, K per K).
     supply_at_zero_outdoor_c: float
     supply_per_outdoor_k: float
-    # From the supply water to the building's thermal mass (W/K), both the
-    # screed's uptake and the water cooling through the loop.
+    # From the supply water to the floor it heats (W/K), the water cooling
+    # through the loop included: to the screed the pipes lie in where the
+    # building has one (see BuildingThermalModel.screed_capacity_j_per_k),
+    # else to its slabs.
     conductance_w_per_k: float
     # The least heat a settled run moves (W, a magnitude): the compressor at
     # its lowest speed. Asked for less, the heat pump cannot turn down further

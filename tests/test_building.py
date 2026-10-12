@@ -1117,6 +1117,88 @@ def test_the_upper_slab_warms_the_living_room_through_its_ceiling():
     }
 
 
+def test_a_screed_holds_part_of_the_slabs_heat_at_the_floors_surface():
+    """With a screed each floor's top layer is it: the floor's heat enters it
+    alone, it passes the heat up to its room and down to the concrete, and
+    the zone stores the same heat - the screed's capacity taken from the
+    slabs'. Without one, the four states as before."""
+
+    model = replace(
+        TRUE_MODEL, screed_capacity_j_per_k=6.0e6, screed_to_slab_w_per_k=1900.0
+    )
+    a, b = zone_state_space(model)
+    share = model.living_area_fraction
+    shares = np.array([share, 1.0 - share])
+    capacity = np.concatenate(
+        [
+            model.c_air_j_per_k * shares,
+            (model.c_mass_j_per_k - 6.0e6) * shares,
+            6.0e6 * shares,
+        ]
+    )
+    uniform = np.full(6, 20.0)
+
+    stored = capacity @ (a @ uniform + b @ np.array([20.0, 0.0, 0.0, 0.0, 1000.0]))
+    assert stored == pytest.approx(1000.0)
+    assert np.nonzero(b[:, 4])[0].tolist() == [4, 5]
+    # Surface up to the room, conductance down to the concrete.
+    assert capacity[0] * a[0, 4] == pytest.approx(model.ua_air_mass_w_per_k * share)
+    assert capacity[4] * a[4, 2] == pytest.approx(1900.0 * share)
+    assert zone_observations(model)[0, 4] == model.sensor_mass_fraction
+    assert zone_state_space(TRUE_MODEL)[0].shape == (4, 4)
+
+
+def test_the_screed_is_read_off_how_runs_fall_off():
+    """A run's heat at one supply falls as its screed warms: from the start
+    and how fast and how far it falls, the screed's capacity and its
+    conductance down to the slabs."""
+
+    capacity, down, water = 9.0e6, 1900.0, 900.0
+    surface = TRUE_MODEL.ua_air_mass_w_per_k
+    identifier = _identifier()
+    identifier.model = TRUE_MODEL
+    rng = np.random.default_rng(5)
+    rows, slabs = [], []
+    time = pd.Timestamp("2026-07-01T00:00Z")
+
+    for run in range(8):
+        supply = rng.uniform(15.0, 18.0) if run % 2 else 25.0
+        slab, room = rng.uniform(19.0, 22.0), rng.uniform(20.0, 23.0)
+        total = water + down + surface
+        balance = (water * supply + down * slab + surface * room) / total
+        decay = np.exp(-total / capacity * DT_SECONDS)
+        mean = (1.0 - decay) / (total / capacity * DT_SECONDS)
+        screed = slab
+
+        for step in range(12 + 4):
+            on = step < 12
+            heat = water * (supply - balance - (screed - balance) * mean) if on else 0.0
+            screed = balance + (screed - balance) * decay if on else slab
+            rows.append(
+                {
+                    "time": time,
+                    "state": "Koelen" if run % 2 else "Verwarmen",
+                    "T_supply": supply if on else np.nan,
+                    "Q_floor_w": heat + (rng.normal(0.0, 30.0) if on else 0.0),
+                    "T_living": room,
+                    "T_rest": room,
+                    "dt_seconds": DT_SECONDS,
+                }
+            )
+            if not on:
+                rows[-1]["state"] = "Uit"
+            slabs.append(slab)
+            time += pd.Timedelta(seconds=DT_SECONDS)
+
+    states = np.zeros((len(slabs), 4))
+    states[:, 2] = states[:, 3] = slabs
+    identifier._filtered = lambda model, df: states
+    fitted, fitted_down = identifier._fit_screed(pd.DataFrame(rows))
+
+    assert fitted == pytest.approx(capacity, rel=0.15)
+    assert fitted_down == pytest.approx(down, rel=0.15)
+
+
 def test_observation_is_air_alone_without_a_radiant_share():
     assert zone_observation(TRUE_MODEL).tolist() == [1.0, 0.0, 0.0, 0.0]
 
