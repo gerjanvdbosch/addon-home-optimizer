@@ -44,6 +44,15 @@ class MPCConfig:
     # saves about 1 kWh or keeps a promise.
     weight_switching: float = 0.25
     weight_temperature_slack: float = 1000.0
+    # What a zone away from its wanted temperature costs (EUR per K^2 per
+    # hour): a comfort choice, not physics. Squared, so a small dip costs next
+    # to nothing and a large one a lot: 0.1 K for an hour half a cent, 1 K for
+    # four hours 2 EUR. Holding the zone a degree warmer costs this house about
+    # a cent an hour (some 280 W/K to outdoors and attic, a COP near 4.5), so
+    # a running heat pump holds the target; a dip deepening to 0.4 K and back
+    # over the four hours before the sun returns costs some 0.1 EUR, less than
+    # the start and least run it saves (weight_switching and more).
+    weight_comfort_eur_per_k2h: float = 0.5
     # A fallback, not the usual case (s): on real data a plan is proven optimal
     # in 1-8 s. Should a harder one come up, the best plan found by then is
     # used - better than a plan that never comes. 60 rather than 30: the Home
@@ -132,14 +141,15 @@ class MPCInput:
     # room's temperature would claim a cold floor is as ready to heat as a
     # charged one. Empty plans no zone.
     zone_state: tuple[float, ...] = ()
-    # Comfort floor per step for the thermostat's room, as a schedule rather
-    # than one number.
+    # The temperature wanted per step in the thermostat's room (deg C, see
+    # config.ComfortSchedule): away from it towards discomfort - colder while
+    # heating, warmer while cooling - costs weight_comfort_eur_per_k2h.
     zone_target_temperature: tuple[float, ...] = ()
-    # Comfort ceiling per step: how warm buffering heat may make the zone.
-    # Empty means none.
+    # The hard edges of the comfort band per step (deg C). The maximum is also
+    # how warm buffering heat may make the zone, the minimum how cold
+    # buffering cold may. Empty bounds nothing.
+    zone_minimum_temperature: tuple[float, ...] = ()
     zone_maximum_temperature: tuple[float, ...] = ()
-    # How far below the target the zone may dip before it counts (K).
-    zone_comfort_tolerance_c: float = 0.0
     # Heat entering the zone that no decision can change (W): appliances,
     # lighting and people, and the sun through the glazing. Both warm the room
     # node (see physics.zone_state_space), but they are forecast apart.

@@ -87,9 +87,6 @@ def test_the_dashboard_draws_a_cooling_plan():
     now = datetime.now(UTC).replace(second=0, microsecond=0)
     times = [now + timedelta(minutes=15 * i) for i in range(12)]
     state = State()
-    state.schedule.heat_pump.heat = [
-        SeriesPoint(time=t, value=3571.0 if i < 4 else 0.0) for i, t in enumerate(times)
-    ]
     state.schedule.building.supply = [
         SeriesPoint(time=t, value=14.5) for t in times[:4]
     ] + [SeriesPoint(time=times[8], value=15.0)]
@@ -101,9 +98,31 @@ def test_the_dashboard_draws_a_cooling_plan():
     html = dashboard_chart(state)
 
     assert "Supply plan" in html
-    assert "Heat pump heat" in html
     assert html.count('"name":"Dew point"') == 1
     assert to_local_time(measured_at).isoformat() in html
+
+
+def test_the_dashboard_draws_the_comfort_band():
+    """The band filled between its edges, the wanted temperature within it,
+    all three toggled together."""
+
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    times = [now + timedelta(minutes=15 * i) for i in range(4)]
+    state = State()
+    building = state.schedule.building
+
+    for points, value in (
+        ("minimum_temperature", 19.0),
+        ("target_temperature", 20.0),
+        ("maximum_temperature", 22.0),
+    ):
+        setattr(building, points, [SeriesPoint(time=t, value=value) for t in times])
+
+    html = dashboard_chart(state)
+
+    assert html.count('"legendgroup":"comfort"') == 3
+    # Filled up to the band's upper edge, as Solcast's is.
+    assert html.count('"fill":"tonexty"') == 2
 
 
 MODEL = BoilerThermalModel(

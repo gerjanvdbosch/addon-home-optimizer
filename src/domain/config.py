@@ -228,18 +228,32 @@ class Thermostat(BaseModel):
     setpoint: SensorReference = Field()
 
 
+# The zone's comfort over the day: from each time of day, the temperature
+# wanted (deg C) and how far the zone may go below and above it (K). Away from
+# the wanted temperature towards discomfort costs the plan
+# MPCConfig.weight_comfort_eur_per_k2h; the band's edges are hard. The other
+# side is free up to its edge: warmer while heating is heat buffered in the
+# floor, cooler while cooling cold buffered - both already paid for in energy.
+ComfortSchedule = list[tuple[time, float, NonNegativeFloat, NonNegativeFloat]]
+
+
+class ComfortTargets(BaseModel):
+    """Heating and cooling each their own comfort: a summer's band is not a
+    winter's. A mode without one is not planned."""
+
+    heating: ComfortSchedule | None = None
+    cooling: ComfortSchedule | None = None
+
+
 class BuildingConfig(BaseModel):
     thermostat: Thermostat = Field()
-    target_temperature: float | list[tuple[time, float]] = Field()
-    # The warmest the zone may be heated to (deg C), a schedule like the target.
-    # Buffering heat in the floor means heating above the target while heat is
-    # cheap, and this is the ceiling of that: without one, cheap heat would be
-    # stored without limit. None plans no space heating at all.
-    maximum_temperature: float | list[tuple[time, float]] | None = Field(default=None)
-    # How far below the target the zone may dip without counting as a shortfall
-    # (K). A comfort choice, not physics: 0 holds the target exactly, down to a
-    # predicted dip of hundredths of a degree that no one would notice.
-    comfort_tolerance: float = Field(default=0.0, ge=0.0)
+    # One schedule for both modes, or one per mode.
+    target_temperature: ComfortSchedule | ComfortTargets = Field()
+    # How tightly the plan holds the wanted temperature (EUR per K^2 per
+    # hour, see MPCConfig.weight_comfort_eur_per_k2h): lower lets the zone
+    # dip further to save a run, higher holds it closer. 0 leaves it free
+    # within the band, to its edge.
+    comfort_weight: float = Field(default=MPCConfig.weight_comfort_eur_per_k2h, ge=0.0)
     # Every room that belongs to the modelled zone. The building model averages
     # their sensors into one representative zone temperature, which is what a
     # whole-dwelling energy balance needs: the delivered heat and the baseload
@@ -299,6 +313,24 @@ class BuildingConfig(BaseModel):
     # chance of condensation. On, a day the tank has been heated is not cooled
     # again until local midnight (see MPCOptimizer._add_space_heating).
     dhw_after_cooling: bool = Field(default=True)
+
+    def comfort(self, cooling: bool) -> tuple[list[tuple[time, float]], ...] | None:
+        """A mode's comfort as three schedules: the wanted temperature and the
+        band's edges below and above it. None where the mode has none."""
+
+        schedule = self.target_temperature
+
+        if isinstance(schedule, ComfortTargets):
+            schedule = schedule.cooling if cooling else schedule.heating
+
+        if schedule is None:
+            return None
+
+        return (
+            [(start, target) for start, target, _, _ in schedule],
+            [(start, target - below) for start, target, below, _ in schedule],
+            [(start, target + above) for start, target, _, above in schedule],
+        )
 
 
 class SolcastAttributes(BaseModel):

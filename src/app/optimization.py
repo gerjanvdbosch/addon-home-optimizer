@@ -64,7 +64,9 @@ class Optimization:
         state = self.state_manager.load()
         config = self.config_repository.load()
 
-        mpc_config = MPCConfig()
+        mpc_config = MPCConfig(
+            weight_comfort_eur_per_k2h=config.building.comfort_weight
+        )
 
         # From the quarter hour running now to the end of tomorrow, the
         # clock's choice rather than however far the last solar prediction
@@ -826,8 +828,8 @@ class Optimization:
         state update: one load and one filter pass give both the state a plan
         starts from and the measured temperature and thermal mass the dashboard
         draws. Two-node, because only that structure has the thermal mass a
-        floor buffer is made of. Only planned with a comfort ceiling
-        configured.
+        floor buffer is made of. Only planned with a comfort schedule for
+        the mode (see BuildingConfig.comfort).
 
         Published for Home Assistant (see publish_zone). A floor run under way
         is the plan's to continue or stop (space_on_current, set by the
@@ -895,9 +897,14 @@ class Optimization:
             temperature=zone["measured"].dropna(), thermal_mass=zone["slab_living"]
         )
 
-        maximum = config.building.maximum_temperature
+        # The heat pump's own mode unless this run asks for one (see
+        # OptimizeConfig.cooling).
+        if cooling is None:
+            cooling = self.state_manager.cooling(state, config)
 
-        if maximum is None:
+        comfort = config.building.comfort(cooling)
+
+        if comfort is None:
             return None
 
         # The plan starts where the filter's estimate of the whole zone state
@@ -909,12 +916,6 @@ class Optimization:
             logger.info("Zone not planned: no zone estimate at %s", times[0])
             return None
 
-        states = config.heat_pump.states
-        mode = state.measurements.heat_pump.mode
-        # The heat pump's own mode unless this run asks for one (see
-        # OptimizeConfig.cooling).
-        if cooling is None:
-            cooling = bool(mode) and str(mode[-1].value).startswith(states.cooling)
         dew_point_c = self._dew_point_forecast(state, times, mpc_config)
 
         if cooling and dew_point_c is None:
@@ -931,19 +932,18 @@ class Optimization:
                 )
             )
 
+        target_c, minimum_c, maximum_c = (
+            tuple(
+                point.value
+                for point in self.state_manager.resolve_schedule(schedule, times)
+            )
+            for schedule in comfort
+        )
         inputs = dict(
             zone_state=tuple(float(c) for c in planned[state_names].iloc[0]),
-            zone_target_temperature=tuple(
-                point.value
-                for point in self.state_manager.resolve_schedule(
-                    config.building.target_temperature, times
-                )
-            ),
-            zone_maximum_temperature=tuple(
-                point.value
-                for point in self.state_manager.resolve_schedule(maximum, times)
-            ),
-            zone_comfort_tolerance_c=config.building.comfort_tolerance,
+            zone_target_temperature=target_c,
+            zone_minimum_temperature=minimum_c,
+            zone_maximum_temperature=maximum_c,
             # Extended where the weather forecast behind the estimate does not
             # reach; no gain assumed without any. The sun through the glazing
             # is not: as for the solar forecast, none where none is forecast.
@@ -970,7 +970,7 @@ class Optimization:
                 to_local_time(t).toordinal() for t in times
             )
             inputs["dhw_earlier_today"] = any(
-                point.value == states.dhw
+                point.value == config.heat_pump.states.dhw
                 for point in state.measurements.heat_pump.state
             )
 

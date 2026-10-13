@@ -142,7 +142,11 @@ class HeatPumpSchedule(BaseModel):
 
 
 class BuildingSchedule(BaseModel):
+    # The comfort band of the heat pump's mode, wanted temperature and edges
+    # (see config.ComfortSchedule), over today and tomorrow.
     target_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
+    minimum_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
+    maximum_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
     # The zone's part of the plan, for comparison with what the thermostats
     # do - not acted on yet (see Optimization._zone). Its heat and power are
     # the heat pump's (see HeatPumpSchedule).

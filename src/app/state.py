@@ -8,6 +8,7 @@ import pandas as pd
 
 from domain.config import Config
 from domain.dataset import DatasetDefinition
+from domain.mpc import MPCConfig
 from domain.physics import tank_stratification_k
 from domain.state import SeriesPoint, State
 from domain.time import local_day_start, to_local_time
@@ -477,9 +478,28 @@ class StateManager:
                         config.heat_pump.boiler.target_temperature, times
                     )
                 )
-                state.schedule.building.target_temperature = self.resolve_schedule(
-                    config.building.target_temperature, times
-                )
+                # Over the whole of today and tomorrow, the dashboard's window,
+                # not only the measured part of it: the band the plan keeps to.
+                step = timedelta(hours=MPCConfig().step_hours)
+                start = local_day_start(state.updated).astimezone(timezone.utc)
+                end = local_day_start(state.updated, days=2)
+                window = [start + i * step for i in range((end - start) // step)]
+                comfort = config.building.comfort(self.cooling(state, config))
+
+                for field, schedule in zip(
+                    (
+                        "target_temperature",
+                        "minimum_temperature",
+                        "maximum_temperature",
+                    ),
+                    comfort or ([], [], []),
+                    strict=True,
+                ):
+                    setattr(
+                        state.schedule.building,
+                        field,
+                        self.resolve_schedule(schedule, window) if schedule else [],
+                    )
 
         return state
 
@@ -547,6 +567,16 @@ class StateManager:
             return series.ffill().bfill().tolist()
 
         return series.fillna(fallback).tolist()
+
+    @staticmethod
+    def cooling(state: State, config: Config) -> bool:
+        """Whether the heat pump is set to cool (see HeatPumpConfig.mode)."""
+
+        mode = state.measurements.heat_pump.mode
+
+        return bool(mode) and str(mode[-1].value).startswith(
+            config.heat_pump.states.cooling
+        )
 
     def resolve_schedule(
         self,

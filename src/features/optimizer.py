@@ -54,6 +54,14 @@ MIP_ABSOLUTE_GAP_EUR = 0.001
 # MIP_ABSOLUTE_GAP_EUR, the tolerance the plan is proven to anyway.
 EXCESS_TANGENT_SPACING_K = 2.0
 
+# The same for the square of the zone's distance from its wanted temperature
+# (see MPCConfig.weight_comfort_eur_per_k2h): missed by at most a quarter of
+# the spacing squared, 0.01 K^2 at 0.2 K - at 0.5 EUR/K^2h half a cent an
+# hour, far finer than that price is known. 0.1 K made the same plans on real
+# data (13 Oct, a zone started 1-1.5 K under its target) in three times the
+# time: 8 s against 2.6.
+COMFORT_TANGENT_SPACING_K = 0.2
+
 # HiGHS's presolve, off. On this model it cut off the optimal plan and proved
 # a dearer one optimal, three times on real data with the zone: 2.076 EUR
 # against 1.802 on a 46-hour plan, 1.7095 against 1.7085 on another, and a
@@ -2744,6 +2752,7 @@ class MPCOptimizer:
             return
 
         target_c = data.zone_target_temperature
+        minimum_c = data.zone_minimum_temperature or None
         maximum_c = data.zone_maximum_temperature or None
         none_w = (0.0,) * num_steps
         internal_gain_w = data.zone_internal_gain_w or none_w
@@ -2779,6 +2788,8 @@ class MPCOptimizer:
         )
         model.zone_slack = pyo.Var(model.K, domain=pyo.NonNegativeReals)
         model.zone_excess = pyo.Var(model.K, domain=pyo.NonNegativeReals)
+        model.zone_discomfort_k = pyo.Var(model.K, domain=pyo.NonNegativeReals)
+        model.zone_discomfort_k2 = pyo.Var(model.K, domain=pyo.NonNegativeReals)
 
         model.zone_constraints = pyo.ConstraintList()
 
@@ -2993,39 +3004,57 @@ class MPCOptimizer:
         coolest = [np.minimum(a, b) for a, b in zip(flat_out, unheated, strict=True)]
         reachable_c = [float(observation @ state) for state in warmest]
         unheated_c = [float(observation @ state) for state in coolest]
-        tolerance_c = float(data.zone_comfort_tolerance_c)
 
         # Comfort at both ends of a step, for the same reason the tank's target
         # is checked at both: T[k] is the value at a step's START.
         for k in range(num_steps):
-            model.zone_constraints.add(
-                measured(k) + model.zone_slack[k]
-                >= min(float(target_c[k]) - tolerance_c, reachable_c[k])
-            )
+            ends = (k, k + 1) if k + 1 < num_steps else (k,)
+            span_k = 0.0
 
-            if k + 1 < num_steps:
+            # How far the zone is from its wanted temperature towards
+            # discomfort, a target it cannot reach taken as far as it can.
+            for j in ends:
+                if cooling:
+                    wanted_c = max(float(target_c[k]), unheated_c[j])
+                    away = measured(j) - wanted_c
+                    edge_c = float(maximum_c[k]) if maximum_c else reachable_c[j]
+                    span_k = max(span_k, min(edge_c, reachable_c[j]) - wanted_c)
+                else:
+                    wanted_c = min(float(target_c[k]), reachable_c[j])
+                    away = wanted_c - measured(j)
+                    edge_c = float(minimum_c[k]) if minimum_c else unheated_c[j]
+                    span_k = max(span_k, wanted_c - max(edge_c, unheated_c[j]))
+
+                model.zone_constraints.add(model.zone_discomfort_k[k] >= away)
+
+            # Its square, bounded from below by tangents as far as the band
+            # reaches: beyond its edge the slacks below take over.
+            for point_k in np.arange(
+                COMFORT_TANGENT_SPACING_K,
+                span_k + COMFORT_TANGENT_SPACING_K,
+                COMFORT_TANGENT_SPACING_K,
+            ):
                 model.zone_constraints.add(
-                    measured(k + 1) + model.zone_slack[k]
-                    >= min(float(target_c[k]) - tolerance_c, reachable_c[k + 1])
+                    model.zone_discomfort_k2[k]
+                    >= 2.0 * point_k * model.zone_discomfort_k[k] - point_k**2
                 )
 
-            # The ceiling, soft like the target: sun alone can push the zone
-            # past it, and a plan must still exist then. Only heat the plan
-            # adds is its to answer for, and the excess is priced as dearly as
-            # a shortfall.
-            if maximum_c is None:
-                continue
+            # The band's edges, soft only so that a plan must still exist where
+            # sun alone pushes the zone past the ceiling, or a cold night below
+            # the floor: only what the plan can change is its to answer for,
+            # priced as dearly as the tank's target.
+            for j in ends:
+                if minimum_c is not None:
+                    model.zone_constraints.add(
+                        measured(j) + model.zone_slack[k]
+                        >= min(float(minimum_c[k]), reachable_c[j])
+                    )
 
-            model.zone_constraints.add(
-                measured(k) - model.zone_excess[k]
-                <= max(float(maximum_c[k]), unheated_c[k])
-            )
-
-            if k + 1 < num_steps:
-                model.zone_constraints.add(
-                    measured(k + 1) - model.zone_excess[k]
-                    <= max(float(maximum_c[k]), unheated_c[k + 1])
-                )
+                if maximum_c is not None:
+                    model.zone_constraints.add(
+                        measured(j) - model.zone_excess[k]
+                        <= max(float(maximum_c[k]), unheated_c[j])
+                    )
 
         # A zone that leaves its comfort band by step k when left alone needs
         # the compressor before then: a start, unless it runs now - the zone's
@@ -3037,15 +3066,14 @@ class MPCOptimizer:
             for k in range(1, num_steps):
                 left_c = float(observation @ unheated[k])
 
-                if cooling:
-                    if maximum_c is None:
-                        break
+                if (maximum_c if cooling else minimum_c) is None:
+                    break
 
+                if cooling:
                     missed_c = left_c - max(float(maximum_c[k]), unheated_c[k])
                     slack = model.zone_excess[k]
                 else:
-                    missed_c = min(float(target_c[k]) - tolerance_c, reachable_c[k])
-                    missed_c -= left_c
+                    missed_c = min(float(minimum_c[k]), reachable_c[k]) - left_c
                     slack = model.zone_slack[k]
 
                 if missed_c > 0.0:
@@ -3331,12 +3359,17 @@ class MPCOptimizer:
 
             objective += self.config.weight_temperature_slack * model.slack[k]
 
-            # Comfort in the zone is weighed the same as the tank's target:
-            # both are promises the plan made, and neither is worth trading for
-            # a few cents of electricity.
+            # The zone's band is weighed the same as the tank's target: both
+            # are promises the plan made, and neither is worth trading for a
+            # few cents of electricity. Within it, comfort is traded.
             if hasattr(model, "zone_slack"):
                 objective += self.config.weight_temperature_slack * (
                     model.zone_slack[k] + model.zone_excess[k]
+                )
+                objective += (
+                    self.config.weight_comfort_eur_per_k2h
+                    * dt_hours[k]
+                    * model.zone_discomfort_k2[k]
                 )
 
         return objective

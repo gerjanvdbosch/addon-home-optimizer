@@ -912,6 +912,8 @@ def _zone_input(**overrides) -> MPCInput:
         zone_internal_gain_w=(0.0,) * len(SOLAR_FORECAST_W),
     )
     defaults.update(overrides)
+    # The target held exactly, unless a test asks for a band below it.
+    defaults.setdefault("zone_minimum_temperature", defaults["zone_target_temperature"])
 
     return _make_input(**defaults)
 
@@ -1388,6 +1390,7 @@ def test_a_higher_ceiling_buffers_the_sun_in_the_floor_and_the_ceiling_holds():
         outdoor_temperature_forecast=(5.0,) * steps,
         zone_state=_zone_state(20.1, 20.4),
         zone_target_temperature=tuple(np.where(hour < 22.0, 20.0, 18.0)),
+        zone_minimum_temperature=tuple(np.where(hour < 22.0, 20.0, 18.0)),
         zone_internal_gain_w=(150.0,) * steps,
     )
     optimizer = MPCOptimizer(
@@ -1417,6 +1420,7 @@ def _cold_day(steps: int = 96, **overrides):
         zone_internal_gain_w=(150.0,) * steps,
     )
     defaults.update(overrides)
+    defaults.setdefault("zone_minimum_temperature", defaults["zone_target_temperature"])
 
     return _make_input(**defaults)
 
@@ -1586,15 +1590,91 @@ def test_without_a_heating_cop_model_the_plan_keeps_to_the_curve():
     assert np.asarray(result.space_supply_c)[on] == pytest.approx(HEATING.supply_c(5.0))
 
 
-def test_a_comfort_tolerance_lets_small_predicted_dips_go():
-    optimizer = MPCOptimizer(
-        THERMAL_MODEL, MPCConfig(), cop_model=COP_MODEL, building_model=TWO_NODE
+def _mild_day(below_k: float, sun_w: float = 0.0, weight: float = 0.5):
+    """A mild day begun just under the target, with or without sun through
+    the glazing from 10:00 to 16:00, planned with a band below_k deep."""
+
+    steps = 96
+    hour = (np.arange(steps) * 0.25 + 6.0) % 24.0
+    target = np.where(hour < 22.0, 20.0, 18.0)
+    data = _cold_day(
+        steps,
+        outdoor_temperature_forecast=(12.0,) * steps,
+        zone_state=_zone_state(19.6, 19.8),
+        zone_minimum_temperature=tuple(target - below_k),
+        zone_solar_gain_w=tuple(np.where((hour >= 10.0) & (hour < 16.0), sun_w, 0.0)),
     )
+    result = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(weight_comfort_eur_per_k2h=weight),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE,
+    ).solve(data)
 
-    exact = optimizer.solve(_cold_day())
-    tolerant = optimizer.solve(_cold_day(zone_comfort_tolerance_c=0.3))
+    return hour, target, result
 
-    assert sum(tolerant.space_heat_w) < sum(exact.space_heat_w)
+
+def test_a_band_lets_the_morning_dip_that_the_sun_brings_back():
+    """Held to its target, the zone is heated in the morning; with a band
+    below it the plan lets the morning dip go where the sun brings the zone
+    back - never past the band's edge."""
+
+    hour, target, exact = _mild_day(0.0, sun_w=2000.0)
+    _, _, banded = _mild_day(1.0, sun_w=2000.0)
+    morning = hour < 10.0
+
+    assert np.asarray(exact.space_heat_w)[morning].sum() > 0.0
+    assert np.asarray(banded.space_heat_w)[morning].sum() == pytest.approx(0.0)
+    assert sum(banded.space_heat_w) < sum(exact.space_heat_w)
+    assert (np.asarray(banded.zone_temperatures) >= target - 1.0 - 1e-6).all()
+
+
+def test_the_comfort_weight_holds_the_zone_near_its_target():
+    """Without a price on comfort the plan lets the zone sit at the band's
+    edge; with one, a day without sun is held near the target - the dip is
+    squared, so most of it costs more than the heat that prevents it."""
+
+    _, target, free = _mild_day(1.0, weight=0.0)
+    _, _, priced = _mild_day(1.0)
+
+    def shortfall(result):
+        return np.maximum(target - np.asarray(result.zone_temperatures), 0.0)
+
+    assert shortfall(free).max() == pytest.approx(1.0, abs=0.01)
+    # No more than the zone starts below its target.
+    assert shortfall(priced).max() <= 0.4 + 1e-6
+    assert shortfall(priced).mean() < 0.25 * shortfall(free).mean()
+
+
+def test_cooling_is_free_below_its_target_and_priced_above():
+    """The mirror of heating: a zone above its wanted temperature is cooled
+    towards it - priced, rather than left at the band's edge - but not past
+    it, which costs energy and buys no comfort."""
+
+    def zone(weight: float) -> np.ndarray:
+        result = MPCOptimizer(
+            THERMAL_MODEL,
+            MPCConfig(weight_comfort_eur_per_k2h=weight),
+            cop_model=COP_MODEL,
+            building_model=TWO_NODE,
+            floor_circuit_model=COOLING,
+            space_cop_model=replace(COP_MODEL, cooling=True),
+        ).solve(
+            _hot_day(
+                zone_state=_zone_state(25.0, 24.5),
+                zone_target_temperature=(23.0,) * HOT_DAY_STEPS,
+                zone_minimum_temperature=(20.0,) * HOT_DAY_STEPS,
+                zone_maximum_temperature=(25.0,) * HOT_DAY_STEPS,
+            )
+        )
+
+        return np.asarray(result.zone_temperatures)
+
+    free, priced = zone(0.0), zone(0.5)
+
+    assert free.max() <= 25.0 + 1e-6
+    assert priced.mean() < free.mean() - 1.0
+    assert priced.min() >= 23.0 - 0.05
 
 
 def test_space_heating_is_costed_with_the_heating_cop_once_there_is_one():
@@ -1926,7 +2006,8 @@ def _hot_day(**overrides):
         target_temperature_top=(10.0,) * steps,
         outdoor_temperature_forecast=(30.0,) * steps,
         zone_state=_zone_state(24.0, 23.5),
-        zone_target_temperature=(18.0,) * steps,
+        zone_target_temperature=(22.5,) * steps,
+        zone_minimum_temperature=(18.0,) * steps,
         zone_maximum_temperature=(22.5,) * steps,
         zone_internal_gain_w=(150.0,) * steps,
         zone_cooling=True,

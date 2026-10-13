@@ -1,14 +1,14 @@
 # Home Optimizer
 
+A Home Assistant addon that learns your home's thermal behavior and uses model
+predictive control to schedule your heat pump around solar production and electricity
+prices.
+
 > ⚠️ **Work in Progress**
 >
 > This project is currently under development and should be considered experimental.
 > Features, configuration, and API endpoints may change at any time. It is not yet
 > recommended for production use.
-
-A Home Assistant addon that learns your home's thermal behavior and uses model
-predictive control to schedule your heat pump around solar production and electricity
-prices.
 
 ## Requirements
 
@@ -222,12 +222,16 @@ actions:
               "temperature": "sensor.danfoss_15_temperature",
               "setpoint": ["climate.danfoss_icon_woonkamer", "temperature"]
             },
-            "target_temperature": [
-              ["18:00", 20.0],
-              ["22:00", 19.0]
-            ],
-            "maximum_temperature": 21.5,
-            "comfort_tolerance": 0.3,
+            "target_temperature": {
+              "heating": [
+                ["18:00", 20.0, 1.0, 1.5],
+                ["22:00", 19.0, 1.0, 2.5]
+              ],
+              "cooling": [
+                ["00:00", 24.0, 2.0, 1.0]
+              ]
+            },
+            "comfort_weight": 0.5,
             "rooms": [
               [6.0, "sensor.danfoss_0_temperature"],
               [10.0, "sensor.danfoss_1_temperature"],

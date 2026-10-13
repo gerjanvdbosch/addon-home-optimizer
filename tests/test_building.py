@@ -82,7 +82,7 @@ def _config() -> Config:
                 "temperature": "sensor.living_room",
                 "setpoint": "climate.living_room",
             },
-            "target_temperature": 20.0,
+            "target_temperature": [["00:00", 20.0, 1.0, 1.0]],
             # Two rooms of unequal size, so an area-weighted mean differs from
             # a plain one - the distinction _shutter_open_fraction and the zone
             # temperature both rest on. The second uses the compact

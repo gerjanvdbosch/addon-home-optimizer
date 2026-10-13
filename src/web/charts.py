@@ -161,37 +161,41 @@ def dashboard_chart(
     def series(name: str, points: list, **kwargs) -> None:
         add_series(fig, name, in_window(points), **kwargs)
 
-    solcast_p10 = in_window(state.forecast.solcast.p10)
-    solcast_p90 = in_window(state.forecast.solcast.p90)
+    def band(
+        lower: list,
+        upper: list,
+        fillcolor: str,
+        legendgroup: str,
+        row: int,
+        edge_line: dict | None = None,
+    ) -> None:
+        """The area between two series, toggled with the line it belongs to
+        and left out of the hover."""
 
-    fig.add_trace(
-        go.Scatter(
-            x=[to_local_time(p.time) for p in solcast_p10],
-            y=[p.value for p in solcast_p10],
-            mode="lines",
-            line=dict(width=0),
-            showlegend=False,
-            legendgroup="solar",
-            hoverinfo="skip",
-        ),
-        row=1,
-        col=1,
-    )
+        for points, fill in ((lower, None), (upper, "tonexty")):
+            points = in_window(points)
+            fig.add_trace(
+                go.Scatter(
+                    x=[to_local_time(p.time) for p in points],
+                    y=[p.value for p in points],
+                    mode="lines",
+                    line=edge_line or dict(width=0),
+                    fill=fill,
+                    fillcolor=fillcolor,
+                    showlegend=False,
+                    legendgroup=legendgroup,
+                    hoverinfo="skip",
+                ),
+                row=row,
+                col=1,
+            )
 
-    fig.add_trace(
-        go.Scatter(
-            x=[to_local_time(p.time) for p in solcast_p90],
-            y=[p.value for p in solcast_p90],
-            mode="lines",
-            line=dict(width=0),
-            fill="tonexty",
-            fillcolor="rgba(255, 161, 90, 0.1)",
-            showlegend=False,
-            legendgroup="solar",
-            hoverinfo="skip",
-        ),
+    band(
+        state.forecast.solcast.p10,
+        state.forecast.solcast.p90,
+        fillcolor="rgba(255, 161, 90, 0.1)",
+        legendgroup="solar",
         row=1,
-        col=1,
     )
 
     series(
@@ -252,24 +256,27 @@ def dashboard_chart(
         line=dict(width=2, color="#AB63FA", shape="hv"),
     )
 
-    # The heat it delivers: into the tank, and into or out of the floor.
-    series(
-        "Heat pump heat",
-        state.schedule.heat_pump.heat,
-        unit="W",
-        row=1,
-        col=1,
-        line=dict(width=1, color="#FECB52", shape="hv", dash="dash"),
-        visible="legendonly",
+    # The comfort band the plan keeps the thermostat's room in, a shade off
+    # the background: hard at its edges, the wanted temperature dotted in the
+    # room's colour within it.
+    # Straight between the quarters, not stepped: a change slopes over the
+    # quarter before its time and holds from that time, as set.
+    band(
+        state.schedule.building.minimum_temperature,
+        state.schedule.building.maximum_temperature,
+        fillcolor="rgba(255, 255, 255, 0.03)",
+        legendgroup="comfort",
+        row=2,
+        edge_line=dict(width=0.5, color="rgba(255, 255, 255, 0.2)"),
     )
 
     series(
-        "Climate target",
+        "Comfort",
         state.schedule.building.target_temperature,
         row=2,
         col=1,
-        line=dict(width=1, color="#FECB52", shape="hv", dash="dot"),
-        visible="legendonly",
+        line=dict(width=1, color="rgba(0, 204, 150, 0.8)", dash="dot"),
+        legendgroup="comfort",
         unit="°C",
         decimal=1,
     )
@@ -298,7 +305,7 @@ def dashboard_chart(
         state.predictions.thermal_mass,
         row=2,
         col=1,
-        line=dict(width=1, color="#FFA15A", shape="spline"),
+        line=dict(width=1, color="#FECB52", shape="spline"),
         unit="°C",
         decimal=2,
     )
@@ -310,7 +317,7 @@ def dashboard_chart(
         joined(state.measurements.building.dew_point, state.predictions.dew_point),
         row=2,
         col=1,
-        line=dict(width=1, color="#B6E880", shape="spline"),
+        line=dict(width=1, color="#636EFA", shape="spline"),
         visible="legendonly",
         unit="°C",
         decimal=1,
@@ -325,7 +332,7 @@ def dashboard_chart(
         ),
         row=2,
         col=1,
-        line=dict(width=1, color="#636EFA", shape="hv"),
+        line=dict(width=1, color="#FF97FF", shape="hv"),
         visible="legendonly",
         unit="°C",
         decimal=1,
@@ -337,7 +344,7 @@ def dashboard_chart(
         state.forecast.open_meteo.temperature,
         row=2,
         col=1,
-        line=dict(width=1, color="rgba(255, 255, 255, 0.4)"),
+        line=dict(width=1, color="#8C9BAB"),
         visible="legendonly",
         unit="°C",
         decimal=1,
