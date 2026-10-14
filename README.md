@@ -145,7 +145,38 @@ template:
             }}
 ```
 
-### 4. InfluxDB Integration
+### 4. Dynamic Prices (Template Sensor)
+
+With a dynamic contract, this sensor lists the prices published by the
+[EPEX Spot](https://github.com/brambo123/ha_epex_spot) integration.
+
+```yaml
+template:
+  - sensor:
+      - name: "Epex Energy Prices"
+        unique_id: epex_energy_prices
+        state: "{{ states('sensor.epex_spot_data_import_price') }}"
+        attributes:
+          time: >
+            {{ state_attr('sensor.epex_spot_data_import_price', 'data')
+              | map(attribute='start_time')
+              | map('as_timestamp')
+              | map('timestamp_custom', '%Y-%m-%dT%H:%M:%S%z')
+              | list
+            }}
+          import: >
+            {{ state_attr('sensor.epex_spot_data_import_price', 'data')
+              | map(attribute='price_per_kwh')
+              | list
+            }}
+          export: >
+            {{ state_attr('sensor.epex_spot_data_export_price', 'data')
+              | map(attribute='price_per_kwh')
+              | list
+            }}
+```
+
+### 5. InfluxDB Integration
 
 Configure the InfluxDB integration in Home Assistant.
 
@@ -163,6 +194,7 @@ influxdb:
     entities:
       - sensor.solcast_pv_forecast
       - sensor.open_meteo_forecast
+      - sensor.epex_energy_prices
       - ...
 ```
 

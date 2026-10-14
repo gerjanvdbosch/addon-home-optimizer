@@ -405,7 +405,11 @@ class Tariff(BaseModel):
 
 
 # A price (EUR/kWh): flat, a daily schedule, one per weekdays and weekend, or a
-# sensor carrying dynamic prices.
+# sensor carrying dynamic prices, with the attribute listing the prices it
+# publishes ahead and its `time` attribute their periods' starts, as Solcast
+# and Open-Meteo publish their forecasts: today's, and tomorrow's once the
+# day-ahead market has (about 13:00). Steps not published are forecast (see
+# features.price); without the attribute the plan takes flat prices.
 Price = float | list[tuple[time, float]] | Tariff | SensorReference
 
 
@@ -414,8 +418,11 @@ class PricesConfig(BaseModel):
 
     Each is one flat price, a daily schedule for a high and low tariff (e.g.
     [["07:00", 0.25], ["23:00", 0.21]]), a Tariff with its own for the
-    weekend, or a sensor carrying dynamic prices. See
-    MPCConfig.export_price_eur_per_kwh for why the export price matters.
+    weekend, or a sensor carrying dynamic prices. Dynamic, both follow the
+    market price, but seldom equal it: the import adds the supplier's margin,
+    energy tax and VAT, the export at most a fee. Under net metering, the same
+    sensor for both. See MPCConfig.export_price_eur_per_kwh for why the export
+    price matters.
     """
 
     # "import" is a Python keyword, so the field carries it as an alias, also

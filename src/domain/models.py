@@ -28,6 +28,8 @@ IdentificationType = Literal[
     "space_heating",
     "space_cooling",
     "dew_point",
+    "price_import",
+    "price_export",
 ]
 
 
@@ -134,6 +136,28 @@ class DewPointModel:
     # The vapour pressure the occupants' own moisture keeps indoors above the
     # outdoor air's (Pa).
     moisture_surplus_pa: float
+
+
+@dataclass
+class PriceModel:
+    """How a dynamic price follows the clock and the weather (see
+    features.price): the typical price of a quarter hour, moved by how much
+    more sun and wind there is than is typical for it."""
+
+    # Medians per local quarter hour of the day (96 columns), for a weekday
+    # (row 0) and a weekend day (row 1), over the last weeks before the fit:
+    # the price (EUR/kWh), Solcast's p50 (kW) and the wind's capacity factor
+    # (-).
+    price_profile: np.ndarray
+    solar_profile_kw: np.ndarray
+    wind_profile: np.ndarray
+    # What a kW of own PV forecast and a unit of capacity factor above their
+    # typical do to the price (EUR/kWh per kW and EUR/kWh): the merit order,
+    # supply that costs nothing pushing dearer plants out. At most 0. The own
+    # panels and the local wind stand in for the country's, so the scale is
+    # this installation's.
+    solar_eur_per_kwh_per_kw: float
+    wind_eur_per_kwh: float
 
 
 @dataclass

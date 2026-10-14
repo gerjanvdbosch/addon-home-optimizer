@@ -608,8 +608,9 @@ class StateManager:
                 "open_meteo",
                 config.forecast.open_meteo,
                 # The outdoor dew point for the indoor one's forecast (see
-                # features.dew_point).
-                attributes=["temperature", "dew_point"],
+                # features.dew_point), the wind for the price's (see
+                # features.price).
+                attributes=["temperature", "dew_point", "wind_speed"],
             )
             # Powers and flows over time (see Aggregation's "time_mean"):
             # the heat pump's power reports every few seconds while running

@@ -1080,8 +1080,8 @@ def test_the_tank_does_not_get_a_second_turn_within_one_run():
 
     Without this the plan flapped the three-way valve - five steps of tank, six
     of zone, then a single step of tank. That single step delivers almost
-    nothing: a DHW start spends an estimated 0.4-0.5 kWh reheating the loop and
-    coil before the tank gains at all.
+    nothing: a DHW start spends an estimated 0.4-0.5 kWh reheating the loops and
+    plate exchanger before the tank gains at all.
     """
 
     result = MPCOptimizer(
@@ -1748,8 +1748,8 @@ def test_net_metering_does_not_heat_today_for_a_cloudy_tomorrow():
 
 def test_a_measured_supply_margin_does_not_depend_on_the_targets():
     """A 60 degC legionella target in the horizon must not change what a normal
-    run costs: how much hotter the supply runs than the tank is the coil's
-    property, not the target's."""
+    run costs: how much hotter the supply runs than the tank is the plate
+    exchanger's property, not the target's."""
 
     optimizer = MPCOptimizer(
         replace(THERMAL_MODEL, supply_margin_k=8.0), MPCConfig(), cop_model=COP_MODEL

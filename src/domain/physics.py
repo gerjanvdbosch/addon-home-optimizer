@@ -141,10 +141,10 @@ def tank_stratification_k(top_c, bottom_c, mixing) -> np.ndarray:
 # 90 days), it cut the error after the first 15-minute step from ~7.0 K to
 # ~2.3 K - but with a heat input the heat pump actually delivers (4.8-6.2 kW)
 # every run ended 4-6 K too cold, and matching run ends needed ~7.6 kW, more
-# than measured calorimetric output: a fit factor compensating for the sensor
-# nearest the coil running ahead of the rest of the tank, not physical heat
-# input. Capturing both the start dip and the run total needs more than the
-# two-sensor average of a stratified tank.
+# than measured calorimetric output: a fit factor, not physical heat input -
+# mid-run the sensors read the tank being stirred from the bottom, where the
+# plate exchanger's heat enters, not its mean. Capturing both the start dip and the
+# run total needs more than the two-sensor average of a stratified tank.
 def lumped_tank_state_space(
     volume_l: float,
     ua_total_w_per_k: float,

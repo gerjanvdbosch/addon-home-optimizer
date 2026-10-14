@@ -235,9 +235,10 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
     MAX_DT_SECONDS_MULTIPLE = 6.0
 
     # Observed directly in this installation's own data: T_top/T_bottom kept rising
-    # for ~15 minutes after `state` flipped to "Uit" (residual heat in the heat
-    # exchanger/coil after the compressor stops). Idle-labeled samples within this
-    # window after a heating stop are excluded from calibration - see calibrate().
+    # for ~15 minutes after `state` flipped to "Uit" (residual heat in the plate
+    # exchanger and its loops after the compressor stops). Idle-labeled samples
+    # within this window after a heating stop are excluded from calibration -
+    # see calibrate().
     POST_HEATING_TAIL_SECONDS = 15.0 * 60.0
 
     # A slow passive decay's true one-step (single sampling interval) signal can be
@@ -429,8 +430,8 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         if "flow_lpm" in df.columns:
             df = self._bridge_flow_reporting_gaps(df)
 
-        # Booster heat still reaches the tank through the coil (it heats the
-        # primary water), so the calorimetric override below covers it - this
+        # Booster heat still reaches the tank through the plate exchanger (it heats
+        # the primary water), so the calorimetric override below covers it - this
         # only tells the two heat sources apart (see _identify_booster).
         df["booster_on"] = booster_active(df, self.states.dhw)
 
@@ -439,7 +440,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         # real, valid flow data exists during SWW - real time-varying
         # delivered power instead of one average value. Confirmed for this
         # installation: no simultaneous space heating + SWW, so a positive
-        # flow during SWW is unambiguously the boiler coil. Strictly gated
+        # flow during SWW is unambiguously the tank's plate exchanger. Strictly gated
         # on boiler_on (never on flow being merely nonzero): this
         # installation's flow sensor does not report while idle, so
         # InfluxDB's fill leaves stale readings behind after shutoff
@@ -695,8 +696,8 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
         # A real after-heat tail was directly observed in this installation's own
         # data: T_top/T_bottom kept rising for ~15 minutes after `state` flipped to
-        # "Uit" (residual heat in the heat exchanger/coil after the compressor
-        # stops) - a real physical effect the binary boiler_on switch cannot
+        # "Uit" (residual heat in the plate exchanger and its loops after the
+        # compressor stops) - a real physical effect the binary boiler_on switch cannot
         # represent. Samples labeled idle within this window after a heating stop
         # are not reliable evidence for the passive ambient-loss/mixing parameters:
         # including them biases UA_top/UA_bottom/UA_mix_idle toward whatever
@@ -1331,7 +1332,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
         The heat pump stops when its own sensor reaches the setpoint, while the
         tank sensors still read below it (real data: a median 1.5 K); the heat
-        around the coil and in the loop then mixes through, and the settled
+        left in the plate exchanger and the loops then mixes through, and the settled
         tank ends above the setpoint (real data: a median 1.75 K, quartiles
         1.5-1.77 K over 50 runs). Runs with the booster are left out - it has
         its own thermostat - and so are runs that settled below the setpoint:
@@ -1714,7 +1715,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         the booster took over; None for what the data cannot show.
 
         The booster engages because the compressor cannot lift the tank any
-        further (its supply temperature limit minus the coil's approach), so
+        further (its supply temperature limit minus the plate exchanger's approach), so
         the tank temperature at booster onset is the heat pump's own limit
         (real data: 55.0-55.5 degC in every session). It then heats until the
         tank's thermostat cuts it out, and the tank keeps warming a little after
@@ -1767,10 +1768,12 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         )
 
     # validate() compares the planning model with the tank this long after a run
-    # ends: heating mixes the tank within a sample (UA_mix_active sits at its
-    # sampling-resolution ceiling), so by then the two-sensor average is a fair
-    # stand-in for its mean temperature - unlike mid-run, when the sensor
-    # nearest the coil runs ahead of the rest of the tank.
+    # ends: the sanitary pump circulates the tank through the plate exchanger
+    # while it heats (UA_mix_active sits at its sampling-resolution ceiling),
+    # so by then the two-sensor average is a fair stand-in for its mean
+    # temperature - unlike mid-run, when the sensors read the circulation: the
+    # heat enters at the bottom (the bottom sensor catches the top up), and the
+    # top sensor drops as a run starts (median 5 K over 50 runs).
     PLANNER_CHECK_SETTLE_S = 900.0
 
     def _planner_run_errors(self, df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:

@@ -64,6 +64,7 @@ class Container:
         from features.cop import HeatPumpCOPIdentifier
         from features.dew_point import DewPointIdentifier
         from features.floor import FloorCircuitIdentifier
+        from features.price import PriceIdentifier
         from features.solar import SolarBiasIdentifier
 
         latitude, longitude = self.settings.latitude, self.settings.longitude
@@ -102,6 +103,9 @@ class Container:
                     key="cooling",
                 ),
                 DewPointIdentifier(),
+                # Only where the price is a sensor (see config.Price).
+                PriceIdentifier(key="import"),
+                PriceIdentifier(key="export"),
             ],
         )
 

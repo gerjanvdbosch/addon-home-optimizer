@@ -3,6 +3,7 @@ import logging
 import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -27,6 +28,15 @@ from features.dataset import DatasetBuilder, DatasetLoader
 from features.dew_point import DewPointIdentifier
 from features.floor import FloorCircuitIdentifier
 from features.optimizer import SOLAR_SCENARIO_WEIGHTS, MPCOptimizer, surplus_scenarios
+from features.price import (
+    PRICE_PERIOD,
+    SOLCAST_PERIOD,
+    WIND_PERIOD,
+    PriceIdentifier,
+    on_quarters,
+    predict_price,
+    published_prices,
+)
 from infrastructure.home_assistant import HomeAssistant
 from infrastructure.repositories import ConfigRepository
 
@@ -157,8 +167,11 @@ class Optimization:
         dhw_state = config.heat_pump.states.dhw
 
         import_price, export_price = (
-            self._price(schedule, forecast_times)
-            for schedule in (config.prices.import_, config.prices.export)
+            self._price(key, price, state, forecast_times)
+            for key, price in (
+                ("import", config.prices.import_),
+                ("export", config.prices.export),
+            )
         )
         heat_pump_changes = self._heat_pump_changes(config, now)
         boiler_on_current, run_start, idle_elapsed_hours = self.dhw_timing(
@@ -510,34 +523,103 @@ class Optimization:
 
     def _price(
         self,
+        key: Literal["import", "export"],
         price: Price,
+        state: State,
         times: list[datetime],
     ) -> tuple[float, ...]:
-        """A configured price per step (EUR/kWh); empty for a sensor, whose
-        dynamic prices are not read yet, so the plan falls back to MPCConfig's
-        flat ones."""
+        """A price per step (EUR/kWh). A sensor's as published where they are
+        (see config.Price), forecast beyond (see features.price). Without a
+        calibrated forecast the mean of those published stands in, a flat
+        price that moves nothing into the steps not known; empty without any,
+        so the plan falls back to MPCConfig's flat ones."""
 
         if isinstance(price, Tariff):
             return tuple(
                 weekend if to_local_time(t).weekday() >= 5 else weekday
                 for t, weekday, weekend in zip(
                     times,
-                    self._price(price.weekdays, times),
-                    self._price(price.weekend, times),
+                    self._price(key, price.weekdays, state, times),
+                    self._price(key, price.weekend, state, times),
                     strict=True,
                 )
             )
 
-        if isinstance(price, SensorReference):
+        if not isinstance(price, SensorReference):
+            return tuple(
+                point.value
+                for point in self.state_manager.resolve_schedule(price, times)
+            )
+
+        sensor = price
+
+        if sensor.attribute is None:
             logger.warning(
-                "Prices from %s are not read yet: planning on flat prices.",
-                price.entity_id,
+                "Prices from %s need the attribute they are published in (e.g. "
+                "data): planning on flat prices.",
+                sensor.entity_id,
             )
             return ()
 
-        return tuple(
-            point.value for point in self.state_manager.resolve_schedule(price, times)
+        # Whatever the sensor publishes, the plan still runs: on flat prices.
+        try:
+            published = self.loader.load(published_prices(sensor), times[0], times[-1])
+        except Exception as error:
+            logger.warning("No prices from %s: %s", sensor.entity_id, error)
+            published = pd.DataFrame()
+
+        def series(index, values) -> pd.Series:
+            return pd.Series(
+                np.asarray(values, dtype=float), index=pd.DatetimeIndex(index)
+            )
+
+        def points(points: list[SeriesPoint]) -> pd.Series:
+            return series([p.time for p in points], [p.value for p in points])
+
+        prices = on_quarters(
+            series(published["time"], published["price"])
+            if "price" in published.columns
+            else pd.Series(dtype=float),
+            times,
+            PRICE_PERIOD,
         )
+        missing = np.isnan(prices)
+
+        if not missing.any():
+            return tuple(prices.tolist())
+
+        identifier = PriceIdentifier(key)
+        identifier.load(self.models_path)
+
+        if identifier.model is not None:
+            forecast = predict_price(
+                identifier.model,
+                times,
+                on_quarters(points(state.forecast.solcast.p50), times, SOLCAST_PERIOD)
+                / 1000.0,
+                on_quarters(
+                    points(state.forecast.open_meteo.wind_speed), times, WIND_PERIOD
+                ),
+            )
+        elif not missing.all():
+            forecast = np.full(len(times), np.nanmean(prices))
+        else:
+            logger.warning(
+                "No prices published by %s and none forecast: planning on flat prices.",
+                sensor.entity_id,
+            )
+            return ()
+
+        logger.info(
+            "%s prices: %d of %d steps published, from %s %s",
+            key.capitalize(),
+            (~missing).sum(),
+            len(times),
+            to_local_time(times[int(np.argmax(missing))]).strftime("%a %H:%M"),
+            "forecast" if identifier.model is not None else "at their mean",
+        )
+
+        return tuple(np.where(missing, forecast, prices).tolist())
 
     @classmethod
     def dhw_summary(
@@ -1224,7 +1306,7 @@ class Optimization:
         any).
 
         The heat pump heats until its setpoint and stops by itself; the heat
-        left around the coil and in the loop then still mixes through, and the
+        left in the plate exchanger and the loops then still mixes through, and the
         tank settles setpoint_overshoot_k above the setpoint (real data: median
         1.75 K). The plan counts that heat - a run it plans ends that much above
         what its targets need (see MPCOptimizer) - so the setpoint is the run's

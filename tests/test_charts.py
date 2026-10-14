@@ -8,7 +8,6 @@ from domain.state import BoilerMeasurement, SeriesPoint, State
 from domain.time import to_local_time
 from web.charts import (
     broken_between_runs,
-    continued,
     dashboard_chart,
     ended,
     joined,
@@ -26,19 +25,6 @@ def _points(values: list[float], first: int = 0) -> list[SeriesPoint]:
     ]
 
 
-def test_a_plan_runs_on_from_the_last_measurement():
-    """Measured 31 and 37 degC; a plan made a quarter hour earlier still starts
-    at 31 there. The line goes on from 37, with the plan's own later points."""
-
-    measured = _points([31.0, 37.0])
-    planned = _points([31.0, 34.0, 46.0])
-
-    joined = continued(measured, planned)
-
-    assert [p.value for p in joined] == [37.0, 46.0]
-    assert joined[0].time == measured[-1].time
-
-
 def test_one_line_runs_from_the_measurements_into_the_plan():
     """Everything measured, then the plan's points after the last measurement -
     a plan made before it overlaps nothing."""
@@ -50,12 +36,6 @@ def test_one_line_runs_from_the_measurements_into_the_plan():
     assert joined([], planned) == planned
 
 
-def test_without_measurements_the_plan_is_drawn_whole():
-    planned = _points([31.0, 46.0])
-
-    assert continued([], planned) == planned
-
-
 def test_the_running_quarters_power_gives_way_to_the_plan():
     """A run started in the running quarter measured 0 W over its first
     second; the plan's 1870 W for that quarter is drawn instead."""
@@ -63,7 +43,7 @@ def test_the_running_quarters_power_gives_way_to_the_plan():
     measured = ended(_points([563.0, 0.0]), START + timedelta(minutes=15, seconds=1))
     planned = _points([1870.0, 2214.0], first=1)
 
-    assert [p.value for p in continued(measured, planned)] == [563.0, 1870.0, 2214.0]
+    assert [p.value for p in joined(measured, planned)] == [563.0, 1870.0, 2214.0]
 
 
 def test_a_planned_supply_stops_between_runs():
@@ -120,7 +100,7 @@ def test_the_dashboard_draws_the_comfort_band():
 
     html = dashboard_chart(state)
 
-    assert html.count('"legendgroup":"comfort"') == 3
+    assert html.count('"legendgroup":"climate"') == 3
     # Filled up to the band's upper edge, as Solcast's is.
     assert html.count('"fill":"tonexty"') == 2
 

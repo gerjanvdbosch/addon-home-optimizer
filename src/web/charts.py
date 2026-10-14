@@ -70,20 +70,6 @@ def joined(measured: list, planned: list) -> list:
     return measured + [p for p in planned if p.time > measured[-1].time]
 
 
-def continued(measured: list, planned: list) -> list:
-    """The planned points from where the measured ones end, starting at the
-    last measurement: a plan starts from the state it was made in, which the
-    measurements have moved on from since, so drawn whole it overlaps them with
-    a line of its own instead of running on from what really happened."""
-
-    if not measured:
-        return planned
-
-    last = measured[-1]
-
-    return [last] + [point for point in planned if point.time > last.time]
-
-
 def read_at(points: list[SeriesPoint], updated: datetime) -> list[SeriesPoint]:
     """Each ended quarter's last reading at the quarter's end, when it was
     read. InfluxDB labels the quarter at its start (see
@@ -265,18 +251,32 @@ def dashboard_chart(
         state.schedule.building.minimum_temperature,
         state.schedule.building.maximum_temperature,
         fillcolor="rgba(255, 255, 255, 0.03)",
-        legendgroup="comfort",
+        legendgroup="climate",
         row=2,
         edge_line=dict(width=0.5, color="rgba(255, 255, 255, 0.2)"),
     )
 
+    # The slab under the thermostat's room, as the filter infers it. No sensor
+    # measures this, so unlike the room it shows something the other lines
+    # cannot: it lags the room by hours and swings less, which is the storage
+    # an MPC would be charging.
     series(
-        "Comfort",
+        "Thermal mass",
+        state.predictions.thermal_mass,
+        row=2,
+        col=1,
+        line=dict(width=1, color="#E58606", shape="spline"),
+        unit="°C",
+        decimal=2,
+    )
+
+    series(
+        "Climate target",
         state.schedule.building.target_temperature,
         row=2,
         col=1,
-        line=dict(width=1, color="rgba(0, 204, 150, 0.8)", dash="dot"),
-        legendgroup="comfort",
+        line=dict(width=1, color="rgba(254, 203, 82, 0.5)", dash="dash"),
+        legendgroup="climate",
         unit="°C",
         decimal=1,
     )
@@ -291,21 +291,7 @@ def dashboard_chart(
         ),
         row=2,
         col=1,
-        line=dict(width=2, color="#00CC96", shape="spline"),
-        unit="°C",
-        decimal=2,
-    )
-
-    # The slab under the thermostat's room, as the filter infers it. No sensor
-    # measures this, so unlike the room it shows something the other lines
-    # cannot: it lags the room by hours and swings less, which is the storage
-    # an MPC would be charging.
-    series(
-        "Thermal mass",
-        state.predictions.thermal_mass,
-        row=2,
-        col=1,
-        line=dict(width=1, color="#FECB52", shape="spline"),
+        line=dict(width=2, color="#FECB52", shape="spline"),
         unit="°C",
         decimal=2,
     )
@@ -332,7 +318,7 @@ def dashboard_chart(
         ),
         row=2,
         col=1,
-        line=dict(width=1, color="#FF97FF", shape="hv"),
+        line=dict(width=1, color="#AB63FA", shape="hv"),
         visible="legendonly",
         unit="°C",
         decimal=1,
@@ -351,8 +337,8 @@ def dashboard_chart(
     )
 
     # The tank mixed - the temperature the optimizer plans from (see
-    # BoilerThermalModel.mixed_temperature) - so the measured line continues
-    # straight into the planned "Boiler temperature" line. The sensors' own
+    # BoilerThermalModel.mixed_temperature) - so measured and planned are one
+    # "Boiler temperature" line. The sensors' own
     # average without a calibrated model, which then is the same thing. The two
     # sensors are drawn beside it: their stratification is what the mixed
     # temperature is read from.
@@ -381,36 +367,24 @@ def dashboard_chart(
         )
 
     series(
+        "Boiler target",
+        state.schedule.heat_pump.boiler.target_temperature,
+        row=3,
+        col=1,
+        line=dict(width=1, color="rgba(25, 211, 243, 0.5)", shape="hv", dash="dash"),
+        unit="°C",
+        decimal=1,
+    )
+
+    series(
         "Boiler temperature",
-        continued(measured_average, state.schedule.heat_pump.boiler.temperatures),
+        joined(measured_average, state.schedule.heat_pump.boiler.temperatures),
         row=3,
         col=1,
         line=dict(width=2, color="#19D3F3", shape="spline"),
         legendgroup="boiler_temperature",
         unit="°C",
         decimal=2,
-    )
-
-    series(
-        "Boiler target",
-        state.schedule.heat_pump.boiler.target_temperature,
-        row=3,
-        col=1,
-        line=dict(width=1, color="#19D3F3", shape="hv", dash="dot"),
-        unit="°C",
-        decimal=1,
-    )
-
-    series(
-        "Boiler temperature",
-        measured_average,
-        row=3,
-        col=1,
-        line=dict(width=2, color="#19D3F3", shape="spline"),
-        legendgroup="boiler_temperature",
-        showlegend=False,
-        unit="°C",
-        decimal=1,
     )
 
     fig.update_layout(

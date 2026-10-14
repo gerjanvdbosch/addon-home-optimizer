@@ -1792,8 +1792,9 @@ class MPCOptimizer:
 
             # The tank's own part of a run lasts as long, also where the zone
             # makes up the rest of the compressor's time: turning the valve to
-            # the tank first reheats loop and coil to tank temperature (an
-            # estimated 0.4-0.5 kWh), a hand-over the plan does not price.
+            # the tank first reheats the loops and plate exchanger to tank
+            # temperature (an estimated 0.4-0.5 kWh), a hand-over the plan does
+            # not price.
             # Without this, one quarter of hot water tacked onto a zone run met
             # the rule above. The booster counts for the same reason as there.
             previous_tank = (
@@ -2599,7 +2600,7 @@ class MPCOptimizer:
         charging (it must stay hotter to keep pushing heat in), which is
         exactly what T[k] represents, already decision-consistent with the
         rest of the model. The margin between T[k] and the real supply
-        temperature is the coil's approach measured on the boiler's own runs
+        temperature is the plate exchanger's approach measured on the boiler's own runs
         (see _supply_margin_c). POWER_FIT_T_LOW_C/HIGH_C are
         real T_supply values (q_th_at_power_fit_low_w/high_w are that fitted
         line evaluated at those *real* T_supply values - see
@@ -2670,8 +2671,8 @@ class MPCOptimizer:
         """How much hotter the heat pump's supply runs than the tank it charges
         (see _power_line_coefficients); 0 without a calibrated COP model.
 
-        The coil's measured approach (BoilerThermalModel.supply_margin_k) where
-        calibrated: a property of the coil, whatever the targets are. A model
+        The plate exchanger's measured approach (BoilerThermalModel.supply_margin_k)
+        where calibrated: a property of the exchanger, whatever the targets are. A model
         calibrated before it existed falls back to the reference supply's margin
         above the highest target until its next calibration - which a target
         near that supply, such as a legionella run, drove to 0, costing every

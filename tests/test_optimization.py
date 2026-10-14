@@ -12,7 +12,7 @@ from domain.config import BoilerConfig, LegionellaConfig, PricesConfig
 from domain.models import BoilerThermalModel
 from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.sensors import SensorReference
-from domain.state import SeriesPoint
+from domain.state import SeriesPoint, State
 from domain.time import local_day_start
 from features.optimizer import MPCOptimizer
 
@@ -528,5 +528,8 @@ def test_the_weekend_tariff_holds_all_saturday():
     )
 
     assert optimization._price(
-        prices.import_, [friday_noon, friday_noon + timedelta(days=1)]
+        "import",
+        prices.import_,
+        State(),
+        [friday_noon, friday_noon + timedelta(days=1)],
     ) == (0.25, 0.21)
