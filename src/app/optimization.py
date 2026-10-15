@@ -17,6 +17,7 @@ from domain.physics import (
     CP_WATER_J_PER_KG_K,
     RHO_WATER_KG_PER_L,
     indoor_dew_point_c,
+    mains_water_temperature_c,
 )
 from domain.sensors import SensorReference
 from domain.state import SeriesPoint, State
@@ -231,6 +232,9 @@ class Optimization:
 
         data = MPCInput(
             solar_forecast_w=solar_forecast,
+            mains_water_temperature=mains_water_temperature_c(
+                to_local_time(now).timetuple().tm_yday
+            ),
             ambient_temperature=state.measurements.heat_pump.boiler.ambient_temperature[
                 -1
             ].value,
@@ -874,7 +878,10 @@ class Optimization:
         seconds = (
             heat_capacity_j_per_k
             * max(min(temperature, limit_c) - start_c, 0.0)
-            / (thermal_model.q_in_steady_w or thermal_model.q_in_nominal_w)
+            / (
+                (thermal_model.q_in_steady_w or thermal_model.q_in_nominal_w)
+                * (thermal_model.calorimetric_gain or 1.0)
+            )
         )
 
         if thermal_model.booster_heat_w and temperature > limit_c:
@@ -961,11 +968,23 @@ class Optimization:
             else bands[1]
         )
 
+        # The sun on the facade ahead, from the array's own forecast (see
+        # BuildingThermalIdentifier.forecast()).
+        pv = pd.Series(
+            {point.time: point.value for point in predictions.solar}, dtype=float
+        )
+
         try:
             zone = identifier.trajectory(
                 self.loader.load(identifier.dataset(config), start, end),
                 now,
                 baseload if not baseload.empty else None,
+                pv if not pv.empty else None,
+                self.loader.load(
+                    identifier.habit_dataset(),
+                    now - timedelta(days=identifier.HABIT_HISTORY_DAYS),
+                    now,
+                ),
             )
         except ValueError as error:
             # Normal right after a restart with no measurements yet, or before
@@ -1231,21 +1250,38 @@ class Optimization:
                 states.cooling if data.zone_cooling else states.heating,
             )
             first = next((k for k, on in enumerate(schedule) if on), None)
-            status = "on" if running else "off"
+            # The tank's block ending in this quarter and the zone's run
+            # planned from the next: on already, so the heat pump goes from the
+            # hot water straight on to the floor - it finishes the tank first.
+            # Off, it stops once the hot water is done and starts again for the
+            # zone a few minutes later, a start the plan does not make: it
+            # counts the hand-over as one run. Heating only: the heat pump
+            # stops to reverse between cooling and the tank anyway.
+            hand_over = (
+                not running
+                and not data.zone_cooling
+                and len(schedule) > 1
+                and schedule[1] == 1
+                and result.schedule[:2] == (1, 0)
+            )
+            # The step whose supply the run is given: the next one's when
+            # handed over, the step now being the tank's.
+            k = 1 if hand_over else 0
+            status = "on" if running or hand_over else "off"
 
             if first is not None:
                 start = (
                     since if running and since is not None else times[first]
                 ).isoformat()
 
-            if running and result.space_supply_c:
+            if (running or hand_over) and result.space_supply_c:
                 measured = state.measurements.heat_pump
                 step = timedelta(hours=MPCConfig().step_hours)
                 settled = since is not None and now - since >= step
                 previous = state.schedule.building.supply_setpoint
                 published = self.zone_supply_c(
-                    planned_c=result.space_supply_c[0],
-                    heat_w=result.space_heat_w[0],
+                    planned_c=result.space_supply_c[k],
+                    heat_w=result.space_heat_w[k],
                     return_c=(
                         measured.return_temperature[-1].value
                         if settled and measured.return_temperature
@@ -1255,7 +1291,7 @@ class Optimization:
                         measured.flow[-1].value if settled and measured.flow else None
                     ),
                     minimum_c=(
-                        data.zone_supply_minimum_c[0]
+                        data.zone_supply_minimum_c[k]
                         if data.zone_supply_minimum_c
                         else None
                     ),

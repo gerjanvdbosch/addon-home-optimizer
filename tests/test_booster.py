@@ -89,18 +89,20 @@ def test_a_stratified_tank_holds_the_cold_layer_below_its_sensors():
     )
 
 
-def test_the_cold_layer_is_learned_from_each_runs_closed_heat_balance():
+@pytest.mark.parametrize("gain", [None, 1.3])
+def test_the_cold_layer_is_learned_from_each_runs_closed_heat_balance(gain):
     """Twelve runs on the model above: a row before, three rows heating at
     3 kW, then idle rows until the loop's heat has reached the tank. The tank
-    settles mixed at its mean before the run plus the heat put in, so the fit
-    recovers the layer's share and temperature. No standing loss: the ambient
-    air is at the tank's own temperature."""
+    settles mixed at its mean before the run plus the heat put in - the
+    measured heat times the calorimetric gain - so the fit recovers the
+    layer's share and temperature. No standing loss: the ambient air is at the
+    tank's own temperature."""
 
     rows = []
     time = pd.Timestamp("2026-09-01 10:00", tz="UTC")
     step = pd.Timedelta(minutes=5)
     heat_w = 3000.0
-    added_k = 3 * heat_w * step.total_seconds() / (200.0 * 4186.0)
+    added_k = (gain or 1.0) * 3 * heat_w * step.total_seconds() / (200.0 * 4186.0)
 
     for n in range(12):
         top, bottom = 30.0 + 1.5 * n, 22.0 + 1.5 * n - (n % 3)
@@ -124,12 +126,57 @@ def test_the_cold_layer_is_learned_from_each_runs_closed_heat_balance():
             time += step
 
     identifier = BoilerThermalIdentifier()
-    identifier.model = MIXING_MODEL
+    identifier.model = replace(MIXING_MODEL, calorimetric_gain=gain)
     fraction, cold_c, spread_k = identifier._identify_cold_layer(pd.DataFrame(rows))
 
     assert fraction == pytest.approx(0.35, abs=0.02)
     assert cold_c == pytest.approx(15.0, abs=1.0)
     assert spread_k == pytest.approx(8.0, abs=1.0)
+
+
+def test_the_calorimetric_gain_is_read_where_the_tank_passes_the_previous_run():
+    """Normal runs settling at 47.5 degC, each followed by a run heating past
+    it, there 1.15 times the heat measured going in. Below 48 degC - the
+    previous run's end plus a sensor step - warmer water may still stand above
+    the circulation, so the rise there counts for nothing, however fast."""
+
+    rows = []
+    time = pd.Timestamp("2026-09-01 10:00", tz="UTC")
+    step = pd.Timedelta(minutes=5)
+    heat_w = 6000.0
+    rise_k = 1.15 * heat_w * step.total_seconds() / (200.0 * 4186.0)
+    hot = [48.5 + n * rise_k for n in range(4)]
+    runs = [
+        ((45.0, 35.0), [40.0, 46.0, 47.0], 47.5),
+        ((46.0, 40.0), [44.0, 46.5, *hot], 59.0),
+    ]
+
+    for _ in range(3):
+        for before, heating, settled in runs:
+            run = [(*before, False, float("nan"))]
+            run += [(T, T, True, heat_w) for T in heating]
+            run += [(settled, settled, False, float("nan"))] * 5
+
+            for T_top, T_bottom, on, q in run:
+                rows.append(
+                    dict(
+                        time=time,
+                        T_top=T_top,
+                        T_bottom=T_bottom,
+                        T_ambient=(T_top + T_bottom) / 2.0,
+                        boiler_on=on,
+                        booster_on=False,
+                        q_in_override_w=q,
+                    )
+                )
+                time += step
+
+    identifier = BoilerThermalIdentifier()
+    identifier.model = MIXING_MODEL
+
+    assert identifier._identify_calorimetric_gain(pd.DataFrame(rows)) == (
+        pytest.approx(1.15)
+    )
 
 
 def _excess_heat_j(model: BoilerThermalModel, bottom_after: float) -> float:
@@ -273,11 +320,15 @@ def test_heat_pump_limit_and_booster_heat_are_identified_from_booster_runs():
         }
     )
     identifier = BoilerThermalIdentifier()
+    identifier.model = replace(MIXING_MODEL, calorimetric_gain=1.1)
 
     # Both runs hand over at 55 degC (heat pump limit). The full run keeps warming
     # after the booster is cut out, to 61 degC - the tank's maximum, whatever the
-    # early-stopped run reached.
-    assert identifier._identify_booster(df) == (55.0, 61.0, 2000.0, 2190.0)
+    # early-stopped run reached. Its heat is what the tank takes up: the
+    # calorimetric gain times what was measured.
+    assert identifier._identify_booster(df) == pytest.approx(
+        (55.0, 61.0, 2200.0, 2190.0)
+    )
     assert identifier._identify_booster(df.assign(booster_on=False)) == (
         None,
         None,

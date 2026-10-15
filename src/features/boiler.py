@@ -18,12 +18,10 @@ from domain.mpc import MPCConfig
 from domain.physics import (
     CP_WATER_J_PER_KG_K,
     RHO_WATER_KG_PER_L,
-    layered_tank_state_space,
     lumped_tank_state_space,
     tank_state_space,
     tank_stratification_k,
 )
-from domain.time import to_local_time
 from features.dataset import DatasetBuilder
 from features.identifier import SystemIdentifier
 
@@ -240,6 +238,12 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
     # within this window after a heating stop are excluded from calibration -
     # see calibrate().
     POST_HEATING_TAIL_SECONDS = 15.0 * 60.0
+    # The data is read per minute: the tank sensors report every 0.5 K change,
+    # every one to three minutes while a run heats them, and a run's start and
+    # stop then land within a minute instead of a 5-minute bucket that read a
+    # still-heating tail as idle. Calibrated on 30 days and scored on the next
+    # 30 (real data, October 2026), the run-end error fell from 1.08 to 0.81 K.
+    SAMPLE_INTERVAL = "1m"
 
     # A slow passive decay's true one-step (single sampling interval) signal can be
     # far smaller than sensor noise/resolution: confirmed directly on real data,
@@ -363,8 +367,9 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         """The rows a DHW run stops in: the state is the last reading of each
         interval, so the interval a run stops in reads as idle while it began
         heating - the previous row's state is this one's at its start. On real
-        data the compressor ran on at full output for up to its whole 5 minutes,
-        some 0.3 kWh a run on average, which the run's heat balance missed."""
+        data read per 5 minutes the compressor ran on at full output for up to
+        a whole interval, some 0.3 kWh a run on average, which the run's heat
+        balance missed."""
 
         if "boiler_on" not in df.columns:
             return pd.Series(False, index=df.index)
@@ -911,9 +916,9 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         ordinary_x, robust_fit, parameters, f_scale = fit()
         self.model = _model_from_parameters(parameters, self.volume_l)
 
-        # The standing loss from tap-free nights needs the cold layer, read from
-        # the runs' heat balance with this first fit's loss; a run's hour of it
-        # is small, and the layer is read again below with the final one.
+        # The standing loss from the rest after runs needs the cold layer, read
+        # from the runs' heat balance with this first fit's loss; a run's hour
+        # of it is small, and the layer is read again below with the final one.
         self.model.cold_layer_fraction, self.model.cold_water_temperature_c, _ = (
             self._identify_cold_layer(df)
         )
@@ -922,7 +927,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         if standing_loss is not None:
             logger.info(
                 "Boiler thermal calibration: standing loss %.2f±%.2f W/K from "
-                "tap-free nights (the first fit gave %.2f W/K); UA_top and "
+                "the rest after runs (the first fit gave %.2f W/K); UA_top and "
                 "UA_bottom held at half of it each.",
                 standing_loss[0],
                 standing_loss[1],
@@ -1196,6 +1201,8 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         steady_w, ramp_seconds = self._identify_heat_input_ramp(df)
         self.model.q_in_steady_w = steady_w
         self.model.q_in_ramp_seconds = ramp_seconds
+        # Before the cold layer, which is read from the heat balance it sets.
+        self.model.calorimetric_gain = self._identify_calorimetric_gain(df)
         (
             self.model.cold_layer_fraction,
             self.model.cold_water_temperature_c,
@@ -1215,9 +1222,13 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             )
 
         logger.info(
-            "Identified heat input: steady %s, ramp %s, supply %s above the tank",
+            "Identified heat input: steady %s, ramp %s, tank heat per measured "
+            "heat %s, supply %s above the tank",
             f"{steady_w:.0f} W" if steady_w else "not shown by this data",
             f"{ramp_seconds / 60:.1f} min" if ramp_seconds else "none",
+            "unknown"
+            if self.model.calorimetric_gain is None
+            else f"{self.model.calorimetric_gain:.2f}",
             "unknown"
             if self.model.supply_margin_k is None
             else f"{self.model.supply_margin_k:.1f} K",
@@ -1297,7 +1308,9 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         step_s = np.r_[np.diff(seconds), 0.0]
         since_start_s = seconds - pd.Series(np.where(onset, seconds, np.nan)).ffill()
         heat_j = (
-            pd.to_numeric(df["q_in_override_w"], errors="coerce").to_numpy() * step_s
+            pd.to_numeric(df["q_in_override_w"], errors="coerce").to_numpy()
+            * (self.model.calorimetric_gain or 1.0)
+            * step_s
         ) * compressor
         heat_so_far_j = (
             pd.Series(heat_j).groupby(np.cumsum(onset)).cumsum() - heat_j / 2
@@ -1383,35 +1396,50 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
     # Fewer runs than this cannot tell the layer's size from its temperature:
     # the two trade off against each other.
     MIN_COLD_LAYER_RUNS = 10
+    # Runs hotter than the previous one left the tank are mostly legionella
+    # runs, a few a month: fewer than this and one tap during a run could set
+    # the calorimetric gain.
+    MIN_GAIN_RUNS = 3
 
-    # Nights are the tank's tap-free rest: in the local hours before this one,
-    # over 90 days of real data, no idle quarter hour showed the bottom sensor
-    # dropping 1 K - the mark of cold water drawn in - against 19-36% of them
+    # The mark of cold water drawn in: the bottom sensor this much below its
+    # highest of the past quarter hour. Over 90 days of real data no idle
+    # quarter hour between midnight and 6 h showed it, against 19-36% of them
     # at 21-22 h, and 1% even with nobody home (timed appliances, trackers).
-    STANDING_LOSS_NIGHT_END_HOUR = 6
-    # A night's standing loss cools the tank about one sensor step
-    # (TANK_SENSOR_RESOLUTION_K), so the loss is only seen over many: on real
-    # data the two halves of 89 nights still put it at 1.7 and 2.2 W/K. With
-    # fewer, the fit is left as it was.
-    MIN_STANDING_LOSS_NIGHTS = 30
+    DRAW_BOTTOM_DROP_K = 1.0
+    DRAW_WINDOW = pd.Timedelta(minutes=15)
+    # A run's rest cools the tank a few sensor steps (TANK_SENSOR_RESOLUTION_K),
+    # so the loss is only seen over many: on real data the two halves of 113
+    # runs put it at 3.3 and 2.9 W/K. With fewer, the fit is left as it was.
+    MIN_STANDING_LOSS_RUNS = 30
 
     def _identify_standing_loss(self, df: pd.DataFrame) -> tuple[float, float] | None:
         """(the tank's heat loss coefficient to its surroundings W/K, its
-        standard error) from tap-free nights at rest; None with too few such
-        nights or no cold layer identified.
+        standard error) from the tank at rest after its runs; None with too few
+        such runs or no cold layer identified.
 
-        At rest after an evening's tapping, the cold water below the bottom
-        sensor (see BoilerThermalModel.cold_layer_fraction) warms against the
-        tank above it, so the bottom sensor cools without the tank losing that
-        heat. A model without that layer takes it for standing loss: fitted on
-        the same 89 nights, the two-node model's loss grew with the evening's
-        stratification from 2.9 to 6.1 W/K. With the layer as a node of its own
-        (see physics.layered_tank_state_space) the loss is 2.1 and 2.4 W/K
-        whether the night starts mixed or stratified, and the same whatever
-        share of the tank the layer is given (1.92 W/K at 25, 52 and 75%) -
-        that share trades against the layer's temperature and is taken from
-        the runs' heat balance. The layer's temperature at the start of each
-        night is not measured, so it is fitted per night.
+        Read from the heat the tank holds - its mixed temperature, the cold
+        layer included (see BoilerThermalModel.mixed_temperature) - as the
+        single tank the plan heats (see physics.lumped_tank_state_space), not
+        from its two sensors: the heat is what the runs' balance closes on.
+        Through the sensors, the layer a node of its own warming against the
+        tank, the loss came out 1.8-2.1 W/K, and a tank carried on from its
+        last tap at that loss went into the next run 2.7 K warmer than the
+        run's own heat balance put it (78 runs, Jul-Oct 2026).
+
+        Over the rest that follows a run - from the tank settled until the next
+        draw (DRAW_BOTTOM_DROP_K) or run - which is what a run has to carry the
+        tank to its target over. The loss is not one constant there: the loop
+        to the plate exchanger leaves a run as hot as the tank and cools over
+        the next hours, after which it draws heat from it (113 runs: 0.05 K in
+        the first hour, 0.36 K in the fifth; a loop node fitted on rest after
+        runs and at night alike, some 40-50 l of water). One node read from
+        the rest after runs puts the tank at an 18:00 target 0.26 K too cold
+        on average, against 0.70 K for the 5.1 W/K the tap-free nights show
+        (107 runs ending before it) - what decides how hot a run must end; the
+        loop node itself gained little more there (0.08 K), only by night,
+        where every replan reads the tank anew. And steadier over the season
+        than the nights: 2.4-3.8 W/K month by month against 6.2 in June to 4.1
+        in October.
         """
 
         model = self.model
@@ -1419,75 +1447,182 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         if model is None or model.cold_layer_fraction is None:
             return None
 
-        local = df["time"].map(to_local_time)
-        last_heating = df["time"].where(df["boiler_on"]).ffill()
-        at_rest = ~df["boiler_on"] & (
-            (df["time"] - last_heating).dt.total_seconds().fillna(np.inf)
-            > self.POST_HEATING_TAIL_SECONDS
+        boiler_on = df["boiler_on"].to_numpy(dtype=bool)
+        top = df["T_top"].to_numpy(dtype=float)
+        bottom = df["T_bottom"].to_numpy(dtype=float)
+        ambient = df["T_ambient"].to_numpy(dtype=float)
+        dt = df["dt_seconds"].to_numpy(dtype=float)
+        bottom_c = pd.Series(bottom, index=df["time"])
+        drawn = (
+            bottom_c.rolling(self.DRAW_WINDOW).max() - bottom_c
+            >= self.DRAW_BOTTOM_DROP_K
+        ).to_numpy()
+        heat_c = model.mixed_temperature(
+            top, bottom, tank_stratification_k(top, bottom, boiler_on)
         )
-        dt = float(df["dt_seconds"].median())
-        steps = int(round(self.STANDING_LOSS_NIGHT_END_HOUR * 3600.0 / dt))
-        night = local.map(lambda t: t.hour < self.STANDING_LOSS_NIGHT_END_HOUR)
-        nights = [
-            rows
-            for _, rows in df[night].groupby(local[night].map(lambda t: t.date()))
-            if len(rows) == steps
-            and at_rest[rows.index].all()
-            and np.allclose(rows["dt_seconds"].iloc[1:], dt)
-        ]
+        rests = []
 
-        if len(nights) < self.MIN_STANDING_LOSS_NIGHTS:
+        for _, _, settled in self._run_balance_spans(df):
+            end = settled
+
+            while end + 1 < len(df) and not (boiler_on[end + 1] or drawn[end + 1]):
+                end += 1
+
+            if end > settled:
+                rests.append(np.arange(settled, end + 1))
+
+        if len(rests) < self.MIN_STANDING_LOSS_RUNS:
             return None
 
-        top = np.stack([rows["T_top"].to_numpy(dtype=float) for rows in nights])
-        bottom = np.stack([rows["T_bottom"].to_numpy(dtype=float) for rows in nights])
-        ambient = np.stack([rows["T_ambient"].to_numpy(dtype=float) for rows in nights])
-        count = len(nights)
-
         def residuals(p: np.ndarray) -> np.ndarray:
-            a_d, b_d = discretize_zoh(
-                *layered_tank_state_space(
-                    model.volume_l, p[0], model.cold_layer_fraction, p[1], p[2]
-                ),
-                dt,
-            )
-            state = np.column_stack([top[:, 0], bottom[:, 0], p[3:]])
+            (rate,) = lumped_tank_state_space(model.volume_l, p[0])[0][0]
             errors = []
 
-            for k in range(1, steps):
-                state = state @ a_d.T + ambient[:, k - 1, None] * b_d.T
-                errors.append(state[:, :2] - np.column_stack([top[:, k], bottom[:, k]]))
+            for rest in rests:
+                state = heat_c[rest[0]]
+                predicted = [state]
 
-            return np.stack(errors, axis=1).ravel()
+                for k in rest[1:]:
+                    decay = np.exp(rate * dt[k])
+                    state = decay * state + (1.0 - decay) * ambient[k - 1]
+                    predicted.append(state)
 
-        # Each night's layer temperature only moves that night's residuals.
-        sparsity = np.zeros((count * (steps - 1) * 2, 3 + count), dtype=int)
-        sparsity[:, :3] = 1
-        for i in range(count):
-            sparsity[i * (steps - 1) * 2 : (i + 1) * (steps - 1) * 2, 3 + i] = 1
+                errors.append(np.asarray(predicted) - heat_c[rest])
 
-        # The layer lies below the bottom sensor, so it is no warmer.
-        layer_upper = bottom[:, 0]
-        layer_start = np.clip(
-            model.cold_water_temperature_c or layer_upper, 0.0, layer_upper
-        )
+            return np.concatenate(errors)
+
         fit = least_squares(
             residuals,
-            np.r_[
-                model.ua_top_w_per_k + model.ua_bottom_w_per_k,
-                self.INITIAL_UA_MIX_IDLE_W_PER_K,
-                self.INITIAL_UA_MIX_IDLE_W_PER_K,
-                layer_start,
-            ],
-            bounds=(np.zeros(3 + count), np.r_[np.inf, np.inf, np.inf, layer_upper]),
-            jac_sparsity=sparsity,
-            x_scale="jac",
+            [model.ua_top_w_per_k + model.ua_bottom_w_per_k],
+            bounds=([0.0], [np.inf]),
         )
 
-        # The Jacobian comes back sparse (see jac_sparsity).
-        fit.jac = fit.jac.toarray()
-
         return float(fit.x[0]), float(self._parameter_std_errors(fit)[0])
+
+    def _run_balance_spans(self, df: pd.DataFrame) -> list[tuple[int, int, int]]:
+        """(onset, stop, settled) rows of each heat pump run a heat balance can
+        close over: the tank settled POST_HEATING_TAIL_SECONDS after the run -
+        the heat left in the loop has reached it - with no heating meanwhile and
+        its sensors reading it mixed (MIXED_SPREAD_K)."""
+
+        heating = (df["boiler_on"] & ~df["booster_on"]).to_numpy(dtype=bool)
+        boiler_on = df["boiler_on"].to_numpy(dtype=bool)
+        seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
+        spread = (df["T_top"] - df["T_bottom"]).abs().to_numpy(dtype=float)
+        spans = []
+
+        for i in np.flatnonzero(heating & ~np.r_[False, heating[:-1]]):
+            if i == 0:
+                continue
+
+            j = i
+
+            while j < len(df) and heating[j]:
+                j += 1
+
+            k = int(
+                np.searchsorted(
+                    seconds,
+                    seconds[min(j, len(df) - 1)] + self.POST_HEATING_TAIL_SECONDS,
+                )
+            )
+
+            if (
+                k >= len(df)
+                or boiler_on[j : k + 1].any()
+                or seconds[k] - seconds[j] > 2.0 * self.POST_HEATING_TAIL_SECONDS
+                or spread[k] > self.MIXED_SPREAD_K
+            ):
+                continue
+
+            spans.append((int(i), j, k))
+
+        return spans
+
+    def _identify_calorimetric_gain(self, df: pd.DataFrame) -> float | None:
+        """The heat a run puts into the tank per unit of calorimetric heat (-):
+        the tank's rise plus the standing loss over the heat measured going in,
+        summed over the stretches of runs where the tank was mixed and hotter
+        than the previous run had left it. None without MIN_GAIN_RUNS of them.
+
+        A run's circulation does not reach the top of the tank: above where it
+        draws, warmer water from earlier stands still until the circulated
+        water passes its temperature, and only then mixes in. Below that, the
+        sensors rose a median 1.49 times the measured heat, past it 1.13 (real
+        data, 150 days: what 150 of the 200 l rising alone gives against the
+        whole tank), and from where a run first mixed its sensors to the
+        settled end a median 1.42 per run - neither of which is the
+        calorimetry.
+        Hotter than the previous run left it, no warmer water can stand above
+        the draw, so the whole tank heats: legionella runs past 48 degC, by the
+        heat pump 1.14 and by the booster 1.15 (real data, 10 runs over 150
+        days; the booster's electrical draw is 1.13 times its calorimetric
+        heat, pumps and controls included). The calorimetry under-reads: why
+        is not known. A stretch counts once it has had at least two sensor
+        steps of heat, so the sensors' resolution does not dominate it.
+        """
+
+        on = df["boiler_on"].to_numpy(dtype=bool)
+        seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
+        step_s = np.r_[np.diff(seconds), 0.0]
+        top = df["T_top"].to_numpy(dtype=float)
+        bottom = df["T_bottom"].to_numpy(dtype=float)
+        average = (top + bottom) / 2.0
+        T_ambient = df["T_ambient"].to_numpy(dtype=float)
+        heat_j = (
+            pd.to_numeric(df["q_in_override_w"], errors="coerce").fillna(0.0).to_numpy()
+            * step_s
+        )
+        loss_j = (
+            self.model.ua_top_w_per_k * (top - T_ambient)
+            + self.model.ua_bottom_w_per_k * (bottom - T_ambient)
+        ) * step_s
+        heat_capacity_j_per_k = (
+            RHO_WATER_KG_PER_L * self.model.volume_l * CP_WATER_J_PER_KG_K
+        )
+        settled = {i: k for i, _, k in self._run_balance_spans(df)}
+        onsets = np.flatnonzero(on & ~np.r_[False, on[:-1]])
+        rise_c = heat_c = 0.0
+        runs = 0
+
+        for previous, i in zip(onsets[:-1], onsets[1:], strict=True):
+            if previous not in settled:
+                continue
+
+            end = i
+
+            while end + 1 < len(on) and on[end + 1]:
+                end += 1
+
+            hotter = np.flatnonzero(
+                (np.abs(top[i:end] - bottom[i:end]) <= self.MIXED_SPREAD_K)
+                & (
+                    average[i:end]
+                    > average[settled[previous]] + TANK_SENSOR_RESOLUTION_K
+                )
+            )
+
+            if not hotter.size:
+                continue
+
+            start = i + int(hotter[0])
+            heat = heat_j[start:end].sum() / heat_capacity_j_per_k
+
+            if heat < 2.0 * TANK_SENSOR_RESOLUTION_K:
+                continue
+
+            rise_c += (
+                average[end]
+                - average[start]
+                + loss_j[start:end].sum() / heat_capacity_j_per_k
+            )
+            heat_c += heat
+            runs += 1
+
+        if runs < self.MIN_GAIN_RUNS:
+            return None
+
+        return rise_c / heat_c
 
     def _identify_cold_layer(
         self, df: pd.DataFrame
@@ -1509,16 +1644,17 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         full at the stratification typical of a run start: a tank mixed by a run
         has none until it is tapped again.
 
-        The layer's temperature is an effective one, not the cold water's: the
-        cold water warms against the tank above it, and the fit places the
-        layer's share and temperature where the mean lies (real data: 62% at
-        32 degC, steady from June to September, end temperatures within 1.3 K on
-        runs not fitted on). Read instead where heating first mixed the tank,
-        the sensors were still catching up there and put it at 38% of cold
-        water at 20 degC, which planned cold starts too long and warm ones too
-        short. The closed balance also confirms the calorimetry and the tank's
-        volume: the heat and the settled rise agree within 4% (real data).
-
+        The heat put in is the tank's (see _identify_calorimetric_gain). The
+        layer is the water neither sensor shows, at an effective temperature:
+        cold water below the bottom one, and above where a run's circulation
+        draws, warmer water left by the previous run - so a cold tank holds
+        more heat than its sensors' average and a warm one less (real data:
+        44% at 24 degC, the tank before a run within 0.5-1.1 K of its closed
+        balance on 30 days not fitted on). Read where a run first mixed the
+        sensors instead, it misses that warmer water: the circulation only
+        reaches it once it passes its temperature (real data, 15 October 2026:
+        the sensors met at 20.0 degC with 1.8 K of heat in, the whole tank was at
+        22 degC before the run).
         The stratification is held since the tank was last mixed (see
         physics.tank_stratification_k), as the plan reads it. Read from the
         sensors' difference instead, the layer came and went with each sensor
@@ -1528,50 +1664,28 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         on runs left out of the fit (0.99 against 1.02 K mean error).
         """
 
-        heating = (df["boiler_on"] & ~df["booster_on"]).to_numpy(dtype=bool)
-        boiler_on = df["boiler_on"].to_numpy(dtype=bool)
-        onsets = np.flatnonzero(heating & ~np.r_[False, heating[:-1]])
         seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
         step_s = np.r_[np.diff(seconds), 0.0]
         heat_w = pd.to_numeric(df["q_in_override_w"], errors="coerce").fillna(0.0)
         top = df["T_top"].to_numpy(dtype=float)
         bottom = df["T_bottom"].to_numpy(dtype=float)
-        stratification = tank_stratification_k(top, bottom, boiler_on)
+        stratification = tank_stratification_k(
+            top, bottom, df["boiler_on"].to_numpy(dtype=bool)
+        )
         loss_w = self.model.ua_top_w_per_k * (
             top - df["T_ambient"].to_numpy(dtype=float)
         ) + self.model.ua_bottom_w_per_k * (
             bottom - df["T_ambient"].to_numpy(dtype=float)
         )
-        net_j = (heat_w.to_numpy() - loss_w) * step_s
+        net_j = (
+            heat_w.to_numpy() * (self.model.calorimetric_gain or 1.0) - loss_w
+        ) * step_s
         heat_capacity_j_per_k = (
             RHO_WATER_KG_PER_L * self.model.volume_l * CP_WATER_J_PER_KG_K
         )
         starts = []
 
-        for i in onsets:
-            if i == 0:
-                continue
-
-            j = i
-
-            while j < len(df) and heating[j]:
-                j += 1
-
-            k = int(
-                np.searchsorted(
-                    seconds,
-                    seconds[min(j, len(df) - 1)] + self.POST_HEATING_TAIL_SECONDS,
-                )
-            )
-
-            if (
-                k >= len(df)
-                or boiler_on[j : k + 1].any()
-                or seconds[k] - seconds[j] > 2.0 * self.POST_HEATING_TAIL_SECONDS
-                or abs(top[k] - bottom[k]) > self.MIXED_SPREAD_K
-            ):
-                continue
-
+        for i, _, k in self._run_balance_spans(df):
             settled_c = (top[k] + bottom[k]) / 2.0
             mean_c = settled_c - float(net_j[i:k].sum()) / heat_capacity_j_per_k
             starts.append((top[i - 1], bottom[i - 1], stratification[i - 1], mean_c))
@@ -1755,7 +1869,12 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             end = settling.index[-1] if len(settling) else stop
             peaks.append(float(T_average.loc[start:end].max()))
 
-        booster_heat_w = df.loc[booster, "q_in_override_w"].median()
+        # As the tank takes it up (see _identify_calorimetric_gain): then the
+        # resistive element's heat is its draw (real data: 2.19 kW drawn, 1.94
+        # kW measured, 2.21 kW taken up).
+        booster_heat_w = df.loc[booster, "q_in_override_w"].median() * (
+            self.model.calorimetric_gain or 1.0
+        )
         booster_electrical_w = (
             df.loc[booster, "power"].median() if "power" in df.columns else np.nan
         )
@@ -1814,7 +1933,9 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         loss_w = model.ua_top_w_per_k * (top - T_ambient) + model.ua_bottom_w_per_k * (
             bottom - T_ambient
         )
-        net_j = (np.where(on, heat_w, 0.0) - loss_w) * np.r_[np.diff(seconds), 0.0]
+        net_j = (
+            np.where(on, heat_w * (model.calorimetric_gain or 1.0), 0.0) - loss_w
+        ) * np.r_[np.diff(seconds), 0.0]
         heat_capacity_j_per_k = (
             RHO_WATER_KG_PER_L * model.volume_l * CP_WATER_J_PER_KG_K
         )
@@ -1876,7 +1997,9 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
                     # of a linear rise. Its share at the step's start instead
                     # left out half a step of the ramp - 0.28 kWh a run, and
                     # every run 1.2 K colder than the plan really makes it.
-                    q_in = model.q_in_steady_w or model.q_in_nominal_w
+                    q_in = (model.q_in_steady_w or model.q_in_nominal_w) * (
+                        model.calorimetric_gain or 1.0
+                    )
                     ramp = model.q_in_ramp_seconds
 
                     if ramp:
@@ -2290,42 +2413,42 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             .timeseries(
                 "T_ambient",
                 config.heat_pump.boiler.ambient_temperature,
-                interval="5m",
+                interval=self.SAMPLE_INTERVAL,
                 aggregation="mean",
                 fill="previous",
             )
             .timeseries(
                 "T_top",
                 config.heat_pump.boiler.top_temperature,
-                interval="5m",
+                interval=self.SAMPLE_INTERVAL,
                 aggregation="mean",
                 fill="previous",
             )
             .timeseries(
                 "T_bottom",
                 config.heat_pump.boiler.bottom_temperature,
-                interval="5m",
+                interval=self.SAMPLE_INTERVAL,
                 aggregation="mean",
                 fill="previous",
             )
             .timeseries(
                 "T_supply",
                 config.heat_pump.supply_temperature,
-                interval="5m",
+                interval=self.SAMPLE_INTERVAL,
                 aggregation="mean",
                 fill="previous",
             )
             .timeseries(
                 "T_return",
                 config.heat_pump.return_temperature,
-                interval="5m",
+                interval=self.SAMPLE_INTERVAL,
                 aggregation="mean",
                 fill="previous",
             )
             .timeseries(
                 "flow_lpm",
                 config.heat_pump.flow,
-                interval="5m",
+                interval=self.SAMPLE_INTERVAL,
                 aggregation="mean",
                 # Unlike a state string, flow physically drops to ~0 as soon as the
                 # circulation pump stops. If the sensor itself stops publishing
@@ -2344,7 +2467,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             .timeseries(
                 "state",
                 config.heat_pump.state,
-                interval="5m",
+                interval=self.SAMPLE_INTERVAL,
                 aggregation="last",
                 fill="previous",
             )
@@ -2353,7 +2476,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             .timeseries(
                 "setpoint",
                 config.heat_pump.boiler.setpoint,
-                interval="5m",
+                interval=self.SAMPLE_INTERVAL,
                 aggregation="last",
                 fill="previous",
             )
@@ -2366,7 +2489,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             .timeseries(
                 "compressor_frequency",
                 config.heat_pump.compressor_frequency,
-                interval="5m",
+                interval=self.SAMPLE_INTERVAL,
                 aggregation="mean",
                 fill="previous",
             )
@@ -2378,7 +2501,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         builder = builder.timeseries(
             "power",
             config.heat_pump.power,
-            interval="5m",
+            interval=self.SAMPLE_INTERVAL,
             aggregation="mean",
             fill="none",
         )
@@ -2388,7 +2511,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             builder = builder.timeseries(
                 "booster",
                 config.heat_pump.booster,
-                interval="5m",
+                interval=self.SAMPLE_INTERVAL,
                 aggregation="last",
                 fill="previous",
             )
@@ -2402,7 +2525,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             builder = builder.timeseries(
                 name,
                 sensor,
-                interval="5m",
+                interval=self.SAMPLE_INTERVAL,
                 aggregation="last",
                 fill="previous",
             )

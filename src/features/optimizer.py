@@ -46,6 +46,17 @@ DEFAULT_MAX_TANK_TEMPERATURE_C = 65.0
 # tank to 57 instead of 45 degC - counted as optimal.
 MIP_ABSOLUTE_GAP_EUR = 0.001
 
+# HiGHS scales the objective by 2 to this power inside the solve (and so its
+# gap and bound with it). The plan's costs run down to ~1e-6 EUR per W of a
+# step, a tenth of a dual tolerance above HiGHS's own (1e-7): its reduced costs
+# were that inexact, and fixing variables on them at the root cut off the
+# optimal plan. On real data (a cold tank, the house 1 K under its target) one
+# of six random seeds proved 1.3987 EUR optimal against a feasible 1.3108 - its
+# root bound already 1.3653 - and the cold solve in the app did the same with
+# one more tank plan to choose from. Scaled by 2^10, all six found 1.3108, in
+# the same time; no setting of cuts, symmetry, restarts or probing did.
+OBJECTIVE_SCALE_EXPONENT = 10
+
 # How far apart (K) the tangents lie that bound the square of the tank's excess
 # over its unheated trajectory from below (see MPCOptimizer._build_model). They
 # miss it by at most a quarter of the spacing squared, 1 K^2 at 2 K: on this
@@ -68,7 +79,10 @@ COMFORT_TANGENT_SPACING_K = 0.2
 # cooling day's plan held to 8757 EUR of comfort it did not have to miss
 # (1.049 without presolve). Leaving out single rules (parallel rows, doubleton
 # equations) mended the one day and not the next; without presolve each of
-# them was proven right, in about the time it took with it.
+# them was proven right, in about the time it took with it. Not the same cause
+# as OBJECTIVE_SCALE_EXPONENT's: with the objective scaled, presolve still
+# proved a plan optimal 0.003 EUR above the optimum (real data, 16 Oct, a cold
+# tank: 0.7170 against 0.7141), though up to a third sooner.
 PRESOLVE = "off"
 
 # HiGHS's primal heuristics, off once the previous plan has given the solve its
@@ -241,15 +255,13 @@ class TankPlan:
     cost_eur: tuple[float, ...]
 
 
-def draw_w(
-    tank: TankSetting, k: int, tank_c, heat_pump_w, booster_w, start, handover=0
-):
+def draw_w(tank: TankSetting, k: int, tank_c, heat_pump_w, booster_w, start):
     """The electrical power step k draws (W) for this much heat from either
     source at tank_c: the power line for the heat pump's share of the step -
     a run's first quarter at its measured power instead (see
-    MPCOptimizer._start_power_correction_w), and a hand-over from the zone at
-    full output for the ramp's share too, the loop coming up to the tank's
-    temperature - and the booster's own draw."""
+    MPCOptimizer._start_power_correction_w); a hand-over from the zone, the
+    compressor at speed, on the power line throughout - and the booster's own
+    draw."""
 
     alpha, beta = tank.power_lines[k]
     heat_pump = (alpha + beta * tank_c) * heat_pump_w / tank.heat_w[k]
@@ -257,8 +269,6 @@ def draw_w(
 
     if tank.start_power_w:
         heat_pump = heat_pump + start * (tank.start_power_w - tank.ramp[k] * unheated_w)
-
-    heat_pump = heat_pump + handover * (1.0 - tank.ramp[k]) * unheated_w
 
     return heat_pump + tank.booster_draw_per_heat * booster_w
 
@@ -278,13 +288,11 @@ def grid_w(tank: TankSetting, k: int, power_w, heat_pump_w, booster_w):
     )
 
 
-def step_cost(
-    tank: TankSetting, k: int, tank_c, heat_pump_w, booster_w, start, handover=0
-):
+def step_cost(tank: TankSetting, k: int, tank_c, heat_pump_w, booster_w, start):
     """What step k costs (EUR) for this heat: the grid power at the import
     price, the own sun at the export it forgoes, and a start."""
 
-    power_w = draw_w(tank, k, tank_c, heat_pump_w, booster_w, start, handover)
+    power_w = draw_w(tank, k, tank_c, heat_pump_w, booster_w, start)
     hours_kwh = tank.dt_hours[k] / 1000.0
     export = tank.export_price[k]
 
@@ -344,7 +352,8 @@ def plan_tank(
     to go - and whether the heat pump has run yet in the plan (a target after
     a run carries its overshoot). The heat pump heats a step
     in full unless it is a run's last, which it uses in part; it starts a run
-    with its ramp, never above its limit, and may hand over to the booster
+    with its ramp - one taken over from the zone without - never above its
+    limit, and may hand over to the booster
     there - in the step it reaches the limit, the booster taking the rest of
     it - which then heats full steps but its last, up to the boiler's maximum.
     """
@@ -471,7 +480,7 @@ def plan_tank(
         everywhere = np.ones_like(tank_c, dtype=bool)
         kinds = {}
 
-        def step_to(ok, heat_pump, booster, start, handover, next_c, heats=True):
+        def step_to(ok, heat_pump, booster, start, next_c, heats=True):
             """A full step: where it lands between the next grid's points -
             and nothing drawn where nothing heats."""
 
@@ -480,11 +489,8 @@ def plan_tank(
                 "heat_pump": heat_pump,
                 "booster": booster,
                 "start": start,
-                "handover": handover,
                 "next": next_c,
-                "energy": step_cost(
-                    tank, k, tank_c, heat_pump, booster, start, handover
-                )
+                "energy": step_cost(tank, k, tank_c, heat_pump, booster, start)
                 if heats
                 else 0.0,
             }
@@ -501,7 +507,7 @@ def plan_tank(
 
             return kind
 
-        def land(low, high, ok, heat_pump_of, booster_of, start, handover, saved=0.0):
+        def land(low, high, ok, heat_pump_of, booster_of, start, saved=0.0):
             """A run's last step, landing on the next grid's own points between
             low and high - less what ending there saves."""
 
@@ -528,23 +534,21 @@ def plan_tank(
                 "heat_pump": heat_pump,
                 "booster": booster,
                 "start": start,
-                "handover": handover,
                 "next": points,
                 "index": index,
-                "energy": step_cost(tank, k, at, heat_pump, booster, start, handover)
-                - saved,
+                "energy": step_cost(tank, k, at, heat_pump, booster, start) - saved,
             }
 
-        kinds["coast"] = step_to(everywhere, 0.0, 0.0, 0, 0, coast, heats=False)
+        kinds["coast"] = step_to(everywhere, 0.0, 0.0, 0, coast, heats=False)
 
         for start in (0, 1):
-            # A block's first step: the compressor starting, or taking over
-            # from the zone - both with the ramp, only the first a start.
-            opening = (0, start) if from_zone[k] else (start, 0)
-            available = heat_w * (tank.ramp[k] if start else 1.0)
+            # A block's first step: the compressor starting, with its ramp, or
+            # taking over from the zone at speed (see _build_model).
+            ramped = start and not from_zone[k]
+            available = heat_w * (tank.ramp[k] if ramped else 1.0)
             full = coast + gain * available
             ok = everywhere if not at_limit else full <= tank.heat_pump_limit_c + 1e-9
-            kinds["heat_pump", start] = step_to(ok, available, 0.0, *opening, full)
+            kinds["heat_pump", start] = step_to(ok, available, 0.0, ramped, full)
             high = np.minimum(full, tank.heat_pump_limit_c) if at_limit else full
             kinds["heat_pump_last", start] = land(
                 coast,
@@ -552,7 +556,7 @@ def plan_tank(
                 everywhere,
                 lambda points, coast=coast: (points - coast[:, None]) / gain,
                 lambda points: np.zeros_like(points),
-                *opening,
+                ramped,
                 handover_eur[k],
             )
 
@@ -561,14 +565,14 @@ def plan_tank(
                 reaches = (to_limit >= 0.0) & (to_limit <= available)
                 to_limit = np.clip(to_limit, 0.0, available)
                 rest = np.maximum(
-                    1.0 - to_limit / heat_w - (1.0 - tank.ramp[k]) * start, 0.0
+                    1.0 - to_limit / heat_w - (1.0 - tank.ramp[k]) * ramped, 0.0
                 )
                 full_booster = tank.heat_pump_limit_c + gain * booster_w * rest
                 kinds["handover", start] = step_to(
                     reaches & (full_booster <= tank.max_tank_c + 1e-9),
                     to_limit,
                     booster_w * rest,
-                    *opening,
+                    ramped,
                     full_booster,
                 )
                 low = np.full_like(tank_c, tank.heat_pump_limit_c)
@@ -580,7 +584,7 @@ def plan_tank(
                         to_limit[:, None], points.shape
                     ),
                     lambda points: (points - tank.heat_pump_limit_c) / gain,
-                    *opening,
+                    ramped,
                 )
 
         if tank.booster_allowed[k] and booster_w and booster_free[k]:
@@ -588,7 +592,7 @@ def plan_tank(
             above = tank_c >= tank.heat_pump_max_c - 1e-9
             full = coast + gain * booster_w
             kinds["booster"] = step_to(
-                above & (full <= tank.max_tank_c + 1e-9), 0.0, booster_w, 0, 0, full
+                above & (full <= tank.max_tank_c + 1e-9), 0.0, booster_w, 0, full
             )
             kinds["booster_last"] = land(
                 coast,
@@ -596,7 +600,6 @@ def plan_tank(
                 above,
                 lambda points: np.zeros_like(points),
                 lambda points, coast=coast: (points - coast[:, None]) / gain,
-                0,
                 0,
             )
 
@@ -731,11 +734,9 @@ def plan_tank(
             for quantity in (action["heat_pump"], action["booster"], action["next"])
         )
         next_c = np.array([next_c])
-        start, handover = action["start"], action["handover"]
+        start = action["start"]
         costs.append(
-            float(
-                np.ravel(step_cost(tank, k, tank_c, heat, booster, start, handover))[0]
-            )
+            float(np.ravel(step_cost(tank, k, tank_c, heat, booster, start))[0])
             + float(np.ravel(shortfall_cost(tank, k, tank_c, next_c, ran))[0])
         )
         heat_pump_w.append(heat)
@@ -844,6 +845,34 @@ class MPCOptimizer:
         if not self._zone_planned(data):
             return self._tank_result(data, tank)
 
+        result, chosen = self._solve_with_zone(data, tank)
+
+        # The tank's plans were built around the zone's runs as estimated
+        # beforehand, and the zone the program settles on may hand the
+        # compressor to a tank block planned as a start: that block's first
+        # step then heats in full rather than with the ramp, and the steps
+        # its pattern holds on overheat the tank (real data, 17 Oct 2026, a
+        # solve without a previous plan: 50.7 degC against 47.9, 4.8 ct
+        # dearer). Once more around the zone as settled, that plan both a
+        # tank plan and the start, and the cheaper of the two kept.
+        settled = tuple(int(on) for on in result.space_schedule)
+        around = plan_tank(tank, settled, data.zone_cooling, data.zone_local_day)
+
+        if settled != tuple(data.previous_space_on) and _runs(around) != chosen:
+            again, _ = self._solve_with_zone(
+                replace(data, previous_space_on=settled), tank
+            )
+
+            if again.objective_value < result.objective_value:
+                return again
+
+        return result
+
+    def _solve_with_zone(
+        self, data: MPCInput, tank: TankSetting
+    ) -> tuple[MPCResult, tuple[tuple[int, int], ...]]:
+        """The plan with the zone, and the tank's pattern in it (see _runs)."""
+
         model = self._build_model(data, tank)
 
         time_limit_s = self.config.solve_time_limit_s
@@ -927,10 +956,20 @@ class MPCOptimizer:
                 "%.3f EUR from optimal",
                 time_limit_s,
                 results.best_feasible_objective,
-                results.best_feasible_objective - results.best_objective_bound,
+                # The bound comes back in HiGHS's scaled units, the plan not.
+                results.best_feasible_objective
+                - results.best_objective_bound / 2.0**OBJECTIVE_SCALE_EXPONENT,
             )
 
-        return self._extract_result(model, data, results.termination_condition)
+        chosen = tuple(
+            (
+                round(pyo.value(model.boiler_on[k])),
+                round(pyo.value(model.booster_on[k])),
+            )
+            for k in model.K
+        )
+
+        return self._extract_result(model, data, results.termination_condition), chosen
 
     @staticmethod
     def _relaxed_zone(model: pyo.ConcreteModel, solver: Highs) -> list[float]:
@@ -1057,7 +1096,8 @@ class MPCOptimizer:
     def _solver() -> Highs:
         solver = Highs()
         solver.highs_options = {
-            "mip_abs_gap": MIP_ABSOLUTE_GAP_EUR,
+            "user_objective_scale": OBJECTIVE_SCALE_EXPONENT,
+            "mip_abs_gap": MIP_ABSOLUTE_GAP_EUR * 2.0**OBJECTIVE_SCALE_EXPONENT,
             "mip_rel_gap": 0.0,
             "presolve": PRESOLVE,
         }
@@ -1295,6 +1335,24 @@ class MPCOptimizer:
             return discretization_cache[hours]
 
         ambient_c = float(data.ambient_temperature)
+
+        # A draw replaces hot water with cold from the mains, so taps cannot
+        # take the tank below the mains' temperature, however much the forecast
+        # expects: held there along the tank left unheated, where it would get
+        # that cold first - a heated tank has heat to give. The forecast is the
+        # heat draws took from the tanks it was learned on (real plan, 16 Oct
+        # 2026: an emptied tank at 25 degC at 12.3 degC by the next morning's
+        # run, the mains at 15.5 and the tank measured at 19.5).
+        if data.mains_water_temperature is not None:
+            tap_w = list(tap_w)
+            tank_c = initial_temperature
+
+            for k in range(num_steps):
+                a_d, b_d = discretized(dt_hours[k])
+                coast_c = float(a_d[0, 0] * tank_c + b_d[0, 0] * ambient_c)
+                floor_c = min(data.mains_water_temperature, coast_c)
+                tap_w[k] = min(float(tap_w[k]), (coast_c - floor_c) / -b_d[0, 2])
+                tank_c = coast_c + b_d[0, 2] * tap_w[k]
 
         def unheated(start_c: float, first: int = 0) -> list[float]:
             """The tank temperature at each step from `first` on with no heating
@@ -1714,16 +1772,23 @@ class MPCOptimizer:
 
         # A tank block begins (tank_start): with a start of the compressor, or
         # handed over from a heating run of the zone in the step before
-        # (tank_handover, the exact product of the two binaries). Either way
-        # the loop comes up to the tank's temperature first, so the ramp (see
-        # _ramp_fraction) hangs on every block rather than on every start - a
-        # run the zone opens heats no tank, and charged the ramp regardless,
-        # the tank's heat in that step was bounded below zero. Only a start
-        # draws the start's measured power (start_step_power_w); a hand-over
-        # runs at full output throughout. Assumed: the loop, at the floor's
-        # supply, takes as long to bring up as after a start - an upper bound,
-        # the compressor is at speed already. Cooling hands over to no tank
-        # (see _add_space_heating).
+        # (tank_handover, the exact product of the two binaries). The ramp
+        # (see _ramp_fraction) hangs on the blocks that start the compressor,
+        # tank_start - tank_handover, not on every start - a run the zone opens
+        # heats no tank, and charged the ramp regardless, the tank's heat in
+        # that step was bounded below zero. A hand-over carries none, as a run
+        # the tank hands to the zone does not (see _add_space_heating): the
+        # ramp is the compressor's own rise to full output, timed on the heat
+        # it delivers into the water, and handed over it is at speed already.
+        # The loop coming up to the tank's temperature is no more a loss there
+        # than after a start, where the ramp and the tank were identified with
+        # it inside: on this installation it rests at 24 degC (120 starts,
+        # Jun-Oct 2026), the floor's supply, and takes some 0.45 kWh either way.
+        # Costed as a start's ramp at full output instead, a hand-over came out
+        # some 6 ct dearer than a start, and the tank went before the zone
+        # rather than after it, hours ahead of its target (17 Oct 2026). Only a
+        # start draws the start's measured power (start_step_power_w). Cooling
+        # hands over to no tank (see _add_space_heating).
         model.tank_start = pyo.Var(model.K, bounds=(0.0, 1.0))
         model.tank_handover = pyo.Var(model.K, bounds=(0.0, 1.0))
 
@@ -1750,6 +1815,7 @@ class MPCOptimizer:
                 <= model.compressor_start[k] + model.tank_handover[k]
             )
             model.start_exact.add(model.tank_start[k] <= model.boiler_on[k])
+            model.start_exact.add(model.tank_start[k] >= model.tank_handover[k])
             model.start_exact.add(
                 model.tank_start[k]
                 >= model.compressor_start[k] + model.boiler_on[k] - 1
@@ -1926,7 +1992,8 @@ class MPCOptimizer:
 
             return (
                 model.q_heat_pump_w[k] / heat_w[k]
-                + (1.0 - self._ramp_fraction(dt_hours[k])) * model.tank_start[k]
+                + (1.0 - self._ramp_fraction(dt_hours[k]))
+                * (model.tank_start[k] - model.tank_handover[k])
                 + model.q_booster_w[k] / booster_heat_w
             )
 
@@ -1937,7 +2004,9 @@ class MPCOptimizer:
             # compressor spends coming up to speed if it starts here (see
             # _ramp_fraction).
             available = heat_w[k] * (
-                on - (1.0 - self._ramp_fraction(dt_hours[k])) * model.tank_start[k]
+                on
+                - (1.0 - self._ramp_fraction(dt_hours[k]))
+                * (model.tank_start[k] - model.tank_handover[k])
             )
 
             model.heat_source_constraints.add(model.q_heat_pump_w[k] <= available)
@@ -2344,11 +2413,9 @@ class MPCOptimizer:
             # over the heat it delivers, the ramp's share of the step: taken
             # as the power at the tank unheated, so its excess over that is
             # priced as in any step - exact for the horizon's first run, which
-            # has none. A hand-over from the zone draws the power line for the
-            # rest of the step too, the loop coming up (see draw_w).
+            # has none. A hand-over from the zone runs on the power line.
             ramp = self._ramp_fraction(dt_hours[k])
             unheated_w = alpha + beta * t_floor[k]
-            heat_pump_power_w += (1.0 - ramp) * unheated_w * model.tank_handover[k]
 
             if start_power_w:
                 heat_pump_power_w += (start_power_w - ramp * unheated_w) * (
@@ -2445,10 +2512,11 @@ class MPCOptimizer:
 
     @property
     def _heat_w(self) -> float:
-        """The heat the compressor puts into the tank once it is up to speed
-        (W). The calorimetric measurement where runs have shown it, the ODE's
-        own fitted constant otherwise - that one is an average over whole runs,
-        including their ramp, so it understates a running compressor.
+        """The heat the compressor delivers once it is up to speed, as its
+        calorimetry measures it (W; the tank takes up _heat_at). The
+        calorimetric measurement where runs have shown it, the ODE's own fitted
+        constant otherwise - that one is an average over whole runs, including
+        their ramp, so it understates a running compressor.
         """
 
         return self.thermal_model.q_in_steady_w or self.thermal_model.q_in_nominal_w
@@ -2457,14 +2525,18 @@ class MPCOptimizer:
         """The heat a running compressor puts into the tank at this outdoor
         temperature (W): the calorimetric line of the COP model (see
         HeatPumpCOPModel.q_in_at_zero_outdoor_w), or _heat_w without it or
-        without a forecast."""
+        without a forecast - as the tank takes it up (see
+        BoilerThermalModel.calorimetric_gain)."""
 
         cop = self.cop_model
+        gain = self.thermal_model.calorimetric_gain or 1.0
 
         if cop is None or outdoor_c is None or not cop.q_in_at_zero_outdoor_w:
-            return self._heat_w
+            return self._heat_w * gain
 
-        return cop.q_in_at_zero_outdoor_w + cop.q_in_per_outdoor_w_per_k * outdoor_c
+        return (
+            cop.q_in_at_zero_outdoor_w + cop.q_in_per_outdoor_w_per_k * outdoor_c
+        ) * gain
 
     def _initial_temperature(self, data: MPCInput) -> float:
         """The tank the plan starts from now (deg C) - its first step runs from
@@ -2657,6 +2729,7 @@ class MPCOptimizer:
 
         return (
             self._heat_w
+            * (self.thermal_model.calorimetric_gain or 1.0)
             * self.config.step_hours
             * 3600.0
             / (
@@ -2761,9 +2834,19 @@ class MPCOptimizer:
         solar_gain_rest_w = data.zone_solar_gain_rest_w or none_w
 
         # The same compressor serves both, so its output is the tank's nominal
-        # heat. A space-heating-specific figure would come from the heating COP
-        # calibration, which needs a heating season first.
-        max_heat_w = self._heat_w
+        # heat - but the zone no more than its runs have moved (see
+        # FloorCircuitModel.max_heat_w), the range its COP model was fitted in.
+        # Beyond it that model is extrapolated, and wrongly: at the tank's
+        # 6.5 kW and a 29 degC supply it gave a COP of 5.9 where the tank's
+        # runs at that output and supply measured 4.0-4.2 (real data, Oct
+        # 2026; the floor's runs at 3.4-4.4 kW were within 10% of it), so the
+        # plan ran the floor flat out at a high supply on a cheap-looking COP.
+        operating_range = self.floor_circuit_model
+        max_heat_w = (
+            min(self._heat_w, operating_range.max_heat_w)
+            if operating_range is not None and operating_range.max_heat_w
+            else self._heat_w
+        )
         cooling = bool(data.zone_cooling)
         # The sign of the heat the zone's mode brings into the floor.
         sign = -1.0 if cooling else 1.0
@@ -3420,9 +3503,6 @@ class MPCOptimizer:
                 else (alpha + beta * temperatures[k]) * used
             )
 
-            if handover[k] and used:
-                ramp = self._ramp_fraction(dt_hours[k])
-                heat_pump_power_w += (1.0 - ramp) * (alpha + beta * model.t_floor[k])
             electrical_power_w.append(
                 heat_pump_power_w + self._booster_draw_per_heat * booster_w[k]
             )

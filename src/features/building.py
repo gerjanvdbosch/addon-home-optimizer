@@ -212,6 +212,17 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # times too small on synthetic data with known parameters.
     MASS_WARMUP_HOURS = 24.0
 
+    # How far back forecast() takes the household's weekly habit from - who
+    # is home, and the shutters that follow them (see forecast()). Three weeks
+    # gives each weekday three days to take a median over, so one odd week -
+    # a holiday, a day off - does not set it. Not a sharp choice for the
+    # shutters (13 Sep - 16 Oct 2026: the thermostat room's sun 119, 104, 107
+    # and 109 W off over six hours from two, three, four and six weeks); for
+    # who is home two weeks is a mean of two days, which a holiday carried for
+    # a fortnight after it (21 Aug - 16 Oct: 0.39 people wrong over a day
+    # against 0.27 from three weeks, 0.27 from four).
+    HABIT_HISTORY_DAYS = 21
+
     # The zone sensors report on a 0.01 K grid - verified against 30 days of
     # raw readings, which sit on it exactly and do not fit a coarser one. A
     # uniform quantisation error of that width has variance step^2/12, which is
@@ -379,6 +390,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         self.facade_azimuth_deg = 180.0
         self.shutter_areas_m2: list[float] = []
         self.shutter_closed_positions: list[float] = []
+        self.shutter_sensors: list[SensorReference] = []
+        self.presence_sensors: list[SensorReference] = []
         self.room_temperature_columns: list[str] = []
         self.room_areas_m2: list[float] = []
         self.shutter_columns: list[str] = []
@@ -663,9 +676,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         irradiance is scaled by it: on 4 Oct 2026 the morning sun was 2-4
         times the forecast's, and the zone was fitted to forecast sun.
 
-        One where there is no measurement - ahead of now, a reporting gap, no
-        plane irradiance before Open-Meteo reported it - or too little forecast
-        light to divide by (see PV_CORRECTION_MIN_IRRADIANCE_W_PER_M2). Carrying
+        One where there is no measurement - ahead of now without a PV forecast
+        (see forecast()), a reporting gap, no plane irradiance before
+        Open-Meteo reported it - or too little forecast light to divide by (see
+        PV_CORRECTION_MIN_IRRADIANCE_W_PER_M2). Carrying
         the last measured sky on into the forecast, fading to it over 0.5-2
         hours, did worse at every fade (105 forecasts, Sep-Oct 2026: 0.128 K
         over the first two hours against 0.131-0.138): the hourly forecast has
@@ -1954,6 +1968,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         df: pd.DataFrame,
         now: datetime,
         baseload_w: pd.Series | None = None,
+        pv_w: pd.Series | None = None,
+        habits: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """Rolls the model forward past the last measurement, indexed by time.
 
@@ -1969,21 +1985,52 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         Two of the inputs are genuine forecasts - irradiance and outdoor
         temperature both come from Open-Meteo - and `baseload_w` takes the
-        baseload forecaster's own curve when given. The shutters stand as they
-        did at the same time of day over the frame's past, not as they last
-        were: a shutter opened at six in the evening says nothing about noon
-        the next day. Over 208 rolling 24 hour forecasts (4 Oct 2026) that put
-        the zone 0.263 K out against 0.286 K holding the last position, and
-        the real future position 0.241 K: the model, not the shutters, limits
-        this. Who is home is taken the same way, on average: over 70 forecasts
-        issued at 7:00 and 18:00 (Sep-Oct 2026) it put 0.44 people wrong
-        against 0.61 carrying the last reading on - the zone 0.352 against
-        0.357 K, 75 W a person being little; 18:00's forecasts gained, a
-        weekend morning's lost, the frame's past being weekdays then. The rest
-        is each sensor's last reading carried forward.
+        baseload forecaster's own curve when given. `pv_w`, the PV forecast,
+        sets the sky ahead as the measured output does behind (see
+        _measured_sky): the array is the facade's sun meter, and Solcast
+        forecasts its sun better than Open-Meteo, which runs low (20 Aug - 16
+        Oct 2026, 0-6 h ahead: PV 148-164 W out against 176-216 W, Open-Meteo
+        65-89 W short). Over 156 forecasts (2 Sep - 16 Oct, issued 7-13 h) that
+        put the zone 0.153 K out over the first six hours against 0.166 K, with
+        the real shutters - the measured sun did 0.147 K - and halved its bias
+        (-0.014 against -0.050 K).
+
+        The shutters stand as they did on the same weekday at that time of day
+        over `habits`, their past weeks (see HABIT_HISTORY_DAYS; the frame's
+        own past without), and one that is open holds where it stands
+        for the rest of the day. They follow who is home in the day, which
+        follows the household's week, not the sky: the thermostat room's
+        shutter opened by 8-10 h on days someone was in and stayed shut until
+        18 h on days no one was (Aug-Oct 2026: its day's mean position
+        correlated 0.75 with who was in, 0.13 with the sun). Over 152
+        forecasts (12 Sep - 16 Oct, issued 7-22 h, 30 h ahead) that put the
+        zone 0.173 K out over the first six hours and 0.229 K over a day,
+        against 0.185 and 0.246 K by the time of day over the frame's last two
+        days, 0.183 and 0.246 K holding today's position, and 0.158 and 0.219
+        K with the real shutters; issued at 7 h, while they are still shut,
+        the thermostat room's sun came out 82 W off against 126 W holding them
+        shut. A gradient-boosted model of the position (weekday, time, lead,
+        position and who is in at issue, and the sun as measured) did worse
+        on the same 34 days, walk-forward: 116-135 W over six hours trained on
+        the last 28-63 days, 154 W on all since June, against 96 W for the
+        habit (Influx, Jun-Oct 2026). The more of the past it took, the worse:
+        the habit moves with the season - in June and July the shutter was
+        shut against the sun.
+
+        Who is home is taken the same way, the median on that weekday at that
+        time of day over `habits`, not the last reading carried on - an
+        evening at home put everyone in all the next day - nor the frame's day
+        or two, whose weekdays a weekend morning was forecast from. Over 226
+        forecasts (21 Aug - 16 Oct 2026, issued 7, 12, 18 and 22 h, 30 h
+        ahead) that put 0.27 people wrong over a day against 0.45 by the time
+        of day over the frame and 0.69 holding the last reading; 0.19 against
+        0.42 once a fortnight away in August was three weeks past - the median,
+        not the mean (0.40), lets one such week go. 75 W a person moves the
+        zone little (0.352 against 0.357 K for 0.44 against 0.61 people wrong,
+        Sep-Oct 2026). The rest is each sensor's last reading carried forward.
         """
 
-        zone, last = self._trajectory(df, now, baseload_w)
+        zone, last = self._trajectory(df, now, baseload_w, pv_w, habits)
 
         return zone.iloc[last:]
 
@@ -1992,6 +2039,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         df: pd.DataFrame,
         now: datetime,
         baseload_w: pd.Series | None = None,
+        pv_w: pd.Series | None = None,
+        habits: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """The zone over the whole frame, indexed by time: the filter's estimate
         of every state up to now, then the free-running forecast from there (see
@@ -2000,7 +2049,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         is driven by, and the history it is drawn against.
         """
 
-        zone, _ = self._trajectory(df, now, baseload_w)
+        zone, _ = self._trajectory(df, now, baseload_w, pv_w, habits)
 
         return zone
 
@@ -2009,9 +2058,21 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         df: pd.DataFrame,
         now: datetime,
         baseload_w: pd.Series | None,
+        pv_w: pd.Series | None,
+        habits: pd.DataFrame | None,
     ) -> tuple[pd.DataFrame, int]:
 
         model = self.get_model()
+
+        # The PV forecast stands in for the measurement ahead, before prepare()
+        # turns the output into the sky (see forecast()).
+        if pv_w is not None:
+            df = df.copy()
+            ahead = df["target_time"] > now
+            df.loc[ahead, "pv_w"] = pv_w.reindex(df.loc[ahead, "target_time"]).to_numpy(
+                dtype=float
+            )
+
         prepared = self.prepare(df)
 
         # Where the measurements stop cannot be read off the frame: every
@@ -2028,36 +2089,52 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         local = prepared["time"].map(to_local_time)
         quarter = local.map(lambda t: t.hour * 60 + t.minute)
 
-        # The shutters ahead as they stood at the same time of day before, not
-        # as they last were: they follow the household's day (see forecast()).
+        # Who is home ahead, and the shutters that follow them, as on that
+        # weekday at that time of day over the past weeks (see forecast()).
+        history = (
+            prepared.loc[known] if habits is None or habits.empty else habits
+        ).set_index("time")
+        past = history.index.map(to_local_time)
+        habit = [
+            past.map(lambda t: t.weekday()),
+            past.map(lambda t: t.hour * 60 + t.minute),
+        ]
+        ahead = pd.MultiIndex.from_arrays(
+            [local[~known].map(lambda t: t.weekday()), quarter[~known]]
+        )
+
+        def usual(values, last):
+            return values.groupby(habit).median().reindex(ahead).fillna(last).to_numpy()
+
+        # An open shutter as it stands for the rest of today.
         if self.shutter_columns:
-            usual = (
-                prepared.loc[known, self.shutter_columns]
+            columns = self.shutter_columns
+            last = (
+                prepared.loc[known, columns]
                 .apply(pd.to_numeric, errors="coerce")
-                .groupby(quarter[known])
-                .median()
+                .iloc[-1]
             )
-            last = prepared.loc[known, self.shutter_columns].iloc[-1]
-            prepared.loc[~known, self.shutter_columns] = (
-                usual.reindex(quarter[~known]).fillna(last).to_numpy()
+            forecast = usual(
+                history[columns].apply(pd.to_numeric, errors="coerce"), last
             )
+            today = (
+                local[~known].map(lambda t: t.date()) == local[known].iloc[-1].date()
+            ).to_numpy()
+            is_open = last.to_numpy() > np.array(
+                self.shutter_closed_positions or [0.0] * len(columns)
+            )
+            forecast[np.ix_(today, is_open)] = last.to_numpy()[is_open]
+            prepared.loc[~known, columns] = forecast
             prepared["shutter_open_fraction"] = self._shutter_open_fraction(prepared)
             prepared["open_living"] = self._shutter_open_fraction(prepared, True)
             prepared["open_rest"] = self._shutter_open_fraction(prepared, False)
 
-        # Who is home ahead, the same way and for the same reason: on average at
-        # that time of day, not the last reading carried on - an evening at
-        # home put everyone in all the next day. From the frame's own past, a
-        # day or two, so a day away is in it and the forecast follows.
+        # A tracker that did not report says nothing about who was home.
         if self.presence_columns:
-            occupants = prepared["occupants"]
-            prepared.loc[~known, "occupants"] = (
-                occupants[known]
-                .groupby(quarter[known])
-                .mean()
-                .reindex(quarter[~known])
-                .fillna(occupants[known].iloc[-1])
-                .to_numpy()
+            reported = history[self.presence_columns].notna().all(axis=1)
+            prepared.loc[~known, "occupants"] = usual(
+                self._occupants(history).where(reported),
+                prepared.loc[known, "occupants"].iloc[-1],
             )
 
         if baseload_w is not None:
@@ -2117,6 +2194,25 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         return zone, last
 
+    def habit_dataset(self) -> DatasetDefinition:
+        """The shutters and who is home alone, over the weeks forecast() takes
+        their habit from (see HABIT_HISTORY_DAYS) - a few series, where the
+        whole zone frame would load weeks of weather snapshots with them.
+        After dataset(), which names them."""
+
+        builder = DatasetBuilder()
+
+        for name, sensor in zip(
+            self.shutter_columns + self.presence_columns,
+            self.shutter_sensors + self.presence_sensors,
+            strict=True,
+        ):
+            builder = builder.timeseries(
+                name, sensor, interval="15m", aggregation="last", fill="previous"
+            )
+
+        return builder.build()
+
     def dataset(self, config: Config) -> DatasetDefinition:
         self.room_areas_m2 = [room.area_m2 for room in config.building.rooms]
         self.states = config.heat_pump.states
@@ -2133,6 +2229,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         ]
         self.shutter_areas_m2 = [glazing.glass_m2 for glazing in shaded]
         self.shutter_closed_positions = [glazing.closed_position for glazing in shaded]
+        self.shutter_sensors = [glazing.cover for glazing in shaded]
         self.glazing_in_thermostat_room = [
             glazing.thermostat_room for glazing in config.building.south_glazing
         ]
@@ -2180,6 +2277,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         ]
         self.shutter_columns = [f"shutter_{i}" for i in range(len(shaded))]
         self.presence_columns = [f"presence_{i}" for i in range(len(config.presence))]
+        self.presence_sensors = list(config.presence)
 
         # Open-Meteo snapshots are the base frame because they are the only
         # source of irradiance. The sensor uses the minutely_15 endpoint, so its
@@ -2250,9 +2348,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # Cover position is an event-driven state - it only changes when a
         # shutter actually moves - so it is carried forward, not averaged.
         shutters: list[tuple[str, SensorReference, Aggregation, FillMethod]] = [
-            (name, glazing.cover, "last", "previous")
-            for name, glazing in zip(self.shutter_columns, shaded, strict=True)
-            if glazing.cover is not None
+            (name, sensor, "last", "previous")
+            for name, sensor in zip(
+                self.shutter_columns, self.shutter_sensors, strict=True
+            )
         ]
         numeric += shutters
 

@@ -21,6 +21,7 @@ from domain.physics import (
     zone_observations,
     zone_state_space,
 )
+from domain.time import to_local_time
 from features.building import BuildingThermalIdentifier, facade_irradiance_w_per_m2
 
 TRUE_VOLUME_M3 = 120.0
@@ -983,9 +984,10 @@ def test_forecast_uses_a_supplied_baseload_curve():
     assert boosted["living"].iloc[-1] > plain["living"].iloc[-1]
 
 
-def test_forecast_shutters_follow_the_time_of_day_not_the_last_position():
-    """A shutter opened just now says nothing about noon tomorrow: ahead it
-    stands as it did at that time of day before."""
+def test_forecast_shutters_hold_for_the_day_then_follow_the_time_of_day():
+    """A shutter opened just now stays open for the rest of the day - someone
+    is in - but says nothing about noon tomorrow: from then on it stands as it
+    did on that weekday before."""
 
     identifier, df, now = _calibrated(with_future=True)
     identifier.model = replace(identifier.model, closed_shutter_gain_fraction=0.1)
@@ -997,9 +999,119 @@ def test_forecast_shutters_follow_the_time_of_day_not_the_last_position():
 
     forecast = identifier.forecast(df, now)
     ahead = forecast.index > now
+    today = np.array(
+        [to_local_time(t).date() == to_local_time(now).date() for t in forecast.index]
+    )
+
+    assert (
+        forecast.loc[ahead & today, "solar_gain_w"]
+        > shut.loc[ahead & today, "solar_gain_w"]
+    ).any()
+    np.testing.assert_allclose(
+        forecast.loc[ahead & ~today, "solar_gain_w"],
+        shut.loc[ahead & ~today, "solar_gain_w"],
+    )
+
+
+def test_forecast_shutters_follow_their_weekday_habit_while_shut():
+    """Shut now, a shutter opens as it did on the same weekday the weeks
+    before - the household's week, not the frame's last days."""
+
+    identifier, df, now = _calibrated(with_future=True)
+    identifier.model = replace(identifier.model, closed_shutter_gain_fraction=0.1)
+    df = df.copy()
+    df["shutter_0"] = 0.0
+    weeks = pd.date_range(now - timedelta(days=21), now, freq="15min")
+    weekday = np.array([to_local_time(t).weekday() for t in weeks])
+
+    def forecast(position: np.ndarray) -> pd.DataFrame:
+        history = pd.DataFrame(
+            {"time": weeks, "shutter_0": position, "presence_0": "not_home"}
+        )
+        return identifier.forecast(df, now, habits=history)
+
+    shut = forecast(np.zeros(len(weeks)))
+    # Open all of today's weekday, shut on every other.
+    habit = forecast(np.where(weekday == to_local_time(now).weekday(), 100.0, 0.0))
+    ahead = habit.index > now
+    today = np.array(
+        [to_local_time(t).date() == to_local_time(now).date() for t in habit.index]
+    )
+
+    assert (
+        habit.loc[ahead & today, "solar_gain_w"]
+        > shut.loc[ahead & today, "solar_gain_w"]
+    ).any()
+    np.testing.assert_allclose(
+        habit.loc[ahead & ~today, "solar_gain_w"],
+        shut.loc[ahead & ~today, "solar_gain_w"],
+    )
+
+
+def test_forecast_presence_follows_its_weekday_habit():
+    """Who is home ahead is who was home on that weekday at that time of day
+    the weeks before - the household's week, not the frame's last days, from
+    which a weekend morning was forecast as a weekday."""
+
+    identifier, df, now = _calibrated(with_future=True)
+    weeks = pd.date_range(now - timedelta(days=21), now, freq="15min")
+    weekday = np.array([to_local_time(t).weekday() for t in weeks])
+
+    def forecast(home: np.ndarray) -> pd.DataFrame:
+        history = pd.DataFrame(
+            {
+                "time": weeks,
+                "shutter_0": 0.0,
+                "presence_0": np.where(home, "home", "not_home"),
+            }
+        )
+        return identifier.forecast(df, now, habits=history)
+
+    away = forecast(np.zeros(len(weeks), dtype=bool))
+    # Home all of today's weekday, away on every other.
+    habit = forecast(weekday == to_local_time(now).weekday())
+    ahead = habit.index > now
+    today = np.array(
+        [to_local_time(t).date() == to_local_time(now).date() for t in habit.index]
+    )
 
     np.testing.assert_allclose(
-        forecast.loc[ahead, "solar_gain_w"], shut.loc[ahead, "solar_gain_w"]
+        habit.loc[ahead & today, "internal_gain_w"]
+        - away.loc[ahead & today, "internal_gain_w"],
+        Q_PERSON_SENSIBLE_W,
+    )
+    np.testing.assert_allclose(
+        habit.loc[ahead & ~today, "internal_gain_w"],
+        away.loc[ahead & ~today, "internal_gain_w"],
+    )
+
+
+def test_forecast_takes_the_sky_ahead_from_the_pv_forecast():
+    """The array is the facade's sun meter ahead as it is behind: forecast to
+    give twice what it gives at Open-Meteo's irradiance on its plane, it puts
+    twice the sun on the zone."""
+
+    identifier, df, now = _calibrated(with_future=True)
+    identifier.pv_power_per_irradiance_m2 = 2.0
+    df = df.copy()
+    df["global_tilted_irradiance"] = df["direct_radiation"] + df["diffuse_radiation"]
+    pv = pd.Series(
+        2.0
+        * identifier.pv_power_per_irradiance_m2
+        * df["global_tilted_irradiance"].to_numpy(),
+        index=df["target_time"],
+    )
+
+    plain = identifier.forecast(df, now)
+    sunnier = identifier.forecast(df, now, pv_w=pv)
+    lit = (plain.index > now) & (
+        df.set_index("target_time")["global_tilted_irradiance"].reindex(plain.index)
+        >= identifier.PV_CORRECTION_MIN_IRRADIANCE_W_PER_M2
+    ).to_numpy()
+
+    assert lit.any()
+    np.testing.assert_allclose(
+        sunnier.loc[lit, "solar_gain_w"], 2.0 * plain.loc[lit, "solar_gain_w"]
     )
 
 

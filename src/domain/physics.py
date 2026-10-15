@@ -16,6 +16,14 @@ from domain.models import BuildingThermalModel, DewPointModel
 RHO_WATER_KG_PER_L = 1.0
 CP_WATER_J_PER_KG_K = 4186.0
 
+# The climate the mains water follows (deg C): KNMI's 1991-2020 normals for De
+# Bilt, the annual mean and the mean of the coldest (January) and warmest (July)
+# months - the Netherlands' reference station, and within a degree of this
+# installation's region. See mains_water_temperature_c.
+CLIMATE_ANNUAL_MEAN_C = 10.5
+CLIMATE_COLDEST_MONTH_C = 3.6
+CLIMATE_WARMEST_MONTH_C = 18.2
+
 # Physical constants of indoor air at room conditions, not fit parameters.
 RHO_AIR_KG_PER_M3 = 1.2
 CP_AIR_J_PER_KG_K = 1005.0
@@ -62,44 +70,6 @@ def tank_state_space(
         )
         / c_node
     )
-
-    return a, b
-
-
-def layered_tank_state_space(
-    volume_l: float,
-    ua_w_per_k: float,
-    layer_fraction: float,
-    k_top_bottom_w_per_k: float,
-    k_bottom_layer_w_per_k: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Continuous state-space for dx/dt = A x + B T_ambient of a tank at rest,
-    x = [T_top, T_bottom, T_layer]: the two sensed nodes and the cold layer
-    below the bottom sensor (see BoilerThermalModel.cold_layer_fraction).
-
-        C_top    dT_top/dt    = UA_top (T_amb - T_top) + K_tb (T_bottom - T_top)
-        C_bottom dT_bottom/dt = UA_bottom (T_amb - T_bottom)
-                                + K_tb (T_top - T_bottom) + K_bl (T_layer - T_bottom)
-        C_layer  dT_layer/dt  = UA_layer (T_amb - T_layer) + K_bl (T_bottom - T_layer)
-
-    The layer holds layer_fraction of the volume, the sensed nodes half of the
-    rest each. The standing loss is spread over the nodes in proportion to their
-    volume: the same loss per height of the cylinder, nothing being known that
-    would make one part lose more. The internal couplings conserve the tank's
-    energy, so only UA takes it out.
-    """
-
-    shares = np.array([(1 - layer_fraction) / 2, (1 - layer_fraction) / 2])
-    shares = np.append(shares, layer_fraction)
-    capacities = RHO_WATER_KG_PER_L * volume_l * CP_WATER_J_PER_KG_K * shares
-    k_tb, k_bl = k_top_bottom_w_per_k, k_bottom_layer_w_per_k
-    coupling = np.array(
-        [[-k_tb, k_tb, 0.0], [k_tb, -k_tb - k_bl, k_bl], [0.0, k_bl, -k_bl]]
-    )
-    losses = ua_w_per_k * shares
-
-    a = (coupling - np.diag(losses)) / capacities[:, None]
-    b = (losses / capacities)[:, None]
 
     return a, b
 
@@ -481,3 +451,25 @@ def indoor_dew_point_c(
         e = e + weight * (outdoor[..., k] + model.moisture_surplus_pa - e)
 
     return dew_point_c(np.stack(pressures, axis=-1))
+
+
+def mains_water_temperature_c(day_of_year: int) -> float:
+    """The cold mains water a tap draw lets into the tank (deg C) on that day:
+    Burch and Christensen's correlation (NREL, 2007; EnergyPlus's
+    Site:WaterMainsTemperature), the year's air temperature cycle damped and
+    delayed by the ground the mains run through, in its own degrees F. Not
+    measured here, and not readable from the tank either: the bottom sensor
+    sits above the cold layer and was still falling 2 K a minute when the
+    largest draws ended. Below the lowest it read in such draws in every month
+    (Aug-Oct 2026: 17.3, 16.7 and 15.5 degC against 17.5, 17.8 and 16.5).
+    """
+
+    annual_f = CLIMATE_ANNUAL_MEAN_C * 9.0 / 5.0 + 32.0
+    swing_f = (CLIMATE_WARMEST_MONTH_C - CLIMATE_COLDEST_MONTH_C) * 9.0 / 5.0
+    ratio = 0.4 + 0.01 * (annual_f - 44.0)
+    lag_days = 35.0 - 1.0 * (annual_f - 44.0)
+    mains_f = (annual_f + 6.0) + ratio * swing_f / 2.0 * np.sin(
+        np.radians(0.986 * (day_of_year - 15.0 - lag_days) - 90.0)
+    )
+
+    return float((mains_f - 32.0) * 5.0 / 9.0)

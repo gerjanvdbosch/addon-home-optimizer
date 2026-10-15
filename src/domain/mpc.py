@@ -204,6 +204,10 @@ class MPCInput:
     # MPCOptimizer.solve). Empty starts the solve cold.
     previous_tank_on: tuple[int, ...] = ()
     previous_space_on: tuple[int, ...] = ()
+    # The cold mains water a draw lets in (deg C; see
+    # physics.mains_water_temperature_c): what taps can cool the tank to at
+    # most. None leaves the tap forecast as it is.
+    mains_water_temperature: float | None = None
     # What a kWh costs from the grid and brings in exported per step (EUR/kWh):
     # a high and low tariff or dynamic prices. Empty uses MPCConfig's flat ones.
     import_price_eur_per_kwh: tuple[float, ...] = ()

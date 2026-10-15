@@ -13,11 +13,9 @@ import pytest
 from domain.dynamics import discretize_zoh
 from domain.models import BoilerThermalModel
 from domain.physics import (
-    layered_tank_state_space,
     lumped_tank_state_space,
     tank_state_space,
 )
-from domain.time import local_day_start
 from features.boiler import BoilerThermalIdentifier, _rollout
 
 TRUE_VOLUME_L = 200.0
@@ -1424,35 +1422,13 @@ def test_identify_heat_input_ramp_needs_enough_runs():
     ) == (None, None)
 
 
-def test_standing_loss_is_found_past_the_cold_layer_warming_at_night():
-    """Nights after evening tapping: the layer below the bottom sensor warms
-    against the tank above it, so the bottom sensor cools faster than the
-    tank loses heat. Read through sensors on the 0.5 K grid, the standing loss
-    still comes out as simulated, not as the layer's warming."""
+def test_standing_loss_is_read_from_the_rest_after_runs():
+    """Runs that leave the tank mixed, then hours at rest before the next one:
+    the heat it holds cools at the simulated loss, read through sensors on the
+    0.5 K grid; a draw ends the rest it falls in."""
 
-    ua, k_tb, k_bl, layer = 2.0, 1.0, 2.0, 0.5
-    a_d, b_d = discretize_zoh(
-        *layered_tank_state_space(TRUE_VOLUME_L, ua, layer, k_tb, k_bl), DT_SECONDS
-    )
+    ua = 3.0
     identifier = BoilerThermalIdentifier()
-    steps = int(identifier.STANDING_LOSS_NIGHT_END_HOUR * 3600 / DT_SECONDS)
-    rng = np.random.default_rng(0)
-    rows = []
-
-    for night in range(identifier.MIN_STANDING_LOSS_NIGHTS):
-        start = local_day_start(datetime(2026, 9, 1, tzinfo=timezone.utc), night)
-        state = np.array([50.0, 45.0, rng.uniform(25.0, 40.0)])
-
-        for k in range(steps):
-            rows.append((start + timedelta(seconds=k * DT_SECONDS), *state[:2]))
-            state = a_d @ state + b_d[:, 0] * T_AMBIENT_C
-
-    df = pd.DataFrame(rows, columns=["time", "T_top", "T_bottom"])
-    df[["T_top", "T_bottom"]] = (df[["T_top", "T_bottom"]] * 2).round() / 2
-    df["time"] = pd.to_datetime(df["time"], utc=True)
-    df["T_ambient"] = T_AMBIENT_C
-    df["boiler_on"] = False
-    df["dt_seconds"] = DT_SECONDS
     identifier.model = BoilerThermalModel(
         volume_l=TRUE_VOLUME_L,
         ua_top_w_per_k=1.0,
@@ -1460,10 +1436,44 @@ def test_standing_loss_is_found_past_the_cold_layer_warming_at_night():
         ua_mix_idle_w_per_k=0.3,
         ua_mix_active_w_per_k=600.0,
         q_in_nominal_w=4500.0,
-        cold_layer_fraction=layer,
+        cold_layer_fraction=0.5,
         cold_water_temperature_c=30.0,
+        cold_layer_spread_k=4.0,
     )
+    a_d, b_d = discretize_zoh(*lumped_tank_state_space(TRUE_VOLUME_L, ua), DT_SECONDS)
+    run_steps, rest_steps = 10, int(6 * 3600 / DT_SECONDS)
+    rng = np.random.default_rng(0)
+    # A reading before the first run: a run's heat balance needs the tank
+    # before it.
+    start = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    rows = [(start - timedelta(seconds=DT_SECONDS), 40.0, 40.0, False)]
+
+    for _ in range(identifier.MIN_STANDING_LOSS_RUNS):
+        heat_c = rng.uniform(45.0, 55.0)
+
+        for k in range(run_steps + rest_steps):
+            on = k < run_steps
+            rows.append((start, heat_c, heat_c, on))
+            start += timedelta(seconds=DT_SECONDS)
+
+            if not on:
+                heat_c = a_d[0, 0] * heat_c + b_d[0, 0] * T_AMBIENT_C
+
+    df = pd.DataFrame(rows, columns=["time", "T_top", "T_bottom", "boiler_on"])
+    df[["T_top", "T_bottom"]] = (df[["T_top", "T_bottom"]] * 2).round() / 2
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    df["T_ambient"] = T_AMBIENT_C
+    df["booster_on"] = False
+    df["dt_seconds"] = DT_SECONDS
 
     found, _ = identifier._identify_standing_loss(df)
 
-    assert found == pytest.approx(ua, rel=0.1)
+    assert found == pytest.approx(ua, rel=0.05)
+
+    # A draw an hour into every rest: only the hour before it is at rest.
+    drawn = df.copy()
+    rest = (~drawn["boiler_on"]).astype(int)
+    minutes_at_rest = rest.groupby((rest == 0).cumsum()).cumsum()
+    drawn.loc[minutes_at_rest >= int(3600 / DT_SECONDS), "T_bottom"] -= 5.0
+
+    assert identifier._identify_standing_loss(drawn)[0] == pytest.approx(ua, rel=0.2)

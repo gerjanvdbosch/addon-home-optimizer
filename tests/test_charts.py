@@ -10,6 +10,7 @@ from web.charts import (
     broken_between_runs,
     dashboard_chart,
     ended,
+    handed_over,
     joined,
     mixed_tank,
     read_at,
@@ -57,6 +58,24 @@ def test_a_planned_supply_stops_between_runs():
     assert math.isnan(broken[2].value)
     assert broken[2].time == supply[1].time + timedelta(minutes=15)
     assert broken[3] == supply[2]
+
+
+def test_the_tanks_last_quarter_runs_on_into_the_zone():
+    """The tank done after a tenth of the quarter (720 of 7200 W), the zone
+    from the next: the rest of the quarter drawn at the zone's power, as the
+    heat pump runs it - not the idle dip the plan's one demand per quarter
+    leaves."""
+
+    state = State()
+    heat_pump, building = state.schedule.heat_pump, state.schedule.building
+    heat_pump.power = _points([2000.0, 200.0, 800.0, 800.0])
+    heat_pump.heat = _points([7200.0, 720.0, 4500.0, 4500.0])
+    heat_pump.boiler.on = _points([1, 1, 0, 0])
+    building.on = _points([0, 0, 1, 1])
+
+    drawn = [p.value for p in handed_over(state.schedule)]
+
+    assert drawn == pytest.approx([2000.0, 200.0 + 0.9 * 800.0, 800.0, 800.0])
 
 
 def test_the_dashboard_renders_without_any_data():

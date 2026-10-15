@@ -8,7 +8,7 @@ import pandas as pd
 
 from app.optimization import Optimization
 from app.state import StateManager
-from domain.config import BoilerConfig, LegionellaConfig, PricesConfig
+from domain.config import BoilerConfig, HeatPumpStates, LegionellaConfig, PricesConfig
 from domain.models import BoilerThermalModel
 from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.sensors import SensorReference
@@ -53,6 +53,75 @@ def _published(
     optimization.publish_dhw(result, TIMES, thermal_model)
 
     return {entity: state for entity, (state, _) in home_assistant.states.items()}
+
+
+def _published_zone(
+    tank: tuple[int, ...], zone: tuple[int, ...], cooling: bool = False
+) -> dict[str, str]:
+    home_assistant = _RecordingHomeAssistant()
+    optimization = Optimization(
+        loader=None,  # type: ignore[arg-type]
+        state_manager=SimpleNamespace(update_supply_setpoint=lambda point: None),  # type: ignore[arg-type]
+        config_repository=None,  # type: ignore[arg-type]
+        models_path=Path("."),
+        home_assistant=home_assistant,  # type: ignore[arg-type]
+    )
+    result = MPCResult(
+        schedule=tank,
+        temperatures=TEMPERATURES,
+        electrical_power_w=(0.0,) * len(tank),
+        heat_w=(0.0,) * len(tank),
+        objective_value=0.0,
+        solver_status="optimal",
+        termination_condition="optimal",
+        space_schedule=zone,
+        space_heat_w=tuple(3000.0 * on for on in zone),
+        space_supply_c=tuple(26.0 if on else float("nan") for on in zone),
+    )
+    data = MPCInput(
+        solar_forecast_w=[0.0] * len(tank),
+        ambient_temperature=20.0,
+        current_temp_top=45.0,
+        current_temp_bottom=45.0,
+        boiler_on_current=bool(tank[0]),
+        zone_cooling=cooling,
+    )
+    config = SimpleNamespace(heat_pump=SimpleNamespace(states=HeatPumpStates()))
+
+    optimization.publish_zone(result, TIMES, State(), config, data, [], START)  # type: ignore[arg-type]
+
+    return {entity: state for entity, (state, _) in home_assistant.states.items()}
+
+
+def test_the_zone_is_on_in_the_quarter_the_tank_hands_over_in():
+    """The heat pump finishes the hot water first; with heating already on it
+    goes straight on to the floor rather than stopping and starting again."""
+
+    published = _published_zone(tank=(1, 0, 0, 0), zone=(0, 1, 1, 0))
+
+    assert published[Optimization.ZONE_STATUS_ENTITY] == "on"
+    assert published[Optimization.ZONE_SUPPLY_ENTITY] == "26.0"
+
+
+def test_no_hand_over_without_a_zone_run_straight_after_or_while_cooling():
+    assert (
+        _published_zone(tank=(1, 0, 0, 0), zone=(0, 0, 1, 0))[
+            Optimization.ZONE_STATUS_ENTITY
+        ]
+        == "off"
+    )
+    assert (
+        _published_zone(tank=(1, 1, 0, 0), zone=(0, 0, 1, 0))[
+            Optimization.ZONE_STATUS_ENTITY
+        ]
+        == "off"
+    )
+    assert (
+        _published_zone(tank=(1, 0, 0, 0), zone=(0, 1, 1, 0), cooling=True)[
+            Optimization.ZONE_STATUS_ENTITY
+        ]
+        == "off"
+    )
 
 
 def test_a_run_planned_later_is_off_now_with_its_start_time():

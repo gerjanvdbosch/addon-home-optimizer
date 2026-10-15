@@ -7,6 +7,7 @@ import pytest
 from domain.dynamics import discretize_zoh
 from domain.models import BoilerThermalModel
 from domain.physics import tank_state_space
+from domain.time import LOCAL_TIMEZONE
 from features.boiler import BoilerThermalIdentifier
 from features.tap import TapForecaster
 
@@ -154,3 +155,38 @@ def test_fit_and_predict_end_to_end(tmp_path):
 
     assert len(prediction) == SAMPLES_PER_DAY
     assert (prediction >= 0).all()
+
+
+def test_what_was_drawn_today_is_not_forecast_again(tmp_path):
+    """A week of one 3 kWh shower each evening: drawn at 20:00 today, the
+    usual 22:00 shower is not forecast on top of it; tomorrow's still is, and
+    a day that drew nothing yet keeps its forecast."""
+
+    forecaster = TapForecaster(tmp_path)
+    index = pd.date_range(
+        "2026-10-09 00:00", "2026-10-16 21:00", freq="15min", tz=LOCAL_TIMEZONE
+    )
+    # 12 kW for a quarter hour is 3 kWh.
+    shower = (index.hour == 22) & (index.minute == 0)
+    drawn = pd.Series(np.where(shower, 12000.0, 0.0), index=index)
+    drawn[pd.Timestamp("2026-10-16 20:00", tz=LOCAL_TIMEZONE)] = 12000.0
+    ahead = pd.date_range(
+        index[-1] + pd.Timedelta(minutes=15), periods=8 * 4, freq="15min"
+    )
+    forecast = pd.Series(
+        np.where((ahead.hour == 22) & (ahead.minute == 0), 12000.0, 0.0), index=ahead
+    )
+    tomorrow = ahead >= pd.Timestamp("2026-10-17", tz=LOCAL_TIMEZONE)
+    forecast[tomorrow & (ahead.hour == 4)] = 1000.0
+
+    held = forecaster._within_todays_budget(forecast, drawn)
+
+    assert held[~tomorrow].sum() == pytest.approx(0.0)
+    np.testing.assert_allclose(held[tomorrow], forecast[tomorrow])
+
+    nothing_yet = drawn.copy()
+    nothing_yet[pd.Timestamp("2026-10-16 20:00", tz=LOCAL_TIMEZONE)] = 0.0
+
+    np.testing.assert_allclose(
+        forecaster._within_todays_budget(forecast, nothing_yet), forecast
+    )

@@ -160,9 +160,12 @@ class SouthGlazing(BaseModel):
     # Assumed: the glazing runs floor to ceiling, so it is glass_m2 over
     # building.ceiling_height wide, between the extensions' walls. Fixed so on
     # this house, the same 90 days were predicted as well as fitted or better
-    # (2.4 m: 0.129 and 0.114 K against 0.129 and 0.115 K). Unset, it is
-    # fitted. For the thermostat's room's glazing only: the rest's, upstairs,
-    # looks over them.
+    # (2.4 m: 0.129 and 0.114 K against 0.129 and 0.115 K). Fitted again on 90
+    # days to October 2026, the west one ran to its bound (4 times the width,
+    # some 10 m against 2.4 measured): the shade stood in for something else,
+    # and the plan heated the zone 1 K hotter for it. Unset, it is fitted. For
+    # the thermostat's room's glazing only: the rest's, upstairs, looks over
+    # them.
     extensions: tuple[NonNegativeFloat, NonNegativeFloat] | None = Field(default=None)
 
     @model_validator(mode="before")

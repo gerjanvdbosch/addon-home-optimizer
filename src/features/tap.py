@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from optuna import Trial
 from skforecast.preprocessing import CalendarFeatures
@@ -46,6 +47,22 @@ class TapForecaster(SkforecastForecaster):
     # only a same-time-yesterday lag gives -0.12 K overall and +0.5 K there.
     # Short lags on this noisy residual (the former 1-4 steps and rolling
     # windows) made the mean miss the evening draws (-1.2 K).
+
+    # What the forecast expects for the rest of today is held to what a heavy
+    # day of the past week - one in four drew more - leaves after what has been
+    # drawn since midnight: a household that showered early does not shower
+    # again (real data, 16 Oct 2026: the evening's draws at 20:30-21:30, then
+    # the usual 22:00 draw forecast on top, 2.3 kWh the tank never lost). Over
+    # 136 forecasts issued at 18-22 h (13 Sep - 16 Oct 2026) the rest of the
+    # day came out 1.38 kWh off against 1.52 for the forecast alone, 0.19 kWh
+    # short on average; held to the week's mean day 1.34, but 0.53 short - the
+    # heavier days' draws cut. A night's tank from 21:30 and 22:30 came out
+    # 2.6 K off by the next run against 3.1 K, and on 16 Oct 1 K against 8.5 K
+    # (88 nights, Sep-Oct). Only ever lowered: raised to the budget where the
+    # forecast expected little, it put up to 41 times its own draw into a
+    # quarter hour.
+    BUDGET_DAYS = 7
+    BUDGET_QUANTILE = 0.75
 
     def __init__(self, models_path: Path) -> None:
         self.models_path = models_path
@@ -148,9 +165,38 @@ class TapForecaster(SkforecastForecaster):
 
         # The target is signed (noise, model error), but a tap draw can only
         # remove heat.
-        return self.forecaster.predict(
+        forecast = self.forecaster.predict(
             steps=steps, last_window=last_window, exog=future_exog
         ).clip(lower=0.0)
+
+        return self._within_todays_budget(forecast, y)
+
+    def _within_todays_budget(self, forecast: pd.Series, y: pd.Series) -> pd.Series:
+        """The forecast with the rest of today held to the day's budget (see
+        BUDGET_DAYS); as it is without a full week drawn before today."""
+
+        if y.empty:
+            return forecast
+
+        midnight = y.index[-1].normalize()
+        week_start = midnight - pd.Timedelta(days=self.BUDGET_DAYS)
+
+        if y.index[0] > week_start:
+            return forecast
+
+        week = y[(y.index >= week_start) & (y.index < midnight)]
+        heavy_day = float(
+            np.quantile(week.groupby(week.index.date).sum(), self.BUDGET_QUANTILE)
+        )
+        left = max(heavy_day - y[y.index >= midnight].sum(), 0.0)
+        today = forecast.index < midnight + pd.Timedelta(days=1)
+        expected = forecast[today].sum()
+
+        if expected > left:
+            forecast = forecast.copy()
+            forecast[today] *= left / expected
+
+        return forecast
 
     def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
         identifier = BoilerThermalIdentifier()

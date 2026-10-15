@@ -18,6 +18,7 @@ from domain.physics import (
     CP_WATER_J_PER_KG_K,
     RHO_WATER_KG_PER_L,
     lumped_tank_state_space,
+    mains_water_temperature_c,
     zone_observation,
     zone_state_space,
 )
@@ -1126,6 +1127,40 @@ def test_heating_hands_the_compressor_from_the_zone_to_the_tank():
     assert _compressor_starts(result) == 1, "the run under way stopped"
 
 
+def test_a_tank_handed_the_compressor_by_the_zone_carries_no_ramp():
+    """The ramp is the compressor's own rise to full output: a tank block that
+    starts it heats less in its first step, one the zone hands over to heats in
+    full, at the power line - as the zone does after the tank. Costed with a
+    start's ramp, a hand-over came out dearer than a start, and the plan put
+    the tank before the zone, hours ahead of its target (real plan, 17 Oct
+    2026: hot water from 8:30 for 18:00, the zone after it)."""
+
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[10] = 45.0
+    data = _zone_input(target_temperature_top=tuple(target))
+    optimizer = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=replace(COP_MODEL, start_ramp_seconds=875.0),
+        building_model=BUILDING_MODEL,
+    )
+    tank = optimizer._tank_setting(data)
+    handed = 5
+    after_zone = plan_tank(tank, [1] * handed + [0] * (tank.num_steps - handed))
+    started = plan_tank(tank)
+
+    first = [
+        next(k for k, w in enumerate(plan.heat_pump_w) if w > 0)
+        for plan in (after_zone, started)
+    ]
+
+    assert first[0] == handed
+    assert after_zone.heat_pump_w[handed] == pytest.approx(tank.heat_w[handed])
+    assert started.heat_pump_w[first[1]] == pytest.approx(
+        tank.ramp[first[1]] * tank.heat_w[first[1]]
+    )
+
+
 def test_hot_water_is_heated_in_one_block_the_booster_finishing_it():
     """The heat pump to its limit and the booster on from there, one block
     before the target - not a block before a zone run and the booster's after
@@ -1553,6 +1588,29 @@ def test_a_runs_heat_never_rises():
     for k in range(len(on) - 1):
         if on[k] and on[k + 1]:
             assert heat[k + 1] <= heat[k] + 1e-6
+
+
+def test_the_floor_is_planned_no_further_than_its_runs_have_gone():
+    """The zone's heat stays within the most the floor's runs have moved, the
+    range its COP model was fitted in, though the compressor gives more."""
+
+    capped = replace(HEATING, max_heat_w=2000.0)
+    free = np.asarray(_heat().space_heat_w)
+    heat = np.asarray(
+        MPCOptimizer(
+            THERMAL_MODEL,
+            MPCConfig(),
+            cop_model=COP_MODEL,
+            building_model=TWO_NODE,
+            floor_circuit_model=capped,
+            space_cop_model=COP_MODEL,
+        )
+        .solve(_cold_day(steps=48))
+        .space_heat_w
+    )
+
+    assert free.max() > capped.max_heat_w
+    assert heat.max() <= capped.max_heat_w + 1e-6
 
 
 def test_the_plan_chooses_the_heating_supply():
@@ -2310,4 +2368,43 @@ def test_the_tanks_own_plan_is_the_programs_optimum(thermal_model, target_c):
     assert any(plan.heat_pump_w)
     assert _program_cost(optimizer, data, plan) == pytest.approx(
         _program_cost(optimizer, data), abs=MIP_ABSOLUTE_GAP_EUR
+    )
+
+
+def test_taps_cannot_cool_the_tank_below_the_mains():
+    """A draw replaces hot water with cold from the mains: forecast to draw far
+    more than the tank holds, it ends at the mains' temperature, and from there
+    the room warms it - not cooled on past it into the cold water's own."""
+
+    horizon = len(SOLAR_FORECAST_W)
+    heavy = [0.0] * horizon
+    heavy[2:6] = [20000.0] * 4
+    data = _make_input(
+        target_temperature_top=(10.0,) * horizon,
+        tap_forecast_w=tuple(heavy),
+        mains_water_temperature=15.0,
+    )
+    optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig())
+
+    result = optimizer.solve(data)
+    unbounded = optimizer.solve(replace(data, mains_water_temperature=None))
+
+    assert not any(result.schedule)
+    assert min(result.temperatures) == pytest.approx(15.0, abs=1e-6)
+    assert result.temperatures[-1] > 15.0
+    assert min(unbounded.temperatures) < 15.0
+
+
+def test_the_mains_follow_the_year_damped_and_late():
+    """Coldest in late winter, warmest in late summer, a few degrees either
+    side of the year's mean air - below the lowest the tank's bottom sensor
+    read in the largest draws (Aug-Oct 2026: 17.5, 17.8, 16.5 degC)."""
+
+    february, august = mains_water_temperature_c(46), mains_water_temperature_c(227)
+
+    assert 9.0 < february < 11.5
+    assert 16.0 < august < 17.5
+    assert all(
+        mains_water_temperature_c(day) < bound
+        for day, bound in ((227, 17.5), (258, 17.8), (288, 16.5))
     )

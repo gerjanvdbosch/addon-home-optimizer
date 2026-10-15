@@ -6,7 +6,13 @@ from plotly.subplots import make_subplots
 
 from domain.models import BoilerThermalModel
 from domain.mpc import MPCConfig
-from domain.state import BacktestResult, BoilerMeasurement, SeriesPoint, State
+from domain.state import (
+    BacktestResult,
+    BoilerMeasurement,
+    Schedule,
+    SeriesPoint,
+    State,
+)
 from domain.time import local_day_start, to_local_series, to_local_time
 
 
@@ -58,6 +64,45 @@ def broken_between_runs(points: list, step: timedelta) -> list:
         broken.append(point)
 
     return broken
+
+
+def handed_over(schedule: Schedule) -> list[SeriesPoint]:
+    """The heat pump's planned power, the quarter the tank's block ends in with
+    the zone's run planned from the next as it is run: the tank's part, then
+    the zone for the rest of the quarter (see Optimization.publish_zone). The
+    plan serves one demand per quarter, which left the rest of that quarter
+    idle, a dip the heat pump does not make. The tank's part is its heat over
+    the quarter before's, which it ran in full; the zone's power is its
+    first quarter's. Heating only: cooling stops between the two."""
+
+    power = schedule.heat_pump.power
+    heat = {p.time: p.value for p in schedule.heat_pump.heat}
+    tank = {p.time: p.value for p in schedule.heat_pump.boiler.on}
+    zone = {p.time: p.value for p in schedule.building.on}
+    drawn = list(power)
+
+    for i in range(1, len(power) - 1):
+        before, now, after = (power[j].time for j in (i - 1, i, i + 1))
+
+        if not (
+            tank.get(now)
+            and not tank.get(after)
+            and zone.get(after)
+            and not zone.get(now)
+            and heat.get(after, 0.0) > 0.0
+        ):
+            continue
+
+        share = (
+            min(heat.get(now, 0.0) / heat[before], 1.0)
+            if tank.get(before) and heat.get(before, 0.0) > 0.0
+            else 1.0
+        )
+        drawn[i] = SeriesPoint(
+            time=now, value=power[i].value + (1.0 - share) * power[i + 1].value
+        )
+
+    return drawn
 
 
 def joined(measured: list, planned: list) -> list:
@@ -234,7 +279,7 @@ def dashboard_chart(
         "Heat pump",
         joined(
             ended(state.measurements.heat_pump.power, state.updated),
-            state.schedule.heat_pump.power,
+            handed_over(state.schedule),
         ),
         unit="W",
         row=1,

@@ -49,6 +49,9 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
     # single reading caught mid-defrost or mid-stop is not the compressor's
     # lowest speed.
     MIN_HEAT_QUANTILE = 0.10
+    # The most it moves, the same way: a high quantile, so one reading caught
+    # in a transient does not set it.
+    MAX_HEAT_QUANTILE = 0.90
 
     # How long the screed between the pipes takes to settle against the water:
     # lateral conduction over half a pipe spacing, (7.5 cm)^2 / 6e-7 m2/s, some
@@ -186,6 +189,7 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
             supply_per_outdoor_k=slope,
             conductance_w_per_k=conductance,
             min_heat_w=float(np.quantile(np.abs(heat), self.MIN_HEAT_QUANTILE)),
+            max_heat_w=float(np.quantile(np.abs(heat), self.MAX_HEAT_QUANTILE)),
         )
 
     def _in_test(self, rows: pd.DataFrame) -> pd.Series:
@@ -204,12 +208,13 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
 
         logger.info(
             "%s calibrated: supply = %.1f %+.2f * T_out degC, "
-            "G = %.0f W/K, at least %.0f W",
+            "G = %.0f W/K, %.0f-%.0f W",
             self.label,
             self.model.supply_at_zero_outdoor_c,
             self.model.supply_per_outdoor_k,
             self.model.conductance_w_per_k,
             self.model.min_heat_w,
+            self.model.max_heat_w,
         )
 
         return self.model

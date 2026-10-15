@@ -45,18 +45,18 @@ class BoilerThermalModel:
     # BoilerThermalIdentifier._identify_booster): the highest tank temperature
     # the heat pump reaches on its own, the tank's maximum (where the thermostat
     # cuts the booster out - the setpoint those runs used), and the booster's
-    # heat input (W). None until such a run has been observed - the optimizer
+    # heat input as the tank takes it up (W). None until such a run has been
+    # observed - the optimizer
     # then plans without the booster, and with a default tank maximum (see
     # optimizer.DEFAULT_MAX_TANK_TEMPERATURE_C).
     heat_pump_max_tank_temperature_c: float | None = None
     max_tank_temperature_c: float | None = None
     booster_heat_w: float | None = None
     # The heat pump's electrical draw while the booster runs (W), identified
-    # alongside it. More than its calorimetric heat: the meter also counts the
-    # circulation pump and controls, and heat lost before the loop's sensors
-    # never shows in it - the data does not separate the two (real data: 2.19
-    # kW drawn against 1.85 kW of heat, 0.76-0.93 kWh heat per kWh over 7
-    # runs). None counts the booster's heat as its draw.
+    # alongside it: the element's heat plus the circulation pump and controls
+    # (real data: 2.19 kW drawn, 1.94 kW measured, 2.21 kW taken up by the
+    # tank - see calorimetric_gain). None counts the booster's heat as its
+    # draw.
     booster_electrical_w: float | None = None
     # How far the settled tank ends above the SWW setpoint of a heat pump run
     # that stopped by itself on it (K; see
@@ -74,6 +74,11 @@ class BoilerThermalModel:
     # input is missing. None until runs have shown them.
     q_in_steady_w: float | None = None
     q_in_ramp_seconds: float | None = None
+    # The heat a run puts into the tank per unit of heat its calorimetry
+    # measures (-; see BoilerThermalIdentifier._identify_calorimetric_gain),
+    # read where the whole tank heats: the calorimetry under-reads. None counts
+    # the measured heat as the tank's.
+    calorimetric_gain: float | None = None
     # How much hotter the heat pump's supply runs than the tank it charges, at
     # the tank's energy temperature, once past a run's first step (K; see
     # BoilerThermalIdentifier._identify_supply_margin). None until runs with a
@@ -83,7 +88,8 @@ class BoilerThermalModel:
     # BoilerThermalIdentifier._identify_cold_layer): after tapping, cold water
     # fills the tank from the bottom, so two point sensors in the stratified
     # tank misstate its mean. Its share of the volume, its temperature (deg C,
-    # an effective one: the cold water warms against the tank above it), and
+    # an effective one: cold water below the sensors and warmer water above
+    # where a run's circulation draws), and
     # the stratification (top minus bottom sensor as tank_stratification_k holds
     # it, beyond one sensor step, K) at which it is full.
     # None until runs have shown it; the sensors' average then stands for the
@@ -298,6 +304,10 @@ class FloorCircuitModel:
     # kW at 22-30 Hz, the water a median 0.5 K colder than set). 0.0 for a
     # model from before it was identified.
     min_heat_w: float = 0.0
+    # The most heat a settled run moves (W, a magnitude): the range its runs
+    # show, and the COP model of its mode was fitted in. 0.0 for a model from
+    # before it was identified: the compressor's own output bounds it then.
+    max_heat_w: float = 0.0
 
     def supply_c(self, outdoor_c):
         return self.supply_at_zero_outdoor_c + self.supply_per_outdoor_k * outdoor_c
