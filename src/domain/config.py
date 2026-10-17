@@ -105,6 +105,10 @@ class HeatPumpConfig(BaseModel):
     # electrical draw follows entirely different physics and must not be
     # mixed into the heat pump's own COP calibration).
     booster: SensorReference | None = Field(default=None)
+    # Optional binary sensor, on while the outdoor unit defrosts: the
+    # operating state does not show it (it stays on the demand being served).
+    # Only drawn on the dashboard.
+    defrost: SensorReference | None = Field(default=None)
     # The unit's own outdoor air temperature sensor, if it really measures
     # outdoor air. Optional, and deliberately unset on this installation: the
     # heat pump stands in a shed, so its sensor reads shed air, which runs on

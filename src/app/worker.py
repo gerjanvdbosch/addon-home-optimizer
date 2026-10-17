@@ -6,7 +6,7 @@ from multiprocessing.context import SpawnProcess
 from queue import Queue
 from threading import Thread
 
-from domain.jobs import Job, JobType
+from domain.jobs import Job, JobType, WorkerState
 
 
 class Worker:
@@ -41,7 +41,7 @@ class Worker:
         self.jobs[job.id] = {
             "id": job.id,
             "type": job.type.value,
-            "state": "queued",
+            "state": WorkerState.QUEUED,
             "created_at": datetime.now(UTC).isoformat(),
         }
 
@@ -74,7 +74,7 @@ class Worker:
                 logging.info("Worker stopped")
                 break
 
-            self.jobs[job.id]["state"] = "running"
+            self.jobs[job.id]["state"] = WorkerState.RUNNING
 
             logging.info(
                 "Job started: id=%s type=%s",

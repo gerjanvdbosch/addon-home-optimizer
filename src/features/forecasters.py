@@ -6,7 +6,6 @@ from typing import Any, Protocol, cast
 
 import numpy as np
 import pandas as pd
-from joblib import dump, load
 from optuna import Study, Trial, create_study
 from skforecast.base import ForecasterBase
 from skforecast.model_selection import (
@@ -15,7 +14,6 @@ from skforecast.model_selection import (
     bayesian_search_forecaster,
 )
 from skforecast.utils import load_forecaster, save_forecaster
-from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_squared_error, r2_score
 
 from domain.config import Config
@@ -360,78 +358,3 @@ class SkforecastForecaster(Forecaster):
             ForecasterBase,
             load_forecaster(str(file_name)),
         )
-
-
-class SklearnForecaster(Forecaster):
-    def __init__(self):
-        self.forecaster = self.create()
-        self.best_params: dict[str, Any] = {}
-
-    @abstractmethod
-    def create(self, **overrides: Any) -> HistGradientBoostingRegressor: ...
-
-    def search_space(self, trial: Trial) -> dict[str, Any]:
-        raise NotImplementedError()
-
-    def arguments(self, df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
-        return df[self.exog_columns], df[self.target_column]
-
-    def predict_arguments(self, df: pd.DataFrame, steps: int = 48) -> pd.DataFrame:
-        return df[self.exog_columns].iloc[:steps]
-
-    def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
-        return df.copy()
-
-    def fit(self, df: pd.DataFrame):
-        df = self.prepare(df)
-
-        self.forecaster = self.create(**self.best_params)
-
-        X, y = self.arguments(df)
-
-        self.forecaster.fit(X, y)
-
-    def predict(self, df: pd.DataFrame, steps: int = 48) -> pd.Series:
-        df = self.prepare(df)
-
-        X = self.predict_arguments(df=df, steps=steps)
-
-        prediction = self.forecaster.predict(X)
-
-        return self.predict_result(prediction, df.reindex(X.index))
-
-    def predict_result(self, prediction: np.ndarray, df: pd.DataFrame) -> pd.Series:
-        return pd.Series(prediction, index=df.index)
-
-    def predict_band(
-        self, df: pd.DataFrame, steps: int = 48
-    ) -> tuple[pd.Series, pd.Series] | None:
-        return None
-
-    def backtest(self, df: pd.DataFrame, steps: int = 24) -> BacktestResult:
-        raise NotImplementedError()
-
-    def tune(
-        self,
-        df: pd.DataFrame,
-        steps: int = 24,
-        n_trials: int = 10,
-        study_storage: str | Path | None = None,
-    ) -> tuple[pd.DataFrame, Study]:
-        raise NotImplementedError()
-
-    def save(self, path: Path) -> None:
-        path.mkdir(parents=True, exist_ok=True)
-
-        dump(self.forecaster, path / f"{self.name}.joblib")
-
-    def load(self, path: Path, study_storage: str | None = None) -> None:
-        file_name = path / f"{self.name}.joblib"
-
-        if not file_name.exists():
-            return
-
-        self.forecaster = load(file_name)
-
-        if study_storage is not None:
-            self.best_params = _best_params(self.name, study_storage)

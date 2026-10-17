@@ -14,6 +14,8 @@ from web.charts import (
     joined,
     mixed_tank,
     read_at,
+    spans,
+    tank_line,
 )
 
 START = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
@@ -169,3 +171,79 @@ def test_a_quarters_last_reading_is_drawn_when_it_was_read():
     assert [p.time for p in read_at(_points([31.0, 41.0]), updated)] == [
         START + timedelta(minutes=15)
     ]
+
+
+def test_a_run_under_way_is_drawn_as_the_state_has_it_not_its_sensors():
+    """Half an hour into a run, the sensors still read the tank as it was:
+    the line leaves them where the run began, for the run as the state has
+    it, then the plan."""
+
+    state = State()
+    boiler = state.schedule.heat_pump.boiler
+    boiler.run = [
+        SeriesPoint(time=START + timedelta(minutes=20), value=29.2),
+        SeriesPoint(time=START + timedelta(minutes=30), value=31.0),
+        SeriesPoint(time=START + timedelta(minutes=45), value=37.5),
+        SeriesPoint(time=START + timedelta(minutes=50), value=40.8),
+    ]
+    boiler.temperatures = _points([40.8, 45.6], first=3)
+    measured = _points([29.3, 29.2, 28.2], first=1)
+
+    assert [p.value for p in tank_line(measured, state)] == [
+        29.3,
+        29.2,
+        31.0,
+        37.5,
+        40.8,
+        45.6,
+    ]
+
+    # Without a run, the sensors are the tank.
+    boiler.run = []
+
+    assert [p.value for p in tank_line(measured, state)] == [29.3, 29.2, 28.2, 45.6]
+
+
+def test_each_state_holds_until_its_next_change():
+    """A run from its change to the next, to the second; the last state up to
+    the update."""
+
+    changes = [
+        SeriesPoint(time=START, value="Uit"),
+        SeriesPoint(time=START + timedelta(minutes=7, seconds=12), value="SWW"),
+        SeriesPoint(time=START + timedelta(minutes=58), value="Uit"),
+    ]
+    updated = START + timedelta(hours=2)
+
+    assert spans(changes, updated) == [
+        (START, changes[1].time, "Uit"),
+        (changes[1].time, changes[2].time, "SWW"),
+        (changes[2].time, updated, "Uit"),
+    ]
+
+
+def test_the_dashboard_shades_what_the_heat_pump_serves():
+    """A DHW run with a defrost in it, measured, then a planned heating run:
+    one legend entry each, and nothing for the idle time."""
+
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    state = State(updated=now)
+    heat_pump = state.measurements.heat_pump
+    heat_pump.state_changes = [
+        SeriesPoint(time=now - timedelta(minutes=50), value="SWW"),
+        SeriesPoint(time=now - timedelta(minutes=5), value="Uit"),
+    ]
+    heat_pump.defrost = [
+        SeriesPoint(time=now - timedelta(minutes=20), value=True),
+        SeriesPoint(time=now - timedelta(minutes=17), value=False),
+    ]
+    state.schedule.building.on = [
+        SeriesPoint(time=now + timedelta(minutes=15 * i), value=on)
+        for i, on in enumerate([0, 1, 1, 0])
+    ]
+
+    html = dashboard_chart(state)
+
+    for name in ("DHW", "Heating", "Defrost"):
+        assert html.count(f'"name":"{name}"') == 1
+    assert '"name":"Cooling"' not in html

@@ -1,11 +1,13 @@
 import math
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
 from app.state import StateManager
+from domain.config import HeatPumpStates
 from domain.state import SeriesPoint, State
 from features.solar import nowcast_solar
 from infrastructure.repositories import StateRepository
@@ -243,3 +245,44 @@ def test_beyond_the_day_before_a_forecast_falls_back():
     assert StateManager.extend_forecast(forecast, times, 0.0) == [0.0, 12.0, 0.0]
     assert StateManager.extend_forecast(forecast, times) == [12.0, 12.0, 12.0]
     assert all(math.isnan(v) for v in StateManager.extend_forecast({}, times))
+
+
+def test_a_run_the_quarters_miss_still_mixes_the_tank():
+    """The quarters read each one's first state, and a state reports only its
+    changes: a run that began inside a quarter reads as off throughout. By the
+    state's own changes the tank mixed, and its cold layer is gone."""
+
+    start = datetime(2026, 10, 18, 14, 0, tzinfo=UTC)
+    times = [start + timedelta(minutes=15 * i) for i in range(6)]
+    df = pd.DataFrame(
+        {
+            "time": times,
+            "heat_pump_state": ["Uit"] * 6,
+            "boiler_top_temperature": [37.0, 33.5, 33.5, 42.5, 47.5, 47.5],
+            "boiler_bottom_temperature": [29.0, 29.0, 32.5, 42.5, 47.5, 47.5],
+        }
+    )
+    existing = State()
+    existing.measurements.heat_pump.state_changes = [
+        SeriesPoint(time=start + timedelta(minutes=20), value="SWW"),
+        SeriesPoint(time=start + timedelta(minutes=70), value="Uit"),
+    ]
+    config = SimpleNamespace(
+        heat_pump=SimpleNamespace(
+            states=HeatPumpStates(),
+            boiler=SimpleNamespace(target_temperature=45.0),
+            mode=None,
+        ),
+        building=SimpleNamespace(comfort=lambda cooling: None),
+    )
+
+    state = _state_manager()._map(df, existing, config=config)  # type: ignore[arg-type]
+
+    assert [p.value for p in state.measurements.heat_pump.boiler.stratification] == [
+        8.0,
+        4.5,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+    ]

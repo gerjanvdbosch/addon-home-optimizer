@@ -24,6 +24,12 @@ CLIMATE_ANNUAL_MEAN_C = 10.5
 CLIMATE_COLDEST_MONTH_C = 3.6
 CLIMATE_WARMEST_MONTH_C = 18.2
 
+# The temperature hot water is used at (deg C): EN 16147 rates a tank's hot
+# water as V40, its volume mixed with mains water to 40 degC, a shower's
+# temperature. Mixed from a tank above it, a draw takes the heat that lifts its
+# whole volume from the mains to this, whatever the tank's own temperature.
+MIXED_TAP_WATER_C = 40.0
+
 # Physical constants of indoor air at room conditions, not fit parameters.
 RHO_AIR_KG_PER_M3 = 1.2
 CP_AIR_J_PER_KG_K = 1005.0

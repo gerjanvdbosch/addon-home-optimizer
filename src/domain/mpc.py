@@ -93,7 +93,7 @@ class MPCInput:
     # the dynamics - empty means "no forecast available", treated as no draws
     # (the same assumption implicitly made before this field existed), not a
     # claim that none will occur. This forecast has known, real but modest
-    # accuracy (see TapForecaster's own backtest) - weight_temperature_slack
+    # accuracy (see TapForecaster) - weight_temperature_slack
     # absorbs the resulting forecast error, same as it already does for solar.
     # It also targets a quantity that is a mix of real tap draws and a known,
     # uncorrected temperature-dependent heat-transfer gap in the passive-loss

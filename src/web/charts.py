@@ -4,6 +4,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from domain.config import HeatPumpStates
 from domain.models import BoilerThermalModel
 from domain.mpc import MPCConfig
 from domain.state import (
@@ -105,6 +106,19 @@ def handed_over(schedule: Schedule) -> list[SeriesPoint]:
     return drawn
 
 
+def spans(changes: list[SeriesPoint], end: datetime) -> list[tuple]:
+    """(start, end, value) of each change's value, held until the next change
+    and the last until `end`."""
+
+    ends = [p.time for p in changes[1:]] + [end]
+
+    return [
+        (p.time, until, p.value)
+        for p, until in zip(changes, ends, strict=False)
+        if until > p.time
+    ]
+
+
 def joined(measured: list, planned: list) -> list:
     """One line of both: the measured points, then the planned ones after the
     last of them."""
@@ -113,6 +127,19 @@ def joined(measured: list, planned: list) -> list:
         return planned
 
     return measured + [p for p in planned if p.time > measured[-1].time]
+
+
+def tank_line(measured: list, state: State) -> list:
+    """The tank measured, then as planned (see joined). Through a DHW run
+    under way as the state has it (see BoilerSchedule.run), in place of the
+    sensors, which lag the heat while the tank heats."""
+
+    run = state.schedule.heat_pump.boiler.run
+
+    if run:
+        measured = [p for p in measured if p.time < run[0].time] + run
+
+    return joined(measured, state.schedule.heat_pump.boiler.temperatures)
 
 
 def read_at(points: list[SeriesPoint], updated: datetime) -> list[SeriesPoint]:
@@ -168,7 +195,9 @@ def mixed_tank(
 
 
 def dashboard_chart(
-    state: State, boiler_model: BoilerThermalModel | None = None
+    state: State,
+    boiler_model: BoilerThermalModel | None = None,
+    states: HeatPumpStates | None = None,
 ) -> str:
     fig = make_subplots(
         rows=3,
@@ -423,7 +452,7 @@ def dashboard_chart(
 
     series(
         "Boiler temperature",
-        joined(measured_average, state.schedule.heat_pump.boiler.temperatures),
+        tank_line(measured_average, state),
         row=3,
         col=1,
         line=dict(width=2, color="#19D3F3", shape="spline"),
@@ -431,6 +460,88 @@ def dashboard_chart(
         unit="°C",
         decimal=2,
     )
+
+    # What the heat pump serves, behind what it acts on: the tank's runs
+    # behind the boiler, the floor's behind the climate. Drawn after the
+    # traces, as plotly leaves a shape out of a subplot without any. Measured
+    # from its state's changes, to the second, then as planned. Only
+    # the configured states (see HeatPumpStates): any other, a legionella run
+    # say, is none of these. A defrost on top of the run it interrupts: it
+    # takes its heat from that run's water.
+    states = states or HeatPumpStates()
+    quarter = timedelta(hours=MPCConfig().step_hours)
+    mode = state.measurements.heat_pump.mode
+    cooling = bool(mode) and str(mode[-1].value).startswith(states.cooling)
+    dhw = ("DHW", "#19D3F3")
+    zone = {
+        states.heating: ("Heating", "#FECB52"),
+        states.cooling: ("Cooling", "#FECB52"),
+    }
+    shown: set[str] = set()
+
+    def shade(
+        runs: list[tuple], name: str, color: str, row: int, opacity: float = 0.06
+    ) -> None:
+        for start, end in runs:
+            start, end = max(start, window_start), min(end, window_end)
+
+            if start >= end:
+                continue
+
+            fig.add_vrect(
+                x0=to_local_time(start),
+                x1=to_local_time(end),
+                fillcolor=color,
+                opacity=opacity,
+                line_width=0,
+                layer="below",
+                name=name,
+                legendgroup=name,
+                showlegend=name not in shown,
+                row=row,
+                col=1,
+            )
+            shown.add(name)
+
+    def planned(on: list[SeriesPoint]) -> list[tuple]:
+        """The plan's runs from the update on, consecutive quarters as one."""
+
+        changes = [p for i, p in enumerate(on) if i == 0 or p.value != on[i - 1].value]
+
+        return [
+            (max(start, state.updated), end)
+            for start, end, value in spans(
+                changes, on[-1].time + quarter if on else now
+            )
+            if value and end > state.updated
+        ]
+
+    measured_states = spans(state.measurements.heat_pump.state_changes, state.updated)
+
+    rows = {states.dhw: 3, states.heating: 2, states.cooling: 2}
+
+    for value, (name, color) in {states.dhw: dhw, **zone}.items():
+        shade(
+            [(start, end) for start, end, v in measured_states if v == value],
+            name,
+            color,
+            row=rows[value],
+        )
+
+    shade(planned(state.schedule.heat_pump.boiler.on), *dhw, row=3)
+    shade(
+        planned(state.schedule.building.on),
+        *zone[states.cooling if cooling else states.heating],
+        row=2,
+    )
+
+    for start, end, on in spans(state.measurements.heat_pump.defrost, state.updated):
+        serving = [v for s, e, v in measured_states if s <= start < e]
+
+        # Both panels where the state does not say which run it was in.
+        for row in [rows[serving[0]]] if serving and serving[0] in rows else [2, 3]:
+            if on:
+                shade([(start, end)], "Defrost", "#FFFFFF", row=row, opacity=0.25)
 
     fig.update_layout(
         title=dict(

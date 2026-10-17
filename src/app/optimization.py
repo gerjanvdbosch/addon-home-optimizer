@@ -38,6 +38,7 @@ from features.price import (
     predict_price,
     published_prices,
 )
+from features.tap import TapForecaster
 from infrastructure.home_assistant import HomeAssistant
 from infrastructure.repositories import ConfigRepository
 
@@ -217,9 +218,23 @@ class Optimization:
                 run_start_temp_bottom = before_bottom[-1].value
                 run_start_stratification_k = stratification.get(before_top[-1].time)
 
-        # No draws assumed beyond the tap forecast, the assumption made before
+        # The tap draws: the past weeks' own profile, held to what today has
+        # drawn up to this plan (see TapForecaster). Kept in the state to be
+        # looked at; no draws assumed beyond it, the assumption made before
         # it existed.
-        tap_forecast = extended(predictions.tap, 0.0)
+        tap = TapForecaster(self.models_path)
+        tap_w = tap.predict(
+            self.loader.load(
+                tap.dataset(config),
+                now - timedelta(days=TapForecaster.PROFILE_DAYS + 1),
+                now,
+            ),
+            steps=len(forecast_times),
+        )
+        self.state_manager.update_prediction("tap", tap_w)
+        tap_forecast = extended(
+            [SeriesPoint(time=t, value=float(w)) for t, w in tap_w.items()], 0.0
+        )
 
         # Empty without any Open-Meteo forecast (fresh install, fetch not yet
         # run), not 0 deg C: MPCOptimizer then falls back to the flat
@@ -339,12 +354,36 @@ class Optimization:
             result.objective_value,
         )
 
+        # The tank through the run under way, as the plan starts from it: at
+        # the run's start, each quarter since, and now.
+        run = []
+
+        if run_start is not None:
+            for time in [
+                run_start,
+                *(
+                    t
+                    for t in pd.date_range(
+                        pd.Timestamp(run_start).ceil(step), now, freq=step
+                    ).to_pydatetime()
+                    if run_start < t < now
+                ),
+                now,
+            ]:
+                tank_c = optimizer.run_temperature(
+                    planned, (time - run_start).total_seconds() / 3600.0
+                )
+
+                if tank_c is not None:
+                    run.append(SeriesPoint(time=time, value=tank_c))
+
         self.state_manager.update_schedule(
             schedule=result.schedule,
             temperatures=result.temperatures,
             power_w=result.electrical_power_w,
             times=forecast_times,
             heat_w=result.heat_w,
+            run=run,
         )
 
         self.publish_dhw(result, forecast_times, thermal_model)

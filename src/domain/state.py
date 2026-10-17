@@ -37,6 +37,11 @@ class HeatPumpMeasurement(BaseModel):
     compressor_frequency: list[SeriesPoint[float]] = Field(default_factory=list)
     # The operating mode it is set to (see HeatPumpConfig.mode).
     mode: list[SeriesPoint[str]] = Field(default_factory=list)
+    # The state's and the defrost's own changes since the previous local
+    # midnight, each holding until the next: `state` is each quarter's first,
+    # while a run starts and ends mid-quarter and a defrost lasts minutes.
+    state_changes: list[SeriesPoint[str]] = Field(default_factory=list)
+    defrost: list[SeriesPoint[bool]] = Field(default_factory=list)
     boiler: BoilerMeasurement = Field(default_factory=BoilerMeasurement)
 
 
@@ -127,6 +132,11 @@ class Predictions(BaseModel):
 class BoilerSchedule(BaseModel):
     target_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
     temperatures: list[SeriesPoint[float]] = Field(default_factory=list)
+    # The tank through the DHW run under way, from its start to the plan's:
+    # by the run's heat balance, which the plan starts from - the sensors lag
+    # it while the tank heats (see MPCOptimizer.run_temperature). Empty
+    # without such a run.
+    run: list[SeriesPoint[float]] = Field(default_factory=list)
     # Whether the plan heats the tank (1/0): the next plan starts from it (see
     # MPCInput.previous_tank_on).
     on: list[SeriesPoint[int]] = Field(default_factory=list)

@@ -41,7 +41,6 @@ class Container:
     def forecasting(self) -> "Forecasting":
         from app.forecasting import Forecasting
         from features.baseload import BaseloadForecaster
-        from features.tap import TapForecaster
 
         return Forecasting(
             loader=self.dataset_loader,
@@ -52,7 +51,6 @@ class Container:
             study_storage=f"sqlite:///{self.models_path / 'optuna.db'}",
             forecasters=[
                 BaseloadForecaster(),
-                TapForecaster(models_path=self.models_path),
             ],
         )
 

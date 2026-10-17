@@ -66,7 +66,10 @@ class StateManager:
         )
         df = df[df["time"] >= start]
 
-        state = self._map(df, self.load(), config=config)
+        # The changes first: the tank's stratification is read with them.
+        state = self.load()
+        self._map_changes(state, config, now)
+        state = self._map(df, state, config=config)
 
         recent_solar = self.loader.load(
             DatasetBuilder()
@@ -78,6 +81,44 @@ class StateManager:
         self._predict_solar(state, now, recent_solar.set_index("time")["pv_production"])
 
         self.state_repository.save(state)
+
+    def _map_changes(self, state: State, config: Config, now: datetime) -> None:
+        """The operating state's and the defrost's changes (see
+        HeatPumpMeasurement.state_changes). From the previous local midnight,
+        so the change in force at today's start is among them; a sensor
+        without one in that window is filled per minute with the reading
+        before it, hence only the changes kept."""
+
+        builder = DatasetBuilder().timeseries(
+            "state", config.heat_pump.state, aggregation=None, fill="previous"
+        )
+
+        if config.heat_pump.defrost is not None:
+            builder = builder.timeseries(
+                "defrost", config.heat_pump.defrost, aggregation=None, fill="previous"
+            )
+
+        frame = self.loader.load(
+            builder.build(), local_day_start(now, days=-1).astimezone(timezone.utc), now
+        )
+
+        def changes(column: str) -> pd.DataFrame:
+            if column not in frame:
+                return frame.iloc[:0]
+
+            points = frame[["time", column]].dropna()
+
+            return points[points[column] != points[column].shift()]
+
+        heat_pump = state.measurements.heat_pump
+        heat_pump.state_changes = [
+            SeriesPoint(time=time, value=value)
+            for time, value in changes("state").itertuples(index=False)
+        ]
+        heat_pump.defrost = [
+            SeriesPoint(time=time, value=float(value) > 0.0)
+            for time, value in changes("defrost").itertuples(index=False)
+        ]
 
     def _predict_solar(
         self, state: State, now: datetime, recent_solar: pd.Series
@@ -298,6 +339,7 @@ class StateManager:
         power_w: Sequence[float],
         times: list[datetime],
         heat_w: Sequence[float] = (),
+        run: Sequence[SeriesPoint] = (),
     ) -> None:
         state = self.load()
 
@@ -318,6 +360,7 @@ class StateManager:
             SeriesPoint(time=t, value=int(on))
             for t, on in zip(times, schedule, strict=False)
         ]
+        state.schedule.heat_pump.boiler.run = list(run)
 
         self.state_repository.save(state)
 
@@ -410,6 +453,13 @@ class StateManager:
             state.measurements.building.zone_temperature = (
                 existing.measurements.building.zone_temperature
             )
+            # Read before (see update): the stratification is read with them.
+            state.measurements.heat_pump.state_changes = (
+                existing.measurements.heat_pump.state_changes
+            )
+            state.measurements.heat_pump.defrost = (
+                existing.measurements.heat_pump.defrost
+            )
 
         state.measurements.solar = self._parse_series(df, "pv_production")
         state.measurements.baseload = self._parse_series(df, "baseload")
@@ -437,14 +487,29 @@ class StateManager:
             "boiler_top_temperature",
             "boiler_bottom_temperature",
         } <= set(df.columns):
-            # Mixed where a quarter hour began on DHW (heat_pump_state is each
-            # quarter's first): a run shorter than a quarter hour that begins
-            # and ends inside one is not seen, and its tank read as at rest.
+            # Mixed in a quarter hour that saw DHW at all, by the state's own
+            # changes: heat_pump_state is each quarter's first reading, and a
+            # state reports only its changes, so InfluxDB's fill repeats it
+            # into the quarters after (real data, 18 Oct 2026: a run from
+            # 16:20 to 17:10 read as off throughout, its tank's 8 K layer
+            # kept, and a plan started at 37.2 degC from both sensors at
+            # 47.5).
+            dhw = config.heat_pump.states.dhw
+            changes = state.measurements.heat_pump.state_changes
+            quarter = pd.Timedelta(minutes=15)
+
+            def saw_dhw(start: pd.Timestamp) -> bool:
+                in_force = [c.value for c in changes if c.time <= start][-1:]
+
+                return in_force == [dhw] or any(
+                    c.value == dhw for c in changes if start < c.time < start + quarter
+                )
+
             df = df.assign(
                 boiler_stratification=tank_stratification_k(
                     pd.to_numeric(df["boiler_top_temperature"], errors="coerce"),
                     pd.to_numeric(df["boiler_bottom_temperature"], errors="coerce"),
-                    df["heat_pump_state"] == config.heat_pump.states.dhw,
+                    (df["heat_pump_state"] == dhw) | df["time"].map(saw_dhw),
                 )
             )
             state.measurements.heat_pump.boiler.stratification = self._parse_series(

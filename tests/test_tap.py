@@ -6,7 +6,7 @@ import pytest
 
 from domain.dynamics import discretize_zoh
 from domain.models import BoilerThermalModel
-from domain.physics import tank_state_space
+from domain.physics import mains_water_temperature_c, tank_state_space
 from domain.time import LOCAL_TIMEZONE
 from features.boiler import BoilerThermalIdentifier
 from features.tap import TapForecaster
@@ -20,7 +20,7 @@ TRUE_MODEL = BoilerThermalModel(
     q_in_nominal_w=3700.0,
 )
 
-DT_SECONDS = 900.0  # 15 minutes, matching TapForecaster.dataset()'s interval
+DT_SECONDS = 900.0  # 15 minutes, the forecast's own step (the dataset is per minute)
 SAMPLES_PER_DAY = int(24 * 3600 / DT_SECONDS)
 T_AMBIENT_C = 20.0
 
@@ -108,7 +108,7 @@ def _save_calibrated_identifier(models_path) -> None:
     identifier.save(models_path)
 
 
-def test_prepare_builds_target_and_presence_columns(tmp_path):
+def test_prepare_builds_the_target(tmp_path):
     _save_calibrated_identifier(tmp_path)
 
     rng = np.random.default_rng(7)
@@ -118,8 +118,6 @@ def test_prepare_builds_target_and_presence_columns(tmp_path):
     prepared = forecaster.prepare(df)
 
     assert "excess_loss_w" in prepared.columns
-    assert "present" in prepared.columns
-    assert prepared.index.name == "time"
 
     # No NaNs left in the target (boiler_on periods are filled with 0, not NaN).
     assert not prepared["excess_loss_w"].isna().any()
@@ -127,9 +125,12 @@ def test_prepare_builds_target_and_presence_columns(tmp_path):
     # The target is signed (see excess_loss_w()): noise must average out.
     assert (prepared["excess_loss_w"] < 0).any()
 
-    # present is a real 0/1 signal, not constant (both present and away periods
-    # exist in the synthetic data).
-    assert prepared["present"].nunique() > 1
+    # The same draws per kelvin above the mains: January's are some 30 K.
+    mains_c = [mains_water_temperature_c(day) for day in prepared.index.dayofyear]
+    np.testing.assert_allclose(
+        prepared["draw_w_per_k"] * (40.0 - np.array(mains_c)),
+        prepared["excess_loss_w"],
+    )
 
 
 def test_prepare_raises_without_a_calibrated_model(tmp_path):
@@ -142,19 +143,21 @@ def test_prepare_raises_without_a_calibrated_model(tmp_path):
         forecaster.prepare(df)
 
 
-def test_fit_and_predict_end_to_end(tmp_path):
+def test_draws_are_forecast_where_the_past_weeks_drew(tmp_path):
+    """Draws only ever in the evening: the next day's are forecast there, from
+    the past weeks' own quarter hours, and hardly any at night."""
+
     _save_calibrated_identifier(tmp_path)
 
     rng = np.random.default_rng(3)
     df = _simulate_with_draws_when_present(rng, days=30)
 
-    forecaster = TapForecaster(models_path=tmp_path)
-    forecaster.fit(df)
-
-    prediction = forecaster.predict(df, steps=SAMPLES_PER_DAY)
+    prediction = TapForecaster(models_path=tmp_path).predict(df, steps=SAMPLES_PER_DAY)
 
     assert len(prediction) == SAMPLES_PER_DAY
     assert (prediction >= 0).all()
+    evening = (prediction.index.hour >= 16).astype(bool)
+    assert prediction[evening].mean() > 10 * prediction[~evening].mean()
 
 
 def test_what_was_drawn_today_is_not_forecast_again(tmp_path):

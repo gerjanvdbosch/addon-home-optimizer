@@ -1,27 +1,21 @@
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pandas as pd
-from optuna import Trial
-from skforecast.preprocessing import CalendarFeatures
-from skforecast.recursive import ForecasterRecursive
-from sklearn.ensemble import HistGradientBoostingRegressor
 
 from domain.config import Config, HeatPumpStates
 from domain.dataset import DatasetDefinition
-from domain.jobs import ForecasterType
+from domain.physics import MIXED_TAP_WATER_C, mains_water_temperature_c
+from domain.time import LOCAL_TIMEZONE
 from features.boiler import BoilerThermalIdentifier
 from features.dataset import DatasetBuilder
-from features.forecasters import SkforecastForecaster
 
 
-class TapForecaster(SkforecastForecaster):
-    """Forecasts hot-water tap demand as the expected excess-heat-loss power (W),
-    using the
-    calibrated boiler thermal model's own residual diagnostic
-    (BoilerThermalIdentifier.excess_loss_w) as the training target and presence
-    as an exogenous feature.
+class TapForecaster:
+    """Forecasts hot-water tap demand as the expected excess-heat-loss power (W):
+    the calibrated boiler thermal model's own residual diagnostic
+    (BoilerThermalIdentifier.excess_loss_w) of the past weeks, averaged per
+    quarter hour of the day.
 
     This does NOT predict a validated tap event or volume - no flow meter exists,
     and the underlying signal is the same unproven "candidate excess heat loss"
@@ -40,13 +34,18 @@ class TapForecaster(SkforecastForecaster):
     """
 
     # The planning model is linear, so its expected tank temperature follows from
-    # the expected heat sink: this forecasts the mean, not a quantile. Backtested
-    # on real data (6 h blocks, tap energy in K of tank): the former 0.85 quantile
-    # was unbiased in total (-0.15 K) but spread a noise floor over quiet hours,
-    # planning 1.1 K too much cooling in the 6 h after heating; the mean with
-    # only a same-time-yesterday lag gives -0.12 K overall and +0.5 K there.
-    # Short lags on this noisy residual (the former 1-4 steps and rolling
-    # windows) made the mean miss the evening draws (-1.2 K).
+    # the expected heat sink: this forecasts the mean, the past weeks' draws
+    # per quarter hour of the day. Yesterday's evening says nothing of
+    # today's (correlation -0.03 over Jun-Oct 2026), and the mean of the past
+    # weeks follows a household's level as it changes. Walk-forward from 09:00
+    # on real data (32 evenings from 15 Sep 2026, and 16 from 1 Oct), the
+    # evening's draws (21-24 h) came out 0.72 and 0.83 kWh off, 0.14 short and
+    # 0.18 over, against 1.06 and 1.16, 0.59 and 0.64 short, for gradient
+    # boosting on the same quarter yesterday and the calendar, trained up to
+    # then - which also forecast a draw at 13:30 for one the day before's
+    # data made up. Two or eight weeks did about as well; weekends apart, no
+    # better.
+    PROFILE_DAYS = 28
 
     # What the forecast expects for the rest of today is held to what a heavy
     # day of the past week - one in four drew more - leaves after what has been
@@ -64,112 +63,47 @@ class TapForecaster(SkforecastForecaster):
     BUDGET_DAYS = 7
     BUDGET_QUANTILE = 0.75
 
+    # Averaged per kelvin the drawn water is heated above the mains (see
+    # MIXED_TAP_WATER_C), and turned back into heat with the mains of the day
+    # forecast: a household's habit is the water it uses, and the colder mains
+    # of winter take more heat for the same showers.
+
     def __init__(self, models_path: Path) -> None:
         self.models_path = models_path
         # The configured state labels, handed to the boiler identifier this
-        # trains on; overwritten by dataset().
+        # reads the draws from; overwritten by dataset().
         self.states = HeatPumpStates()
-        super().__init__()
-
-    @property
-    def name(self) -> ForecasterType:
-        return "tap"
-
-    @property
-    def label(self) -> str:
-        return "Estimated tap draw"
-
-    @property
-    def unit(self) -> str:
-        return "W"
-
-    @property
-    def target_column(self) -> str:
-        return "excess_loss_w"
-
-    @property
-    def exog_columns(self) -> list[str]:
-        return ["present"]
-
-    def create(self, **overrides: Any):
-        return ForecasterRecursive(
-            forecaster_id=overrides.pop("forecaster_id", self.name),
-            estimator=overrides.pop(
-                "estimator",
-                HistGradientBoostingRegressor(
-                    loss="squared_error",
-                    learning_rate=0.03,
-                    max_depth=7,
-                    max_iter=120,
-                    min_samples_leaf=5,
-                    l2_regularization=5.0,
-                    random_state=42,
-                ),
-            ),
-            # Tap draws follow the daily activity rhythm, so the same quarter
-            # yesterday plus the calendar features carry the signal (see above).
-            lags=overrides.pop("lags", [96]),
-            calendar_features=overrides.pop(
-                "calendar_features",
-                CalendarFeatures(
-                    features=["hour", "day_of_week", "weekend"], encoding="onehot"
-                ),
-            ),
-            # No sqrt transform: the target is signed, and a mean does not
-            # survive a nonlinear transform.
-            **overrides,
-        )
-
-    def search_space(self, trial: Trial) -> dict[str, Any]:
-        return {
-            "learning_rate": trial.suggest_float(
-                "learning_rate",
-                0.02,
-                0.06,
-                log=True,
-            ),
-            "max_depth": trial.suggest_int("max_depth", 5, 9),
-            "max_iter": trial.suggest_int(
-                "max_iter",
-                80,
-                160,
-                step=40,
-            ),
-            "min_samples_leaf": trial.suggest_int(
-                "min_samples_leaf",
-                3,
-                12,
-            ),
-            "l2_regularization": trial.suggest_float(
-                "l2_regularization", 1.0, 15.0, log=True
-            ),
-        }
 
     def predict(self, df: pd.DataFrame, steps: int = 48) -> pd.Series:
         prepared = self.prepare(df)
-
-        y = prepared[self.target_column].dropna()
-        last_window = y if not y.empty else None
-
-        # No presence forecast exists (predicting future presence is a separate,
-        # harder problem this forecaster does not attempt) - conservatively
-        # assume "present" for the whole horizon, since that cannot understate a
-        # possible draw the way assuming an empty house would. A real presence
-        # forecast, if one is built later, would replace this block.
+        y = prepared["draw_w_per_k"].dropna()
         future_index = pd.date_range(
-            start=prepared.index[-1] + prepared.index.freq,
-            periods=steps,
-            freq=prepared.index.freq,
-        )
-        future_exog = pd.DataFrame({"present": 1.0}, index=future_index)
+            start=prepared.index[-1], periods=steps + 1, freq="15min"
+        )[1:]
+
+        def quarter_of_day(index: pd.DatetimeIndex) -> np.ndarray:
+            return np.asarray(index.hour * 4 + index.minute // 15)
+
+        recent = y[y.index >= y.index[-1] - pd.Timedelta(days=self.PROFILE_DAYS)]
+        profile = recent.groupby(quarter_of_day(recent.index)).mean()
 
         # The target is signed (noise, model error), but a tap draw can only
         # remove heat.
-        forecast = self.forecaster.predict(
-            steps=steps, last_window=last_window, exog=future_exog
+        forecast = pd.Series(
+            profile.reindex(quarter_of_day(future_index)).fillna(0.0).to_numpy()
+            * self._heated_k(future_index),
+            index=future_index,
         ).clip(lower=0.0)
 
-        return self._within_todays_budget(forecast, y)
+        return self._within_todays_budget(forecast, prepared["excess_loss_w"].dropna())
+
+    @staticmethod
+    def _heated_k(index: pd.DatetimeIndex) -> np.ndarray:
+        """How far drawn water is heated above the mains at each time (K)."""
+
+        return MIXED_TAP_WATER_C - np.array(
+            [mains_water_temperature_c(day) for day in index.dayofyear]
+        )
 
     def _within_todays_budget(self, forecast: pd.Series, y: pd.Series) -> pd.Series:
         """The forecast with the rest of today held to the day's budget (see
@@ -207,42 +141,45 @@ class TapForecaster(SkforecastForecaster):
             raise RuntimeError(
                 "The boiler thermal model must be calibrated (see "
                 "BoilerThermalIdentifier) before the tap forecaster can be "
-                "trained or used, since it trains on that model's own "
+                "used, since it reads the draws from that model's own "
                 "excess-heat-loss diagnostic."
             )
-
-        # Reuses the exact same column names dataset() below requests, so
-        # presence_columns is whatever presence_N columns are actually present -
-        # no need to thread config through here.
-        identifier.presence_columns = sorted(
-            column for column in df.columns if column.startswith("presence_")
-        )
 
         prepared = identifier.prepare(df)
         excess_loss = identifier.excess_loss_w(prepared)
 
-        merged = excess_loss.merge(
-            prepared[["time", "confirmed_away_settled"]], on="time", how="left"
-        )
-
-        # "Present" = NOT reliably known to be an empty house - the inverse of the
-        # same conservative, whitelist-only confirmed_away_settled column already
-        # computed by prepare() (only trusts an explicit away reading, sustained
-        # for a settling margin - see boiler.py). Where no trackers are
-        # configured, confirmed_away_settled is always False, so this defaults to
-        # "present" everywhere - the safer assumption for not under-predicting
-        # tap demand.
-        merged["present"] = (~merged["confirmed_away_settled"]).astype(float)
-
+        # Each minute's loss is the heat over the interval that ends there,
+        # summed into the quarter hour that interval began in. Taken from
+        # quarter-hour means instead, InfluxDB's fill repeated a quarter's mean
+        # into the next ones while the sensors did not change, and the tank
+        # seemed to lose 1.1 kWh when they did (real data, 17 Oct 2026 13:30:
+        # 4468 W after a run, the sensors 0.25 K down); against the minutes,
+        # its quarters correlated 0.76, and its median 0.73.
         # A real draw during active heating is out of scope (confounded with
         # Q_in, same as the calibration diagnostics) - treated as a neutral zero
-        # signal here rather than a gap, so the training series stays regular
-        # instead of full of holes skforecast would need to fill.
-        merged["excess_loss_w"] = merged["excess_loss_w"].fillna(0.0)
+        # signal here rather than a gap.
+        dt_seconds = prepared["dt_seconds"].to_numpy()[1:]
+        began = pd.to_datetime(excess_loss["time"]) - pd.to_timedelta(
+            dt_seconds, unit="s"
+        )
+        quarter = pd.Timedelta(minutes=15)
+        heat_j = pd.Series(
+            excess_loss["excess_loss_w"].fillna(0.0).to_numpy() * dt_seconds,
+            index=began,
+        )
 
-        merged = merged[["time", "excess_loss_w", "present"]]
+        # Indexed in local time: a household's day follows the local clock.
+        prepared = (
+            (heat_j.resample(quarter).sum() / quarter.total_seconds())
+            .to_frame("excess_loss_w")
+            .asfreq(quarter)
+            .tz_convert(LOCAL_TIMEZONE)
+        )
+        prepared["draw_w_per_k"] = prepared["excess_loss_w"] / self._heated_k(
+            prepared.index
+        )
 
-        return super().prepare(merged)
+        return prepared
 
     def dataset(self, config: Config) -> DatasetDefinition:
         self.states = config.heat_pump.states
@@ -251,40 +188,31 @@ class TapForecaster(SkforecastForecaster):
             .timeseries(
                 "T_ambient",
                 config.heat_pump.boiler.ambient_temperature,
-                interval="15m",
+                interval=BoilerThermalIdentifier.SAMPLE_INTERVAL,
                 aggregation="mean",
                 fill="previous",
             )
             .timeseries(
                 "T_top",
                 config.heat_pump.boiler.top_temperature,
-                interval="15m",
+                interval=BoilerThermalIdentifier.SAMPLE_INTERVAL,
                 aggregation="mean",
                 fill="previous",
             )
             .timeseries(
                 "T_bottom",
                 config.heat_pump.boiler.bottom_temperature,
-                interval="15m",
+                interval=BoilerThermalIdentifier.SAMPLE_INTERVAL,
                 aggregation="mean",
                 fill="previous",
             )
             .timeseries(
                 "state",
                 config.heat_pump.state,
-                interval="15m",
+                interval=BoilerThermalIdentifier.SAMPLE_INTERVAL,
                 aggregation="last",
                 fill="previous",
             )
         )
-
-        for i, sensor in enumerate(config.presence):
-            builder = builder.timeseries(
-                f"presence_{i}",
-                sensor,
-                interval="15m",
-                aggregation="last",
-                fill="previous",
-            )
 
         return builder.build()

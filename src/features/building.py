@@ -1039,7 +1039,6 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         x: np.ndarray,
         df: pd.DataFrame,
         plan: tuple[list[tuple[int, int]], int, int],
-        include_partial: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Forward-simulate every scored window; returns (predicted, measured,
         active, row indices), predicted and measured with a column per
@@ -1051,11 +1050,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         free-floating and actively conditioned regimes apart instead of letting
         a good result in one hide a poor one in the other.
 
-        `include_partial` keeps a run's trailing window even when it is shorter
-        than the horizon. Scoring must not: a shorter window accumulates error
-        over less time, so its residuals come out systematically smaller and
-        would flatter the metrics. Display must, or the curve stops up to a
-        full horizon - six hours here - short of the last measurement.
+        A run's trailing window shorter than the horizon is left out: it
+        accumulates error over less time, so its residuals would come out
+        systematically smaller and flatter the metrics.
         """
 
         runs, warmup_samples, horizon_samples = plan
@@ -1096,11 +1093,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
             window_start = run_start
 
-            # Two samples is the shortest window _rollout can step through.
-            minimum = 2 if include_partial else horizon_samples
-
-            while window_start + minimum <= run_end:
-                window_end = min(window_start + horizon_samples, run_end)
+            while window_start + horizon_samples <= run_end:
+                window_end = window_start + horizon_samples
 
                 simulated = _rollout(
                     a,
@@ -1737,42 +1731,12 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         return metrics
 
-    def simulate(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Predicted and measured temperature of the thermostat's room over a
-        window, by time.
-
-        Exactly the view validate() scores - the room temperature is re-anchored
-        to the measurement every ROLLOUT_HORIZON_HOURS while the unmeasured mass
-        node carries through - so what the dashboard draws is the same quantity
-        the reported metrics describe, not a more flattering variant of it.
-
-        Every input is measured. This is deliberately a reconstruction of what
-        the model says the house did, not a forecast: predicting forward would
-        need future shutter positions and occupancy, which nothing reports and
-        which are not the model's to invent.
-        """
-
-        model = self.get_model()
-
-        prepared = self.prepare(df)
-        median_dt = float(prepared["dt_seconds"].median())
-        plan = self._rollout_plan(prepared, median_dt)
-
-        predicted, measured, _, positions = self._simulate_windows(
-            self._parameters(model), prepared, plan, include_partial=True
-        )
-
-        return pd.DataFrame(
-            {"predicted": predicted[:, 0], "measured": measured[:, 0]},
-            index=prepared["time"].to_numpy()[positions],
-        ).sort_index()
-
     def estimate(self, df: pd.DataFrame) -> pd.DataFrame:
         """The filter's running estimate of every state, indexed by time.
 
-        Unlike simulate(), this never restarts: the filter corrects at every
-        step, so the result is continuous by construction and has none of the
-        jumps a sequence of fixed-horizon rollouts necessarily shows. That
+        Unlike the fixed-horizon rollouts validate() scores, this never
+        restarts: the filter corrects at every step, so the result is
+        continuous by construction and has none of their jumps. That
         makes it the right thing to draw, and for the two-node model it is the
         only way to see the mass node at all - no sensor measures the screed.
 

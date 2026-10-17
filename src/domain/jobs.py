@@ -25,9 +25,11 @@ class JobType(str, Enum):
 
 
 class WorkerState(str, Enum):
-    IDLE = "idle"
+    """Where a submitted job is: waiting its turn, or running. A job leaves
+    the worker's list once it has ended, however it ended."""
+
+    QUEUED = "queued"
     RUNNING = "running"
-    FAILED = "failed"
 
 
 JsonType = dict[str, Any] | list[Any]

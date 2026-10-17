@@ -477,6 +477,21 @@ def test_a_run_just_started_keeps_heating_until_its_minimum_runtime():
     assert result.schedule[: config.compressor_min_runtime_steps] == (1, 1)
 
 
+def test_a_run_under_way_keeps_the_compressor_from_the_zone_planned_there():
+    """The previous plan had the zone where the tank has since started: the
+    tank's plan around those runs finishes its own run first."""
+
+    tank = MPCOptimizer(THERMAL_MODEL, MPCConfig())._tank_setting(
+        _running_run_input(0.1)
+    )
+    zone_on = [1] * 4 + [0] * (tank.num_steps - 4)
+
+    plan = plan_tank(tank, zone_on)
+
+    assert tank.running_steps > 0
+    assert all(plan.heat_pump_w[: tank.running_steps])
+
+
 def test_a_run_past_its_minimum_runtime_may_stop():
     result = MPCOptimizer(THERMAL_MODEL, MPCConfig()).solve(_running_run_input(1.0))
 
@@ -1994,6 +2009,31 @@ def test_a_run_under_way_starts_from_the_heat_it_has_put_in():
     ) == pytest.approx(55.0)
 
 
+def test_a_run_under_way_is_traced_by_the_same_heat_from_its_start():
+    """Through the run, the same balance: the tank before it at its start,
+    rising with the ramp, up to the plan's own start now."""
+
+    optimizer = MPCOptimizer(STARTING_MODEL, MPCConfig())
+    data = _make_input(
+        boiler_on_current=True,
+        compressor_elapsed_hours=0.5,
+        run_start_temp_top=34.0,
+        run_start_temp_bottom=34.0,
+    )
+    traced = [
+        optimizer.run_temperature(data, hours) for hours in (0.0, 0.05, 0.25, 0.5)
+    ]
+
+    assert traced[0] == pytest.approx(34.0)
+    assert traced == sorted(traced)
+    # Slower within the ramp than after it.
+    assert (traced[1] - traced[0]) / 0.05 < (traced[3] - traced[2]) / 0.25
+    assert traced[-1] == pytest.approx(optimizer._initial_temperature(data))
+    assert (
+        optimizer.run_temperature(replace(data, boiler_on_current=False), 0.25) is None
+    )
+
+
 def _hot_water_soon(due: int = 4, **overrides) -> MPCInput:
     """A cold tank wanted hot at step `due`, too soon to wait."""
 
@@ -2393,6 +2433,32 @@ def test_taps_cannot_cool_the_tank_below_the_mains():
     assert min(result.temperatures) == pytest.approx(15.0, abs=1e-6)
     assert result.temperatures[-1] > 15.0
     assert min(unbounded.temperatures) < 15.0
+
+
+def test_a_tank_heated_to_its_target_has_the_draws_after_it():
+    """The mains only hold back draws of a tank left unheated: emptied by an
+    early draw and heated to a later target, the draw after that target is
+    planned in full."""
+
+    horizon = len(SOLAR_FORECAST_W)
+    taps = [0.0] * horizon
+    taps[2:6] = [20000.0] * 4
+    taps[20] = 3000.0
+    target = [10.0] * horizon
+    target[18] = 45.0
+    data = _make_input(
+        target_temperature_top=tuple(target),
+        tap_forecast_w=tuple(taps),
+        mains_water_temperature=15.0,
+    )
+    optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig())
+
+    tap_w = optimizer._tank_setting(data).tap_w
+    result = optimizer.solve(data)
+
+    assert sum(tap_w[2:6]) < sum(taps[2:6])
+    assert tap_w[20] == pytest.approx(3000.0)
+    assert result.temperatures[21] < result.temperatures[20] - 1.0
 
 
 def test_the_mains_follow_the_year_damped_and_late():

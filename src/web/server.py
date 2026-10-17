@@ -24,6 +24,7 @@ from domain.jobs import (
     TuneConfig,
     UpdateConfig,
     ValidateConfig,
+    WorkerState,
 )
 from domain.models import BoilerThermalModel
 from web.charts import backtest_chart, dashboard_chart
@@ -91,7 +92,7 @@ async def dashboard(request: Request):
     repositories = request.app.state.repositories
 
     try:
-        repositories.config.load()
+        config = repositories.config.load()
     except Exception:
         return templates.TemplateResponse(request=request, name="setup.html")
 
@@ -103,7 +104,9 @@ async def dashboard(request: Request):
         name="dashboard.html",
         context={
             "dashboard_chart": dashboard_chart(
-                state, boiler_model(request.app.state.models_path)
+                state,
+                boiler_model(request.app.state.models_path),
+                config.heat_pump.states,
             ),
             "backtest_chart": backtest_chart(backtest),
         },
@@ -128,7 +131,7 @@ async def config(request: Request, config: Config):
 
     return {
         "job_id": job.id,
-        "state": "queued",
+        "state": WorkerState.QUEUED,
     }
 
 
@@ -140,7 +143,7 @@ async def update(request: Request, config: UpdateConfig):
 
     return {
         "job_id": job.id,
-        "state": "queued",
+        "state": WorkerState.QUEUED,
     }
 
 
@@ -152,7 +155,7 @@ async def fit(request: Request, config: FitConfig):
 
     return {
         "job_id": job.id,
-        "state": "queued",
+        "state": WorkerState.QUEUED,
     }
 
 
@@ -164,7 +167,7 @@ async def predict(request: Request, config: PredictConfig):
 
     return {
         "job_id": job.id,
-        "state": "queued",
+        "state": WorkerState.QUEUED,
     }
 
 
@@ -176,7 +179,7 @@ async def backtest(request: Request, config: BacktestConfig):
 
     return {
         "job_id": job.id,
-        "state": "queued",
+        "state": WorkerState.QUEUED,
     }
 
 
@@ -188,7 +191,7 @@ async def tune(request: Request, config: TuneConfig):
 
     return {
         "job_id": job.id,
-        "state": "queued",
+        "state": WorkerState.QUEUED,
     }
 
 
@@ -200,7 +203,7 @@ async def calibrate(request: Request, config: CalibrateConfig):
 
     return {
         "job_id": job.id,
-        "state": "queued",
+        "state": WorkerState.QUEUED,
     }
 
 
@@ -212,7 +215,7 @@ async def validate(request: Request, config: ValidateConfig):
 
     return {
         "job_id": job.id,
-        "state": "queued",
+        "state": WorkerState.QUEUED,
     }
 
 
@@ -224,5 +227,5 @@ async def optimize(request: Request, config: OptimizeConfig):
 
     return {
         "job_id": job.id,
-        "state": "queued",
+        "state": WorkerState.QUEUED,
     }

@@ -374,6 +374,11 @@ def plan_tank(
     # all, so not in the step after or before one either, and a day's cooling
     # comes before its hot water: no tank before a later cooling run that day.
     zone = (list(zone_on) + [0] * num_steps)[:num_steps]
+    # Nor while a tank run under way has its minimum runtime to go (see
+    # _build_model's running_run): the zone's runs of a plan made before the
+    # tank started have no place there (real data, 18 Oct 2026 16:22: a tank
+    # run 4 minutes in, the previous plan's zone in its next hour - no plan).
+    zone[: tank.running_steps] = [0] * min(tank.running_steps, num_steps)
     later_cooling = [
         cooling
         and bool(local_day)
@@ -1343,16 +1348,41 @@ class MPCOptimizer:
         # heat draws took from the tanks it was learned on (real plan, 16 Oct
         # 2026: an emptied tank at 25 degC at 12.3 degC by the next morning's
         # run, the mains at 15.5 and the tank measured at 19.5).
+        # A target the tank can reach by then is heated to, so the tank left
+        # unheated starts again from it: held to a tank never heated again, the
+        # next day's evening showers were cut to nothing after a run at noon
+        # (real plan, 18 Oct 2026: 1.07 of 4.47 kWh drawn).
+        max_heat_w = max(max(heat_w), booster_heat_w or 0.0)
+        heat_pump_limit_c = (
+            min(heat_pump_max_c, max_tank_c)
+            if heat_pump_max_c is not None
+            else max_tank_c
+        )
+
         if data.mains_water_temperature is not None:
             tap_w = list(tap_w)
-            tank_c = initial_temperature
+            tank_c = ceiling_c = initial_temperature
+            hottest_c = max(
+                initial_temperature,
+                max_tank_c if booster_heat_w is not None else heat_pump_limit_c,
+            )
 
             for k in range(num_steps):
+                tank_c = max(tank_c, min(float(target_c[k]), ceiling_c))
                 a_d, b_d = discretized(dt_hours[k])
                 coast_c = float(a_d[0, 0] * tank_c + b_d[0, 0] * ambient_c)
                 floor_c = min(data.mains_water_temperature, coast_c)
                 tap_w[k] = min(float(tap_w[k]), (coast_c - floor_c) / -b_d[0, 2])
                 tank_c = coast_c + b_d[0, 2] * tap_w[k]
+                ceiling_c = min(
+                    hottest_c,
+                    float(
+                        a_d[0, 0] * ceiling_c
+                        + b_d[0, 0] * ambient_c
+                        + b_d[0, 1] * max_heat_w
+                        + b_d[0, 2] * tap_w[k]
+                    ),
+                )
 
         def unheated(start_c: float, first: int = 0) -> list[float]:
             """The tank temperature at each step from `first` on with no heating
@@ -1453,7 +1483,6 @@ class MPCOptimizer:
         # the big-M constraints below are built from them: with one loose range
         # for every step, the solver's relaxation could run the booster at a
         # fraction everywhere and had to branch on nearly every step of it.
-        max_heat_w = max(max(heat_w), booster_heat_w or 0.0)
         t_floor = unheated(initial_temperature)
         t_ceiling = [initial_temperature]
 
@@ -1463,11 +1492,6 @@ class MPCOptimizer:
             heated = a_d[0, 0] * t_ceiling[-1] + passive + b_d[0, 1] * max_heat_w
             t_ceiling.append(min(t_upper, float(heated)))
 
-        heat_pump_limit_c = (
-            min(heat_pump_max_c, max_tank_c)
-            if heat_pump_max_c is not None
-            else max_tank_c
-        )
         # A heat pump run does not end where the plan stops it: it settles
         # setpoint_overshoot_k above its setpoint (see the target rule in
         # _build_model), where the target and that overshoot fit under the
@@ -2551,11 +2575,21 @@ class MPCOptimizer:
         during the run are not known and left out. At most the heat pump's
         own limit: beyond it the booster, not this estimate, takes over."""
 
-        sensors_c = self.thermal_model.mixed_temperature(
+        heated_c = self.run_temperature(data, data.compressor_elapsed_hours)
+
+        if heated_c is not None:
+            return heated_c
+
+        return self.thermal_model.mixed_temperature(
             data.current_temp_top,
             data.current_temp_bottom,
             data.current_stratification_k,
         )
+
+    def run_temperature(self, data: MPCInput, elapsed_hours: float) -> float | None:
+        """The tank elapsed_hours into the DHW run under way (deg C) by the
+        run's heat balance (see _initial_temperature), None without such a
+        run or the tank before it."""
 
         if (
             not data.boiler_on_current
@@ -2563,7 +2597,7 @@ class MPCOptimizer:
             or data.run_start_temp_bottom is None
             or data.compressor_elapsed_hours <= 0.0
         ):
-            return sensors_c
+            return None
 
         start_c = self.thermal_model.mixed_temperature(
             data.run_start_temp_top,
@@ -2576,16 +2610,14 @@ class MPCOptimizer:
             else None
         )
         # The mean heat over the time run so far, its ramp included.
-        heat_w = self._heat_at(outdoor_c) * self._ramp_fraction(
-            data.compressor_elapsed_hours
-        )
+        heat_w = self._heat_at(outdoor_c) * self._ramp_fraction(elapsed_hours)
         a_d, b_d = discretize_zoh(
             *lumped_tank_state_space(
                 self.thermal_model.volume_l,
                 self.thermal_model.ua_top_w_per_k
                 + self.thermal_model.ua_bottom_w_per_k,
             ),
-            data.compressor_elapsed_hours * 3600.0,
+            elapsed_hours * 3600.0,
         )
         estimate_c = float(
             a_d[0, 0] * start_c
