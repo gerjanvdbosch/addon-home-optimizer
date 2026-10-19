@@ -529,6 +529,31 @@ def test_heating_fit_takes_the_evaporator_approach_from_dhw(tmp_path):
     assert model.q_th_at_power_fit_high_w == 0.0
 
 
+def test_heating_fit_on_its_approach_bound_takes_the_approach_from_dhw(tmp_path):
+    """Heating readings flatter in the lift than the Carnot form at any
+    approach within its bound push it onto that bound, with a standard error
+    small enough to pass for identified: there too the DHW fit's approach is
+    used."""
+
+    dhw = HeatPumpCOPIdentifier(key="dhw")
+    dhw.model = TRUE_COP_MODEL
+    dhw.save(tmp_path)
+
+    df = _simulate(np.random.default_rng(7), HEATING_STATE, t_supply=28.0)
+    flat = HeatPumpCOPModel(
+        eta_carnot=0.8,
+        delta_t_cond=TRUE_DELTA_T_COND,
+        delta_t_evap=2.0 * HeatPumpCOPIdentifier.MAX_DELTA_T_EVAP,
+    )
+    df["P_el"] *= TRUE_COP_MODEL.cop(df["T_outdoor"], 28.0) / flat.cop(
+        df["T_outdoor"], 28.0
+    )
+
+    model = HeatPumpCOPIdentifier(key="heating", models_path=tmp_path).calibrate(df)
+
+    assert model.delta_t_evap == TRUE_DELTA_T_EVAP
+
+
 def test_cooling_fit_reads_the_heat_taken_from_the_water(tmp_path, monkeypatch):
     """While cooling the water returns warmer than it left and the outdoor
     coil condenses: the fit keeps those rows, takes the coil's approach from

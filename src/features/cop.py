@@ -504,7 +504,9 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             zip(parameter_names, std_errors.tolist(), strict=True)
         )
 
-        shared = self._shared_delta_t_evap(delta_t_evap, float(std_errors[1]))
+        shared = self._shared_delta_t_evap(
+            delta_t_evap, float(std_errors[1]), bool(result.active_mask[1])
+        )
 
         if shared is not None:
             # With the approach fixed the COP is eta_carnot times the Carnot
@@ -626,7 +628,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         return self.model
 
     def _shared_delta_t_evap(
-        self, delta_t_evap: float, std_error: float
+        self, delta_t_evap: float, std_error: float, at_bound: bool
     ) -> float | None:
         """The DHW model's outdoor coil approach, for a heating or cooling fit
         that cannot pin down its own.
@@ -646,6 +648,13 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         three days of real cooling runs, a free approach ran to 35 K with
         eta_carnot at 0.79 for an RMSE of 0.52 against 0.57 at the DHW
         approach: chasing a bound, not converging.
+
+        An approach on its bound is not identified either, however small its
+        standard error: that error describes the curvature at the bound, not an
+        optimum. Real heating runs (Sep-Oct 2026, one warm day the only low
+        lift) put it at 20.0 +/- 1.8 K and eta_carnot at 0.70; without the
+        bound they ran on to 42 K and an eta_carnot of 1.17, above what any
+        machine can reach.
         """
 
         if self.key == "dhw" or self.models_path is None:
@@ -653,6 +662,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
 
         if (
             not self.cooling
+            and not at_bound
             and np.isfinite(std_error)
             and std_error <= abs(delta_t_evap)
         ):

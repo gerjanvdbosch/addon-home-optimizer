@@ -1778,8 +1778,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         physics.zone_state_space). (0, 0) without a saved model to estimate
         the slabs by, or too few runs.
 
-        Each run followed from its start with the screed at its slab's
-        temperature - nothing has heated it apart yet - its heat from the
+        Each run followed from its start with the screed where the slab below
+        and the room above hold it while nothing heats it - in between, by
+        their conductances (real data, Oct 2026: started at the slab, runs
+        from a night off read 800-1000 W short at first) - its heat from the
         water, Q = G (supply - screed), shared with the slabs below and the
         rooms above through the floor's surface, at the saved model's
         surface conductance: the slabs as that model estimates them, the
@@ -1838,7 +1840,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 total = water + down + surface
                 decay = np.exp(-total / capacity * dt_s)
                 mean = (1.0 - decay) / (total / capacity * dt_s)
-                screed_c = slab_c[0]
+                screed_c = (down * slab_c[0] + surface * room_c[0]) / (down + surface)
                 heat = []
 
                 # Each step exactly: the screed relaxes to where the water's

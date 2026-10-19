@@ -253,7 +253,7 @@ def dashboard_chart(
     band(
         state.forecast.solcast.p10,
         state.forecast.solcast.p90,
-        fillcolor="rgba(255, 161, 90, 0.1)",
+        fillcolor="rgba(255, 161, 90, 0.08)",
         legendgroup="solar",
         row=1,
     )
