@@ -194,9 +194,9 @@ def test_the_floors_plan_joins_the_heat_pumps(tmp_path):
 
 
 def test_the_thermal_mass_ahead_is_the_plans(tmp_path):
-    """The building model's estimate holds up to now; from there the slab is
-    the one the plan heats, not the zone left alone - which showed the slab
-    cooling all through a planned floor run."""
+    """The building model's estimate holds up to now; from there the slab and
+    its screed are the ones the plan heats, not the zone left alone - which
+    showed the slab cooling all through a planned floor run."""
     manager = _state_manager()
     manager.state_repository = StateRepository(JsonStorage(tmp_path / "state.json"))
     times = [NOW + timedelta(minutes=15 * i) for i in range(3)]
@@ -206,6 +206,7 @@ def test_the_thermal_mass_ahead_is_the_plans(tmp_path):
         thermal_mass=pd.Series(
             [20.5, 20.4, 20.3, 20.2], index=[past, *times], dtype=float
         ),
+        screed=pd.Series([21.0, 20.9, 20.8, 20.7], index=[past, *times], dtype=float),
     )
 
     manager.update_building_schedule(
@@ -213,12 +214,17 @@ def test_the_thermal_mass_ahead_is_the_plans(tmp_path):
         temperatures=[20.0, 20.1, 20.2],
         times=times,
         thermal_mass=[20.4, 20.8, 21.1],
+        screed=[20.9, 22.0, 22.6],
     )
 
-    mass = manager.load().predictions.thermal_mass
-    assert [(p.time, p.value) for p in mass] == [
+    predictions = manager.load().predictions
+    assert [(p.time, p.value) for p in predictions.thermal_mass] == [
         (past, 20.5),
         *zip(times, [20.4, 20.8, 21.1], strict=True),
+    ]
+    assert [(p.time, p.value) for p in predictions.screed] == [
+        (past, 21.0),
+        *zip(times, [20.9, 22.0, 22.6], strict=True),
     ]
 
 

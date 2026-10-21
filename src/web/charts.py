@@ -130,14 +130,18 @@ def joined(measured: list, planned: list) -> list:
 
 
 def tank_line(measured: list, state: State) -> list:
-    """The tank measured, then as planned (see joined). Through a DHW run
-    under way as the state has it (see BoilerSchedule.run), in place of the
+    """The tank measured, then as planned (see joined). Through the last DHW
+    run as the state has it (see BoilerSchedule.run), in place of the
     sensors, which lag the heat while the tank heats."""
 
     run = state.schedule.heat_pump.boiler.run
 
     if run:
-        measured = [p for p in measured if p.time < run[0].time] + run
+        measured = (
+            [p for p in measured if p.time < run[0].time]
+            + run
+            + [p for p in measured if p.time > run[-1].time]
+        )
 
     return joined(measured, state.schedule.heat_pump.boiler.temperatures)
 
@@ -178,19 +182,23 @@ def mixed_tank(
     a calibrated model."""
 
     bottom_by_time = {p.time: p.value for p in boiler.bottom_temperature}
+    ambient_by_time = {p.time: p.value for p in boiler.ambient_temperature}
     stratification_by_time = {p.time: p.value for p in boiler.stratification}
 
     return [
         SeriesPoint(
             time=p.time,
             value=model.mixed_temperature(
-                p.value, bottom_by_time[p.time], stratification_by_time.get(p.time)
+                p.value,
+                bottom_by_time[p.time],
+                ambient_by_time[p.time],
+                stratification_by_time.get(p.time),
             )
             if model is not None
             else (p.value + bottom_by_time[p.time]) / 2.0,
         )
         for p in boiler.top_temperature
-        if p.time in bottom_by_time
+        if p.time in bottom_by_time and p.time in ambient_by_time
     ]
 
 
@@ -344,6 +352,18 @@ def dashboard_chart(
         decimal=2,
     )
 
+    # The screed the pipes lie in, above that slab: it takes the floor's heat
+    # first, so it leads the slab through a run.
+    series(
+        "Screed",
+        state.predictions.screed,
+        row=2,
+        col=1,
+        line=dict(width=1, color="#E58606", shape="spline", dash="dot"),
+        unit="°C",
+        decimal=2,
+    )
+
     series(
         "Climate target",
         state.schedule.building.target_temperature,
@@ -420,6 +440,7 @@ def dashboard_chart(
     boiler = BoilerMeasurement(
         top_temperature=read_at(measured.top_temperature, state.updated),
         bottom_temperature=read_at(measured.bottom_temperature, state.updated),
+        ambient_temperature=read_at(measured.ambient_temperature, state.updated),
         stratification=read_at(measured.stratification, state.updated),
     )
     measured_average = mixed_tank(boiler, boiler_model)

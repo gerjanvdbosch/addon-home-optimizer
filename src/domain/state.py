@@ -124,6 +124,10 @@ class Predictions(BaseModel):
     # horizon, and lagging and damped relative to the air as a heavy mass
     # should be. This is also the state an MPC must start a plan from.
     thermal_mass: list[SeriesPoint[float]] = Field(default_factory=list)
+    # The screed the floor's pipes lie in above that slab, the same way: it
+    # takes the floor's heat first and passes it on within hours. Empty
+    # where the building model has no screed.
+    screed: list[SeriesPoint[float]] = Field(default_factory=list)
     # The indoor dew point over the plan's horizon (see features.dew_point):
     # what a cooled floor must stay above.
     dew_point: list[SeriesPoint[float]] = Field(default_factory=list)
@@ -132,10 +136,10 @@ class Predictions(BaseModel):
 class BoilerSchedule(BaseModel):
     target_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
     temperatures: list[SeriesPoint[float]] = Field(default_factory=list)
-    # The tank through the DHW run under way, from its start to the plan's:
-    # by the run's heat balance, which the plan starts from - the sensors lag
-    # it while the tank heats (see MPCOptimizer.run_temperature). Empty
-    # without such a run.
+    # The tank through the last DHW run, from its start to the plan's while it
+    # was under way: by the run's heat balance, which the plan starts from -
+    # the sensors lag it while the tank heats (see
+    # MPCOptimizer.run_temperature). Empty before any run.
     run: list[SeriesPoint[float]] = Field(default_factory=list)
     # Whether the plan heats the tank (1/0): the next plan starts from it (see
     # MPCInput.previous_tank_on).

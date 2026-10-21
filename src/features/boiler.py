@@ -919,7 +919,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         # The standing loss from the rest after runs needs the cold layer, read
         # from the runs' heat balance with this first fit's loss; a run's hour
         # of it is small, and the layer is read again below with the final one.
-        self.model.cold_layer_fraction, self.model.cold_water_temperature_c, _ = (
+        self.model.cold_layer_fraction, self.model.cold_layer_above_ambient_k, _ = (
             self._identify_cold_layer(df)
         )
         standing_loss = self._identify_standing_loss(train_df)
@@ -1205,7 +1205,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         self.model.calorimetric_gain = self._identify_calorimetric_gain(df)
         (
             self.model.cold_layer_fraction,
-            self.model.cold_water_temperature_c,
+            self.model.cold_layer_above_ambient_k,
             self.model.cold_layer_spread_k,
         ) = self._identify_cold_layer(df)
         # Against the mixed tank, so after the cold layer.
@@ -1214,10 +1214,10 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         if self.model.cold_layer_fraction is not None:
             logger.info(
                 "Boiler thermal calibration: %.0f%% of the tank is a layer at an "
-                "effective %.1f degC the sensors do not show, once %.1f K "
-                "stratified.",
+                "effective %+.1f K from its surroundings the sensors do not show, "
+                "once %.1f K stratified.",
                 100 * self.model.cold_layer_fraction,
-                self.model.cold_water_temperature_c,
+                self.model.cold_layer_above_ambient_k,
                 self.model.cold_layer_spread_k,
             )
 
@@ -1321,6 +1321,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
                 self.model.mixed_temperature(
                     df["T_top"].to_numpy(dtype=float),
                     df["T_bottom"].to_numpy(dtype=float),
+                    df["T_ambient"].to_numpy(dtype=float),
                 ),
                 np.nan,
             )
@@ -1458,7 +1459,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             >= self.DRAW_BOTTOM_DROP_K
         ).to_numpy()
         heat_c = model.mixed_temperature(
-            top, bottom, tank_stratification_k(top, bottom, boiler_on)
+            top, bottom, ambient, tank_stratification_k(top, bottom, boiler_on)
         )
         rests = []
 
@@ -1627,8 +1628,9 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
     def _identify_cold_layer(
         self, df: pd.DataFrame
     ) -> tuple[float | None, float | None, float | None]:
-        """(the layer's share of the volume, its temperature degC,
-        stratification K at which it is full) from the closed heat balance of
+        """(the layer's share of the volume, its temperature above the tank's
+        surroundings K, stratification K at which it is full) from the closed
+        heat balance of
         each heat pump run; None for each without enough runs, or for a fit with
         no physical meaning.
 
@@ -1655,6 +1657,15 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         reaches it once it passes its temperature (real data, 15 October 2026:
         the sensors met at 20.0 degC with 1.8 K of heat in, the whole tank was at
         22 degC before the run).
+        Its temperature follows the surroundings, as a constant it did not: the
+        layer the runs' balance asked for fell from 24-25 degC in Jul-Sep to
+        22-23 in October, with the surroundings from 25 to 21 degC. Over the
+        later 30% of 105 runs (Jun-Oct 2026), fitted on the rest, the tank
+        before a run came out within 0.81 K (bias -0.01) instead of 1.12
+        (+0.97); the mains water's seasonal course (see
+        physics.mains_water_temperature_c) gave 0.86 (+0.50). Water standing in
+        the loop to the plate exchanger cools to the surroundings between runs,
+        and the circulation stirs it in as a run starts.
         The stratification is held since the tank was last mixed (see
         physics.tank_stratification_k), as the plan reads it. Read from the
         sensors' difference instead, the layer came and went with each sensor
@@ -1669,14 +1680,13 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         heat_w = pd.to_numeric(df["q_in_override_w"], errors="coerce").fillna(0.0)
         top = df["T_top"].to_numpy(dtype=float)
         bottom = df["T_bottom"].to_numpy(dtype=float)
+        ambient = df["T_ambient"].to_numpy(dtype=float)
         stratification = tank_stratification_k(
             top, bottom, df["boiler_on"].to_numpy(dtype=bool)
         )
         loss_w = self.model.ua_top_w_per_k * (
-            top - df["T_ambient"].to_numpy(dtype=float)
-        ) + self.model.ua_bottom_w_per_k * (
-            bottom - df["T_ambient"].to_numpy(dtype=float)
-        )
+            top - ambient
+        ) + self.model.ua_bottom_w_per_k * (bottom - ambient)
         net_j = (
             heat_w.to_numpy() * (self.model.calorimetric_gain or 1.0) - loss_w
         ) * step_s
@@ -1688,13 +1698,24 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         for i, _, k in self._run_balance_spans(df):
             settled_c = (top[k] + bottom[k]) / 2.0
             mean_c = settled_c - float(net_j[i:k].sum()) / heat_capacity_j_per_k
-            starts.append((top[i - 1], bottom[i - 1], stratification[i - 1], mean_c))
+            starts.append(
+                (
+                    top[i - 1],
+                    bottom[i - 1],
+                    ambient[i - 1],
+                    stratification[i - 1],
+                    mean_c,
+                )
+            )
 
         if len(starts) < self.MIN_COLD_LAYER_RUNS:
             return None, None, None
 
-        top_c, bottom_c, held_k, mean_c = map(np.asarray, zip(*starts, strict=True))
+        top_c, bottom_c, ambient_c, held_k, mean_c = map(
+            np.asarray, zip(*starts, strict=True)
+        )
         average_c = (top_c + bottom_c) / 2.0
+        above_ambient_c = average_c - ambient_c
         # Held since the tank was last mixed and beyond one sensor step, as
         # BoilerThermalModel.mixed_temperature reads it.
         stratification_k = held_k - TANK_SENSOR_RESOLUTION_K
@@ -1704,10 +1725,10 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             return None, None, None
 
         share = np.clip(stratification_k / spread_k, 0.0, 1.0)
-        # mean - average = -fraction * share * (average - layer), linear in
-        # (fraction, fraction * layer).
+        # mean - average = -fraction * share * (average - ambient - layer),
+        # layer above the ambient: linear in (fraction, fraction * layer).
         (fraction, fraction_layer), *_ = np.linalg.lstsq(
-            np.column_stack([-share * average_c, share]),
+            np.column_stack([-share * above_ambient_c, share]),
             mean_c - average_c,
             rcond=None,
         )
@@ -1715,10 +1736,12 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         if not 0.0 < fraction < 1.0:
             return None, None, None
 
-        layer_c = float(fraction_layer / fraction)
-
+        layer_k = float(fraction_layer / fraction)
         # Somewhere between freezing and the hottest the tank read.
-        if not 0.0 < layer_c < float(top_c.max()):
+        lowest_k = -float(ambient_c.min())
+        highest_k = float(top_c.max() - ambient_c.max())
+
+        if not lowest_k < layer_k < highest_k:
             return None, None, None
 
         # The stratification at which the layer is full is learned with the
@@ -1729,20 +1752,20 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         def residuals(p: np.ndarray) -> np.ndarray:
             f, layer, spread = p
             share = np.clip(stratification_k / spread, 0.0, 1.0)
-            return average_c - f * share * (average_c - layer) - mean_c
+            return average_c - f * share * (above_ambient_c - layer) - mean_c
 
         max_spread_k = float(stratification_k.max())
         fit = least_squares(
             residuals,
-            [fraction, layer_c, min(spread_k, max_spread_k)],
+            [fraction, layer_k, min(spread_k, max_spread_k)],
             bounds=(
-                [0.0, 0.0, self.MIXED_SPREAD_K],
-                [1.0, float(top_c.max()), max(max_spread_k, spread_k)],
+                [0.0, lowest_k, self.MIXED_SPREAD_K],
+                [1.0, highest_k, max(max_spread_k, spread_k)],
             ),
         )
-        fraction, layer_c, spread_k = map(float, fit.x)
+        fraction, layer_k, spread_k = map(float, fit.x)
 
-        return fraction, layer_c, spread_k
+        return fraction, layer_k, spread_k
 
     def _identify_heat_input_ramp(
         self, df: pd.DataFrame
@@ -1927,7 +1950,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         T_ambient = df["T_ambient"].to_numpy(dtype=float)
         on = df["boiler_on"].to_numpy(dtype=bool)
         T_tank = model.mixed_temperature(
-            top, bottom, tank_stratification_k(top, bottom, on)
+            top, bottom, T_ambient, tank_stratification_k(top, bottom, on)
         )
         heat_w = pd.to_numeric(df["q_in_override_w"], errors="coerce").to_numpy()
         loss_w = model.ua_top_w_per_k * (top - T_ambient) + model.ua_bottom_w_per_k * (
@@ -2382,11 +2405,14 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         # median 68% of the heat taps took between runs on real data. Without
         # a calibrated layer this is that same average. Positive = the tank lost
         # more than the model predicts.
-        # The prediction taps nothing, so it keeps the layer the tank had.
+        # The prediction taps nothing, so it keeps the layer the tank had; both
+        # at the same surroundings, which a draw does not change.
         stratification = tank_stratification_k(T_top, T_bottom, boiler_on)
         residual_k = self.model.mixed_temperature(
-            predictions[:, 0], predictions[:, 1], stratification[:-1]
-        ) - self.model.mixed_temperature(T_top[1:], T_bottom[1:], stratification[1:])
+            predictions[:, 0], predictions[:, 1], T_ambient[1:], stratification[:-1]
+        ) - self.model.mixed_temperature(
+            T_top[1:], T_bottom[1:], T_ambient[1:], stratification[1:]
+        )
 
         heat_capacity_j_per_k = (
             RHO_WATER_KG_PER_L * self.model.volume_l * CP_WATER_J_PER_KG_K

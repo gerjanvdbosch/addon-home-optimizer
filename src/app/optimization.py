@@ -191,7 +191,7 @@ class Optimization:
         if not 0.0 < first_step_hours < mpc_config.step_hours:
             first_step_hours = None
         run_start_temp_top = run_start_temp_bottom = None
-        run_start_stratification_k = None
+        run_start_stratification_k = run_start_ambient_c = None
         stratification = {
             p.time: p.value for p in state.measurements.heat_pump.boiler.stratification
         }
@@ -212,11 +212,37 @@ class Optimization:
                 for p in boiler.bottom_temperature
                 if p.time + reading_interval <= run_start
             ]
+            ambient = {p.time: p.value for p in boiler.ambient_temperature}
 
             if before_top and before_bottom:
                 run_start_temp_top = before_top[-1].value
                 run_start_temp_bottom = before_bottom[-1].value
                 run_start_stratification_k = stratification.get(before_top[-1].time)
+                run_start_ambient_c = ambient.get(before_top[-1].time)
+
+        # The tank through the run under way, as the plan starts from it: at
+        # the run's start, each quarter since, and now - with the heat its
+        # calorimetry measured by each.
+        trace_times = (
+            [
+                run_start,
+                *(
+                    t
+                    for t in pd.date_range(
+                        pd.Timestamp(run_start).ceil(step), now, freq=step
+                    ).to_pydatetime()
+                    if run_start < t < now
+                ),
+                now,
+            ]
+            if run_start is not None
+            else []
+        )
+        trace_heat_j = (
+            self._run_heat_j(config, run_start, trace_times)
+            if run_start is not None
+            else None
+        )
 
         # The tap draws: the past weeks' own profile, held to what today has
         # drawn up to this plan (see TapForecaster). Kept in the state to be
@@ -271,6 +297,8 @@ class Optimization:
             solar_p90_w=solar_p90,
             compressor_elapsed_hours=compressor_elapsed_hours,
             run_start_temp_top=run_start_temp_top,
+            run_start_ambient_c=run_start_ambient_c,
+            run_heat_j=trace_heat_j[-1] if trace_heat_j else None,
             run_start_temp_bottom=run_start_temp_bottom,
             first_step_hours=first_step_hours,
             idle_elapsed_hours=idle_elapsed_hours,
@@ -354,28 +382,17 @@ class Optimization:
             result.objective_value,
         )
 
-        # The tank through the run under way, as the plan starts from it: at
-        # the run's start, each quarter since, and now.
         run = []
 
-        if run_start is not None:
-            for time in [
-                run_start,
-                *(
-                    t
-                    for t in pd.date_range(
-                        pd.Timestamp(run_start).ceil(step), now, freq=step
-                    ).to_pydatetime()
-                    if run_start < t < now
-                ),
-                now,
-            ]:
-                tank_c = optimizer.run_temperature(
-                    planned, (time - run_start).total_seconds() / 3600.0
-                )
+        for i, time in enumerate(trace_times):
+            tank_c = optimizer.run_temperature(
+                planned,
+                (time - run_start).total_seconds() / 3600.0,
+                trace_heat_j[i] if trace_heat_j else None,
+            )
 
-                if tank_c is not None:
-                    run.append(SeriesPoint(time=time, value=tank_c))
+            if tank_c is not None:
+                run.append(SeriesPoint(time=time, value=tank_c))
 
         self.state_manager.update_schedule(
             schedule=result.schedule,
@@ -415,6 +432,7 @@ class Optimization:
             power_w=result.space_electrical_w,
             on=result.space_schedule,
             thermal_mass=result.zone_mass_temperatures,
+            screed=result.zone_screed_temperatures,
         )
         self.publish_zone(
             result,
@@ -425,6 +443,47 @@ class Optimization:
             heat_pump_changes[0],
             now,
         )
+
+    def _run_heat_j(
+        self, config: Config, run_start: datetime, times: list[datetime]
+    ) -> list[float] | None:
+        """The heat the DHW run under way had carried to the tank by each of
+        `times` (J): its calorimetry as the boiler model is identified on (see
+        BoilerThermalIdentifier.prepare), each minute's reading held until the
+        next. None where it shows none - no flow reported yet, say - and the
+        plan's own heat input stands in. Taken from the minutes, not the
+        state's quarter hours: the heat is flow times temperature rise, and
+        the product of two quarter-hour means is not the quarter's heat."""
+
+        boiler = BoilerThermalIdentifier()
+        # From one reading before the run: prepare() drops the first, which has
+        # no interval of its own.
+        df = boiler.prepare(
+            self.loader.load(
+                boiler.dataset(config),
+                run_start - 2 * pd.Timedelta(boiler.SAMPLE_INTERVAL),
+                times[-1],
+            )
+        )
+        heat_w = pd.to_numeric(df["q_in_override_w"], errors="coerce")
+
+        if heat_w.isna().all():
+            return None
+
+        start = df["time"].clip(lower=pd.Timestamp(run_start))
+        end = df["time"].shift(-1, fill_value=pd.Timestamp(times[-1]))
+
+        return [
+            float(
+                (
+                    heat_w.fillna(0.0)
+                    * (end.clip(upper=pd.Timestamp(t)) - start)
+                    .dt.total_seconds()
+                    .clip(lower=0.0)
+                ).sum()
+            )
+            for t in times
+        ]
 
     def _heat_pump_changes(
         self, config: Config, now: datetime
@@ -911,6 +970,7 @@ class Optimization:
         start_c = thermal_model.mixed_temperature(
             data.current_temp_top,
             data.current_temp_bottom,
+            data.ambient_temperature,
             data.current_stratification_k,
         )
         limit_c = thermal_model.heat_pump_max_tank_temperature_c or temperature
@@ -1032,9 +1092,12 @@ class Optimization:
             return None
 
         zone.index = pd.to_datetime(zone.index, utc=True)
-        # The thermostat's room, which comfort is set in, and the slab under it.
+        # The thermostat's room, which comfort is set in, and the slab and
+        # screed under it.
         self.state_manager.update_zone(
-            temperature=zone["measured"].dropna(), thermal_mass=zone["slab_living"]
+            temperature=zone["measured"].dropna(),
+            thermal_mass=zone["slab_living"],
+            screed=zone.get("screed_living"),
         )
 
         # The heat pump's own mode unless this run asks for one (see

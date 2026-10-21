@@ -360,7 +360,11 @@ class StateManager:
             SeriesPoint(time=t, value=int(on))
             for t, on in zip(times, schedule, strict=False)
         ]
-        state.schedule.heat_pump.boiler.run = list(run)
+        # Kept once the run has ended, until the next: mid-run the sensors read
+        # the circulation stirring the tank, not its mean (real data, 21 Oct
+        # 2026: 27.1 degC 18 minutes in, 32.8 by the run's heat balance).
+        if run:
+            state.schedule.heat_pump.boiler.run = list(run)
 
         self.state_repository.save(state)
 
@@ -369,15 +373,23 @@ class StateManager:
         state.schedule.building.supply_setpoint = point
         self.state_repository.save(state)
 
-    def update_zone(self, temperature: pd.Series, thermal_mass: pd.Series) -> None:
+    def update_zone(
+        self,
+        temperature: pd.Series,
+        thermal_mass: pd.Series,
+        screed: pd.Series | None = None,
+    ) -> None:
         """The zone as the optimization job estimates it (see
         Optimization._zone): its measured temperature, and the
-        thermal mass no sensor measures."""
+        thermal mass and screed no sensor measures."""
 
         state = self.load()
 
         state.measurements.building.zone_temperature = self._series_points(temperature)
         state.predictions.thermal_mass = self._series_points(thermal_mass)
+        state.predictions.screed = (
+            self._series_points(screed) if screed is not None else []
+        )
 
         self.state_repository.save(state)
 
@@ -390,13 +402,14 @@ class StateManager:
         power_w: Sequence[float] = (),
         on: Sequence[int] = (),
         thermal_mass: Sequence[float] = (),
+        screed: Sequence[float] = (),
     ) -> None:
         """The zone's part of the plan, not acted on yet. Its heat and power go
         into the heat pump's plan beside the tank's (see update_schedule, which
         rewrote those this same run): one plan, one machine serving both. The
         thermal mass ahead is the plan's: update_zone stored the zone left
         alone from now on, and beside a planned floor run that showed the slab
-        cooling while the run heated the room."""
+        cooling while the run heated the room. The screed likewise."""
 
         state = self.load()
         heat_pump = state.schedule.heat_pump
@@ -425,15 +438,19 @@ class StateManager:
             for t, value in zip(times, on, strict=False)
         ]
 
-        if thermal_mass:
-            state.predictions.thermal_mass = [
-                point
-                for point in state.predictions.thermal_mass
-                if point.time < times[0]
-            ] + [
+        def planned(points: list[SeriesPoint], values: Sequence[float]) -> list:
+            return [point for point in points if point.time < times[0]] + [
                 SeriesPoint(time=t, value=float(value))
-                for t, value in zip(times, thermal_mass, strict=False)
+                for t, value in zip(times, values, strict=False)
             ]
+
+        if thermal_mass:
+            state.predictions.thermal_mass = planned(
+                state.predictions.thermal_mass, thermal_mass
+            )
+
+        if screed:
+            state.predictions.screed = planned(state.predictions.screed, screed)
 
         self.state_repository.save(state)
 

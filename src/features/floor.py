@@ -220,8 +220,14 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
         return self.model
 
     def validate(self, df: pd.DataFrame) -> dict[str, float]:
-        """How well the operating point predicts the heat delivered on runs it
-        was not fitted on, from the outdoor temperature and the mass alone."""
+        """How well the model predicts the heat delivered on runs it was not
+        fitted on: Q = G (supply - mass) at the supply the heat pump ran,
+        since the plan chooses the supply itself wherever its mode has a COP
+        model (see MPCOptimizer._add_space_heating). The heating curve is
+        scored on its own, as the supply it predicts: through the heat it
+        mixed the curve's miss into G's (real data, Oct 2026: the heat pump's
+        own room-led flow control, not the outdoor temperature, set the
+        supply, 642 W off through the curve against 256 W through G)."""
 
         model = self.get_model()
         rows = self.runs(df)
@@ -237,26 +243,30 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
                 "fitted on every run there is."
             )
 
-        predicted = model.heat_w(
-            test["T_out"].to_numpy(dtype=float), test["T_mass"].to_numpy(dtype=float)
+        supply = test["T_supply"].to_numpy(dtype=float)
+        predicted = model.conductance_w_per_k * (
+            supply - test["T_mass"].to_numpy(dtype=float)
         )
         error = predicted - test["Q_floor_w"].to_numpy(dtype=float)
+        supply_error = model.supply_c(test["T_out"].to_numpy(dtype=float)) - supply
 
         metrics = {
             "mae_w": float(np.mean(np.abs(error))),
             "bias_w": float(np.mean(error)),
+            "supply_mae_k": float(np.mean(np.abs(supply_error))),
             "runs": float(test["run"].nunique()),
             **self._pipe_conductance(rows),
         }
 
         logger.info(
-            "%s validation: MAE %.0f W, bias %+.0f W over %d runs; the water "
-            "implies %.0f W/K to the mass (%.0f before the screed settles, %.0f "
-            "after) over %d runs",
+            "%s validation: MAE %.0f W, bias %+.0f W over %d runs, the curve's "
+            "supply %.2f K off; the water implies %.0f W/K to the mass (%.0f "
+            "before the screed settles, %.0f after) over %d runs",
             self.label,
             metrics["mae_w"],
             metrics["bias_w"],
             int(metrics["runs"]),
+            metrics["supply_mae_k"],
             metrics["pipe_ua_w_per_k"],
             metrics["pipe_ua_early_w_per_k"],
             metrics["pipe_ua_late_w_per_k"],

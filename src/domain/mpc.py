@@ -187,6 +187,14 @@ class MPCInput:
     # (see MPCOptimizer._initial_temperature).
     run_start_temp_top: float | None = None
     run_start_temp_bottom: float | None = None
+    # The tank's surroundings then (deg C), which the cold layer is read
+    # against: the sensor in the unit warms ~3 K over a run (21 Oct 2026: 21.0
+    # to 24.5 degC). None takes ambient_temperature.
+    run_start_ambient_c: float | None = None
+    # The heat the DHW run under way has carried to the tank so far, as its
+    # calorimetry measures it (J, see BoilerThermalIdentifier.prepare); None
+    # without a measurement, and the plan's own ramp and heat input stand in.
+    run_heat_j: float | None = None
     # What is left of the running quarter (hours): the plan starts from the
     # state now, so its first step runs from now to that quarter's end and
     # every step after it is a whole quarter again. None is a whole step. A
@@ -240,6 +248,8 @@ class MPCResult:
     # The slab under the thermostat's room the plan heats (deg C): the thermal
     # mass the floor's heat lands in, as planned rather than left alone.
     zone_mass_temperatures: tuple[float, ...] = ()
+    # The screed above that slab (deg C), empty where the floor has none.
+    zone_screed_temperatures: tuple[float, ...] = ()
     # The supply each step runs the floor at (deg C), NaN where it does not:
     # the heat pump's own curve while heating, the plan's choice while cooling
     # - the setpoint to give it. Empty without a space-heating model.

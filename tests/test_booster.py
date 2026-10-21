@@ -61,30 +61,30 @@ MIXING_MODEL = BoilerThermalModel(
     ua_mix_active_w_per_k=500.0,
     q_in_nominal_w=6000.0,
     cold_layer_fraction=0.35,
-    cold_water_temperature_c=15.0,
+    cold_layer_above_ambient_k=-5.0,
     cold_layer_spread_k=8.0,
 )
 
 
 def test_a_mixed_tank_is_its_sensors_average():
-    assert MIXING_MODEL.mixed_temperature(46.0, 46.0) == 46.0
+    assert MIXING_MODEL.mixed_temperature(46.0, 46.0, 20.0) == 46.0
 
 
 def test_one_sensor_step_apart_is_a_mixed_tank():
     """At rest the sensors flip a 0.5 K step apart: no stratification."""
 
-    assert MIXING_MODEL.mixed_temperature(46.0, 45.5) == 45.75
+    assert MIXING_MODEL.mixed_temperature(46.0, 45.5, 20.0) == 45.75
 
 
 def test_a_stratified_tank_holds_the_cold_layer_below_its_sensors():
     """Fully stratified - 8 K beyond one sensor step: 35% of the tank at
-    15 degC, the rest at the 41 degC average; half as stratified, half that
-    layer."""
+    15 degC, 5 K below its 20 degC surroundings, the rest at the 41 degC
+    average; half as stratified, half that layer."""
 
-    assert MIXING_MODEL.mixed_temperature(45.25, 36.75) == pytest.approx(
+    assert MIXING_MODEL.mixed_temperature(45.25, 36.75, 20.0) == pytest.approx(
         41.0 - 0.35 * (41.0 - 15.0)
     )
-    assert MIXING_MODEL.mixed_temperature(43.25, 38.75) == pytest.approx(
+    assert MIXING_MODEL.mixed_temperature(43.25, 38.75, 20.0) == pytest.approx(
         41.0 - 0.35 * 0.5 * (41.0 - 15.0)
     )
 
@@ -95,8 +95,8 @@ def test_the_cold_layer_is_learned_from_each_runs_closed_heat_balance(gain):
     3 kW, then idle rows until the loop's heat has reached the tank. The tank
     settles mixed at its mean before the run plus the heat put in - the
     measured heat times the calorimetric gain - so the fit recovers the
-    layer's share and temperature. No standing loss: the ambient air is at the
-    tank's own temperature."""
+    layer's share and temperature. At 20 degC surroundings, with no standing
+    loss to them."""
 
     rows = []
     time = pd.Timestamp("2026-09-01 10:00", tz="UTC")
@@ -106,7 +106,7 @@ def test_the_cold_layer_is_learned_from_each_runs_closed_heat_balance(gain):
 
     for n in range(12):
         top, bottom = 30.0 + 1.5 * n, 22.0 + 1.5 * n - (n % 3)
-        settled = MIXING_MODEL.mixed_temperature(top, bottom) + added_k
+        settled = MIXING_MODEL.mixed_temperature(top, bottom, 20.0) + added_k
         run = [(top, bottom, False, float("nan"))]
         run += [(top + 2.0, bottom + 4.0, True, heat_w)] * 3
         run += [(settled, settled, False, float("nan"))] * 5
@@ -117,7 +117,7 @@ def test_the_cold_layer_is_learned_from_each_runs_closed_heat_balance(gain):
                     time=time,
                     T_top=T_top,
                     T_bottom=T_bottom,
-                    T_ambient=(T_top + T_bottom) / 2.0,
+                    T_ambient=20.0,
                     boiler_on=on,
                     booster_on=False,
                     q_in_override_w=q,
@@ -126,11 +126,15 @@ def test_the_cold_layer_is_learned_from_each_runs_closed_heat_balance(gain):
             time += step
 
     identifier = BoilerThermalIdentifier()
-    identifier.model = replace(MIXING_MODEL, calorimetric_gain=gain)
-    fraction, cold_c, spread_k = identifier._identify_cold_layer(pd.DataFrame(rows))
+    identifier.model = replace(
+        MIXING_MODEL, ua_top_w_per_k=0.0, ua_bottom_w_per_k=0.0, calorimetric_gain=gain
+    )
+    fraction, above_ambient_k, spread_k = identifier._identify_cold_layer(
+        pd.DataFrame(rows)
+    )
 
     assert fraction == pytest.approx(0.35, abs=0.02)
-    assert cold_c == pytest.approx(15.0, abs=1.0)
+    assert above_ambient_k == pytest.approx(-5.0, abs=1.0)
     assert spread_k == pytest.approx(8.0, abs=1.0)
 
 
@@ -225,7 +229,7 @@ def test_a_plan_starts_from_the_tank_mixed():
     result = MPCOptimizer(MIXING_MODEL, MPCConfig()).solve(data)
 
     assert result.temperatures[0] == pytest.approx(
-        MIXING_MODEL.mixed_temperature(45.0, 37.0)
+        MIXING_MODEL.mixed_temperature(45.0, 37.0, 20.0)
     )
 
 
@@ -239,7 +243,7 @@ def test_the_supply_margin_is_against_the_tanks_energy_temperature():
     count."""
 
     heat_w = 2.5 * 200.0 * 4186.0 / 300.0
-    mixed = MIXING_MODEL.mixed_temperature(48.0, 32.0)
+    mixed = MIXING_MODEL.mixed_temperature(48.0, 32.0, 20.0)
     middle = [mixed + 2.5 * (row + 0.5) for row in range(6)]
     df = pd.DataFrame(
         {
@@ -254,6 +258,7 @@ def test_the_supply_margin_is_against_the_tanks_energy_temperature():
             + [90.0, 20.0],
             "T_top": [48.0] + [50.0] * 7,
             "T_bottom": [32.0] + [40.0] * 7,
+            "T_ambient": [20.0] * 8,
         }
     )
     identifier = BoilerThermalIdentifier()
@@ -495,7 +500,7 @@ def test_a_tank_at_rest_keeps_its_cold_layer_when_its_top_steps_down():
     bottom = [46.5, 45.5, 45.5, 45.0, 46.5, 46.5]
     mixing = [False, False, False, False, True, False]
     held = tank_stratification_k(top, bottom, mixing)
-    mixed = MIXING_MODEL.mixed_temperature(np.array(top), np.array(bottom), held)
+    mixed = MIXING_MODEL.mixed_temperature(np.array(top), np.array(bottom), 20.0, held)
 
     assert list(held) == [0.0, 1.0, 1.0, 1.0, 0.5, 0.5]
     assert np.all(np.diff(mixed[:4]) <= 0.0)

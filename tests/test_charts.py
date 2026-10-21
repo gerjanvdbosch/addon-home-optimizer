@@ -134,11 +134,13 @@ MODEL = BoilerThermalModel(
     ua_mix_active_w_per_k=500.0,
     q_in_nominal_w=6000.0,
     cold_layer_fraction=0.35,
-    cold_water_temperature_c=15.0,
+    cold_layer_above_ambient_k=-5.0,
     cold_layer_spread_k=8.0,
 )
 BOILER = BoilerMeasurement(
-    top_temperature=_points([45.0, 46.0]), bottom_temperature=_points([37.0, 46.0])
+    top_temperature=_points([45.0, 46.0]),
+    bottom_temperature=_points([37.0, 46.0]),
+    ambient_temperature=_points([20.0, 20.0]),
 )
 
 
@@ -148,7 +150,7 @@ def test_the_measured_tank_is_drawn_mixed_as_it_is_planned():
 
     drawn = mixed_tank(BOILER, MODEL)
 
-    assert drawn[0].value == pytest.approx(MODEL.mixed_temperature(45.0, 37.0))
+    assert drawn[0].value == pytest.approx(MODEL.mixed_temperature(45.0, 37.0, 20.0))
     assert drawn[1].value == 46.0
 
 
@@ -198,10 +200,20 @@ def test_a_run_under_way_is_drawn_as_the_state_has_it_not_its_sensors():
         45.6,
     ]
 
+    # Ended, the sensors take over again after it.
+    measured += _points([44.0], first=4)
+
+    assert [p.value for p in tank_line(measured, state)][-2:] == [40.8, 44.0]
+
     # Without a run, the sensors are the tank.
     boiler.run = []
 
-    assert [p.value for p in tank_line(measured, state)] == [29.3, 29.2, 28.2, 45.6]
+    assert [p.value for p in tank_line(measured, state)] == [
+        29.3,
+        29.2,
+        28.2,
+        44.0,
+    ]
 
 
 def test_each_state_holds_until_its_next_change():

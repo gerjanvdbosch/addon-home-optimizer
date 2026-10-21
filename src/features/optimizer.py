@@ -2567,15 +2567,18 @@ class MPCOptimizer:
         now (see MPCInput.first_step_hours): mixed from its sensors (see
         BoilerThermalModel.mixed_temperature), or while a DHW run is under way
         the tank mixed just before it began plus the heat the run has put in
-        since, less the standing loss - the same ramp and heat input the plan
-        runs on. The sensors lag that heat while the tank is heating (real
+        since, less the standing loss - as its calorimetry measured it (see
+        MPCInput.run_heat_j), or without that the same ramp and heat input the
+        plan runs on. The sensors lag that heat while the tank is heating (real
         data, 28 Sep: 42.0/41.5 degC half an hour into a run, 41.0 mixed,
         against 44 degC by the run's own heat balance), and a plan started
         from them saw the run go on a quarter hour longer than it did. Taps
         during the run are not known and left out. At most the heat pump's
         own limit: beyond it the booster, not this estimate, takes over."""
 
-        heated_c = self.run_temperature(data, data.compressor_elapsed_hours)
+        heated_c = self.run_temperature(
+            data, data.compressor_elapsed_hours, data.run_heat_j
+        )
 
         if heated_c is not None:
             return heated_c
@@ -2583,13 +2586,19 @@ class MPCOptimizer:
         return self.thermal_model.mixed_temperature(
             data.current_temp_top,
             data.current_temp_bottom,
+            data.ambient_temperature,
             data.current_stratification_k,
         )
 
-    def run_temperature(self, data: MPCInput, elapsed_hours: float) -> float | None:
+    def run_temperature(
+        self, data: MPCInput, elapsed_hours: float, heat_j: float | None = None
+    ) -> float | None:
         """The tank elapsed_hours into the DHW run under way (deg C) by the
         run's heat balance (see _initial_temperature), None without such a
-        run or the tank before it."""
+        run or the tank before it. heat_j is the heat the run's calorimetry
+        measured going in by then (J); None takes the plan's own ramp and heat
+        input. The plan's ran 2-4 K warmer than the measured heat over a run
+        whose compressor came up slower than its ramp (21 Oct 2026)."""
 
         if (
             not data.boiler_on_current
@@ -2602,6 +2611,9 @@ class MPCOptimizer:
         start_c = self.thermal_model.mixed_temperature(
             data.run_start_temp_top,
             data.run_start_temp_bottom,
+            data.run_start_ambient_c
+            if data.run_start_ambient_c is not None
+            else data.ambient_temperature,
             data.run_start_stratification_k,
         )
         outdoor_c = (
@@ -2610,7 +2622,14 @@ class MPCOptimizer:
             else None
         )
         # The mean heat over the time run so far, its ramp included.
-        heat_w = self._heat_at(outdoor_c) * self._ramp_fraction(elapsed_hours)
+        if heat_j is None:
+            heat_w = self._heat_at(outdoor_c) * self._ramp_fraction(elapsed_hours)
+        else:
+            heat_w = (
+                heat_j
+                * (self.thermal_model.calorimetric_gain or 1.0)
+                / max(elapsed_hours * 3600.0, 1.0)
+            )
         a_d, b_d = discretize_zoh(
             *lumped_tank_state_space(
                 self.thermal_model.volume_l,
@@ -3545,6 +3564,7 @@ class MPCOptimizer:
         space_heat_w: tuple[float, ...] = ()
         zone_temperatures: tuple[float, ...] = ()
         zone_mass_temperatures: tuple[float, ...] = ()
+        zone_screed_temperatures: tuple[float, ...] = ()
         space_supply_c: tuple[float, ...] = ()
         space_electrical_w: tuple[float, ...] = ()
 
@@ -3560,6 +3580,12 @@ class MPCOptimizer:
                 float(pyo.value(model.zone_state[k, ZONE_SLAB_STATES[0]]))
                 for k in range(num_steps)
             )
+
+            if ZONE_SCREED_STATES[0] in model.ZONE_STATES:
+                zone_screed_temperatures = tuple(
+                    float(pyo.value(model.zone_state[k, ZONE_SCREED_STATES[0]]))
+                    for k in range(num_steps)
+                )
             # The electricity that heat costs, as the objective prices it:
             # the heat moved, either way, over the step's COP.
             space_electrical_w = tuple(
@@ -3607,6 +3633,7 @@ class MPCOptimizer:
             space_heat_w=space_heat_w,
             zone_temperatures=zone_temperatures,
             zone_mass_temperatures=zone_mass_temperatures,
+            zone_screed_temperatures=zone_screed_temperatures,
             space_supply_c=space_supply_c,
             space_electrical_w=space_electrical_w,
             electricity_kwh=sum(electricity_step_kwh),

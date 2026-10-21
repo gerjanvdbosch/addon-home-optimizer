@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 from app.optimization import Optimization
 from app.state import StateManager
@@ -14,6 +15,7 @@ from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.sensors import SensorReference
 from domain.state import SeriesPoint, State
 from domain.time import local_day_start
+from features.boiler import BoilerThermalIdentifier
 from features.optimizer import MPCOptimizer
 
 START = datetime(2026, 9, 17, 10, 0, tzinfo=UTC)
@@ -493,6 +495,44 @@ def test_the_heat_pump_changes_are_read_per_series():
     assert frequency == _changes(("13:18:00", 38.0))
     optimization.loader = SimpleNamespace(load=lambda *_: frame[["time", "state"]])
     assert optimization._heat_pump_changes(config, DAY)[1] == []
+
+
+def test_a_runs_measured_heat_is_summed_to_each_trace_time(monkeypatch):
+    """Per minute, from the run's start: 20 L/min warmed 5 K is 6977 W, the
+    first minute's 0 K (no heat yet) - so 4 and 9 minutes of it by 10:05 and
+    10:10. The minutes before the run carry none."""
+
+    start = DAY + pd.Timedelta("10:00:00")
+    minutes = pd.date_range(start - pd.Timedelta("3min"), periods=14, freq="1min")
+    on = minutes >= start
+    frame = pd.DataFrame(
+        {
+            "time": minutes,
+            "T_ambient": 20.0,
+            "T_top": 40.0,
+            "T_bottom": 35.0,
+            "state": ["SWW" if o else "Uit" for o in on],
+            "T_supply": [45.0 if t > start else 40.0 for t in minutes],
+            "T_return": 40.0,
+            "flow_lpm": [20.0 if o else float("nan") for o in on],
+        }
+    )
+    monkeypatch.setattr(
+        BoilerThermalIdentifier,
+        "dataset",
+        lambda self, config: setattr(self, "states", HeatPumpStates()),
+    )
+    optimization = Optimization.__new__(Optimization)
+    optimization.loader = SimpleNamespace(load=lambda *_: frame)
+    times = [start, start + pd.Timedelta("5min"), start + pd.Timedelta("10min")]
+
+    heat_j = optimization._run_heat_j(None, start, times)
+
+    watts = 20.0 / 60.0 * 4186.0 * 5.0
+    assert heat_j == pytest.approx([0.0, 4 * 60 * watts, 9 * 60 * watts])
+
+    frame["flow_lpm"] = float("nan")
+    assert optimization._run_heat_j(None, start, times) is None
 
 
 def test_a_settled_cooling_run_is_set_the_planned_heat_below_its_return():

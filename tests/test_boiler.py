@@ -1437,7 +1437,7 @@ def test_standing_loss_is_read_from_the_rest_after_runs():
         ua_mix_active_w_per_k=600.0,
         q_in_nominal_w=4500.0,
         cold_layer_fraction=0.5,
-        cold_water_temperature_c=30.0,
+        cold_layer_above_ambient_k=30.0 - T_AMBIENT_C,
         cold_layer_spread_k=4.0,
     )
     a_d, b_d = discretize_zoh(*lumped_tank_state_space(TRUE_VOLUME_L, ua), DT_SECONDS)

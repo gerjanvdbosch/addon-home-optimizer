@@ -2034,6 +2034,31 @@ def test_a_run_under_way_is_traced_by_the_same_heat_from_its_start():
     )
 
 
+def test_a_run_under_way_is_traced_by_its_measured_heat_where_there_is_one():
+    """The heat its calorimetry measured, times the calorimetric gain, in place
+    of the plan's ramp: 7 kW for half an hour, over the tank's own loss."""
+
+    model = replace(STARTING_MODEL, calorimetric_gain=1.1)
+    optimizer = MPCOptimizer(model, MPCConfig())
+    data = _make_input(
+        boiler_on_current=True,
+        compressor_elapsed_hours=0.5,
+        run_start_temp_top=34.0,
+        run_start_temp_bottom=34.0,
+    )
+    a_d, b_d = discretize_zoh(
+        *lumped_tank_state_space(
+            model.volume_l, model.ua_top_w_per_k + model.ua_bottom_w_per_k
+        ),
+        1800.0,
+    )
+
+    assert optimizer.run_temperature(data, 0.5, 7000.0 * 1800.0) == pytest.approx(
+        a_d[0, 0] * 34.0 + b_d[0, 0] * 20.0 + b_d[0, 1] * 7000.0 * 1.1
+    )
+    assert optimizer.run_temperature(data, 0.0, 0.0) == pytest.approx(34.0)
+
+
 def _hot_water_soon(due: int = 4, **overrides) -> MPCInput:
     """A cold tank wanted hot at step `due`, too soon to wait."""
 

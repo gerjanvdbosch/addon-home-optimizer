@@ -87,18 +87,20 @@ class BoilerThermalModel:
     # The layer the two sensors do not show (see
     # BoilerThermalIdentifier._identify_cold_layer): after tapping, cold water
     # fills the tank from the bottom, so two point sensors in the stratified
-    # tank misstate its mean. Its share of the volume, its temperature (deg C,
-    # an effective one: cold water below the sensors and warmer water above
-    # where a run's circulation draws), and
+    # tank misstate its mean. Its share of the volume, how far its temperature
+    # lies above the tank's surroundings (K; an effective temperature: cold
+    # water below the sensors, warmer water above where a run's circulation
+    # draws, and the loop to the plate exchanger cooled to the surroundings
+    # since the last run, which a run stirs in), and
     # the stratification (top minus bottom sensor as tank_stratification_k holds
     # it, beyond one sensor step, K) at which it is full.
     # None until runs have shown it; the sensors' average then stands for the
     # tank.
     cold_layer_fraction: float | None = None
-    cold_water_temperature_c: float | None = None
+    cold_layer_above_ambient_k: float | None = None
     cold_layer_spread_k: float | None = None
 
-    def mixed_temperature(self, top_c, bottom_c, stratification_k=None):
+    def mixed_temperature(self, top_c, bottom_c, ambient_c, stratification_k=None):
         """The tank's mean temperature (deg C): what mixing it gives, and so
         what a plan starts from. The layer counts in proportion to the
         stratification, up to full at cold_layer_spread_k: held since the tank
@@ -106,7 +108,10 @@ class BoilerThermalModel:
         history the sensors' own difference now. Only beyond one sensor step
         (TANK_SENSOR_RESOLUTION_K): the sensors of a tank at rest flip a step
         apart, which read as stratification dropped the tank 1.4 K on every flip
-        (real data, 28 September 2026). Scalars or arrays."""
+        (real data, 28 September 2026). The layer's temperature follows the
+        tank's surroundings (ambient_c, deg C): read as one constant, it put
+        the tank before October's runs 0.9 K too warm (2.6 K on 21 October)
+        while the surroundings cooled from 25 to 21 degC. Scalars or arrays."""
 
         average = (top_c + bottom_c) / 2.0
 
@@ -115,7 +120,7 @@ class BoilerThermalModel:
 
         if (
             self.cold_layer_fraction is None
-            or self.cold_water_temperature_c is None
+            or self.cold_layer_above_ambient_k is None
             or not self.cold_layer_spread_k
         ):
             return average
@@ -127,7 +132,7 @@ class BoilerThermalModel:
         )
 
         return average - self.cold_layer_fraction * share * (
-            average - self.cold_water_temperature_c
+            average - ambient_c - self.cold_layer_above_ambient_k
         )
 
 
