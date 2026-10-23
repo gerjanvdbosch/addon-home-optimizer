@@ -67,6 +67,23 @@ def broken_between_runs(points: list, step: timedelta) -> list:
     return broken
 
 
+def on_clock(points: list) -> list:
+    """The points whose local clock time runs on from the last one's. Plotly's
+    time axis has no time zone: when the clocks go back, an hour's clock times
+    come twice, and a line through both ran back over itself. That hour is
+    drawn once, as first read."""
+
+    kept = []
+
+    for point in points:
+        clock = to_local_time(point.time).replace(tzinfo=None)
+
+        if not kept or clock > kept[-1][0]:
+            kept.append((clock, point))
+
+    return [point for _, point in kept]
+
+
 def handed_over(schedule: Schedule) -> list[SeriesPoint]:
     """The heat pump's planned power, the quarter the tank's block ends in with
     the zone's run planned from the next as it is run: the tank's part, then
@@ -224,7 +241,7 @@ def dashboard_chart(
     window_end = local_day_start(now, days=2)
 
     def in_window(points: list) -> list:
-        return [p for p in points if window_start <= p.time < window_end]
+        return on_clock([p for p in points if window_start <= p.time < window_end])
 
     def series(name: str, points: list, **kwargs) -> None:
         add_series(fig, name, in_window(points), **kwargs)
@@ -360,6 +377,7 @@ def dashboard_chart(
         row=2,
         col=1,
         line=dict(width=1, color="#E58606", shape="spline", dash="dot"),
+        visible="legendonly",
         unit="°C",
         decimal=2,
     )

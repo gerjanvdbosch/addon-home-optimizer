@@ -13,7 +13,7 @@ from domain.config import BoilerConfig, HeatPumpStates, LegionellaConfig, Prices
 from domain.models import BoilerThermalModel
 from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.sensors import SensorReference
-from domain.state import SeriesPoint, State
+from domain.state import SeriesPoint, State, ZoneHabit
 from domain.time import local_day_start
 from features.boiler import BoilerThermalIdentifier
 from features.optimizer import MPCOptimizer
@@ -642,3 +642,47 @@ def test_the_weekend_tariff_holds_all_saturday():
         State(),
         [friday_noon, friday_noon + timedelta(days=1)],
     ) == (0.25, 0.21)
+
+
+def test_the_rooms_habit_is_made_once_a_day():
+    """Three weeks' median moves little in a day: today's is kept in the state
+    and taken from there, yesterday's is made anew."""
+
+    made: list[datetime] = []
+
+    class Identifier:
+        HABIT_HISTORY_DAYS = 21
+
+        def dataset(self, config):
+            return None
+
+        def room_heat_habit(self, df, now):
+            made.append(now)
+            return pd.DataFrame(
+                {"living": 1.0, "rest": 2.0}, index=range(0, 24 * 60, 15)
+            )
+
+    saved: list[ZoneHabit] = []
+    optimization = Optimization(
+        loader=SimpleNamespace(load=lambda *_: None),  # type: ignore[arg-type]
+        state_manager=SimpleNamespace(  # type: ignore[arg-type]
+            update_habit=lambda _, habit: saved.append(habit)
+        ),
+        config_repository=None,  # type: ignore[arg-type]
+        models_path=Path("."),
+        home_assistant=None,  # type: ignore[arg-type]
+    )
+    state = State()
+
+    first = optimization._room_heat_habit(state, None, Identifier(), START)  # type: ignore[arg-type]
+    state.predictions.zone_habit = saved[-1]
+    again = optimization._room_heat_habit(  # type: ignore[arg-type]
+        state, None, Identifier(), START + timedelta(hours=6)
+    )
+    optimization._room_heat_habit(  # type: ignore[arg-type]
+        state, None, Identifier(), START + timedelta(days=1)
+    )
+
+    assert len(made) == 2
+    assert first.loc[22 * 60, "rest"] == 2.0
+    pd.testing.assert_frame_equal(first, again, check_dtype=False)

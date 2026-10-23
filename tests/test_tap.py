@@ -182,7 +182,10 @@ def test_what_was_drawn_today_is_not_forecast_again(tmp_path):
     tomorrow = ahead >= pd.Timestamp("2026-10-17", tz=LOCAL_TIMEZONE)
     forecast[tomorrow & (ahead.hour == 4)] = 1000.0
 
-    held = forecaster._within_todays_budget(forecast, drawn)
+    _, heavy_day_w = forecaster._habit(
+        pd.DataFrame({"excess_loss_w": drawn, "draw_w_per_k": drawn})
+    )
+    held = forecaster._within_todays_budget(forecast, drawn, heavy_day_w)
 
     assert held[~tomorrow].sum() == pytest.approx(0.0)
     np.testing.assert_allclose(held[tomorrow], forecast[tomorrow])
@@ -191,5 +194,5 @@ def test_what_was_drawn_today_is_not_forecast_again(tmp_path):
     nothing_yet[pd.Timestamp("2026-10-16 20:00", tz=LOCAL_TIMEZONE)] = 0.0
 
     np.testing.assert_allclose(
-        forecaster._within_todays_budget(forecast, nothing_yet), forecast
+        forecaster._within_todays_budget(forecast, nothing_yet, heavy_day_w), forecast
     )

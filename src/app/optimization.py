@@ -20,7 +20,7 @@ from domain.physics import (
     mains_water_temperature_c,
 )
 from domain.sensors import SensorReference
-from domain.state import SeriesPoint, State
+from domain.state import SeriesPoint, State, TapHabit, ZoneHabit
 from domain.time import local_day_start, to_local_time
 from features.boiler import BoilerThermalIdentifier
 from features.building import BuildingThermalIdentifier
@@ -250,12 +250,16 @@ class Optimization:
         # it existed.
         tap = TapForecaster(self.models_path)
         tap_w = tap.predict(
+            # From a reading before midnight: the boiler's prepare() drops the
+            # first, which has no interval of its own.
             self.loader.load(
                 tap.dataset(config),
-                now - timedelta(days=TapForecaster.PROFILE_DAYS + 1),
+                local_day_start(now).astimezone(timezone.utc)
+                - 2 * pd.Timedelta(BoilerThermalIdentifier.SAMPLE_INTERVAL),
                 now,
             ),
             steps=len(forecast_times),
+            habit=self._tap_habit(state, config, tap, now),
         )
         self.state_manager.update_prediction("tap", tap_w)
         tap_forecast = extended(
@@ -1000,6 +1004,69 @@ class Optimization:
             key=lambda k: (covered[k] - covered[max(k - run_steps, 0)], k),
         )
 
+    def _tap_habit(
+        self, state: State, config: Config, tap: TapForecaster, now: datetime
+    ) -> tuple[pd.Series, float | None]:
+        """The tap draws' habit (see TapForecaster.habit), made once a day and
+        kept in the state: its four weeks of the boiler's minutes load in some
+        1 s a plan."""
+
+        today = to_local_time(now).date()
+        habit = state.predictions.tap_habit
+
+        if habit is None or habit.day != today:
+            profile, heavy_day_w = tap.habit(
+                self.loader.load(
+                    tap.dataset(config),
+                    now - timedelta(days=TapForecaster.PROFILE_DAYS + 1),
+                    now,
+                )
+            )
+            habit = TapHabit(
+                day=today,
+                draw_w_per_k=profile.tolist(),
+                heavy_day_w=heavy_day_w,
+            )
+            self.state_manager.update_habit("tap_habit", habit)
+
+        return pd.Series(habit.draw_w_per_k), habit.heavy_day_w
+
+    def _room_heat_habit(
+        self,
+        state: State,
+        config: Config,
+        identifier: BuildingThermalIdentifier,
+        now: datetime,
+    ) -> pd.DataFrame:
+        """The rooms' habit (see BuildingThermalIdentifier.room_heat_habit),
+        made once a day and kept in the state: a median over three weeks moves
+        little in a day (the forecast as good, within 0.002 K), and its weeks
+        load in some 2 s against the zone's own 0.6 s."""
+
+        today = to_local_time(now).date()
+        habit = state.predictions.zone_habit
+
+        if habit is None or habit.day != today:
+            frame = identifier.room_heat_habit(
+                self.loader.load(
+                    identifier.dataset(config),
+                    now - timedelta(days=identifier.HABIT_HISTORY_DAYS),
+                    now,
+                ),
+                now,
+            )
+            habit = ZoneHabit(
+                day=today,
+                living_w=frame["living"].tolist(),
+                rest_w=frame["rest"].tolist(),
+            )
+            self.state_manager.update_habit("zone_habit", habit)
+
+        return pd.DataFrame(
+            {"living": habit.living_w, "rest": habit.rest_w},
+            index=range(0, 24 * 60, 24 * 60 // len(habit.living_w)),
+        )
+
     def _zone(
         self,
         state: State,
@@ -1084,6 +1151,7 @@ class Optimization:
                     now - timedelta(days=identifier.HABIT_HISTORY_DAYS),
                     now,
                 ),
+                self._room_heat_habit(state, config, identifier, now),
             )
         except ValueError as error:
             # Normal right after a restart with no measurements yet, or before
@@ -1151,8 +1219,8 @@ class Optimization:
             # reach; no gain assumed without any. The sun through the glazing
             # is not: as for the solar forecast, none where none is forecast.
             zone_internal_gain_w=gain("internal_gain_w"),
-            zone_solar_gain_w=tuple(planned["solar_gain_w"].fillna(0.0)),
-            zone_solar_gain_rest_w=tuple(planned["solar_gain_rest_w"].fillna(0.0)),
+            zone_living_gain_w=tuple(planned["living_gain_w"].fillna(0.0)),
+            zone_rest_gain_w=tuple(planned["rest_gain_w"].fillna(0.0)),
             zone_cooling=cooling,
             zone_mass_minimum_c=(
                 tuple(c + config.building.dew_point_margin for c in dew_point_c)

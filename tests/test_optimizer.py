@@ -1333,7 +1333,7 @@ def test_solar_gain_displaces_heating_in_the_two_node_zone():
     sunny = optimizer.solve(
         _zone_input(
             zone_state=_zone_state(19.5, 19.5),
-            zone_solar_gain_w=(2000.0,) * steps,
+            zone_living_gain_w=(2000.0,) * steps,
         )
     )
 
@@ -1675,7 +1675,7 @@ def _mild_day(below_k: float, sun_w: float = 0.0, weight: float = 0.5):
         outdoor_temperature_forecast=(12.0,) * steps,
         zone_state=_zone_state(19.6, 19.8),
         zone_minimum_temperature=tuple(target - below_k),
-        zone_solar_gain_w=tuple(np.where((hour >= 10.0) & (hour < 16.0), sun_w, 0.0)),
+        zone_living_gain_w=tuple(np.where((hour >= 10.0) & (hour < 16.0), sun_w, 0.0)),
     )
     result = MPCOptimizer(
         THERMAL_MODEL,

@@ -154,9 +154,11 @@ class MPCInput:
     # lighting and people, and the sun through the glazing. Both warm the room
     # node (see physics.zone_state_space), but they are forecast apart.
     zone_internal_gain_w: tuple[float, ...] = ()
-    # The sun through the thermostat's room's glazing, and through the rest's.
-    zone_solar_gain_w: tuple[float, ...] = ()
-    zone_solar_gain_rest_w: tuple[float, ...] = ()
+    # The heat landing in the thermostat's room alone, and in the rest alone:
+    # its glazing's sun, and the occupants' heat beyond the floor-area share
+    # (asleep, in the bedrooms - see physics.zone_state_space).
+    zone_living_gain_w: tuple[float, ...] = ()
+    zone_rest_gain_w: tuple[float, ...] = ()
     # Whether the heat pump is serving the zone right now, the space-heating
     # counterpart of boiler_on_current.
     space_on_current: bool = False

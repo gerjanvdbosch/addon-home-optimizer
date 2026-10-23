@@ -63,6 +63,8 @@ class TapForecaster:
     BUDGET_DAYS = 7
     BUDGET_QUANTILE = 0.75
 
+    QUARTERS_PER_DAY = 96
+
     # Averaged per kelvin the drawn water is heated above the mains (see
     # MIXED_TAP_WATER_C), and turned back into heat with the mains of the day
     # forecast: a household's habit is the water it uses, and the colder mains
@@ -74,28 +76,68 @@ class TapForecaster:
         # reads the draws from; overwritten by dataset().
         self.states = HeatPumpStates()
 
-    def predict(self, df: pd.DataFrame, steps: int = 48) -> pd.Series:
+    def predict(
+        self,
+        df: pd.DataFrame,
+        steps: int = 48,
+        habit: tuple[pd.Series, float | None] | None = None,
+    ) -> pd.Series:
+        """The draws ahead from `habit` (see habit()), made from `df` without
+        one - which then need only reach back to today's midnight."""
+
         prepared = self.prepare(df)
-        y = prepared["draw_w_per_k"].dropna()
+        profile, heavy_day_w = habit if habit is not None else self._habit(prepared)
         future_index = pd.date_range(
             start=prepared.index[-1], periods=steps + 1, freq="15min"
         )[1:]
 
-        def quarter_of_day(index: pd.DatetimeIndex) -> np.ndarray:
-            return np.asarray(index.hour * 4 + index.minute // 15)
-
-        recent = y[y.index >= y.index[-1] - pd.Timedelta(days=self.PROFILE_DAYS)]
-        profile = recent.groupby(quarter_of_day(recent.index)).mean()
-
         # The target is signed (noise, model error), but a tap draw can only
         # remove heat.
         forecast = pd.Series(
-            profile.reindex(quarter_of_day(future_index)).fillna(0.0).to_numpy()
+            profile.reindex(self._quarter_of_day(future_index)).fillna(0.0).to_numpy()
             * self._heated_k(future_index),
             index=future_index,
         ).clip(lower=0.0)
 
-        return self._within_todays_budget(forecast, prepared["excess_loss_w"].dropna())
+        return self._within_todays_budget(
+            forecast, prepared["excess_loss_w"].dropna(), heavy_day_w
+        )
+
+    def habit(self, df: pd.DataFrame) -> tuple[pd.Series, float | None]:
+        """(the draws per K above the mains per quarter hour of the day over
+        the PROFILE_DAYS before today, a heavy day's draws over the BUDGET_DAYS
+        before it or None without a full week): what predict() needs of the
+        past weeks, which today hardly moves (the next day's draws came out
+        0.861 kWh off made at midnight against 0.866 at each forecast, 179
+        forecasts 8 Sep - 22 Oct 2026), so it can be made once a day."""
+
+        return self._habit(self.prepare(df))
+
+    def _habit(self, prepared: pd.DataFrame) -> tuple[pd.Series, float | None]:
+        midnight = prepared.index[-1].normalize()
+        past = prepared[prepared.index < midnight]
+        y = past["draw_w_per_k"].dropna()
+        recent = y[y.index >= midnight - pd.Timedelta(days=self.PROFILE_DAYS)]
+        profile = (
+            recent.groupby(self._quarter_of_day(recent.index))
+            .mean()
+            .reindex(range(self.QUARTERS_PER_DAY), fill_value=0.0)
+        )
+        drawn = past["excess_loss_w"].dropna()
+        week_start = midnight - pd.Timedelta(days=self.BUDGET_DAYS)
+
+        if drawn.empty or drawn.index[0] > week_start:
+            return profile, None
+
+        week = drawn[drawn.index >= week_start]
+
+        return profile, float(
+            np.quantile(week.groupby(week.index.date).sum(), self.BUDGET_QUANTILE)
+        )
+
+    @staticmethod
+    def _quarter_of_day(index: pd.DatetimeIndex) -> np.ndarray:
+        return np.asarray(index.hour * 4 + index.minute // 15)
 
     @staticmethod
     def _heated_k(index: pd.DatetimeIndex) -> np.ndarray:
@@ -105,24 +147,18 @@ class TapForecaster:
             [mains_water_temperature_c(day) for day in index.dayofyear]
         )
 
-    def _within_todays_budget(self, forecast: pd.Series, y: pd.Series) -> pd.Series:
-        """The forecast with the rest of today held to the day's budget (see
-        BUDGET_DAYS); as it is without a full week drawn before today."""
+    @staticmethod
+    def _within_todays_budget(
+        forecast: pd.Series, y: pd.Series, heavy_day_w: float | None
+    ) -> pd.Series:
+        """The forecast with the rest of today held to a heavy day's draws
+        (see BUDGET_DAYS) less what today has drawn; as it is without one."""
 
-        if y.empty:
+        if y.empty or heavy_day_w is None:
             return forecast
 
         midnight = y.index[-1].normalize()
-        week_start = midnight - pd.Timedelta(days=self.BUDGET_DAYS)
-
-        if y.index[0] > week_start:
-            return forecast
-
-        week = y[(y.index >= week_start) & (y.index < midnight)]
-        heavy_day = float(
-            np.quantile(week.groupby(week.index.date).sum(), self.BUDGET_QUANTILE)
-        )
-        left = max(heavy_day - y[y.index >= midnight].sum(), 0.0)
+        left = max(heavy_day_w - y[y.index >= midnight].sum(), 0.0)
         today = forecast.index < midnight + pd.Timedelta(days=1)
         expected = forecast[today].sum()
 

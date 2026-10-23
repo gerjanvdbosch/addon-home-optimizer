@@ -4,7 +4,7 @@ The running picture the dashboard draws and the optimizer starts from, as
 plain series of timestamped points.
 """
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Generic, TypeVar
 
 from pydantic import BaseModel, Field
@@ -105,6 +105,27 @@ class Forecast(BaseModel):
     open_meteo: OpenMeteoForecast = Field(default_factory=OpenMeteoForecast)
 
 
+class ZoneHabit(BaseModel):
+    """The heat each room gains beyond the building model per local quarter
+    hour of the day (W, 96 each): the median over the past weeks, made once a
+    day (see BuildingThermalIdentifier.room_heat_habit)."""
+
+    day: date
+    living_w: list[float]
+    rest_w: list[float]
+
+
+class TapHabit(BaseModel):
+    """The tap draws of the past weeks (see TapForecaster.habit): per K above
+    the mains per local quarter hour of the day (W/K, 96), and a heavy day's
+    draws (sum of quarter-hour means, W; None without a full week). Made once
+    a day."""
+
+    day: date
+    draw_w_per_k: list[float]
+    heavy_day_w: float | None
+
+
 class Predictions(BaseModel):
     solar: list[SeriesPoint[float]] = Field(default_factory=list)
     # Calibrated p10/p90 band around `solar` (see features.solar.predict_solar_band),
@@ -131,6 +152,8 @@ class Predictions(BaseModel):
     # The indoor dew point over the plan's horizon (see features.dew_point):
     # what a cooled floor must stay above.
     dew_point: list[SeriesPoint[float]] = Field(default_factory=list)
+    zone_habit: ZoneHabit | None = None
+    tap_habit: TapHabit | None = None
 
 
 class BoilerSchedule(BaseModel):

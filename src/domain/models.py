@@ -281,6 +281,11 @@ class BuildingThermalModel:
     # concrete floor that is the living room's ceiling. Zero is no floor of
     # the rest's above the living room - and a model saved before it.
     ua_ceiling_w_per_k: float = 0.0
+    # Share of the occupants' heat that is in the rest of the house while they
+    # sleep (see BuildingThermalIdentifier.ASLEEP_FROM_HOUR): the bedrooms are
+    # there. By day it lands by floor area. None is by floor area at night too
+    # - a model saved before it.
+    asleep_in_rest_fraction: float | None = None
 
 
 # Exact by definition of the Kelvin scale (0 degC = 273.15 K) - used

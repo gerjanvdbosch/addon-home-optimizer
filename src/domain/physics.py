@@ -160,10 +160,12 @@ def zone_state_space(
 
     x = [T_living, T_rest, T_slab_living, T_slab_rest] and, where the floor
     has a screed, [T_screed_living, T_screed_rest] after them;
-    u = [T_outdoor, Q_internal, Q_solar_living, Q_solar_rest, Q_floor].
+    u = [T_outdoor, Q_internal, Q_living, Q_rest, Q_floor].
 
-    Q_internal and Q_floor are the dwelling's, divided by floor area; each
-    room's sun is its own glazing's. The floor's heat enters each floor's top
+    Q_internal and Q_floor are the dwelling's, divided by floor area; Q_living
+    and Q_rest land in that room alone: its own glazing's sun, and the
+    occupants' heat that is there beyond its floor area's share (asleep, in the
+    bedrooms). The floor's heat enters each floor's top
     layer - its screed, or without one its slab - which is the surface its
     room sees; a screed passes it on to the concrete below. The rest's slab
     exchanges with the living room below it too, through its ceiling.

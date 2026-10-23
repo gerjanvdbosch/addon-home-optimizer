@@ -2881,8 +2881,8 @@ class MPCOptimizer:
         maximum_c = data.zone_maximum_temperature or None
         none_w = (0.0,) * num_steps
         internal_gain_w = data.zone_internal_gain_w or none_w
-        solar_gain_w = data.zone_solar_gain_w or none_w
-        solar_gain_rest_w = data.zone_solar_gain_rest_w or none_w
+        living_gain_w = data.zone_living_gain_w or none_w
+        rest_gain_w = data.zone_rest_gain_w or none_w
 
         # The same compressor serves both, so its output is the tank's nominal
         # heat - but the zone no more than its runs have moved (see
@@ -3084,8 +3084,8 @@ class MPCOptimizer:
                     )
                     + b_d[i, 0] * outdoor
                     + b_d[i, 1] * float(internal_gain_w[k])
-                    + b_d[i, 2] * float(solar_gain_w[k])
-                    + b_d[i, 3] * float(solar_gain_rest_w[k])
+                    + b_d[i, 2] * float(living_gain_w[k])
+                    + b_d[i, 3] * float(rest_gain_w[k])
                     + b_d[i, 4] * floor_w(k)
                 )
 
@@ -3121,8 +3121,8 @@ class MPCOptimizer:
                     [
                         zone_outdoor_c[k],
                         float(internal_gain_w[k]),
-                        float(solar_gain_w[k]),
-                        float(solar_gain_rest_w[k]),
+                        float(living_gain_w[k]),
+                        float(rest_gain_w[k]),
                         heat_w,
                     ]
                 )

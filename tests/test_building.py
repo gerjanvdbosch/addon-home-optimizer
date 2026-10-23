@@ -21,7 +21,7 @@ from domain.physics import (
     zone_observations,
     zone_state_space,
 )
-from domain.time import to_local_time
+from domain.time import LOCAL_TIMEZONE, to_local_time
 from features.building import BuildingThermalIdentifier, facade_irradiance_w_per_m2
 
 TRUE_VOLUME_M3 = 120.0
@@ -204,7 +204,9 @@ def _identifier() -> BuildingThermalIdentifier:
 
 
 def _simulate(
-    rng: np.random.Generator, wind_kmh: np.ndarray | None = None
+    rng: np.random.Generator,
+    wind_kmh: np.ndarray | None = None,
+    rest_loss_w: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """Generate a room-temperature trajectory from the known ODE parameters.
 
@@ -213,7 +215,8 @@ def _simulate(
     second, parallel implementation of them.
 
     With wind, the zone also loses INFILTRATION_W_PER_K_M_S per K of
-    indoor-outdoor difference per m/s of it - physics TRUE_MODEL lacks.
+    indoor-outdoor difference per m/s of it - physics TRUE_MODEL lacks; with
+    rest_loss_w, the rest loses that heat (W) as well, an open window.
     """
 
     identifier = _identifier()
@@ -243,6 +246,8 @@ def _simulate(
         # Into the rooms, like the other internal flows (index 1).
         zone = share * state[0] + (1.0 - share) * state[1]
         forcing[1] -= INFILTRATION_W_PER_K_M_S * wind.iloc[i] * (zone - forcing[0])
+        if rest_loss_w is not None:
+            forcing[3] -= rest_loss_w[i]
         state = a_d @ state + b_d @ forcing
 
     noisy = rooms + rng.normal(0.0, MEASUREMENT_NOISE_STD_C, rooms.shape)
@@ -430,6 +435,34 @@ def test_occupancy_adds_metabolic_heat_to_the_air_node():
     assert difference - baseload_difference == pytest.approx(
         Q_PERSON_SENSIBLE_W, abs=1e-6
     )
+
+
+def test_asleep_the_occupants_heat_moves_to_the_bedrooms():
+    identifier = _identifier()
+    prepared = identifier.prepare(_raw_frame())
+
+    by_area = identifier._inputs(TRUE_MODEL, prepared)
+    upstairs = identifier._inputs(
+        replace(TRUE_MODEL, asleep_in_rest_fraction=1.0), prepared
+    )
+
+    hour = pd.DatetimeIndex(prepared["time"]).tz_convert(LOCAL_TIMEZONE).hour
+    asleep = (hour >= identifier.ASLEEP_FROM_HOUR) | (
+        hour < identifier.ASLEEP_UNTIL_HOUR
+    )
+    people_w = prepared["occupants"].to_numpy(dtype=float) * Q_PERSON_SENSIBLE_W
+    moved = by_area[:, 2] - upstairs[:, 2]
+
+    # The thermostat's room's floor-area share of them, asleep only; the
+    # dwelling keeps all of it.
+    assert moved.max() > 0.0
+    np.testing.assert_allclose(
+        moved, np.where(asleep, TRUE_MODEL.living_area_fraction * people_w, 0.0)
+    )
+    np.testing.assert_allclose(
+        upstairs[:, 2] + upstairs[:, 3], by_area[:, 2] + by_area[:, 3]
+    )
+    np.testing.assert_array_equal(upstairs[:, 1], by_area[:, 1])
 
 
 def test_validate_flags_a_physically_impossible_aperture(caplog):
@@ -891,6 +924,35 @@ def test_forecast_delivers_no_heat_to_the_zone():
     assert len(with_cooling) == len(without)
 
 
+def test_forecast_takes_the_rooms_unexplained_heat_by_time_of_day():
+    """A window opened upstairs every night, which no sensor sees, shows in
+    the filter and recurs in the forecast - only at night, only upstairs."""
+
+    loss_w = 300.0
+    raw = _raw_frame()
+    hour = pd.DatetimeIndex(raw["target_time"]).tz_convert(LOCAL_TIMEZONE).hour
+    night = np.asarray(hour < 6)
+    identifier = _identifier()
+    identifier.model = TRUE_MODEL
+    now = raw["target_time"].iloc[len(raw) * 3 // 4]
+
+    zones = []
+    for loss in (0.0, loss_w):
+        df = _simulate(np.random.default_rng(7), rest_loss_w=night * loss)
+        zones.append(
+            identifier.trajectory(
+                df, now, room_heat_w=identifier.room_heat_habit(df, now)
+            )
+        )
+    ahead = zones[0].index > now
+    added = (zones[1] - zones[0]).loc[ahead]
+    asleep = pd.DatetimeIndex(added.index).tz_convert(LOCAL_TIMEZONE).hour < 6
+
+    assert added.loc[asleep, "rest_gain_w"].mean() == pytest.approx(-loss_w, rel=0.2)
+    assert added.loc[~asleep, "rest_gain_w"].abs().mean() < 0.1 * loss_w
+    assert added["living_gain_w"].abs().mean() < 0.1 * loss_w
+
+
 def test_forecast_needs_both_a_past_and_a_future():
     identifier, df, _ = _calibrated(with_future=True)
 
@@ -936,12 +998,12 @@ def test_forecast_shutters_hold_for_the_day_then_follow_the_time_of_day():
     )
 
     assert (
-        forecast.loc[ahead & today, "solar_gain_w"]
-        > shut.loc[ahead & today, "solar_gain_w"]
+        forecast.loc[ahead & today, "living_gain_w"]
+        > shut.loc[ahead & today, "living_gain_w"]
     ).any()
     np.testing.assert_allclose(
-        forecast.loc[ahead & ~today, "solar_gain_w"],
-        shut.loc[ahead & ~today, "solar_gain_w"],
+        forecast.loc[ahead & ~today, "living_gain_w"],
+        shut.loc[ahead & ~today, "living_gain_w"],
     )
 
 
@@ -971,12 +1033,12 @@ def test_forecast_shutters_follow_their_weekday_habit_while_shut():
     )
 
     assert (
-        habit.loc[ahead & today, "solar_gain_w"]
-        > shut.loc[ahead & today, "solar_gain_w"]
+        habit.loc[ahead & today, "living_gain_w"]
+        > shut.loc[ahead & today, "living_gain_w"]
     ).any()
     np.testing.assert_allclose(
-        habit.loc[ahead & ~today, "solar_gain_w"],
-        shut.loc[ahead & ~today, "solar_gain_w"],
+        habit.loc[ahead & ~today, "living_gain_w"],
+        shut.loc[ahead & ~today, "living_gain_w"],
     )
 
 
@@ -1043,7 +1105,7 @@ def test_forecast_takes_the_sky_ahead_from_the_pv_forecast():
 
     assert lit.any()
     np.testing.assert_allclose(
-        sunnier.loc[lit, "solar_gain_w"], 2.0 * plain.loc[lit, "solar_gain_w"]
+        sunnier.loc[lit, "living_gain_w"], 2.0 * plain.loc[lit, "living_gain_w"]
     )
 
 

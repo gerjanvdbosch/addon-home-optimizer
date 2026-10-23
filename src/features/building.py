@@ -17,7 +17,7 @@ than a term in its energy balance - not modelled here, and not yet anywhere.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -30,6 +30,7 @@ from domain.dynamics import discretize_zoh, kalman_states
 from domain.models import BuildingThermalModel
 from domain.physics import (
     CP_AIR_J_PER_KG_K,
+    Q_PERSON_SENSIBLE_W,
     RHO_AIR_KG_PER_M3,
     extension_shaded_fraction,
     floor_heat_w,
@@ -42,7 +43,7 @@ from domain.physics import (
     zone_state_space,
 )
 from domain.sensors import Aggregation, FillMethod, SensorReference
-from domain.time import to_local_time
+from domain.time import LOCAL_TIMEZONE, to_local_time
 from features.dataset import DatasetBuilder
 from features.identifier import SystemIdentifier
 
@@ -123,6 +124,16 @@ def facade_irradiance_w_per_m2(
         np.nan_to_num(np.asarray(total["poa_direct"], dtype=float), nan=0.0),
         sun_from_normal_deg,
     )
+
+
+def _asleep_in_rest(model: BuildingThermalModel) -> float:
+    """The share of the occupants' heat in the rest while they sleep: by floor
+    area for a model saved without one."""
+
+    if model.asleep_in_rest_fraction is None:
+        return 1.0 - model.living_area_fraction
+
+    return model.asleep_in_rest_fraction
 
 
 def _rollout(
@@ -348,6 +359,19 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     MAX_UA_CEILING_W_PER_M2_K = 6.0
     INITIAL_UA_CEILING_W_PER_M2_K = 3.0
 
+    # The local hours the occupants are taken to sleep, in the bedrooms in the
+    # rest of the house (see BuildingThermalModel.asleep_in_rest_fraction);
+    # by day their heat lands by floor area. Fitted on two folds (to 15 Oct /
+    # from 15 Sep 2026) the share asleep in the rest came out 0.89 on both
+    # (std error 0.05) and the same, 0.87-0.90, from 22 or 0 h and to 7 or 8 h:
+    # the result does not hang on these hours. Held out, the living room was
+    # predicted to 0.084/0.106 K against 0.091/0.114 (6 h) and 0.161/0.201
+    # against 0.179/0.212 (24 h), the rest to 0.096/0.143 against 0.089/0.137:
+    # what it moves into the bedrooms the rest's other parameters take back.
+    # A share by day as well fitted 0.71 and 0.92, not identified.
+    ASLEEP_FROM_HOUR = 23
+    ASLEEP_UNTIL_HOUR = 7
+
     # The screed (see _fit_screed), per m2 of floor: 1 to 15 cm of it (some
     # 2000 kg/m3 at 850 J/kgK), and at most half the slabs; from the water to
     # it and from it down to the concrete, anything a floor's pipes and
@@ -536,6 +560,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         "extension_east_depth_ratio",
         "extension_west_depth_ratio",
         "ua_ceiling_w_per_k",
+        "asleep_in_rest_fraction",
     )
 
     @staticmethod
@@ -556,6 +581,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 model.extension_east_depth_ratio,
                 model.extension_west_depth_ratio,
                 model.ua_ceiling_w_per_k,
+                _asleep_in_rest(model),
             ]
         )
 
@@ -588,6 +614,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             extension_east_depth_ratio=float(x[11]),
             extension_west_depth_ratio=float(x[12]),
             ua_ceiling_w_per_k=float(x[13]),
+            asleep_in_rest_fraction=float(x[14]),
             screed_capacity_j_per_k=self.screed[0],
             screed_to_slab_w_per_k=self.screed[1],
         )
@@ -938,13 +965,13 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         return df[columns or [name]]
 
     def _inputs(self, model, df: pd.DataFrame) -> np.ndarray:
-        """u = [T_outdoor, Q_internal, Q_solar_living, Q_solar_rest, Q_floor]
-        per sample (see physics.zone_state_space).
+        """u = [T_outdoor, Q_internal, Q_living, Q_rest, Q_floor] per sample
+        (see physics.zone_state_space).
 
         Rebuilt per fit iteration because three of the five depend on
-        identified parameters (the effective apertures and the in-zone
-        baseload fraction). Takes the model rather than the raw parameter
-        vector.
+        identified parameters (the effective apertures, the in-zone baseload
+        fraction and where the occupants sleep). Takes the model rather than
+        the raw parameter vector.
         """
 
         irradiance = df["I_facade_w_per_m2"].to_numpy(dtype=float)
@@ -972,17 +999,32 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             )
         ]
 
+        occupants = df["occupants"].to_numpy(dtype=float)
         q_internal = internal_gain_w(
             baseload_w=df["baseload_w"].to_numpy(dtype=float),
             internal_gain_fraction=model.internal_gain_fraction,
-            occupants=df["occupants"].to_numpy(dtype=float),
+            occupants=occupants,
+        )
+
+        # Q_internal lands by floor area; asleep, the occupants are in the
+        # bedrooms instead, so what the thermostat's room has of them beyond
+        # its asleep share moves to the rest - the dwelling's total unchanged.
+        hour = pd.DatetimeIndex(df["time"]).tz_convert(LOCAL_TIMEZONE).hour
+        asleep = (hour >= self.ASLEEP_FROM_HOUR) | (hour < self.ASLEEP_UNTIL_HOUR)
+        moved = np.where(
+            asleep,
+            (model.living_area_fraction - (1.0 - _asleep_in_rest(model)))
+            * occupants
+            * Q_PERSON_SENSIBLE_W,
+            0.0,
         )
 
         return np.column_stack(
             [
                 df["T_out"].to_numpy(dtype=float),
                 q_internal,
-                *q_solar,
+                q_solar[0] - moved,
+                q_solar[1] + moved,
                 df["Q_floor_w"].to_numpy(dtype=float),
             ]
         )
@@ -1197,6 +1239,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 0.0,
                 0.0,
                 0.0,
+                0.0,
             ]
         )
 
@@ -1216,6 +1259,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 max_extension,
                 max_extension,
                 max(self.MAX_UA_CEILING_W_PER_M2_K * ceiling_m2, self.MIN_F_SCALE),
+                1.0,
             ]
         )
 
@@ -1236,6 +1280,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.INITIAL_EXTENSION_DEPTH_RATIO,
                 self.INITIAL_EXTENSION_DEPTH_RATIO,
                 self.INITIAL_UA_CEILING_W_PER_M2_K * ceiling_m2,
+                # Asleep by floor area to start, as by day.
+                1.0 - self.living_area_fraction,
             ]
         )
 
@@ -1770,6 +1816,74 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             self.DISTURBANCE_INPUTS,
         )
 
+    def room_heat_habit(self, df: pd.DataFrame, now: datetime) -> pd.DataFrame:
+        """What each room gained or lost beyond the model - windows opened, a
+        shower's warmth - per local quarter hour of the day (W; index the
+        minute of the day, a column a room): the median over the frame's
+        HABIT_HISTORY_DAYS up to now, the floor's runs left out - its own
+        error is not a habit, and a plan decides its runs (see forecast())."""
+
+        model = self.get_model()
+        prepared = self.prepare(df)
+        prepared = prepared[prepared["time"] <= now].reset_index(drop=True)
+
+        if prepared.empty:
+            raise ValueError("No measurements to take the rooms' habit from.")
+
+        unexplained = self._unexplained_heat_w(
+            model,
+            self._filtered(model, prepared),
+            self._inputs(model, prepared),
+            prepared["dt_seconds"].to_numpy(dtype=float),
+        )
+        usable = (
+            (prepared["time"] >= now - timedelta(days=self.HABIT_HISTORY_DAYS))
+            & (prepared["Q_floor_w"] == 0.0)
+        ).to_numpy()
+        # The filter's first step has no prediction to differ from.
+        usable[0] = False
+        local = prepared["time"].map(to_local_time)
+        minute = local.map(lambda t: t.hour * 60 + t.minute).to_numpy()
+
+        return (
+            pd.DataFrame(unexplained[usable], columns=["living", "rest"])
+            .groupby(minute[usable])
+            .median()
+            .reindex(range(0, 24 * 60, 15), fill_value=0.0)
+        )
+
+    def _unexplained_heat_w(
+        self,
+        model: BuildingThermalModel,
+        estimates: np.ndarray,
+        inputs: np.ndarray,
+        dt_seconds: np.ndarray,
+    ) -> np.ndarray:
+        """The heat into each room (W, a column each) the filter added over
+        each step beyond the model's own prediction: its correction of the
+        whole state read back as the heat flows it lets in (see
+        DISTURBANCE_INPUTS) - a room's loss also cools the floor under it."""
+
+        a, b = zone_state_space(model)
+        heat = np.zeros((len(estimates), len(self.DISTURBANCE_INPUTS)))
+        cache: dict[float, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+
+        for i in range(1, len(estimates)):
+            dt = float(dt_seconds[i])
+            key = round(dt, 3)
+
+            if key not in cache:
+                a_d, b_d = discretize_zoh(a, b, dt)
+                cache[key] = (a_d, b_d, np.linalg.pinv(b_d[:, self.DISTURBANCE_INPUTS]))
+
+            a_d, b_d, back = cache[key]
+            heat[i] = back @ (
+                estimates[i] - a_d @ estimates[i - 1] - b_d @ inputs[i - 1]
+            )
+
+        # The rooms' own channels; the floor's is the floor's error.
+        return heat[:, :2]
+
     def _fit_screed(self, df: pd.DataFrame) -> tuple[float, float]:
         """(screed J/K, its conductance down to the slabs W/K) from the
         floor's runs in a prepared frame, either mode: what the rooms alone
@@ -1936,6 +2050,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         baseload_w: pd.Series | None = None,
         pv_w: pd.Series | None = None,
         habits: pd.DataFrame | None = None,
+        room_heat_w: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """Rolls the model forward past the last measurement, indexed by time.
 
@@ -1993,10 +2108,27 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         0.42 once a fortnight away in August was three weeks past - the median,
         not the mean (0.40), lets one such week go. 75 W a person moves the
         zone little (0.352 against 0.357 K for 0.44 against 0.61 people wrong,
-        Sep-Oct 2026). The rest is each sensor's last reading carried forward.
+        Sep-Oct 2026).
+
+        Each room also takes `room_heat_w`, the heat the filter found it
+        gaining or losing beyond the model at that time of day over the past
+        weeks (see room_heat_habit()). No sensor sees an open window or a
+        shower, but they recur - the bedrooms' windows open on summer nights,
+        and showers at 8 and 22 h -
+        and they showed in it as some 60-95 W lost upstairs at night and
+        150-230 W gained at those hours. Walk-forward, issued every 6 h on
+        days the model was not fitted on (15-23 Oct and 10 Aug - 15 Sep
+        2026), the living room came out 0.085/0.098 K off over six hours
+        against 0.084/0.107 K without, and 0.146/0.181 against 0.163/0.211 K
+        over a day; the rest 0.084/0.138 against 0.096/0.143, and 0.157/0.332
+        against 0.201/0.318 K. The mean instead of the median did worse,
+        a night's odd window taken as every night's; the habit made at
+        midnight instead of at each forecast did as well (within 0.002 K).
+
+        The rest is each sensor's last reading carried forward.
         """
 
-        zone, last = self._trajectory(df, now, baseload_w, pv_w, habits)
+        zone, last = self._trajectory(df, now, baseload_w, pv_w, habits, room_heat_w)
 
         return zone.iloc[last:]
 
@@ -2007,6 +2139,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         baseload_w: pd.Series | None = None,
         pv_w: pd.Series | None = None,
         habits: pd.DataFrame | None = None,
+        room_heat_w: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """The zone over the whole frame, indexed by time: the filter's estimate
         of every state up to now, then the free-running forecast from there (see
@@ -2015,7 +2148,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         is driven by, and the history it is drawn against.
         """
 
-        zone, _ = self._trajectory(df, now, baseload_w, pv_w, habits)
+        zone, _ = self._trajectory(df, now, baseload_w, pv_w, habits, room_heat_w)
 
         return zone
 
@@ -2026,6 +2159,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         baseload_w: pd.Series | None,
         pv_w: pd.Series | None,
         habits: pd.DataFrame | None,
+        room_heat_w: pd.DataFrame | None,
     ) -> tuple[pd.DataFrame, int]:
 
         model = self.get_model()
@@ -2132,6 +2266,15 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         inputs = inputs.copy()
         inputs[last:, 4] = 0.0
 
+        # What each room gains beyond the model at that time of day (see
+        # room_heat_habit()).
+        if room_heat_w is not None:
+            inputs[last:, 2:4] += (
+                room_heat_w.reindex(quarter.iloc[last:].to_numpy())
+                .fillna(0.0)
+                .to_numpy()
+            )
+
         simulated = _rollout(
             a,
             b,
@@ -2155,8 +2298,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # The heat no decision changes, split by where it lands, for a plan to
         # start from: the same gains the rollout was driven by.
         zone["internal_gain_w"] = inputs[:, 1]
-        zone["solar_gain_w"] = inputs[:, 2]
-        zone["solar_gain_rest_w"] = inputs[:, 3]
+        zone["living_gain_w"] = inputs[:, 2]
+        zone["rest_gain_w"] = inputs[:, 3]
 
         return zone, last
 

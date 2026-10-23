@@ -1,4 +1,5 @@
 import math
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -13,6 +14,7 @@ from web.charts import (
     handed_over,
     joined,
     mixed_tank,
+    on_clock,
     read_at,
     spans,
     tank_line,
@@ -60,6 +62,24 @@ def test_a_planned_supply_stops_between_runs():
     assert math.isnan(broken[2].value)
     assert broken[2].time == supply[1].time + timedelta(minutes=15)
     assert broken[3] == supply[2]
+
+
+def test_the_hour_the_clocks_go_back_is_drawn_once(monkeypatch):
+    """25 Oct 2026, 03:00 CEST becomes 02:00 CET: the line runs from 02:45 on
+    to 03:00, not back to 02:00 over itself."""
+
+    monkeypatch.setenv("TZ", "Europe/Amsterdam")
+    time.tzset()
+    first = datetime(2026, 10, 24, 23, 45, tzinfo=UTC)  # 01:45 CEST
+    points = [
+        SeriesPoint(time=first + timedelta(minutes=15 * i), value=float(i))
+        for i in range(10)
+    ]
+    clock = [to_local_time(p.time).strftime("%H:%M") for p in on_clock(points)]
+    monkeypatch.undo()
+    time.tzset()
+
+    assert clock == ["01:45", "02:00", "02:15", "02:30", "02:45", "03:00"]
 
 
 def test_the_tanks_last_quarter_runs_on_into_the_zone():
