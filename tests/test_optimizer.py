@@ -1176,6 +1176,47 @@ def test_a_tank_handed_the_compressor_by_the_zone_carries_no_ramp():
     )
 
 
+def test_a_zone_run_handed_over_by_the_tank_takes_the_loops_heat():
+    """The water in the heat pump and its pipes, at the tank's temperature as
+    the valve turns, flows on into the floor: the first step of a zone run the
+    tank hands over takes that heat on top of the compressor's, and no other
+    step does."""
+
+    handover_j = 0.25 * 3.6e6
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[10] = 45.0
+    data = _zone_input(target_temperature_top=tuple(target))
+    result = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=BUILDING_MODEL,
+        space_cop_model=replace(
+            COP_MODEL, start_ramp_seconds=0.0, handover_heat_j=handover_j
+        ),
+    ).solve(data)
+    handed = [
+        k
+        for k in range(1, len(result.schedule))
+        if result.space_schedule[k] and result.schedule[k - 1]
+    ]
+
+    assert handed, "expected the tank to hand the run to the zone"
+
+    a_d, b_d = discretize_zoh(*zone_state_space(BUILDING_MODEL), 900.0)
+    state = np.array(data.zone_state, dtype=float)
+
+    for k in range(len(result.schedule) - 1):
+        floor_w = result.space_heat_w[k] + handover_j / 900.0 * (k in handed)
+        state = a_d @ state + b_d @ np.array(
+            [data.ambient_temperature, 0.0, 0.0, 0.0, floor_w]
+        )
+
+        assert float(zone_observation(BUILDING_MODEL) @ state) == pytest.approx(
+            result.zone_temperatures[k + 1], abs=1e-4
+        )
+
+
 def test_hot_water_is_heated_in_one_block_the_booster_finishing_it():
     """The heat pump to its limit and the booster on from there, one block
     before the target - not a block before a zone run and the booster's after
@@ -1588,6 +1629,57 @@ def _heat(space_cop_model=COP_MODEL):
         floor_circuit_model=HEATING,
         space_cop_model=space_cop_model,
     ).solve(_cold_day(steps=48))
+
+
+def test_a_run_the_zone_opens_draws_the_starts_measured_power():
+    """The compressor's start-up is the same in every mode, so a run the zone
+    opens draws the start's measured power over its first step, as the tank's
+    does - its running draw above the least heat's on top - and from the next
+    step on its running draw."""
+
+    start_w = 900.0
+    cop = replace(COP_MODEL, start_step_power_w=start_w)
+    data = _cold_day(steps=48)
+    result = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE,
+        floor_circuit_model=HEATING,
+        space_cop_model=cop,
+    ).solve(data)
+    on = list(result.space_schedule)
+    first = on.index(1)
+
+    before = (
+        result.schedule[first - 1]
+        if first
+        else data.boiler_on_current or data.space_on_current
+    )
+
+    assert not before, "expected the zone to start the compressor"
+    assert on[first + 1], "expected the run to go on"
+
+    def draw(k: int, heat_w: float, supply_c: float) -> float:
+        return heat_w / float(
+            cop.clamped_cop(data.outdoor_temperature_forecast[k], supply_c)
+        )
+
+    heat = result.space_heat_w
+    supply = result.space_supply_c
+    # The floor the water delivers against, nothing heated before this run.
+    sink_c = supply[first] - heat[first] / HEATING.conductance_w_per_k
+    least_w = HEATING.min_heat_w
+    expected_w = (
+        start_w
+        + draw(first, heat[first], supply[first])
+        - draw(first, least_w, sink_c + least_w / HEATING.conductance_w_per_k)
+    )
+
+    assert result.space_electrical_w[first] == pytest.approx(expected_w, rel=0.02)
+    assert result.space_electrical_w[first + 1] == pytest.approx(
+        draw(first + 1, heat[first + 1], supply[first + 1]), rel=0.02
+    )
 
 
 def test_a_runs_heat_never_rises():

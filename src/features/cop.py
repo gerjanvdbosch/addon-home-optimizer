@@ -419,7 +419,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         # From the raw readings: prepare() leaves the start-up out. DHW
         # planning uses both, a floor run its ramp (see
         # MPCOptimizer._add_space_heating).
-        start_ramp_seconds, start_step_power_w = self._start_up(df)
+        start_ramp_seconds, start_step_power_w, handover_heat_j = self._start_up(df)
         df = self.prepare(df)
 
         if len(df) < 10:
@@ -562,6 +562,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             cooling=self.cooling,
             start_step_power_w=start_step_power_w,
             start_ramp_seconds=start_ramp_seconds,
+            handover_heat_j=handover_heat_j,
         )
 
         # Cooling is planned down to a lift of a kelvin or two - water just
@@ -582,10 +583,12 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         # would mean nothing.
         logger.info(
             "Heat pump COP calibration (%s): a %.0f s ramp and %.0f W "
-            "electrical over a run's first step",
+            "electrical over a run's first step, %.2f kWh from the loop "
+            "handed over by hot water",
             self.mode,
             self.model.start_ramp_seconds,
             self.model.start_step_power_w,
+            self.model.handover_heat_j / 3.6e6,
         )
 
         if self.key != "dhw":
@@ -600,10 +603,18 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             self.model.q_th_at_power_fit_high_w,
             self.model.q_th_per_outdoor_w_per_k,
         ) = self._fit_q_th_line(train_df, self.model)
+        # On all of it, not the training split: the line is planned with at
+        # the coming days' outdoor temperature, which the season moves past
+        # what older runs saw, and the newest runs are the nearest to it.
+        # Fitted on the oldest 80% of 90 days, it read October's runs 8% too
+        # much heat, so planned them minutes too short (real data, 14 runs
+        # 11-24 Oct 2026, each refitted on the days before it: run energy off
+        # by 3.0% against 4.9%, bias +0.5% against -2.2%). validate() does not
+        # score it.
         (
             self.model.q_in_at_zero_outdoor_w,
             self.model.q_in_per_outdoor_w_per_k,
-        ) = self._fit_heat_input(train_df)
+        ) = self._fit_heat_input(df)
 
         logger.info(
             "Heat pump COP calibration (%s): reference_supply_temperature_c="
@@ -749,16 +760,20 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             float(q_outdoor),
         )
 
-    def _start_up(self, df: pd.DataFrame) -> tuple[float, float]:
-        """(ramp s, electrical power over the first planning step W) of runs in
-        this mode, from the readings as loaded - minute readings, so a run
-        starts within a minute of when it really did, and prepare() has not yet
-        left the start-up out. The ramp as the boiler reads it (see
-        BoilerThermalIdentifier._identify_heat_input_ramp), from the
+    def _start_up(self, df: pd.DataFrame) -> tuple[float, float, float]:
+        """(ramp s, electrical power over the first planning step W, loop heat
+        handed over J) of how runs in this mode begin, from the readings as
+        loaded - minute readings, so a run starts within a minute of when it
+        really did, and prepare() has not yet left the start-up out.
+
+        Of the runs the compressor starts for: the ramp as the boiler reads it
+        (see BoilerThermalIdentifier._identify_heat_input_ramp), from the
         calorimetric heat in the direction this mode moves it; the power the
         median, over runs that lasted past their first step
         (MPCConfig.step_hours) without the booster, of their mean power over
-        it. 0.0 for either without such runs."""
+        it. Of the heating runs hot water hands over: the median of the heat
+        their first step brings beyond the second's median rate (see
+        HeatPumpCOPModel.handover_heat_j). 0.0 for each without such runs."""
 
         df = self._bridge_reporting_gaps(
             df.sort_values("time")
@@ -769,7 +784,31 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
                 flow_lpm=lambda d: pd.to_numeric(d["flow_lpm"], errors="coerce"),
             )
         )
+        # Only runs that start the compressor from off. A run handed over by
+        # another mode starts with the compressor at speed and the loop warm:
+        # eight heating runs handed over from hot water gave 5.0 kW in their
+        # first quarter, against 2.7-3.9 kW from cold, and counted as starts
+        # they read the heating ramp below zero, so none (real data, Jul-Oct
+        # 2026). The state alone is not enough, as it can trail the
+        # compressor (25 Sep: 36 Hz while still off).
+        frequency = (
+            pd.to_numeric(df["compressor_frequency"], errors="coerce")
+            .ffill()
+            .fillna(0.0)
+            if "compressor_frequency" in df
+            else pd.Series(0.0, index=df.index)
+        )
+        compressor_off = (
+            (df["state"] == self.states.off) & (frequency <= 0.0)
+        ).to_numpy()
         running = (df["state"] == self.mode).to_numpy(dtype=bool)
+        starts = running & ~np.r_[False, running[:-1]]
+        run_id = np.cumsum(starts)
+        cold = starts & np.r_[False, compressor_off[:-1]]
+        previous = np.r_[None, df["state"].to_numpy()[:-1]]
+        handed_over = starts & (previous == self.states.dhw)
+        in_mode = running.copy()
+        running &= np.isin(run_id, run_id[cold])
         booster = booster_active(df, self.mode).to_numpy(dtype=bool)
         heat_w = (
             (RHO_WATER_KG_PER_L / 60.0)
@@ -817,9 +856,42 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
 
             powers.append(float(power_w[first].mean()))
 
+        # The loop's heat: what the first step brings beyond the rate the run
+        # settles at in the second, at the same compressor speed (real data).
+        heat = heat_w.to_numpy(dtype=float)
+        excess_j = []
+
+        for start in np.flatnonzero(handed_over) if self.key == "heating" else ():
+            end = start
+
+            while end + 1 < len(df) and in_mode[end + 1]:
+                end += 1
+
+            since = seconds[start : end + 1] - seconds[start]
+            run_heat = heat[start : end + 1]
+            first = since[:-1] < step_s
+            second = (since >= step_s) & (since < 2.0 * step_s)
+
+            if (
+                since[-1] < 2.0 * step_s
+                or np.isnan(run_heat[since < 2.0 * step_s]).any()
+            ):
+                continue
+
+            interval_s = np.diff(since)[first]
+            excess_j.append(
+                float(
+                    (run_heat[:-1][first] * interval_s).sum()
+                    - np.median(run_heat[second]) * interval_s.sum()
+                )
+            )
+
         return (
             ramp_seconds or 0.0,
             float(np.median(powers)) if powers else 0.0,
+            float(np.median(excess_j))
+            if len(excess_j) >= BoilerThermalIdentifier.MIN_RAMP_RUNS
+            else 0.0,
         )
 
     @staticmethod

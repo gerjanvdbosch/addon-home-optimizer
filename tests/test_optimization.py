@@ -58,7 +58,10 @@ def _published(
 
 
 def _published_zone(
-    tank: tuple[int, ...], zone: tuple[int, ...], cooling: bool = False
+    tank: tuple[int, ...],
+    zone: tuple[int, ...],
+    cooling: bool = False,
+    room_c: tuple[float, ...] = (),
 ) -> dict[str, str]:
     home_assistant = _RecordingHomeAssistant()
     optimization = Optimization(
@@ -79,6 +82,7 @@ def _published_zone(
         space_schedule=zone,
         space_heat_w=tuple(3000.0 * on for on in zone),
         space_supply_c=tuple(26.0 if on else float("nan") for on in zone),
+        zone_temperatures=room_c,
     )
     data = MPCInput(
         solar_forecast_w=[0.0] * len(tank),
@@ -103,6 +107,55 @@ def test_the_zone_is_on_in_the_quarter_the_tank_hands_over_in():
 
     assert published[Optimization.ZONE_STATUS_ENTITY] == "on"
     assert published[Optimization.ZONE_SUPPLY_ENTITY] == "26.0"
+
+
+def test_the_zone_setpoint_is_past_the_room_the_next_run_heats_to():
+    """The least step past the warmest the plan has the room from the run's
+    start to the next run's - after the run too, as the screed warms the room
+    later - and unknown without a run."""
+
+    published = _published_zone(
+        tank=(0, 0, 0, 0), zone=(0, 1, 1, 0), room_c=(19.2, 19.24, 19.6, 19.83)
+    )
+
+    assert published[Optimization.ZONE_SETPOINT_ENTITY] == "19.9"
+    assert (
+        _published_zone(tank=(0, 0, 0, 0), zone=(0, 0, 0, 0), room_c=(19.2,) * 4)[
+            Optimization.ZONE_SETPOINT_ENTITY
+        ]
+        == "unknown"
+    )
+
+
+FALLING = (19.75, 19.7, 19.65, 19.6)
+
+
+@pytest.mark.parametrize(
+    ("schedule", "temperatures", "measured_c", "limit_c", "cooling", "expected"),
+    [
+        # A run under way past a room warmer than the plan has it, which it
+        # heats for later: past the room, or the thermostat asks for nothing.
+        ((1, 1, 0, 0), FALLING, 19.82, None, False, "19.9"),
+        # At a step of its own: still strictly past it.
+        ((1, 1, 0, 0), FALLING, 19.8, None, False, "19.9"),
+        # The next run's temperatures are not this run's.
+        ((1, 0, 1, 1), (19.75, 19.7, 19.65, 20.4), None, None, False, "19.8"),
+        # Never past the comfort band.
+        ((1, 1, 0, 0), FALLING, 19.82, (19.85,) * 4, False, "19.9"),
+        ((1, 1, 0, 0), FALLING, 19.82, (19.5,) * 4, False, "19.5"),
+        # Cooling the other way.
+        ((1, 1, 0, 0), FALLING, None, None, True, "19.5"),
+    ],
+)
+def test_the_zone_setpoint(
+    schedule, temperatures, measured_c, limit_c, cooling, expected
+):
+    assert (
+        Optimization.zone_setpoint_c(
+            schedule, 0, temperatures, measured_c, limit_c, cooling
+        )
+        == expected
+    )
 
 
 def test_no_hand_over_without_a_zone_run_straight_after_or_while_cooling():

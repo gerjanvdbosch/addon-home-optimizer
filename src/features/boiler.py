@@ -305,9 +305,12 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
     # "ramp" longer than this is a sign of something else (a tap draw during
     # the run, a mis-detected start) and is not used.
     MAX_RAMP_SECONDS = 45.0 * 60.0
-    # Fewer runs than this cannot give a trustworthy median of either, so
-    # planning keeps its single constant instead.
-    MIN_RAMP_RUNS = 10
+    # Fewer runs than this give no ramp, and planning keeps its single
+    # constant - the compressor at full output from its first second. Two
+    # runs are a rough median, but better than that for a mode that starts
+    # rarely: heating's two cold starts by Oct 2026 read 572 s, where without
+    # them it planned none at all.
+    MIN_RAMP_RUNS = 2
 
     # Below this many directly-measured heating timesteps, a calorimetric sample
     # mean is not yet reliable enough to anchor q_in_nominal_w's bounds (see

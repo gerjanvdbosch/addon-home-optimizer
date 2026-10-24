@@ -57,6 +57,7 @@ class Optimization:
     ZONE_STATUS_ENTITY = "binary_sensor.home_optimizer_zone_status"
     ZONE_START_ENTITY = "sensor.home_optimizer_zone_start"
     ZONE_SUPPLY_ENTITY = "sensor.home_optimizer_zone_supply"
+    ZONE_SETPOINT_ENTITY = "sensor.home_optimizer_zone_setpoint"
 
     def __init__(
         self,
@@ -923,11 +924,11 @@ class Optimization:
         window = timedelta(hours=mpc_config.legionella_overdue_hours)
         # To the end of the local day the interval ends on: the daily maxima are
         # UTC days, and a deadline at their midnight fell in the night, leaving
-        # only night hours - grid power - to choose from.
+        # only night hours - grid power - to choose from. Counted in calendar
+        # days: seven times 24 hours across a change to winter time ended an
+        # hour early, on the day before.
         deadline = (
-            local_day_start(
-                disinfected.max() + timedelta(days=legionella.interval), days=1
-            )
+            local_day_start(disinfected.max(), days=legionella.interval + 1)
             if len(disinfected)
             else now
         )
@@ -1388,6 +1389,51 @@ class Optimization:
 
         return rounded_c
 
+    # The resolution the zone's room setpoint is published at (K).
+    ZONE_SETPOINT_STEP_C = 0.1
+
+    @classmethod
+    def zone_setpoint_c(
+        cls,
+        schedule: tuple[int, ...],
+        first: int,
+        temperatures: tuple[float, ...],
+        measured_c: float | None,
+        limit_c: tuple[float, ...] | None,
+        cooling: bool,
+    ) -> str:
+        """The room setpoint (deg C) for the zone run starting at step first:
+        the least step of ZONE_SETPOINT_STEP_C past the warmest (coolest)
+        temperature the plan has the room at from that run's start to the next
+        run's, and past measured_c, the room now; no further than the comfort
+        band's edge where the run starts. temperatures are at each step's
+        start."""
+
+        end = first
+
+        while end + 1 < len(schedule) and schedule[end + 1]:
+            end += 1
+
+        following = next(
+            (k for k in range(end + 1, len(schedule)) if schedule[k]), len(schedule)
+        )
+        window = list(temperatures[first : following + 1])
+
+        if measured_c is not None:
+            window.append(measured_c)
+
+        step = cls.ZONE_SETPOINT_STEP_C
+        # Strictly past it: at the room's own temperature a thermostat asks for
+        # nothing.
+        if cooling:
+            setpoint_c = (math.ceil(round(min(window) / step, 6)) - 1) * step
+            setpoint_c = max(setpoint_c, limit_c[first]) if limit_c else setpoint_c
+        else:
+            setpoint_c = (math.floor(round(max(window) / step, 6)) + 1) * step
+            setpoint_c = min(setpoint_c, limit_c[first]) if limit_c else setpoint_c
+
+        return f"{setpoint_c:.1f}"
+
     def publish_zone(
         self,
         result: MPCResult,
@@ -1400,15 +1446,16 @@ class Optimization:
     ) -> None:
         """Writes the plan's floor decision to Home Assistant, as publish_dhw
         does the hot water's: on/off for the quarter hour running now, the
-        start of the run under way or the next one planned, and the supply
-        setpoint while a run is under way (see zone_supply_c).
+        start of the run under way or the next one planned, the room setpoint
+        for that run (see zone_setpoint_c), and the supply setpoint while a run
+        is under way (see zone_supply_c).
 
-        All three 'unknown' where the zone cannot be planned at all: nothing
+        All four 'unknown' where the zone cannot be planned at all: nothing
         then for an automation to act on.
-        The setpoint 'unknown' outside a run too.
+        The supply 'unknown' outside a run too.
         """
 
-        status = start = setpoint = "unknown"
+        status = start = setpoint = room = "unknown"
         published = None
 
         if data is not None and result.space_schedule:
@@ -1443,6 +1490,34 @@ class Optimization:
                 start = (
                     since if running and since is not None else times[first]
                 ).isoformat()
+
+            # The room setpoint the thermostat is given for that run, which
+            # asks the heat pump for heat while the room is below it: what the
+            # run warms the room to in the plan, up to the next run - after it
+            # too, as the screed gives its heat to the room for hours - and,
+            # for a run under way, above the room as measured. Without that a
+            # run that heats the floor for later, the room already as warm as
+            # the plan has it, asked for nothing (real plan, 25 Oct 2026: 19.8
+            # degC against a room at 19.82). The least published step past
+            # either, never past the comfort band: status says when it ends.
+            if first is not None and result.zone_temperatures:
+                room = self.zone_setpoint_c(
+                    schedule,
+                    first,
+                    result.zone_temperatures,
+                    (
+                        state.measurements.building.zone_temperature[-1].value
+                        if status == "on"
+                        and state.measurements.building.zone_temperature
+                        else None
+                    ),
+                    (
+                        data.zone_minimum_temperature
+                        if data.zone_cooling
+                        else data.zone_maximum_temperature
+                    ),
+                    data.zone_cooling,
+                )
 
             if (running or hand_over) and result.space_supply_c:
                 measured = state.measurements.heat_pump
@@ -1489,6 +1564,15 @@ class Optimization:
             self.ZONE_START_ENTITY,
             start,
             {"friendly_name": "Home Optimizer zone start", "device_class": "timestamp"},
+        )
+        self.home_assistant.set_state(
+            self.ZONE_SETPOINT_ENTITY,
+            room,
+            {
+                "friendly_name": "Home Optimizer zone setpoint",
+                "device_class": "temperature",
+                "unit_of_measurement": "°C",
+            },
         )
         self.home_assistant.set_state(
             self.ZONE_SUPPLY_ENTITY,

@@ -2956,15 +2956,52 @@ class MPCOptimizer:
             else 0.0
         )
 
+        # Handed over by hot water, the zone also takes the heat in the water
+        # of the heat pump and the pipes it shares with the tank, which flows
+        # on into the floor at the tank's temperature rather than cooling where
+        # it stands as after a run that stops (see
+        # HeatPumpCOPModel.handover_heat_j): in the first step of the run, on
+        # top of the compressor's. Cooling hands over to no tank.
+        handover_j = (
+            self.space_cop_model.handover_heat_j
+            if self.space_cop_model is not None and not cooling
+            else 0.0
+        )
+
         def floor_w(k: int):
             """The heat the floor takes in step k (W)."""
 
-            if not ramp_seconds:
-                return model.q_space_w[k]
+            heat_w = model.q_space_w[k]
 
-            share = self._ramp_share(dt_hours[k], ramp_seconds)
+            if ramp_seconds:
+                share = self._ramp_share(dt_hours[k], ramp_seconds)
+                heat_w = heat_w - sign * (1.0 - share) * model.space_ramp_w[k]
 
-            return model.q_space_w[k] - sign * (1.0 - share) * model.space_ramp_w[k]
+            if handover_j:
+                heat_w = (
+                    heat_w
+                    + handover_j / (dt_hours[k] * 3600.0) * (model.zone_from_tank[k])
+                )
+
+            return heat_w
+
+        if handover_j:
+            # space_on * boiler_on the step before, exact for the binaries.
+            # Not in the step under way: with no step before it in the plan,
+            # its heat would lie above the flat-out rollout below, which bounds
+            # every plan - a later hand-over follows a step the zone is off in,
+            # and brings less than a step of it.
+            model.zone_from_tank = pyo.Var(model.K, bounds=(0.0, 1.0))
+            model.zone_from_tank[0].fix(0.0)
+
+            for k in range(1, num_steps):
+                for bound in (
+                    model.zone_from_tank[k] <= model.space_on[k],
+                    model.zone_from_tank[k] <= model.boiler_on[k - 1],
+                    model.zone_from_tank[k]
+                    >= model.space_on[k] + model.boiler_on[k - 1] - 1,
+                ):
+                    model.zone_constraints.add(bound)
 
         if ramp_seconds:
             # |Q| * (the zone starts the compressor), exact: the start is 0 or 1
@@ -3344,6 +3381,28 @@ class MPCOptimizer:
                 # planned, doubled the solve.
                 if efficiency is not None:
                     reference_c = sink_c(unheated[k])
+                    # A run the zone opens draws the start's measured power
+                    # over its first step (HeatPumpCOPModel.start_step_power_w)
+                    # in place of its running draw, as the tank's does: the
+                    # compressor's start-up is the same in every mode. That
+                    # draw taken at the least heat, where the plan's runs
+                    # start. Priced at running power, a start on the zone came
+                    # out cheaper than one on the tank, and the plan opened
+                    # hot water runs with a quarter hour on the floor (real
+                    # plan, 25 Oct 2026). A run the tank hands over is no start.
+                    start_w = 0.0
+
+                    if efficiency.start_step_power_w:
+                        start_w = (
+                            efficiency.start_step_power_w
+                            - draw_w(
+                                operating.min_heat_w, zone_outdoor_c[k], reference_c
+                            )
+                        ) * (
+                            model.compressor_start[k]
+                            - model.tank_start[k]
+                            + model.tank_handover[k]
+                        )
 
                     for point_w in np.linspace(0.0, max_heat_w, 7):
                         at_w = draw_w(point_w, zone_outdoor_c[k], reference_c)
@@ -3361,6 +3420,7 @@ class MPCOptimizer:
                             >= at_w * on
                             + per_w * (sign * model.q_space_w[k] - point_w * on)
                             + per_k * (sink_on - reference_c * on)
+                            + start_w
                         )
 
                 # A supply no colder than uninsulated pipes allow, so no more

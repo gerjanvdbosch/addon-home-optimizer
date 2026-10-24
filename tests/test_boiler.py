@@ -1412,14 +1412,18 @@ def test_identify_heat_input_ramp_recovers_a_known_ramp():
 
 
 def test_identify_heat_input_ramp_needs_enough_runs():
-    """Below MIN_RAMP_RUNS the medians are not worth trusting, and planning
-    keeps its single constant."""
+    """Below MIN_RAMP_RUNS there is no median to take, and planning keeps its
+    single constant; from two runs on the ramp is read. The frame's first run
+    does not count: its start is not in the data."""
 
     identifier = BoilerThermalIdentifier()
 
     assert identifier._identify_heat_input_ramp(
-        _ramp_frame(runs=3, steady_w=6000.0, ramp_seconds=600.0)
+        _ramp_frame(runs=2, steady_w=6000.0, ramp_seconds=600.0)
     ) == (None, None)
+    assert identifier._identify_heat_input_ramp(
+        _ramp_frame(runs=3, steady_w=6000.0, ramp_seconds=600.0)
+    )[1] == pytest.approx(600.0, rel=0.02)
 
 
 def test_standing_loss_is_read_from_the_rest_after_runs():

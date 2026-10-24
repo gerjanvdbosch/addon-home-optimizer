@@ -424,6 +424,15 @@ class HeatPumpCOPModel:
     # minute). 0.0 until calibrated: DHW planning then uses the boiler's, a
     # floor run none (real cooling data: 530 s over 30 runs).
     start_ramp_seconds: float = 0.0
+    # The heat (J) a heating run handed over by hot water gets beyond the
+    # compressor's own in its first planning step: the water in the heat
+    # pump and the pipes it shares with the tank, at the tank's temperature as
+    # the valve turns, flows on into the floor rather than cooling where it
+    # stands (see HeatPumpCOPIdentifier._start_up; real data, 9 hand-overs:
+    # 0.25 kWh at the same compressor speed, the loop 31-34 K above the
+    # floor's return each time, so one energy rather than a capacity). 0.0
+    # until calibrated, and for the other modes.
+    handover_heat_j: float = 0.0
 
     def cop(self, T_outdoor: float, T_supply: float) -> float:
         """Carnot COP scaled by eta_carnot - see
