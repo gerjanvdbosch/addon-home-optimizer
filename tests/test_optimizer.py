@@ -498,6 +498,52 @@ def test_a_run_past_its_minimum_runtime_may_stop():
     assert result.schedule[0] == 0
 
 
+def test_a_run_past_its_minimum_runtime_is_finished_not_split():
+    """A run under way heats for a later target: it goes on until it has,
+    rather than stopping - for the zone, or for sun later on - and heating
+    the same target in a second block (real data, 25 Oct 2026)."""
+
+    num_steps = len(SOLAR_FORECAST_W)
+    target = [10.0] * (num_steps - 2) + [45.0] * 2
+    tank = MPCOptimizer(THERMAL_MODEL, MPCConfig())._tank_setting(
+        _make_input(
+            current_temp_top=31.0,
+            current_temp_bottom=30.0,
+            boiler_on_current=True,
+            compressor_elapsed_hours=0.6,
+            target_temperature_top=tuple(target),
+        )
+    )
+    alone = plan_tank(tank)
+    around_zone = plan_tank(tank, [1, 1] + [0] * (num_steps - 2))
+
+    assert tank.running_steps == 0
+    assert _blocks([int(w > 0) for w in alone.heat_pump_w]) == 1
+    assert alone.heat_pump_w[0] > 0
+    assert not any(around_zone.heat_pump_w[: num_steps - 2])
+
+
+def test_the_tank_does_not_take_the_compressor_back_from_the_zone():
+    """A block that hands the compressor to the zone does not come back in
+    that run: the next block waits until the compressor has paused."""
+
+    num_steps = len(SOLAR_FORECAST_W)
+    target = [10.0] * 2 + [36.0] * 4 + [10.0] * 2 + [45.0] * (num_steps - 8)
+    tank = MPCOptimizer(THERMAL_MODEL, MPCConfig())._tank_setting(
+        _make_input(
+            solar_forecast_w=[0.0] * num_steps,
+            target_temperature_top=tuple(target),
+            idle_elapsed_hours=5.0,
+        )
+    )
+    zone_on = [0, 0, 1, 1, 1, 1] + [0] * (num_steps - 6)
+    heated = [int(w > 0) for w in plan_tank(tank, zone_on).heat_pump_w]
+    min_off = MPCConfig().heat_pump_min_off_steps
+
+    assert heated[:2] == [1, 1]
+    assert not any(heated[2 : 6 + min_off])
+
+
 def test_the_solve_starts_from_the_previous_plan_and_still_finds_the_best():
     """A solve stopped at its time limit publishes its best plan so far, so it
     starts from the previous one: loaded beyond the first step as it was, and

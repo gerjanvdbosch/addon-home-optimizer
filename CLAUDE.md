@@ -23,6 +23,7 @@ Guidelines for coding agents in this repository.
 * Heating and DHW may be served sequentially within the same compressor run, but are not
   simultaneous.
 * DHW also heats the space; perform DHW after cooling to avoid condensation.
+* A started DHW run must be completed in one run, never interrupted.
 
 ### Boiler
 

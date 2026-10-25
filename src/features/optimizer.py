@@ -673,10 +673,15 @@ def plan_tank(
                 take(("heat_pump_last", start), ((ended, 0), 1))
                 take(("handover_last", start), ((ended, 0), 1))
 
+        # The pause after a block counts only steps the compressor is off: a
+        # heating zone run keeps it running, so a block that hands it to the
+        # zone cannot take it back within that run (hot water, zone, hot water).
+        paused = count if zone[k] and not cooling else min(count + 1, min_off)
+
         if kind == "rest":
-            take("coast", ((ended, min(count + 1, min_off)), ran))
+            take("coast", ((ended, paused), ran))
         elif kind == "off":
-            take("coast", (("off", min(count + 1, min_off)), ran))
+            take("coast", (("off", paused), ran))
 
             if (
                 count >= min_off
@@ -710,10 +715,16 @@ def plan_tank(
 
     # Forward from the tank as it is, exactly: in each step the action that
     # is cheapest together with the next step's values.
+    # A run under way is a block under way: past its minimum runtime it may
+    # end now, but as any block ends - resting until its target - not as a
+    # tank free to start another block for the same target. As a free tank,
+    # a run past its minimum runtime was planned off for the zone and on again
+    # half an hour later (real data, 25 Oct 2026 12:35: a run 31 minutes in,
+    # at 31 of 45 degC).
     if tank.running:
         now = [("heat_pump", max(tank.running_steps - 1, 0))]
         now += [("booster", 0)] if booster_w else []
-        now += [("off", min_off)] if tank.running_steps == 0 else []
+        now += [("off" if targets[0] else "rest", 0)] if tank.running_steps == 0 else []
     else:
         now = [("off", min_off)]
 
