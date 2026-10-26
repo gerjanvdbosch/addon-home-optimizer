@@ -221,7 +221,8 @@ class BuildingThermalModel:
     condensation limit, not in this balance.
     """
 
-    # The dwelling's envelope conductance, both rooms together (W/K).
+    # The dwelling's envelope conductance, both rooms together (W/K), its
+    # windows shut (see physics.envelope_conductance_w_per_k).
     ua_envelope_w_per_k: float
     # Slab surface to room, both rooms together (W/K).
     ua_air_mass_w_per_k: float
@@ -282,10 +283,34 @@ class BuildingThermalModel:
     # the rest's above the living room - and a model saved before it.
     ua_ceiling_w_per_k: float = 0.0
     # Share of the occupants' heat that is in the rest of the house while they
-    # sleep (see BuildingThermalIdentifier.ASLEEP_FROM_HOUR): the bedrooms are
-    # there. By day it lands by floor area. None is by floor area at night too
-    # - a model saved before it.
+    # sleep: the bedrooms are there. By day it lands by floor area. None is by
+    # floor area at night too - a model saved before it.
     asleep_in_rest_fraction: float | None = None
+    # The household's own hours of sleep (local; past midnight counted on
+    # past 24, see physics.night_share): gone to bed around asleep_from_hour,
+    # up around asleep_until_hour, each night within asleep_spread_h (h) of
+    # them.
+    asleep_from_hour: float = 23.0
+    asleep_until_hour: float = 7.0
+    asleep_spread_h: float = 0.25
+    # Windows opened overnight to cool the house on warm days (see
+    # physics.envelope_conductance_w_per_k): what the open windows add to the
+    # envelope's conductance (W/K, the air's rho * c_p times the airflow
+    # through them), on the share of nights they are open - half of them on a
+    # day whose mean outdoor temperature is window_half_day_c (deg C), most
+    # within window_spread_k (K) of it - from window_open_hour in the evening
+    # to window_close_hour in the morning (local hours; an opening past
+    # midnight counts on past 24), each night within window_hour_spread_h
+    # (h) of them. The filter's missing loss, real data Jun-Oct 2026, both
+    # rooms alike: overnight some 0 W/K on days below 14 degC, 10-20 at
+    # 14-17, 50 at 17-20 and 65 above 20 degC; none by day. Zero is none -
+    # and a model saved before it.
+    ua_window_w_per_k: float = 0.0
+    window_half_day_c: float = 0.0
+    window_spread_k: float = 1.0
+    window_open_hour: float = 23.0
+    window_close_hour: float = 7.0
+    window_hour_spread_h: float = 1.0
 
 
 # Exact by definition of the Kelvin scale (0 degC = 273.15 K) - used

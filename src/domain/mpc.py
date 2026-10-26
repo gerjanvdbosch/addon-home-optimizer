@@ -159,6 +159,10 @@ class MPCInput:
     # (asleep, in the bedrooms - see physics.zone_state_space).
     zone_living_gain_w: tuple[float, ...] = ()
     zone_rest_gain_w: tuple[float, ...] = ()
+    # The envelope's conductance per step (W/K): windows open more on warmer
+    # days (see physics.envelope_conductance_w_per_k). Empty is the building
+    # model's own, every step.
+    zone_envelope_w_per_k: tuple[float, ...] = ()
     # Each floor's open loop area the plan's runs go through, the living
     # room's and the rest's, as shares of the zone's floor area (see
     # Room.climate): the floor's heat lands only there, and the circuit

@@ -221,26 +221,10 @@ class Optimization:
                 run_start_stratification_k = stratification.get(before_top[-1].time)
                 run_start_ambient_c = ambient.get(before_top[-1].time)
 
-        # The tank through the run under way, as the plan starts from it: at
-        # the run's start, each quarter since, and now - with the heat its
-        # calorimetry measured by each.
-        trace_times = (
-            [
-                run_start,
-                *(
-                    t
-                    for t in pd.date_range(
-                        pd.Timestamp(run_start).ceil(step), now, freq=step
-                    ).to_pydatetime()
-                    if run_start < t < now
-                ),
-                now,
-            ]
-            if run_start is not None
-            else []
-        )
-        trace_heat_j = (
-            self._run_heat_j(config, run_start, trace_times)
+        # The heat the run under way has put in by now, as the plan starts
+        # from it.
+        run_heat_j = (
+            self._run_heat_j(config, run_start, [now])
             if run_start is not None
             else None
         )
@@ -303,7 +287,7 @@ class Optimization:
             compressor_elapsed_hours=compressor_elapsed_hours,
             run_start_temp_top=run_start_temp_top,
             run_start_ambient_c=run_start_ambient_c,
-            run_heat_j=trace_heat_j[-1] if trace_heat_j else None,
+            run_heat_j=run_heat_j[-1] if run_heat_j else None,
             run_start_temp_bottom=run_start_temp_bottom,
             first_step_hours=first_step_hours,
             idle_elapsed_hours=idle_elapsed_hours,
@@ -387,25 +371,13 @@ class Optimization:
             result.objective_value,
         )
 
-        run = []
-
-        for i, time in enumerate(trace_times):
-            tank_c = optimizer.run_temperature(
-                planned,
-                (time - run_start).total_seconds() / 3600.0,
-                trace_heat_j[i] if trace_heat_j else None,
-            )
-
-            if tank_c is not None:
-                run.append(SeriesPoint(time=time, value=tank_c))
-
         self.state_manager.update_schedule(
             schedule=result.schedule,
             temperatures=result.temperatures,
             power_w=result.electrical_power_w,
             times=forecast_times,
             heat_w=result.heat_w,
-            run=run,
+            now=now,
         )
 
         self.publish_dhw(result, forecast_times, thermal_model)
@@ -1224,6 +1196,12 @@ class Optimization:
             zone_internal_gain_w=gain("internal_gain_w"),
             zone_living_gain_w=tuple(planned["living_gain_w"].fillna(0.0)),
             zone_rest_gain_w=tuple(planned["rest_gain_w"].fillna(0.0)),
+            # Beyond the forecast the envelope a day earlier, else the nearest.
+            zone_envelope_w_per_k=tuple(
+                self.state_manager.extend_forecast(
+                    zone["envelope_w_per_k"].dropna().to_dict(), times
+                )
+            ),
             zone_floor_open=loops[:2] if loops else (),
             zone_floor_flow_lpm=loops[2] if loops else None,
             zone_cooling=cooling,

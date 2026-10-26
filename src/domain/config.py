@@ -7,7 +7,14 @@ physical constants and its own target schedule.
 from datetime import time
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, NonNegativeFloat, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    NonNegativeFloat,
+    field_validator,
+    model_validator,
+)
 
 from domain.mpc import MPCConfig
 from domain.sensors import SensorAttributesReference, SensorReference
@@ -215,8 +222,10 @@ class Room(BaseModel):
     temperature: SensorReference = Field()
     # The room's own floor thermostat, whose mode opens and closes the room's
     # floor loops: closed while it reads "off" (Home Assistant's hvac mode),
-    # open otherwise. In Influx a climate entity's mode is its "state" field,
-    # e.g. ["climate.danfoss_icon_woonkamer", "state"]. A room switched on is
+    # open otherwise, e.g. "climate.danfoss_icon_woonkamer". Read from its
+    # "state" field unless another attribute is named: beside it Home
+    # Assistant stores a "value" (0 while off, nothing while heating) that
+    # never reads "off" - every loop then counted open. A room switched on is
     # taken as open throughout a run: real data, 336 heating quarters
     # Sep-Oct 2026, the rooms reached their setpoint in 9 of 1600 room-samples.
     # None: the room's loops are always open.
@@ -229,6 +238,14 @@ class Room(BaseModel):
             return dict(zip(("area_m2", "temperature", "climate"), value, strict=False))
 
         return value
+
+    @field_validator("climate")
+    @classmethod
+    def mode(cls, climate: SensorReference | None) -> SensorReference | None:
+        if climate is not None and climate.attribute is None:
+            return climate.model_copy(update={"attribute": "state"})
+
+        return climate
 
 
 class Thermostat(BaseModel):

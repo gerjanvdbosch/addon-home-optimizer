@@ -8,12 +8,14 @@ import pytest
 from pvlib import irradiance, solarposition
 
 from domain.config import Config, HeatPumpStates, SouthGlazing
-from domain.dynamics import discretize_zoh, kalman_states
+from domain.dynamics import ScheduledSystem, discretize_zoh, kalman_states
 from domain.models import BuildingThermalModel
 from domain.physics import (
     CP_AIR_J_PER_KG_K,
     Q_PERSON_SENSIBLE_W,
     RHO_AIR_KG_PER_M3,
+    envelope_conductance_w_per_k,
+    night_share,
     extension_shaded_fraction,
     floor_heat_moved_w,
     floor_heat_w,
@@ -440,6 +442,23 @@ def test_occupancy_adds_metabolic_heat_to_the_air_node():
     )
 
 
+def test_presence_not_yet_recorded_is_the_usual_not_nobody_home():
+    """Before its tracker was recorded the household is home as it usually is
+    at that time of day, not away."""
+
+    identifier = _identifier()
+    raw = _raw_frame()
+    measured = identifier.prepare(raw)
+    unrecorded = raw["time"] < raw["time"].min() + pd.Timedelta(days=1)
+    raw.loc[unrecorded, "presence_0"] = np.nan
+    prepared = identifier.prepare(raw)
+
+    early = prepared["time"] < prepared["time"].min() + pd.Timedelta(days=1)
+    np.testing.assert_array_equal(
+        prepared.loc[early, "occupants"], measured.loc[early, "occupants"]
+    )
+
+
 def test_asleep_the_occupants_heat_moves_to_the_bedrooms():
     identifier = _identifier()
     prepared = identifier.prepare(_raw_frame())
@@ -449,10 +468,16 @@ def test_asleep_the_occupants_heat_moves_to_the_bedrooms():
         replace(TRUE_MODEL, asleep_in_rest_fraction=1.0), prepared
     )
 
-    hour = pd.DatetimeIndex(prepared["time"]).tz_convert(LOCAL_TIMEZONE).hour
-    asleep = (hour >= identifier.ASLEEP_FROM_HOUR) | (
-        hour < identifier.ASLEEP_UNTIL_HOUR
+    local = pd.DatetimeIndex(prepared["time"]).tz_convert(LOCAL_TIMEZONE)
+    asleep = night_share(
+        local.hour + local.minute / 60.0,
+        TRUE_MODEL.asleep_from_hour,
+        TRUE_MODEL.asleep_until_hour,
+        TRUE_MODEL.asleep_spread_h,
     )
+    # Asleep in the small hours, awake in the afternoon.
+    assert asleep[local.hour == 3].min() > 0.99
+    assert asleep[local.hour == 15].max() < 0.01
     people_w = prepared["occupants"].to_numpy(dtype=float) * Q_PERSON_SENSIBLE_W
     moved = by_area[:, 2] - upstairs[:, 2]
 
@@ -460,10 +485,10 @@ def test_asleep_the_occupants_heat_moves_to_the_bedrooms():
     # dwelling keeps all of it.
     assert moved.max() > 0.0
     np.testing.assert_allclose(
-        moved, np.where(asleep, TRUE_MODEL.living_area_fraction * people_w, 0.0)
+        moved, asleep * TRUE_MODEL.living_area_fraction * people_w, atol=1e-9
     )
     np.testing.assert_allclose(
-        upstairs[:, 2] + upstairs[:, 3], by_area[:, 2] + by_area[:, 3]
+        upstairs[:, 2] + upstairs[:, 3], by_area[:, 2] + by_area[:, 3], atol=1e-9
     )
     np.testing.assert_array_equal(upstairs[:, 1], by_area[:, 1])
 
@@ -697,6 +722,9 @@ def test_a_room_may_name_the_thermostat_that_opens_its_loops():
     loaded = {d.name: d for d in definition.definitions}
 
     assert rooms[0].climate is None
+    # Without an attribute, its mode rather than Home Assistant's numeric value.
+    plain = type(rooms[1]).model_validate([7.0, "sensor.bath", "climate.bath"])
+    assert plain.climate.attribute == "state"
     assert identifier.room_climate_columns == [None, "room_climate_1"]
     assert loaded["room_climate_1"].sensor.entity_id == "climate.bedroom"
     assert loaded["room_climate_1"].sensor.attribute == "state"
@@ -1109,6 +1137,12 @@ def test_forecast_takes_the_sky_ahead_from_the_pv_forecast():
 
     identifier, df, now = _calibrated(with_future=True)
     identifier.pv_power_per_irradiance_m2 = 2.0
+    # Asleep by floor area, as by day: the room's gain is its sun alone, also
+    # around waking on a sunny morning.
+    model = identifier.get_model()
+    identifier.model = replace(
+        model, asleep_in_rest_fraction=1.0 - model.living_area_fraction
+    )
     df = df.copy()
     df["global_tilted_irradiance"] = df["direct_radiation"] + df["diffuse_radiation"]
     pv = pd.Series(
@@ -1417,6 +1451,83 @@ def test_the_screed_is_read_off_how_runs_fall_off():
 
     assert fitted == pytest.approx(capacity, rel=0.15)
     assert fitted_down == pytest.approx(down, rel=0.15)
+
+
+def test_a_schedule_is_exact_at_whole_values_and_linear_between():
+    """Each step's system is the exact discretization at a whole value, and
+    between two the blend of them - within 1e-5 of the exact one."""
+
+    schedule = ScheduledSystem(
+        lambda ua: zone_state_space(TRUE_MODEL, ua), np.array([180.0, 180.4])
+    )
+    a_d, b_d = schedule.steps(np.array([DT_SECONDS, DT_SECONDS]))
+    exact = discretize_zoh(*zone_state_space(TRUE_MODEL, 180.4), DT_SECONDS)
+
+    assert a_d[0] == pytest.approx(
+        discretize_zoh(*zone_state_space(TRUE_MODEL), DT_SECONDS)[0]
+    )
+    assert a_d[1] == pytest.approx(exact[0], abs=1e-6)
+    assert b_d[1] == pytest.approx(exact[1], rel=1e-5, abs=1e-12)
+
+
+def test_a_constant_schedule_filters_as_the_constant_system():
+    """An envelope that does not move gives the filter of before."""
+
+    rng = np.random.default_rng(3)
+    a, b = zone_state_space(TRUE_MODEL)
+    n = 50
+    inputs = np.column_stack(
+        [rng.uniform(0, 15, n), rng.uniform(0, 500, n)] + [np.zeros(n)] * 4
+    )
+    measured = 20.0 + rng.normal(0, 0.1, (n, 2))
+    dt = np.full(n, DT_SECONDS)
+    arguments = (
+        measured,
+        inputs,
+        dt,
+        30.0,
+        1e-3,
+        zone_observations(TRUE_MODEL),
+        (2, 3, 4),
+    )
+    schedule = ScheduledSystem(
+        lambda ua: zone_state_space(TRUE_MODEL, ua),
+        np.full(n, TRUE_MODEL.ua_envelope_w_per_k),
+    )
+
+    assert kalman_states(a, b, *arguments, schedule=schedule) == pytest.approx(
+        kalman_states(a, b, *arguments)
+    )
+
+
+def test_the_windows_open_overnight_on_warm_days_only():
+    """Half the nights open at the half day, none on cold days, every night
+    on hot ones - half open at the opening and closing hours, shut by day."""
+
+    model = replace(
+        TRUE_MODEL,
+        ua_window_w_per_k=60.0,
+        window_half_day_c=17.0,
+        window_spread_k=1.0,
+        window_open_hour=22.0,
+        window_close_hour=6.0,
+        window_hour_spread_h=0.25,
+    )
+    ua = TRUE_MODEL.ua_envelope_w_per_k
+
+    assert envelope_conductance_w_per_k(
+        model, [17.0, 0.0, 30.0, 30.0, 30.0, 30.0], [2.0, 2.0, 2.0, 14.0, 22.0, 6.0]
+    ) == pytest.approx([ua + 30.0, ua, ua + 60.0, ua, ua + 30.0, ua + 30.0], abs=1e-3)
+    assert envelope_conductance_w_per_k(TRUE_MODEL, 25.0, 2.0) == pytest.approx(ua)
+
+
+def test_the_day_the_windows_follow_is_the_last_24_hours():
+    prepared = _identifier().prepare(_raw_frame())
+    expected = prepared.set_index("time")["T_out"].rolling("24h").mean()
+
+    assert prepared["T_out_day"].to_numpy() == pytest.approx(expected.to_numpy())
+    # A whole day of this frame's swing averages out to its mean.
+    assert prepared["T_out_day"].iloc[200] == pytest.approx(12.0, abs=0.1)
 
 
 def test_observation_is_air_alone_without_a_radiant_share():

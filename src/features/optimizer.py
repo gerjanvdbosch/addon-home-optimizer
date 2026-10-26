@@ -11,7 +11,7 @@ import pyomo.environ as pyo
 from pyomo.contrib.appsi.base import TerminationCondition
 from pyomo.contrib.appsi.solvers.highs import Highs
 
-from domain.dynamics import discretize_zoh
+from domain.dynamics import ScheduledSystem, discretize_zoh
 from domain.models import (
     BoilerThermalModel,
     BuildingThermalModel,
@@ -3047,6 +3047,30 @@ class MPCOptimizer:
                     model.zone_constraints.add(bound)
 
         discretized: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+        # The envelope step by step where it follows the day's outdoor
+        # temperature (see MPCInput.zone_envelope_w_per_k), else the model's.
+        schedule = (
+            ScheduledSystem(
+                lambda ua: zone_state_space(building, ua),
+                np.asarray(data.zone_envelope_w_per_k, dtype=float),
+            )
+            if data.zone_envelope_w_per_k
+            else None
+        )
+
+        def zone_step(k: int) -> tuple[np.ndarray, np.ndarray]:
+            """The zone's discrete (A, B) over step k."""
+
+            hours = dt_hours[k]
+
+            if schedule is not None:
+                return schedule.discrete(k, hours * 3600.0)
+
+            if hours not in discretized:
+                discretized[hours] = discretize_zoh(a, b, hours * 3600.0)
+
+            return discretized[hours]
+
         zone_outdoor_c = [
             float(outdoor_c[k]) if outdoor_c else float(data.ambient_temperature)
             for k in range(num_steps)
@@ -3123,12 +3147,7 @@ class MPCOptimizer:
             if k + 1 >= num_steps:
                 continue
 
-            hours = dt_hours[k]
-
-            if hours not in discretized:
-                discretized[hours] = discretize_zoh(a, b, hours * 3600.0)
-
-            a_d, b_d = discretized[hours]
+            a_d, b_d = zone_step(k)
             outdoor = zone_outdoor_c[k]
 
             # u = [T_outdoor, Q_internal, Q_solar_living, Q_solar_rest,
@@ -3176,7 +3195,7 @@ class MPCOptimizer:
             states = [state]
 
             for k in range(num_steps - 1):
-                a_d, b_d = discretized[dt_hours[k]]
+                a_d, b_d = zone_step(k)
                 inputs = np.array(
                     [
                         zone_outdoor_c[k],

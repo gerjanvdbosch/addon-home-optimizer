@@ -5,11 +5,9 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from domain.config import HeatPumpStates
-from domain.models import BoilerThermalModel
 from domain.mpc import MPCConfig
 from domain.state import (
     BacktestResult,
-    BoilerMeasurement,
     Schedule,
     SeriesPoint,
     State,
@@ -146,23 +144,6 @@ def joined(measured: list, planned: list) -> list:
     return measured + [p for p in planned if p.time > measured[-1].time]
 
 
-def tank_line(measured: list, state: State) -> list:
-    """The tank measured, then as planned (see joined). Through the last DHW
-    run as the state has it (see BoilerSchedule.run), in place of the
-    sensors, which lag the heat while the tank heats."""
-
-    run = state.schedule.heat_pump.boiler.run
-
-    if run:
-        measured = (
-            [p for p in measured if p.time < run[0].time]
-            + run
-            + [p for p in measured if p.time > run[-1].time]
-        )
-
-    return joined(measured, state.schedule.heat_pump.boiler.temperatures)
-
-
 def read_at(points: list[SeriesPoint], updated: datetime) -> list[SeriesPoint]:
     """Each ended quarter's last reading at the quarter's end, when it was
     read. InfluxDB labels the quarter at its start (see
@@ -191,39 +172,7 @@ def ended(points: list[SeriesPoint], updated: datetime) -> list[SeriesPoint]:
     return [p for p in points if p.time + quarter <= updated]
 
 
-def mixed_tank(
-    boiler: BoilerMeasurement, model: BoilerThermalModel | None
-) -> list[SeriesPoint]:
-    """The measured tank as the optimizer plans with it: mixed (see
-    BoilerThermalModel.mixed_temperature), or the two sensors' average without
-    a calibrated model."""
-
-    bottom_by_time = {p.time: p.value for p in boiler.bottom_temperature}
-    ambient_by_time = {p.time: p.value for p in boiler.ambient_temperature}
-    stratification_by_time = {p.time: p.value for p in boiler.stratification}
-
-    return [
-        SeriesPoint(
-            time=p.time,
-            value=model.mixed_temperature(
-                p.value,
-                bottom_by_time[p.time],
-                ambient_by_time[p.time],
-                stratification_by_time.get(p.time),
-            )
-            if model is not None
-            else (p.value + bottom_by_time[p.time]) / 2.0,
-        )
-        for p in boiler.top_temperature
-        if p.time in bottom_by_time and p.time in ambient_by_time
-    ]
-
-
-def dashboard_chart(
-    state: State,
-    boiler_model: BoilerThermalModel | None = None,
-    states: HeatPumpStates | None = None,
-) -> str:
+def dashboard_chart(state: State, states: HeatPumpStates | None = None) -> str:
     fig = make_subplots(
         rows=3,
         cols=1,
@@ -448,20 +397,11 @@ def dashboard_chart(
         decimal=1,
     )
 
-    # The tank mixed - the temperature the optimizer plans from (see
-    # BoilerThermalModel.mixed_temperature) - so measured and planned are one
-    # "Boiler temperature" line. The sensors' own
-    # average without a calibrated model, which then is the same thing. The two
+    # The tank as the optimizer plans from it (see BoilerMeasurement.
+    # temperature), then as planned: one "Boiler temperature" line. The two
     # sensors are drawn beside it: their stratification is what the mixed
     # temperature is read from.
-    measured = state.measurements.heat_pump.boiler
-    boiler = BoilerMeasurement(
-        top_temperature=read_at(measured.top_temperature, state.updated),
-        bottom_temperature=read_at(measured.bottom_temperature, state.updated),
-        ambient_temperature=read_at(measured.ambient_temperature, state.updated),
-        stratification=read_at(measured.stratification, state.updated),
-    )
-    measured_average = mixed_tank(boiler, boiler_model)
+    boiler = state.measurements.heat_pump.boiler
 
     for name, points in (
         ("Boiler bottom", boiler.bottom_temperature),
@@ -469,7 +409,7 @@ def dashboard_chart(
     ):
         series(
             name,
-            points,
+            read_at(points, state.updated),
             row=3,
             col=1,
             line=dict(width=1, color="#636EFA", dash="dot"),
@@ -491,7 +431,10 @@ def dashboard_chart(
 
     series(
         "Boiler temperature",
-        tank_line(measured_average, state),
+        joined(
+            read_at(boiler.temperature, state.updated),
+            state.schedule.heat_pump.boiler.temperatures,
+        ),
         row=3,
         col=1,
         line=dict(width=2, color="#19D3F3", shape="spline"),

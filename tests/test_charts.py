@@ -3,8 +3,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from domain.models import BoilerThermalModel
-from domain.state import BoilerMeasurement, SeriesPoint, State
+from domain.state import SeriesPoint, State
 from domain.time import to_local_time
 from web.charts import (
     broken_between_runs,
@@ -12,11 +11,9 @@ from web.charts import (
     ended,
     handed_over,
     joined,
-    mixed_tank,
     on_clock,
     read_at,
     spans,
-    tank_line,
 )
 
 START = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
@@ -141,43 +138,12 @@ def test_the_dashboard_draws_the_comfort_band():
     assert html.count('"fill":"tonexty"') == 2
 
 
-MODEL = BoilerThermalModel(
-    volume_l=200.0,
-    ua_top_w_per_k=1.0,
-    ua_bottom_w_per_k=1.0,
-    ua_mix_idle_w_per_k=0.1,
-    ua_mix_active_w_per_k=500.0,
-    q_in_nominal_w=6000.0,
-    cold_layer_fraction=0.35,
-    cold_layer_above_ambient_k=-5.0,
-    cold_layer_spread_k=8.0,
-)
-BOILER = BoilerMeasurement(
-    top_temperature=_points([45.0, 46.0]),
-    bottom_temperature=_points([37.0, 46.0]),
-    ambient_temperature=_points([20.0, 20.0]),
-)
-
-
-def test_the_measured_tank_is_drawn_mixed_as_it_is_planned():
-    """Stratified, the tank holds its cold layer; mixed after a run, it is the
-    sensors' average."""
-
-    drawn = mixed_tank(BOILER, MODEL)
-
-    assert drawn[0].value == pytest.approx(MODEL.mixed_temperature(45.0, 37.0, 20.0))
-    assert drawn[1].value == 46.0
-
-
-def test_without_a_calibrated_model_the_sensors_average_is_drawn():
-    assert [p.value for p in mixed_tank(BOILER, None)] == [41.0, 46.0]
-
-
-def test_the_dashboard_renders_with_a_calibrated_boiler():
+def test_the_dashboard_renders_the_boiler():
     state = State()
-    state.measurements.heat_pump.boiler = BOILER
+    state.measurements.heat_pump.boiler.top_temperature = _points([45.0, 46.0])
+    state.measurements.heat_pump.boiler.temperature = _points([41.0, 46.0])
 
-    assert "Boiler bottom" in dashboard_chart(state, MODEL)
+    assert "Boiler bottom" in dashboard_chart(state)
 
 
 def test_a_quarters_last_reading_is_drawn_when_it_was_read():
@@ -187,47 +153,6 @@ def test_a_quarters_last_reading_is_drawn_when_it_was_read():
 
     assert [p.time for p in read_at(_points([31.0, 41.0]), updated)] == [
         START + timedelta(minutes=15)
-    ]
-
-
-def test_a_run_under_way_is_drawn_as_the_state_has_it_not_its_sensors():
-    """Half an hour into a run, the sensors still read the tank as it was:
-    the line leaves them where the run began, for the run as the state has
-    it, then the plan."""
-
-    state = State()
-    boiler = state.schedule.heat_pump.boiler
-    boiler.run = [
-        SeriesPoint(time=START + timedelta(minutes=20), value=29.2),
-        SeriesPoint(time=START + timedelta(minutes=30), value=31.0),
-        SeriesPoint(time=START + timedelta(minutes=45), value=37.5),
-        SeriesPoint(time=START + timedelta(minutes=50), value=40.8),
-    ]
-    boiler.temperatures = _points([40.8, 45.6], first=3)
-    measured = _points([29.3, 29.2, 28.2], first=1)
-
-    assert [p.value for p in tank_line(measured, state)] == [
-        29.3,
-        29.2,
-        31.0,
-        37.5,
-        40.8,
-        45.6,
-    ]
-
-    # Ended, the sensors take over again after it.
-    measured += _points([44.0], first=4)
-
-    assert [p.value for p in tank_line(measured, state)][-2:] == [40.8, 44.0]
-
-    # Without a run, the sensors are the tank.
-    boiler.run = []
-
-    assert [p.value for p in tank_line(measured, state)] == [
-        29.3,
-        29.2,
-        28.2,
-        44.0,
     ]
 
 

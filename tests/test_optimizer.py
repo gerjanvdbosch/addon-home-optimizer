@@ -1678,6 +1678,29 @@ def _heat(space_cop_model=COP_MODEL):
     ).solve(_cold_day(steps=48))
 
 
+def test_a_plan_takes_the_envelope_of_each_step():
+    """An envelope given per step (MPCInput.zone_envelope_w_per_k) is planned
+    as a building with that envelope."""
+
+    leakier = TWO_NODE.ua_envelope_w_per_k + 40.0
+
+    def plan(building, **overrides):
+        return MPCOptimizer(
+            THERMAL_MODEL,
+            MPCConfig(),
+            cop_model=COP_MODEL,
+            building_model=building,
+            floor_circuit_model=HEATING,
+            space_cop_model=COP_MODEL,
+        ).solve(_cold_day(steps=24, **overrides))
+
+    scheduled = plan(TWO_NODE, zone_envelope_w_per_k=(leakier,) * 24)
+    constant = plan(replace(TWO_NODE, ua_envelope_w_per_k=leakier))
+
+    assert scheduled.zone_temperatures == pytest.approx(constant.zone_temperatures)
+    assert scheduled.space_heat_w == pytest.approx(constant.space_heat_w, abs=1.0)
+
+
 def test_a_plan_through_the_living_rooms_loops_alone_heats_its_floor():
     """With the rest's loops closed (MPCInput.zone_floor_open) the plan's floor
     heat lands under the living room alone, and the circuit passes what the

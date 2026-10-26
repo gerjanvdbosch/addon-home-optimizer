@@ -3,11 +3,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import joblib
 import pandas as pd
 import pytest
 
 from app.state import StateManager
 from domain.config import HeatPumpStates
+from domain.models import BoilerThermalModel
 from domain.state import SeriesPoint, State
 from features.solar import nowcast_solar
 from infrastructure.repositories import StateRepository
@@ -292,3 +294,83 @@ def test_a_run_the_quarters_miss_still_mixes_the_tank():
         0.0,
         0.0,
     ]
+
+
+RUN_START = datetime(2026, 10, 27, 10, 0, 49, tzinfo=UTC)
+# 27 Oct 2026, the quarters around a run from 10:00:49 to 10:53:06, each read
+# at its end: as it starts its circulation stirs the cold layer up and the top
+# sensor drops.
+TANK = pd.DataFrame(
+    {
+        "time": [
+            datetime(2026, 10, 27, 9, 45, tzinfo=UTC) + timedelta(minutes=15 * i)
+            for i in range(5)
+        ],
+        "boiler_top_temperature": [35.5, 29.0, 34.5, 44.0, 48.5],
+        "boiler_bottom_temperature": [24.5, 24.5, 34.0, 44.0, 48.5],
+        "boiler_ambient_temperature": [21.0] * 5,
+        "boiler_stratification": [15.5, 4.5, 0.5, 0.0, 0.0],
+    }
+)
+
+
+def test_a_run_holds_the_tank_at_no_less_than_before_it():
+    """Without a calibrated model the sensors' average: through the run never
+    below the 30.0 it began from, after it the sensors again."""
+
+    changes = [
+        SeriesPoint(time=RUN_START, value="SWW"),
+        SeriesPoint(time=datetime(2026, 10, 27, 10, 53, 6, tzinfo=UTC), value="Uit"),
+    ]
+
+    assert _state_manager()._tank_temperature(TANK, changes, "SWW").tolist() == [
+        30.0,
+        30.0,
+        34.25,
+        44.0,
+        48.5,
+    ]
+
+
+def test_a_run_under_way_leaves_the_tank_to_the_plan(tmp_path):
+    """Its lagging sensors not drawn; before it, the tank mixed."""
+
+    model = BoilerThermalModel(
+        volume_l=200.0,
+        ua_top_w_per_k=1.0,
+        ua_bottom_w_per_k=1.0,
+        ua_mix_idle_w_per_k=0.1,
+        ua_mix_active_w_per_k=500.0,
+        q_in_nominal_w=6000.0,
+        cold_layer_fraction=0.48,
+        cold_layer_above_ambient_k=0.69,
+        cold_layer_spread_k=2.38,
+    )
+    joblib.dump(model, tmp_path / "boiler.joblib")
+    manager = _state_manager()
+    manager.models_path = tmp_path
+
+    tank = manager._tank_temperature(
+        TANK, [SeriesPoint(time=RUN_START, value="SWW")], "SWW"
+    )
+
+    assert tank[0] == pytest.approx(model.mixed_temperature(35.5, 24.5, 21.0, 15.5))
+    assert tank[1:].isna().all()
+
+
+def test_the_plan_line_starts_at_the_tank_now(tmp_path):
+    manager = _state_manager()
+    manager.state_repository = StateRepository(JsonStorage(tmp_path / "state.json"))
+    times = [NOW.replace(minute=30) + timedelta(minutes=15 * i) for i in range(3)]
+
+    manager.update_schedule(
+        schedule=[1, 1, 0],
+        temperatures=[40.0, 44.0, 47.0],
+        power_w=[1500.0] * 3,
+        times=times,
+        now=NOW,
+    )
+
+    boiler = manager.load().schedule.heat_pump.boiler
+    assert [p.time for p in boiler.temperatures] == [NOW, *times[1:]]
+    assert [p.time for p in boiler.on] == times

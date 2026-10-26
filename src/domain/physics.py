@@ -9,6 +9,7 @@ that estimates their states and to the planner that acts on them.
 """
 
 import numpy as np
+from scipy.special import expit
 
 from domain.models import BuildingThermalModel, DewPointModel, FloorCircuitModel
 
@@ -152,8 +153,53 @@ def lumped_tank_state_space(
     return a, b
 
 
+def night_share(local_hour, start_hour: float, end_hour: float, spread_h: float):
+    """Share (0-1) of nights a household's habit of the night - asleep, the
+    windows open - is under way at a local hour of the day (0-24): begun
+    around start_hour in the evening (one past midnight counted on past 24)
+    and over around end_hour in the morning, each night within spread_h (h)
+    of them. Counted on from noon, so a night is one stretch across
+    midnight."""
+
+    hour = np.asarray(local_hour, dtype=float)
+    hour = np.where(hour < 12.0, hour + 24.0, hour)
+
+    return expit((hour - start_hour) / spread_h) * expit(
+        (end_hour + 24.0 - hour) / spread_h
+    )
+
+
+def envelope_conductance_w_per_k(
+    model: BuildingThermalModel, day_outdoor_c, local_hour
+):
+    """The envelope's conductance (W/K) at a local hour of the day (0-24), on
+    a day whose mean outdoor temperature (deg C, over the last 24 hours) is
+    day_outdoor_c: the conductance with the windows shut, plus the open
+    windows' on the share of nights they are open, while they are (see
+    BuildingThermalModel.ua_window_w_per_k). Both shares are logistic: in the
+    day - none on cold days, every night on hot ones, the occupants opening
+    them to cool the house down - and in the hour, around the household's
+    own times of opening and closing them. Their other airing, irregular (a
+    bedroom window on an autumn night), is the rooms' heat habit's (see
+    BuildingThermalIdentifier.room_heat_habit)."""
+
+    nights = expit(
+        (np.asarray(day_outdoor_c, dtype=float) - model.window_half_day_c)
+        / model.window_spread_k
+    )
+    open_now = night_share(
+        local_hour,
+        model.window_open_hour,
+        model.window_close_hour,
+        model.window_hour_spread_h,
+    )
+
+    return model.ua_envelope_w_per_k + model.ua_window_w_per_k * nights * open_now
+
+
 def zone_state_space(
     model: BuildingThermalModel,
+    ua_envelope_w_per_k: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Continuous state-space of the zone for dx/dt = A x + B u - what the
     Kalman filter, a rollout and the MPC all drive (see BuildingThermalModel).
@@ -173,7 +219,13 @@ def zone_state_space(
     only the floors still open (see floor_heat_moved_w) - zero with every loop
     open. The rest's slab exchanges with the living room below it too,
     through its ceiling.
+
+    The envelope at ua_envelope_w_per_k where given - its conductance that
+    day (see envelope_conductance_w_per_k) - else at the model's own.
     """
+
+    if ua_envelope_w_per_k is None:
+        ua_envelope_w_per_k = model.ua_envelope_w_per_k
 
     share = model.living_area_fraction
     shares = np.array([share, 1.0 - share])
@@ -186,7 +238,7 @@ def zone_state_space(
 
     ua_surface = model.ua_air_mass_w_per_k * shares
     ua_down = model.screed_to_slab_w_per_k * shares
-    ua_env = model.ua_envelope_w_per_k * np.array(
+    ua_env = ua_envelope_w_per_k * np.array(
         [model.living_envelope_fraction, 1.0 - model.living_envelope_fraction]
     )
     ua_rooms = model.ua_rooms_w_per_k

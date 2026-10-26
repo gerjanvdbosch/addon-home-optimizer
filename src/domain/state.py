@@ -26,6 +26,10 @@ class BoilerMeasurement(BaseModel):
     # Top less bottom, held since the tank was last mixed (K, see
     # physics.tank_stratification_k): what the cold layer is read from.
     stratification: list[SeriesPoint[float]] = Field(default_factory=list)
+    # The tank as a plan starts from it (deg C, see
+    # StateManager._tank_temperature): mixed, through a run never below the
+    # tank before it, and none through the run under way.
+    temperature: list[SeriesPoint[float]] = Field(default_factory=list)
 
 
 class HeatPumpMeasurement(BaseModel):
@@ -159,11 +163,6 @@ class Predictions(BaseModel):
 class BoilerSchedule(BaseModel):
     target_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
     temperatures: list[SeriesPoint[float]] = Field(default_factory=list)
-    # The tank through the last DHW run, from its start to the plan's while it
-    # was under way: by the run's heat balance, which the plan starts from -
-    # the sensors lag it while the tank heats (see
-    # MPCOptimizer.run_temperature). Empty before any run.
-    run: list[SeriesPoint[float]] = Field(default_factory=list)
     # Whether the plan heats the tank (1/0): the next plan starts from it (see
     # MPCInput.previous_tank_on).
     on: list[SeriesPoint[int]] = Field(default_factory=list)

@@ -4,6 +4,7 @@ from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
+import joblib
 import pandas as pd
 
 from domain.config import Config
@@ -339,7 +340,7 @@ class StateManager:
         power_w: Sequence[float],
         times: list[datetime],
         heat_w: Sequence[float] = (),
-        run: Sequence[SeriesPoint] = (),
+        now: datetime | None = None,
     ) -> None:
         state = self.load()
 
@@ -352,19 +353,20 @@ class StateManager:
             for t, heat in zip(times, heat_w, strict=False)
         ]
 
+        # The first is the tank the plan starts from now, not at its quarter's
+        # start: drawn there, a heating tank's line ran up to 15 minutes ahead.
         state.schedule.heat_pump.boiler.temperatures = [
             SeriesPoint(time=t, value=float(val))
-            for t, val in zip(times, temperatures, strict=False)
+            for t, val in zip(
+                [now, *times[1:]] if now and times else times,
+                temperatures,
+                strict=False,
+            )
         ]
         state.schedule.heat_pump.boiler.on = [
             SeriesPoint(time=t, value=int(on))
             for t, on in zip(times, schedule, strict=False)
         ]
-        # Kept once the run has ended, until the next: mid-run the sensors read
-        # the circulation stirring the tank, not its mean (real data, 21 Oct
-        # 2026: 27.1 degC 18 minutes in, 32.8 by the run's heat balance).
-        if run:
-            state.schedule.heat_pump.boiler.run = list(run)
 
         self.state_repository.save(state)
 
@@ -539,6 +541,10 @@ class StateManager:
             state.measurements.heat_pump.boiler.stratification = self._parse_series(
                 df, "boiler_stratification"
             )
+            state.measurements.heat_pump.boiler.temperature = self._parse_series(
+                df.assign(boiler_temperature=self._tank_temperature(df, changes, dhw)),
+                "boiler_temperature",
+            )
         state.measurements.building.setpoint = self._parse_series(
             df, "thermostat_setpoint"
         )
@@ -591,6 +597,70 @@ class StateManager:
                     )
 
         return state
+
+    def _tank_temperature(
+        self,
+        df: pd.DataFrame,
+        changes: list[SeriesPoint],
+        dhw: str,
+    ) -> pd.Series:
+        """The tank measured as a plan starts from it: mixed (see
+        BoilerThermalModel.mixed_temperature), or the sensors' average without
+        a calibrated model, per quarter as its last reading - at its end.
+
+        Through a DHW run that has ended, never below the tank before it: the
+        heat pump only puts heat in, and the dip its sensors show as it starts
+        is its circulation stirring the cold layer up, not heat lost (real
+        data, 27 Oct 2026: 26.0 degC before a run, 24.3 a quarter into it,
+        29.3 by its heat balance). Through the run under way none: its
+        sensors lag the heat the plan starts from (see
+        MPCOptimizer._initial_temperature), 3.3 K on average 15-30 minutes
+        in over 19 runs in October, and the plan's line takes over from the
+        tank before it."""
+
+        top = pd.to_numeric(df["boiler_top_temperature"], errors="coerce")
+        bottom = pd.to_numeric(df["boiler_bottom_temperature"], errors="coerce")
+        path = self.models_path / "boiler.joblib"
+        # Read as saved, without the identifier that made it: that would
+        # import the modelling libraries a state update stays free of.
+        model = joblib.load(path) if path.exists() else None
+
+        if model is None or "boiler_ambient_temperature" not in df:
+            tank = (top + bottom) / 2.0
+        else:
+            tank = pd.Series(
+                model.mixed_temperature(
+                    top,
+                    bottom,
+                    pd.to_numeric(df["boiler_ambient_temperature"], errors="coerce"),
+                    df["boiler_stratification"],
+                ),
+                index=df.index,
+            )
+
+        read = df["time"] + pd.Timedelta(minutes=15)
+        # Each run once, from its change into DHW to the next change out.
+        runs = [
+            c
+            for i, c in enumerate(changes)
+            if i == 0 or (c.value == dhw) != (changes[i - 1].value == dhw)
+        ]
+
+        for i, change in enumerate(runs):
+            if change.value != dhw:
+                continue
+
+            if i + 1 == len(runs):
+                tank[read > change.time] = float("nan")
+                continue
+
+            inside = (read > change.time) & (read <= runs[i + 1].time)
+            before = tank[(read <= change.time) & tank.notna()].iloc[-1:]
+            tank[inside] = (
+                pd.concat([before, tank[inside]]).cummax().iloc[len(before) :]
+            )
+
+        return tank
 
     def _parse_series(self, df: pd.DataFrame, column: str) -> list[SeriesPoint]:
         if column not in df.columns:
