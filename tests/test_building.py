@@ -15,7 +15,10 @@ from domain.physics import (
     Q_PERSON_SENSIBLE_W,
     RHO_AIR_KG_PER_M3,
     extension_shaded_fraction,
+    floor_heat_moved_w,
     floor_heat_w,
+    floor_living_fraction,
+    floor_loops_conductance_w_per_k,
     solar_gain_w,
     zone_observation,
     zone_observations,
@@ -680,6 +683,25 @@ def test_volume_is_derived_from_the_zone_areas_and_ceiling_height():
     assert identifier.room_areas_m2 == [room.area_m2 for room in config.building.rooms]
 
 
+def test_a_room_may_name_the_thermostat_that_opens_its_loops():
+    """[area, thermometer, thermostat mode]: the mode is loaded per sample
+    beside the heat it splits (see prepare); a room without one is open."""
+
+    config = _config()
+    rooms = config.building.rooms
+    rooms[1] = type(rooms[1]).model_validate(
+        [rooms[1].area_m2, "sensor.bedroom", ["climate.bedroom", "state"]]
+    )
+    identifier = BuildingThermalIdentifier(latitude=52.39, longitude=5.79)
+    definition = identifier.dataset(config)
+    loaded = {d.name: d for d in definition.definitions}
+
+    assert rooms[0].climate is None
+    assert identifier.room_climate_columns == [None, "room_climate_1"]
+    assert loaded["room_climate_1"].sensor.entity_id == "climate.bedroom"
+    assert loaded["room_climate_1"].sensor.attribute == "state"
+
+
 def test_filter_infers_the_unmeasured_mass_node():
     """The point of the filter: a state nothing measures still gets corrected.
 
@@ -1133,7 +1155,7 @@ def test_a_rooms_sun_warms_that_room_before_the_rest():
     runs ahead."""
 
     a_d, b_d = discretize_zoh(*zone_state_space(TRUE_MODEL), 3600.0)
-    sun_in_living = np.array([20.0, 0.0, 2000.0, 0.0, 0.0])
+    sun_in_living = np.array([20.0, 0.0, 2000.0, 0.0, 0.0, 0.0])
 
     state = a_d @ np.full(4, 20.0) + b_d @ sun_in_living
 
@@ -1223,6 +1245,88 @@ def test_the_upper_slab_warms_the_living_room_through_its_ceiling():
     }
 
 
+def test_the_floors_heat_lands_only_under_the_loops_that_are_open():
+    """With the rest's loops closed the floor's heat all enters the living
+    room's screed, the zone storing the same heat; with every loop open
+    nothing is moved."""
+
+    model = replace(
+        TRUE_MODEL, screed_capacity_j_per_k=6.0e6, screed_to_slab_w_per_k=1900.0
+    )
+    a, b = zone_state_space(model)
+    share = model.living_area_fraction
+    shares = np.array([share, 1.0 - share])
+    capacity = np.concatenate(
+        [
+            model.c_air_j_per_k * shares,
+            (model.c_mass_j_per_k - 6.0e6) * shares,
+            6.0e6 * shares,
+        ]
+    )
+    living = floor_living_fraction(share, 0.0, share)
+    moved = floor_heat_moved_w(1000.0, living, share)
+    heated = capacity * (b @ np.array([0.0, 0.0, 0.0, 0.0, 1000.0, moved]))
+
+    assert heated.sum() == pytest.approx(1000.0)
+    assert heated[4] == pytest.approx(1000.0)
+    assert heated[5] == pytest.approx(0.0, abs=1e-9)
+    every_loop = floor_living_fraction(share, 1.0 - share, share)
+    assert floor_heat_moved_w(1000.0, every_loop, share) == pytest.approx(0.0)
+
+
+def test_a_plan_takes_the_loops_the_last_run_held_longest():
+    """The rooms switch at a run's ends, one at a time: the last run's loops
+    are the set it held longest, at its flow then - not its last step, and
+    not an earlier run's."""
+
+    columns = ["floor_open_living", "floor_open_rest", "floor_flow_lpm"]
+    nan = (np.nan, np.nan, np.nan)
+    every, two, bath = (0.5, 0.5, 18.0), (0.5, 0.07, 16.0), (0.0, 0.07, 9.0)
+    zone = pd.DataFrame(
+        [two, two, two, nan, every, every, two, two, two, bath, nan], columns=columns
+    )
+
+    assert BuildingThermalIdentifier.last_run_loops(zone) == (0.5, 0.07, 16.0)
+    assert BuildingThermalIdentifier.last_run_loops(zone.iloc[:6]) == (0.5, 0.5, 18.0)
+    assert BuildingThermalIdentifier.last_run_loops(zone.iloc[[3, 10]]) is None
+
+
+def test_a_room_that_closes_its_loops_takes_none_of_the_floors_heat():
+    """Per sample, as the heat: a step whose last two samples ran with the
+    rest's loops closed moves those samples' rest share of the heat under the
+    living room, and was open over the rest a third of it."""
+
+    states = HeatPumpStates()
+    identifier = _identifier()
+    identifier.room_climate_columns = [None, "room_climate_1"]
+    frame = _raw_frame().head(4)
+    samples = {
+        "state": [states.heating] * 3,
+        "flow_lpm": [18.0] * 3,
+        "T_supply": [25.0] * 3,
+        "T_return": [22.0] * 3,
+        "room_climate_1": ["heat", "off", "off"],
+    }
+
+    for name, values in samples.items():
+        frame = frame.drop(columns=name, errors="ignore")
+
+        for k, value in enumerate(values):
+            frame[f"{name}_{k}"] = value
+
+    prepared = identifier.prepare(frame)
+    heating = floor_heat_w(np.array([18.0]), np.array([25.0]), np.array([22.0]))[0]
+    rest = 1.0 - identifier.living_area_fraction
+
+    assert prepared["Q_floor_w"].to_numpy() == pytest.approx(heating)
+    assert prepared["Q_floor_moved_w"].to_numpy() == pytest.approx(
+        2.0 / 3.0 * heating * rest
+    )
+    assert prepared["floor_open_rest"].to_numpy() == pytest.approx(rest / 3.0)
+    assert prepared["floor_open_living"].to_numpy() == pytest.approx(1.0 - rest)
+    assert prepared["floor_flow_lpm"].to_numpy() == pytest.approx(18.0)
+
+
 def test_a_screed_holds_part_of_the_slabs_heat_at_the_floors_surface():
     """With a screed each floor's top layer is it: the floor's heat enters it
     alone, it passes the heat up to its room and down to the concrete, and
@@ -1244,7 +1348,7 @@ def test_a_screed_holds_part_of_the_slabs_heat_at_the_floors_surface():
     )
     uniform = np.full(6, 20.0)
 
-    stored = capacity @ (a @ uniform + b @ np.array([20.0, 0.0, 0.0, 0.0, 1000.0]))
+    stored = capacity @ (a @ uniform + b @ np.array([20.0, 0.0, 0.0, 0.0, 1000.0, 0.0]))
     assert stored == pytest.approx(1000.0)
     assert np.nonzero(b[:, 4])[0].tolist() == [4, 5]
     # Surface up to the room, conductance down to the concrete.
@@ -1257,12 +1361,15 @@ def test_a_screed_holds_part_of_the_slabs_heat_at_the_floors_surface():
 def test_the_screed_is_read_off_how_runs_fall_off():
     """A run's heat at one supply falls as its screed warms: from the start
     and how fast and how far it falls, the screed's capacity and its
-    conductance down to the slabs."""
+    conductance down to the slabs - also from runs through half the loops,
+    which heat half the screed from water the pump drives faster through
+    them."""
 
-    capacity, down, water = 9.0e6, 1900.0, 900.0
+    capacity, down, pipes = 9.0e6, 1900.0, 1600.0
     surface = TRUE_MODEL.ua_air_mass_w_per_k
     identifier = _identifier()
     identifier.model = TRUE_MODEL
+    share = identifier.living_area_fraction
     rng = np.random.default_rng(5)
     rows, slabs = [], []
     time = pd.Timestamp("2026-07-01T00:00Z")
@@ -1270,6 +1377,9 @@ def test_the_screed_is_read_off_how_runs_fall_off():
     for run in range(8):
         supply = rng.uniform(15.0, 18.0) if run % 2 else 25.0
         slab, room = rng.uniform(19.0, 22.0), rng.uniform(20.0, 23.0)
+        open_, flow = (0.5, 16.0) if run % 4 > 1 else (1.0, 18.0)
+        loops = float(floor_loops_conductance_w_per_k(pipes, open_, flow))
+        water = loops / open_
         total = water + down + surface
         balance = (water * supply + down * slab + surface * room) / total
         decay = np.exp(-total / capacity * DT_SECONDS)
@@ -1278,7 +1388,7 @@ def test_the_screed_is_read_off_how_runs_fall_off():
 
         for step in range(12 + 4):
             on = step < 12
-            heat = water * (supply - balance - (screed - balance) * mean) if on else 0.0
+            heat = loops * (supply - balance - (screed - balance) * mean) if on else 0.0
             screed = balance + (screed - balance) * decay if on else slab
             rows.append(
                 {
@@ -1289,6 +1399,10 @@ def test_the_screed_is_read_off_how_runs_fall_off():
                     "T_living": room,
                     "T_rest": room,
                     "dt_seconds": DT_SECONDS,
+                    "floor_open_living": open_ * share if on else np.nan,
+                    "floor_open_rest": open_ * (1.0 - share) if on else np.nan,
+                    "floor_flow_lpm": flow if on else np.nan,
+                    "flow_lpm": flow if on else 0.0,
                 }
             )
             if not on:

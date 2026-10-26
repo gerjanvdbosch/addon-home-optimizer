@@ -1211,6 +1211,8 @@ class Optimization:
             )
             for schedule in comfort
         )
+        # Every loop, at the flow its runs ran at, without a run in the frame.
+        loops = identifier.last_run_loops(zone)
         inputs = dict(
             zone_state=tuple(float(c) for c in planned[state_names].iloc[0]),
             zone_target_temperature=target_c,
@@ -1222,6 +1224,8 @@ class Optimization:
             zone_internal_gain_w=gain("internal_gain_w"),
             zone_living_gain_w=tuple(planned["living_gain_w"].fillna(0.0)),
             zone_rest_gain_w=tuple(planned["rest_gain_w"].fillna(0.0)),
+            zone_floor_open=loops[:2] if loops else (),
+            zone_floor_flow_lpm=loops[2] if loops else None,
             zone_cooling=cooling,
             zone_mass_minimum_c=(
                 tuple(c + config.building.dew_point_margin for c in dew_point_c)

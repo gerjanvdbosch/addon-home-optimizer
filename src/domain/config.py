@@ -213,12 +213,20 @@ class Room(BaseModel):
 
     area_m2: float = Field()
     temperature: SensorReference = Field()
+    # The room's own floor thermostat, whose mode opens and closes the room's
+    # floor loops: closed while it reads "off" (Home Assistant's hvac mode),
+    # open otherwise. In Influx a climate entity's mode is its "state" field,
+    # e.g. ["climate.danfoss_icon_woonkamer", "state"]. A room switched on is
+    # taken as open throughout a run: real data, 336 heating quarters
+    # Sep-Oct 2026, the rooms reached their setpoint in 9 of 1600 room-samples.
+    # None: the room's loops are always open.
+    climate: SensorReference | None = Field(default=None)
 
     @model_validator(mode="before")
     @classmethod
     def resolve(cls, value):
         if isinstance(value, (list, tuple)):
-            return {"area_m2": value[0], "temperature": value[1]}
+            return dict(zip(("area_m2", "temperature", "climate"), value, strict=False))
 
         return value
 

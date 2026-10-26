@@ -265,11 +265,11 @@ actions:
             },
             "comfort_weight": 0.5,
             "rooms": [
-              [6.0, "sensor.danfoss_0_temperature"],
-              [10.0, "sensor.danfoss_1_temperature"],
-              [19.0, "sensor.danfoss_2_temperature"],
-              [7.0, "sensor.danfoss_3_temperature"],
-              [42.0, "sensor.danfoss_15_temperature"]
+              [6.0, "sensor.danfoss_0_temperature", "climate.danfoss_icon_badkamer"],
+              [10.0, "sensor.danfoss_1_temperature", "climate.danfoss_icon_slaapkamer_voor"],
+              [19.0, "sensor.danfoss_2_temperature", "climate.danfoss_icon_slaapkamer_groot"],
+              [7.0, "sensor.danfoss_3_temperature", "climate.danfoss_icon_slaapkamer_achter"],
+              [42.0, "sensor.danfoss_15_temperature", "climate.danfoss_icon_woonkamer"]
             ],
             "ceiling_height": 2.6,
             "south_glazing": [
@@ -477,6 +477,19 @@ Home Optimizer writes the following entities to Home Assistant:
 | `sensor.home_optimizer_zone_start`         | Start of the zone run under way or the next one planned (`unknown` if none) |
 | `sensor.home_optimizer_zone_setpoint`      | Room temperature (°C) that run heats or cools to (`unknown` if none)        |
 | `sensor.home_optimizer_zone_supply`        | Supply setpoint (°C) while a zone run is under way (`unknown` otherwise)    |
+
+## Blueprints
+
+The [Home Optimizer MPC](blueprints/home_optimizer_mpc.yaml) blueprint acts
+on these sensors: it handles the DHW and zone schedule.
+
+1. In Home Assistant go to **Settings → Automations & scenes → Blueprints → Import
+   blueprint** and paste
+   `https://github.com/gerjanvdbosch/addon-home-optimizer/blob/main/blueprints/home_optimizer_mpc.yaml`.
+2. Create an automation from it and select your entities. Adjust the time windows and
+   temperatures if needed.
+
+To update, re-import the blueprint from the same page.
 
 ## Development
 

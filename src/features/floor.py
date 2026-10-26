@@ -20,19 +20,35 @@ BuildingThermalIdentifier._fit_screed), which warms within the hour: against
 the slabs instead, one conductance read too little heat at a run's start and
 too much later (real data, 33 runs: 424 W off on runs left out, 207 W with
 the screed).
+
+The conductance is the pipes' UA and the water's cooling along them (see
+physics.floor_circuit_conductance_w_per_k): the UA the whole floor's, every
+loop open, and where rooms have closed theirs (see Room.climate) the open
+loops' share of it by floor area, at the flow the pump then drives through
+them. Fewer loops open, more water through each: 26 Oct 2026, 57% of the
+floor open, the flow fell from 18.0 to 16.0 L/min only. Over the runs with
+loops closed (Oct 2026, 15 settled steps) the heat was predicted 234 W off
+(+59 W) this way, 294 W (-232 W) with the conductance by area alone - the
+same 234 W on the runs left out with every loop open, the flow there
+hardly varying (18.0 +- 0.1 L/min).
 """
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import least_squares
 
 from domain.config import Config, HeatPumpStates
 from domain.dataset import DatasetDefinition
 from domain.models import FloorCircuitModel
-from domain.physics import floor_pipe_conductance_w_per_k
+from domain.physics import (
+    floor_circuit_conductance_w_per_k,
+    floor_pipe_conductance_w_per_k,
+)
 from features.building import BuildingThermalIdentifier
 from features.cop import HeatPumpCOPIdentifier
 from features.identifier import SystemIdentifier
@@ -127,8 +143,12 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
 
         prepared = self.building.prepare(df).reset_index(drop=True)
         # What the water delivers against: the screed it lies in where the
-        # building has one, else its slabs (see physics.zone_floor).
+        # building has one, else its slabs (see physics.zone_floor) - of the
+        # floors whose loops were open.
         prepared["T_mass"] = self.building.estimate(df)["floor"].to_numpy()
+        # The share of the circuit the water ran through, its flow in
+        # floor_flow_lpm (see prepare).
+        prepared["open"] = prepared["floor_open_living"] + prepared["floor_open_rest"]
 
         running = prepared["state"] == self.mode
         prepared["run"] = (running & ~running.shift(fill_value=False)).cumsum()
@@ -150,11 +170,13 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
         standard error, says the outdoor range was too narrow, not that the
         curve is shaped that way. Cooling too: a warmer day asks for a colder
         supply, as a colder one asks for a warmer supply while heating.
-        The floor: Q = G * (supply - T_mass), a conductance from the supply
-        water to the mass. It covers both the water warming the screed and the
-        water cooling on its way through the loop - G = 1 / (1 / UA_floor +
-        1 / (2 m_dot c_p)) - and is fitted through the origin, because no heat
-        flows at no temperature difference.
+        The floor: Q = G (supply - T_mass), a conductance from the supply
+        water to the mass, through the origin because no heat flows at no
+        temperature difference. It covers both the pipes warming the screed
+        and the water cooling on its way through them: G = m_dot c_p (1 -
+        exp(-open UA / (m_dot c_p))) (see
+        physics.floor_circuit_conductance_w_per_k), UA fitted at each
+        reading's open share and flow.
         """
 
         settled = rows[rows["settled"] & (self.sign * rows["Q_floor_w"] > 0.0)]
@@ -182,15 +204,33 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
 
         lift = (settled["T_supply"] - settled["T_mass"]).to_numpy(dtype=float)
         heat = settled["Q_floor_w"].to_numpy(dtype=float)
-        conductance = float(np.dot(lift, heat) / np.dot(lift, lift))
-
-        return FloorCircuitModel(
+        open_ = settled["open"].to_numpy(dtype=float)
+        flow = settled["floor_flow_lpm"].to_numpy(dtype=float)
+        model = FloorCircuitModel(
             supply_at_zero_outdoor_c=intercept,
             supply_per_outdoor_k=slope,
-            conductance_w_per_k=conductance,
+            conductance_w_per_k=0.0,
             min_heat_w=float(np.quantile(np.abs(heat), self.MIN_HEAT_QUANTILE)),
             max_heat_w=float(np.quantile(np.abs(heat), self.MAX_HEAT_QUANTILE)),
+            flow_lpm=float(np.median(flow)),
         )
+
+        def residuals(ua: np.ndarray) -> np.ndarray:
+            conductance = floor_circuit_conductance_w_per_k(
+                replace(model, pipe_ua_w_per_k=float(ua[0])), open_, flow
+            )
+
+            # In kW, so the residuals sit near 1.
+            return (conductance * lift - heat) / 1000.0
+
+        # From the conductance by area alone, which UA is never below: the
+        # water cooling along the pipes only takes from it.
+        by_area = float(np.dot(open_ * lift, heat) / np.dot(open_ * lift, open_ * lift))
+        fit = least_squares(residuals, [by_area], bounds=(0.0, np.inf))
+        model.pipe_ua_w_per_k = float(fit.x[0])
+        model.conductance_w_per_k = float(floor_circuit_conductance_w_per_k(model))
+
+        return model
 
     def _in_test(self, rows: pd.DataFrame) -> pd.Series:
         """Whether each reading belongs to the runs held out for validation:
@@ -208,11 +248,13 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
 
         logger.info(
             "%s calibrated: supply = %.1f %+.2f * T_out degC, "
-            "G = %.0f W/K, %.0f-%.0f W",
+            "G = %.0f W/K (UA %.0f W/K at %.1f L/min), %.0f-%.0f W",
             self.label,
             self.model.supply_at_zero_outdoor_c,
             self.model.supply_per_outdoor_k,
             self.model.conductance_w_per_k,
+            self.model.pipe_ua_w_per_k,
+            self.model.flow_lpm,
             self.model.min_heat_w,
             self.model.max_heat_w,
         )
@@ -244,9 +286,11 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
             )
 
         supply = test["T_supply"].to_numpy(dtype=float)
-        predicted = model.conductance_w_per_k * (
-            supply - test["T_mass"].to_numpy(dtype=float)
-        )
+        predicted = floor_circuit_conductance_w_per_k(
+            model,
+            test["open"].to_numpy(dtype=float),
+            test["floor_flow_lpm"].to_numpy(dtype=float),
+        ) * (supply - test["T_mass"].to_numpy(dtype=float))
         error = predicted - test["Q_floor_w"].to_numpy(dtype=float)
         supply_error = model.supply_c(test["T_out"].to_numpy(dtype=float)) - supply
 
@@ -288,17 +332,19 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
         300 W/K per K in either direction here. Within a run it falls until
         the screed settles (see SCREED_SETTLE): what the mass node, one
         temperature for the whole slab, cannot show, and why the return is
-        not an observation of it.
+        not an observation of it. The whole floor's, every loop open, as
+        FloorCircuitModel.pipe_ua_w_per_k is.
         """
 
         settled = rows[rows["settled"] & (self.sign * rows["Q_floor_w"] > 0.0)]
         conductance = pd.Series(
             floor_pipe_conductance_w_per_k(
-                settled["flow_lpm"].to_numpy(dtype=float),
+                settled["floor_flow_lpm"].to_numpy(dtype=float),
                 settled["T_supply"].to_numpy(dtype=float),
                 settled["T_return"].to_numpy(dtype=float),
                 settled["T_mass"].to_numpy(dtype=float),
-            ),
+            )
+            / settled["open"].to_numpy(dtype=float),
             index=settled.index,
         )
         start = rows["time"].groupby(rows["run"]).transform("min")

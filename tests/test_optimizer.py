@@ -17,6 +17,7 @@ from domain.mpc import MPCConfig, MPCInput
 from domain.physics import (
     CP_WATER_J_PER_KG_K,
     RHO_WATER_KG_PER_L,
+    floor_circuit_conductance_w_per_k,
     lumped_tank_state_space,
     mains_water_temperature_c,
     zone_observation,
@@ -1255,7 +1256,7 @@ def test_a_zone_run_handed_over_by_the_tank_takes_the_loops_heat():
     for k in range(len(result.schedule) - 1):
         floor_w = result.space_heat_w[k] + handover_j / 900.0 * (k in handed)
         state = a_d @ state + b_d @ np.array(
-            [data.ambient_temperature, 0.0, 0.0, 0.0, floor_w]
+            [data.ambient_temperature, 0.0, 0.0, 0.0, floor_w, 0.0]
         )
 
         assert float(zone_observation(BUILDING_MODEL) @ state) == pytest.approx(
@@ -1675,6 +1676,43 @@ def _heat(space_cop_model=COP_MODEL):
         floor_circuit_model=HEATING,
         space_cop_model=space_cop_model,
     ).solve(_cold_day(steps=48))
+
+
+def test_a_plan_through_the_living_rooms_loops_alone_heats_its_floor():
+    """With the rest's loops closed (MPCInput.zone_floor_open) the plan's floor
+    heat lands under the living room alone, and the circuit passes what the
+    open pipes do at the flow through them: the supply is that floor plus
+    Q / G."""
+
+    share = TWO_NODE.living_area_fraction
+    circuit = replace(HEATING, pipe_ua_w_per_k=480.0, flow_lpm=18.0)
+    data = _cold_day(steps=48, zone_floor_open=(share, 0.0), zone_floor_flow_lpm=16.0)
+    result = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE,
+        floor_circuit_model=circuit,
+        space_cop_model=COP_MODEL,
+    ).solve(data)
+    conductance = floor_circuit_conductance_w_per_k(circuit, share, 16.0)
+    heat = np.asarray(result.space_heat_w)
+    living_floor = np.asarray(result.zone_mass_temperatures)
+    on = heat > 1.0
+
+    assert on.any(), "expected the zone to be heated"
+    assert np.asarray(result.space_supply_c)[on] == pytest.approx(
+        living_floor[on] + heat[on] / conductance
+    )
+
+    a_d, b_d = discretize_zoh(*zone_state_space(TWO_NODE), 900.0)
+    state = np.array(data.zone_state)
+
+    for k in range(len(heat) - 1):
+        state = a_d @ state + b_d @ np.array(
+            [5.0, 150.0, 0.0, 0.0, heat[k], (1.0 - share) * heat[k]]
+        )
+        assert living_floor[k + 1] == pytest.approx(state[2], abs=1e-4)
 
 
 def test_a_run_the_zone_opens_draws_the_starts_measured_power():
@@ -2347,7 +2385,7 @@ def test_a_cooling_run_takes_its_ramp_from_the_floor_in_the_step_it_starts():
 
     def zone_after(floor_w: float) -> float:
         state = a_d @ np.array(data.zone_state) + b_d @ np.array(
-            [30.0, 150.0, 0.0, 0.0, floor_w]
+            [30.0, 150.0, 0.0, 0.0, floor_w, 0.0]
         )
 
         return float(zone_observation(TWO_NODE) @ state)

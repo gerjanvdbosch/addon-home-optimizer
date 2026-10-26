@@ -306,7 +306,8 @@ class FloorCircuitModel:
     # From the supply water to the floor it heats (W/K), the water cooling
     # through the loop included: to the screed the pipes lie in where the
     # building has one (see BuildingThermalModel.screed_capacity_j_per_k),
-    # else to its slabs.
+    # else to its slabs. Every loop open, at flow_lpm; at another flow or
+    # through part of the loops see physics.floor_circuit_conductance_w_per_k.
     conductance_w_per_k: float
     # The least heat a settled run moves (W, a magnitude): the compressor at
     # its lowest speed. Asked for less, the heat pump cannot turn down further
@@ -318,6 +319,12 @@ class FloorCircuitModel:
     # show, and the COP model of its mode was fitted in. 0.0 for a model from
     # before it was identified: the compressor's own output bounds it then.
     max_heat_w: float = 0.0
+    # The pipes' own conductance to the floor (W/K), every loop open: what
+    # conductance_w_per_k is at its flow, before the water cools along them.
+    # 0.0 for a model from before it was identified.
+    pipe_ua_w_per_k: float = 0.0
+    # The flow its runs ran at (L/min, the median of their settled readings).
+    flow_lpm: float = 0.0
 
     def supply_c(self, outdoor_c):
         return self.supply_at_zero_outdoor_c + self.supply_per_outdoor_k * outdoor_c

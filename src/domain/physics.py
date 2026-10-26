@@ -10,7 +10,7 @@ that estimates their states and to the planner that acts on them.
 
 import numpy as np
 
-from domain.models import BuildingThermalModel, DewPointModel
+from domain.models import BuildingThermalModel, DewPointModel, FloorCircuitModel
 
 # Physical constants (water), not fit parameters.
 RHO_WATER_KG_PER_L = 1.0
@@ -160,15 +160,19 @@ def zone_state_space(
 
     x = [T_living, T_rest, T_slab_living, T_slab_rest] and, where the floor
     has a screed, [T_screed_living, T_screed_rest] after them;
-    u = [T_outdoor, Q_internal, Q_living, Q_rest, Q_floor].
+    u = [T_outdoor, Q_internal, Q_living, Q_rest, Q_floor, Q_floor_moved].
 
     Q_internal and Q_floor are the dwelling's, divided by floor area; Q_living
     and Q_rest land in that room alone: its own glazing's sun, and the
     occupants' heat that is there beyond its floor area's share (asleep, in the
     bedrooms). The floor's heat enters each floor's top
     layer - its screed, or without one its slab - which is the surface its
-    room sees; a screed passes it on to the concrete below. The rest's slab
-    exchanges with the living room below it too, through its ceiling.
+    room sees; a screed passes it on to the concrete below. Q_floor_moved is
+    the floor's heat that lands under the living room beyond its area share,
+    out of the rest's: where rooms have closed their loops, the water heats
+    only the floors still open (see floor_heat_moved_w) - zero with every loop
+    open. The rest's slab exchanges with the living room below it too,
+    through its ceiling.
     """
 
     share = model.living_area_fraction
@@ -190,7 +194,7 @@ def zone_state_space(
     size = 6 if screed else 4
 
     a = np.zeros((size, size))
-    b = np.zeros((size, 5))
+    b = np.zeros((size, 6))
 
     for room, other in ((0, 1), (1, 0)):
         slab = room + 2
@@ -207,6 +211,7 @@ def zone_state_space(
         b[room, 1] = shares[room] / c_room[room]
         b[room, 2 + room] = 1.0 / c_room[room]
         b[top, 4] = shares[room] / c_top
+        b[top, 5] = (1.0 if room == 0 else -1.0) / c_top
 
         if screed:
             a[top, top] -= ua_down[room] / c_top
@@ -274,16 +279,44 @@ def zone_slab(model: BuildingThermalModel) -> np.ndarray:
     return row
 
 
-def zone_floor(model: BuildingThermalModel) -> np.ndarray:
+def zone_floor(
+    model: BuildingThermalModel, living_fraction: float | None = None
+) -> np.ndarray:
     """Row vector of the temperature the floor circuit delivers its heat
     against, the one water running through both floors: their screeds' mean
-    by floor area, or without them their slabs'."""
+    by the share of the water under each (see floor_living_fraction; by floor
+    area, every loop open, without one), or without screeds their slabs'."""
 
-    share = model.living_area_fraction
+    share = model.living_area_fraction if living_fraction is None else living_fraction
     row = np.zeros(zone_size(model))
     row[list(_surfaces(model))] = [share, 1.0 - share]
 
     return row
+
+
+def floor_living_fraction(open_living, open_rest, living_area_fraction: float):
+    """The share of the floor circuit's water - its heat, and the screed it
+    sees - that runs under the living room: by open loop area, taking every
+    loop to take as much per m2. open_living and open_rest are each floor's
+    open loop area as a share of the zone's floor area: (living_area_fraction,
+    1 - it) with every loop open. With none open nothing flows, and floor
+    area keeps it defined - as where none was measured (NaN)."""
+
+    open_living = np.asarray(open_living, dtype=float)
+    open_total = open_living + np.asarray(open_rest, dtype=float)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(
+            open_total > 0.0, open_living / open_total, living_area_fraction
+        )
+
+
+def floor_heat_moved_w(floor_w, living_fraction, living_area_fraction: float):
+    """The floor's heat under the living room beyond its floor-area share
+    (W), out of the rest's: zone_state_space's Q_floor_moved. Zero with
+    every loop open."""
+
+    return floor_w * (living_fraction - living_area_fraction)
 
 
 # The zone's slab and screed states (see zone_state_space): each must stay
@@ -311,6 +344,47 @@ def floor_heat_w(
         mass_flow_kg_per_s
         * CP_WATER_J_PER_KG_K
         * (supply_temperature_c - return_temperature_c)
+    )
+
+
+def floor_loops_conductance_w_per_k(pipe_ua_w_per_k, open_fraction, flow_lpm):
+    """From the supply water to the floor (W/K), the water cooling through
+    the loops included: Q = G (supply - floor). The loops taken as one heat
+    exchanger against one floor temperature (effectiveness-NTU, see
+    floor_pipe_conductance_w_per_k), G = m_dot c_p (1 - exp(-open UA /
+    (m_dot c_p))): the pipes' UA, every loop open, by the open share of the
+    floor area, and the flow through those open. Closing loops leaves the
+    pump's flow to fewer of them, so each cools its water less (26 Oct 2026:
+    18.0 to 16.0 L/min with 57% of the floor open). No flow, none.
+    """
+
+    capacity_w_per_k = (
+        RHO_WATER_KG_PER_L * np.asarray(flow_lpm, dtype=float) / 60.0
+    ) * CP_WATER_J_PER_KG_K
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(
+            capacity_w_per_k > 0.0,
+            capacity_w_per_k
+            * (1.0 - np.exp(-open_fraction * pipe_ua_w_per_k / capacity_w_per_k)),
+            0.0,
+        )
+
+
+def floor_circuit_conductance_w_per_k(
+    model: FloorCircuitModel, open_fraction=1.0, flow_lpm=None
+):
+    """The floor circuit's conductance (see floor_loops_conductance_w_per_k):
+    at the flow its runs ran at without one. A model from before its pipes'
+    UA was identified scales its conductance by the open share alone."""
+
+    if not model.pipe_ua_w_per_k:
+        return model.conductance_w_per_k * open_fraction
+
+    return floor_loops_conductance_w_per_k(
+        model.pipe_ua_w_per_k,
+        open_fraction,
+        model.flow_lpm if flow_lpm is None else flow_lpm,
     )
 
 

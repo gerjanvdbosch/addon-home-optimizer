@@ -24,6 +24,9 @@ from domain.physics import (
     RHO_WATER_KG_PER_L,
     ZONE_SCREED_STATES,
     ZONE_SLAB_STATES,
+    floor_circuit_conductance_w_per_k,
+    floor_heat_moved_w,
+    floor_living_fraction,
     lumped_tank_state_space,
     zone_floor,
     zone_observation,
@@ -2917,6 +2920,15 @@ class MPCOptimizer:
         a, b = zone_state_space(building)
         observation = zone_observation(building)
         num_states = a.shape[0]
+        # The loops the plan's runs go through (see MPCInput.zone_floor_open):
+        # where the floor's heat lands - the part of it moved under the living
+        # room per W, Q_floor_moved - and how much of the circuit takes it.
+        area_share = building.living_area_fraction
+        open_living, open_rest = data.zone_floor_open or (area_share, 1.0 - area_share)
+        living_fraction = float(
+            floor_living_fraction(open_living, open_rest, area_share)
+        )
+        moved_per_w = float(floor_heat_moved_w(1.0, living_fraction, area_share))
         initial = np.array([float(t) for t in data.zone_state])
 
         if len(initial) != num_states:
@@ -3120,10 +3132,10 @@ class MPCOptimizer:
             outdoor = zone_outdoor_c[k]
 
             # u = [T_outdoor, Q_internal, Q_solar_living, Q_solar_rest,
-            # Q_floor], the same input vector the zone is identified with. Each
-            # state advances by its own row of the discrete matrices, so where
-            # a gain lands - which room, or the slabs - is the model's to
-            # decide, not this block's.
+            # Q_floor, Q_floor_moved], the same input vector the zone is
+            # identified with. Each state advances by its own row of the
+            # discrete matrices, so where a gain lands - which room, or the
+            # slabs - is the model's to decide, not this block's.
             for i in model.ZONE_STATES:
                 model.zone_constraints.add(
                     model.zone_state[k + 1, i]
@@ -3134,7 +3146,7 @@ class MPCOptimizer:
                     + b_d[i, 1] * float(internal_gain_w[k])
                     + b_d[i, 2] * float(living_gain_w[k])
                     + b_d[i, 3] * float(rest_gain_w[k])
-                    + b_d[i, 4] * floor_w(k)
+                    + (b_d[i, 4] + moved_per_w * b_d[i, 5]) * floor_w(k)
                 )
 
         # What a thermostat reads of the plan: an operative temperature, part
@@ -3172,6 +3184,7 @@ class MPCOptimizer:
                         float(living_gain_w[k]),
                         float(rest_gain_w[k]),
                         heat_w,
+                        moved_per_w * heat_w,
                     ]
                 )
                 state = a_d @ state + b_d @ inputs
@@ -3289,8 +3302,8 @@ class MPCOptimizer:
 
         # The temperature the floor's water delivers against: the screeds it
         # heats first where the floor has them, else the slabs' mean, one
-        # circuit running through both (see zone_floor).
-        against = zone_floor(building)
+        # circuit running through both - the open loops (see zone_floor).
+        against = zone_floor(building, living_fraction)
 
         def sink_c(state: np.ndarray) -> float:
             return float(against @ state)
@@ -3317,7 +3330,11 @@ class MPCOptimizer:
         # sink's range, which the unheated and flat-out rollouts bound - the
         # slabs' mean being monotone in the heat like each slab.
         model.space_sink_on = pyo.Var(model.K)
-        conductance = operating.conductance_w_per_k
+        conductance = float(
+            floor_circuit_conductance_w_per_k(
+                operating, open_living + open_rest, data.zone_floor_flow_lpm
+            )
+        )
         # The mode's own COP (EER) model, where runs have shown one. The heat
         # pump holds the supply it is given (its flow mode), so the plan
         # chooses it - heating only with that model: on a flat COP a warmer

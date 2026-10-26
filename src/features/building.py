@@ -32,8 +32,12 @@ from domain.physics import (
     CP_AIR_J_PER_KG_K,
     Q_PERSON_SENSIBLE_W,
     RHO_AIR_KG_PER_M3,
+    ZONE_SLAB_STATES,
     extension_shaded_fraction,
+    floor_heat_moved_w,
     floor_heat_w,
+    floor_living_fraction,
+    floor_loops_conductance_w_per_k,
     internal_gain_w,
     solar_gain_w,
     zone_floor,
@@ -340,6 +344,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # either is driven exactly as measured.
     DISTURBANCE_INPUTS = (2, 3, 4)
 
+    # Home Assistant's hvac mode of a room thermostat that has closed its
+    # floor loops (see Room.climate).
+    CLIMATE_OFF_STATE = "off"
+
     # Between the two rooms (W/K): at least what a closed door and an
     # insulated floor between them still pass; at most an open stairwell and
     # an uninsulated concrete ceiling, some 2.5 W/m2K over its whole area, with
@@ -373,7 +381,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     ASLEEP_UNTIL_HOUR = 7
 
     # The screed (see _fit_screed), per m2 of floor: 1 to 15 cm of it (some
-    # 2000 kg/m3 at 850 J/kgK), and at most half the slabs; from the water to
+    # 2000 kg/m3 at 850 J/kgK), and at most half the slabs; the pipes' UA to
     # it and from it down to the concrete, anything a floor's pipes and
     # layers conduct. A loose physical range, not an expectation. With it the
     # floor's heat held out of a run was predicted to 207 W against 424 W for
@@ -418,6 +426,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         self.presence_sensors: list[SensorReference] = []
         self.room_temperature_columns: list[str] = []
         self.room_areas_m2: list[float] = []
+        # Each room's floor thermostat mode (see Room.climate), aligned with
+        # room_areas_m2; None for a room whose loops are always open.
+        self.room_climate_columns: list[str | None] = []
         self.shutter_columns: list[str] = []
         # Which glazing, and which shutter, is in the thermostat's room
         # (SouthGlazing.thermostat_room), aligned with the lists above.
@@ -906,10 +917,51 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             & ~np.isnan(ret)
         )
 
+        heat = np.where(measurable, floor_heat_w(flow, supply, ret), 0.0)
         df["flow_lpm"] = flow.mean(axis=1)
-        df["Q_floor_w"] = np.where(
-            measurable, floor_heat_w(flow, supply, ret), 0.0
+        df["Q_floor_w"] = heat.mean(axis=1)
+
+        # Each floor's open loop area per sample, as a share of the zone's
+        # floor area (see Room.climate): a room without a thermostat mode, or
+        # whose mode has no reading, is open. The heat lands where the water
+        # runs, so the floor's heat is split per sample too.
+        share = self.living_area_fraction
+        open_floor = np.zeros((2,) + heat.shape)
+        total_m2 = sum(self.room_areas_m2)
+
+        for i, column in enumerate(
+            self.room_climate_columns or [None] * len(self.room_areas_m2)
+        ):
+            is_open = (
+                1.0
+                if column is None
+                else self._samples(df, column).to_numpy() != self.CLIMATE_OFF_STATE
+            )
+            floor = 0 if i == self.thermostat_room_index else 1
+            open_floor[floor] += self.room_areas_m2[i] / total_m2 * is_open
+
+        if not self.room_areas_m2:
+            open_floor[0], open_floor[1] = share, 1.0 - share
+
+        df["Q_floor_moved_w"] = floor_heat_moved_w(
+            heat, floor_living_fraction(*open_floor, share), share
         ).mean(axis=1)
+
+        # Each floor's open share over the step's samples that ran the floor,
+        # and the flow through them: what the water was delivered against
+        # (see estimate()) and how much of the circuit took it (see
+        # features.floor). NaN where none did.
+        running = measurable.sum(axis=1)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            df["floor_open_living"], df["floor_open_rest"], df["floor_flow_lpm"] = (
+                np.where(
+                    running > 0,
+                    (np.vstack([open_floor, flow[None]]) * measurable).sum(axis=2)
+                    / running,
+                    np.nan,
+                )
+            )
 
         # dt_seconds[i] is the step ENDING at row i, matching _rollout, which
         # advances from i-1 to i over it.
@@ -965,10 +1017,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         return df[columns or [name]]
 
     def _inputs(self, model, df: pd.DataFrame) -> np.ndarray:
-        """u = [T_outdoor, Q_internal, Q_living, Q_rest, Q_floor] per sample
-        (see physics.zone_state_space).
+        """u = [T_outdoor, Q_internal, Q_living, Q_rest, Q_floor,
+        Q_floor_moved] per sample (see physics.zone_state_space).
 
-        Rebuilt per fit iteration because three of the five depend on
+        Rebuilt per fit iteration because three of the six depend on
         identified parameters (the effective apertures, the in-zone baseload
         fraction and where the occupants sleep). Takes the model rather than
         the raw parameter vector.
@@ -1026,6 +1078,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 q_solar[0] - moved,
                 q_solar[1] + moved,
                 df["Q_floor_w"].to_numpy(dtype=float),
+                df["Q_floor_moved_w"].to_numpy(dtype=float),
             ]
         )
 
@@ -1793,9 +1846,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         model = self.get_model()
         prepared = self.prepare(df)
 
-        return self._states_frame(
-            model, self._filtered(model, prepared), prepared["time"].to_numpy()
-        )
+        return self._states_frame(model, self._filtered(model, prepared), prepared)
 
     def _filtered(
         self, model: BuildingThermalModel, prepared: pd.DataFrame
@@ -1899,11 +1950,15 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         water, Q = G (supply - screed), shared with the slabs below and the
         rooms above through the floor's surface, at the saved model's
         surface conductance: the slabs as that model estimates them, the
-        rooms as measured, both floors taken as one by floor area. Scored on
-        the heat where the compressor had settled. G is the floor circuit's
-        to identify (see features.floor), against the screed this fixes.
-        Bounded per m2 of floor (see MIN_SCREED_J_PER_M2_K) and below the
-        slabs' whole capacity, which holds it.
+        rooms as measured, both floors taken as one by the water under each.
+        G is the pipes' UA at each step's open loops and flow (see
+        physics.floor_loops_conductance_w_per_k), so a run through fewer
+        loops heats less of the screed, from water that cools less along
+        them. Scored on the heat where the compressor had settled. The
+        pipes' UA is the floor circuit's to identify (see features.floor),
+        against the screed this fixes. Bounded per m2 of floor (see
+        MIN_SCREED_J_PER_M2_K) and below the slabs' whole capacity, which
+        holds it.
         """
 
         # Here, not at the top: see validate().
@@ -1914,9 +1969,18 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         if saved is None:
             return 0.0, 0.0
 
-        share = saved.living_area_fraction
-        slab = self._filtered(saved, df) @ zone_slab(saved)
-        room = share * df["T_living"] + (1.0 - share) * df["T_rest"]
+        # Both floors as one, weighted by the water under each: the heated
+        # part of the floor, which takes the open share of the circuit's
+        # conductances and capacity alike - so only its heat scales with it.
+        states = self._filtered(saved, df)
+        living = floor_living_fraction(
+            df["floor_open_living"], df["floor_open_rest"], saved.living_area_fraction
+        )
+        slab = (
+            living * states[:, ZONE_SLAB_STATES[0]]
+            + (1.0 - living) * states[:, ZONE_SLAB_STATES[1]]
+        )
+        room = living * df["T_living"] + (1.0 - living) * df["T_rest"]
         running = df["state"].isin((self.states.heating, self.states.cooling))
         begins = running & (
             ~running.shift(fill_value=False) | (df["state"] != df["state"].shift())
@@ -1929,6 +1993,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 "heat": df["Q_floor_w"],
                 "slab": slab,
                 "room": room,
+                # Every loop, at the step's own flow, in a step the water did
+                # not run (see prepare).
+                "open": (df["floor_open_living"] + df["floor_open_rest"]).fillna(1.0),
+                "flow": df["floor_flow_lpm"].fillna(df["flow_lpm"]),
             }
         )[running.to_numpy()].dropna()
         start = frame["time"].groupby(frame["run"]).transform("min")
@@ -1943,13 +2011,19 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         surface = saved.ua_air_mass_w_per_k
 
         def residuals(log_x: np.ndarray) -> np.ndarray:
-            water, capacity, down = np.exp(log_x)
+            pipes, capacity, down = np.exp(log_x)
             errors = []
 
             for run in runs:
-                supply, slab_c, room_c = (
+                supply, slab_c, room_c, open_, flow = (
                     run[name].to_numpy(dtype=float)
-                    for name in ("supply", "slab", "room")
+                    for name in ("supply", "slab", "room", "open", "flow")
+                )
+                # The water to the heated part of the screed, per the open
+                # share it is of the floor: the same balance as every loop's.
+                loops = floor_loops_conductance_w_per_k(pipes, open_, flow)
+                water = np.divide(
+                    loops, open_, out=np.zeros_like(loops), where=open_ > 0.0
                 )
                 total = water + down + surface
                 decay = np.exp(-total / capacity * dt_s)
@@ -1961,12 +2035,13 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 # heat and its losses balance.
                 for k in range(len(run)):
                     balance = (
-                        water * supply[k] + down * slab_c[k] + surface * room_c[k]
-                    ) / total
+                        water[k] * supply[k] + down * slab_c[k] + surface * room_c[k]
+                    ) / total[k]
                     heat.append(
-                        water * (supply[k] - balance - (screed_c - balance) * mean)
+                        loops[k]
+                        * (supply[k] - balance - (screed_c - balance) * mean[k])
                     )
-                    screed_c = balance + (screed_c - balance) * decay
+                    screed_c = balance + (screed_c - balance) * decay[k]
 
                 errors.append(
                     (np.array(heat) - run["heat"].to_numpy(dtype=float))[
@@ -2004,14 +2079,14 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         fit = least_squares(
             residuals, np.clip(initial, lower, upper), bounds=(lower, upper)
         )
-        water, capacity, down = map(float, np.exp(fit.x))
+        pipes, capacity, down = map(float, np.exp(fit.x))
         logger.info(
             "Building thermal calibration: screed %.1f MJ/K (%.0f kJ/m2K) on to "
-            "the slabs at %.0f W/K, the water to it at %.0f W/K, over %d runs",
+            "the slabs at %.0f W/K, the pipes to it at UA %.0f W/K, over %d runs",
             capacity / 1e6,
             capacity / floor_m2 / 1e3,
             down,
-            water,
+            pipes,
             len(runs),
         )
 
@@ -2031,15 +2106,27 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
     @classmethod
     def _states_frame(
-        cls, model: BuildingThermalModel, states: np.ndarray, index: np.ndarray
+        cls, model: BuildingThermalModel, states: np.ndarray, prepared: pd.DataFrame
     ) -> pd.DataFrame:
-        """The states by name, with `mass` the slabs' mean (see
-        physics.zone_slab) and `floor` what the floor circuit delivers against
-        (see physics.zone_floor)."""
+        """The states by name, indexed by the prepared frame's time, with
+        `mass` the slabs' mean (see physics.zone_slab) and `floor` what the
+        floor circuit delivers against (see physics.zone_floor): through the
+        loops that were open, or every loop where it did not run."""
 
-        frame = pd.DataFrame(states, columns=list(cls.state_names(model)), index=index)
+        frame = pd.DataFrame(
+            states,
+            columns=list(cls.state_names(model)),
+            index=prepared["time"].to_numpy(),
+        )
         frame["mass"] = states @ zone_slab(model)
-        frame["floor"] = states @ zone_floor(model)
+        living = floor_living_fraction(
+            prepared["floor_open_living"].to_numpy(dtype=float),
+            prepared["floor_open_rest"].to_numpy(dtype=float),
+            model.living_area_fraction,
+        )
+        frame["floor"] = living * (states @ zone_floor(model, 1.0)) + (1.0 - living) * (
+            states @ zone_floor(model, 0.0)
+        )
 
         return frame
 
@@ -2264,7 +2351,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # Nothing is delivered to the zone: this is what happens if the heat
         # pump is left out of it.
         inputs = inputs.copy()
-        inputs[last:, 4] = 0.0
+        inputs[last:, 4:6] = 0.0
 
         # What each room gains beyond the model at that time of day (see
         # room_heat_habit()).
@@ -2286,7 +2373,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # The rollout starts from the filter's last estimate, so the two join
         # without a seam.
         states = np.vstack([estimates[:last], simulated])
-        zone = self._states_frame(model, states, prepared["time"].to_numpy())
+        zone = self._states_frame(model, states, prepared)
 
         # What the thermostat would read of it, which is the only column that
         # can be drawn against - or scored on - its measurement (see
@@ -2300,8 +2387,42 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         zone["internal_gain_w"] = inputs[:, 1]
         zone["living_gain_w"] = inputs[:, 2]
         zone["rest_gain_w"] = inputs[:, 3]
+        # Which loops the floor's runs went through, and their flow, where
+        # they were measured (see prepare and last_run_loops()).
+        for column in ("floor_open_living", "floor_open_rest", "floor_flow_lpm"):
+            zone[column] = np.where(known, prepared[column], np.nan)
 
         return zone, last
+
+    @staticmethod
+    def last_run_loops(zone: pd.DataFrame) -> tuple[float, float, float] | None:
+        """The loops the last floor run in a trajectory() went through, what
+        a plan takes its own runs to go through: (open_living, open_rest,
+        flow_lpm), the set it held longest and its flow then - or None
+        without a run. Not now: the rooms close theirs between runs. Not its
+        last step: the rooms switch at a run's ends, one at a time (26 Oct
+        2026: its last step had the bathroom alone open)."""
+
+        columns = ["floor_open_living", "floor_open_rest"]
+        ran = zone[columns[0]].notna().to_numpy()
+        starts = ran & ~np.concatenate([[False], ran[:-1]])
+        run = zone[ran & (np.cumsum(starts) == starts.sum())]
+        loops = list(
+            zip(run[columns[0]].round(3), run[columns[1]].round(3), strict=True)
+        )
+
+        if not loops:
+            return None
+
+        # The longest held, the latest of equally long.
+        held = max(reversed(loops), key=loops.count)
+
+        if sum(held) <= 0.0:
+            return None
+
+        flow = run["floor_flow_lpm"][[loop == held for loop in loops]].mean()
+
+        return float(held[0]), float(held[1]), float(flow)
 
     def habit_dataset(self) -> DatasetDefinition:
         """The shutters and who is home alone, over the weeks forecast() takes
@@ -2383,6 +2504,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         self.thermostat_room_index = matching[0]
         self.room_temperature_columns = [
             f"room_temperature_{i}" for i in range(len(self.room_areas_m2))
+        ]
+        self.room_climate_columns = [
+            None if room.climate is None else f"room_climate_{i}"
+            for i, room in enumerate(config.building.rooms)
         ]
         self.shutter_columns = [f"shutter_{i}" for i in range(len(shaded))]
         self.presence_columns = [f"presence_{i}" for i in range(len(config.presence))]
@@ -2487,6 +2612,15 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             ("T_supply", config.heat_pump.supply_temperature, "time_mean", "none"),
             ("T_return", config.heat_pump.return_temperature, "time_mean", "none"),
             ("flow_lpm", config.heat_pump.flow, "time_mean", "none"),
+            # Which loops the water runs through: per sample too, as the rooms
+            # close theirs within a run (see prepare).
+            *[
+                (name, room.climate, "last", "previous")
+                for name, room in zip(
+                    self.room_climate_columns, config.building.rooms, strict=True
+                )
+                if name is not None
+            ],
         ]
 
         for name, sensor, aggregation, fill in hydronic:

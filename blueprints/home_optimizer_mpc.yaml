@@ -1,0 +1,214 @@
+blueprint:
+  name: Home Optimizer MPC
+  description: >-
+    Runs the Home Optimizer plan: starts DHW on schedule and, when heating
+    follows, presets the thermostats so the heat pump goes straight from the
+    tank to the floor in one compressor run.
+  domain: automation
+  source_url: https://github.com/gerjanvdbosch/addon-home-optimizer/blob/main/blueprints/home_optimizer_mpc.yaml
+  input:
+    optimizer:
+      name: Optimizer enabled
+      selector:
+        entity:
+          domain: input_boolean
+    dhw_switch:
+      name: DHW block switch (turned off at DHW start)
+      selector:
+        entity:
+          domain: switch
+    boiler_soc:
+      name: Tank state of charge
+      selector:
+        entity:
+          domain: sensor
+    boiler_soc_max:
+      name: No DHW above state of charge (%)
+      default: 90
+      selector:
+        number: { min: 0, max: 100, unit_of_measurement: "%" }
+    dhw_after:
+      name: DHW not before
+      default: "09:00:00"
+      selector: { time: { } }
+    dhw_before:
+      name: DHW not after
+      default: "18:00:00"
+      selector: { time: { } }
+    zone_after:
+      name: Zone not before
+      default: "08:00:00"
+      selector: { time: { } }
+    zone_before:
+      name: Zone not after
+      default: "20:00:00"
+      selector: { time: { } }
+    living_climate:
+      name: Living room thermostat
+      selector:
+        entity:
+          domain: climate
+    zone_window:
+      name: Heating counts as 'after DHW' when it starts within this many minutes of the DHW start
+      default: 120
+      selector:
+        number: { min: 15, max: 240, unit_of_measurement: min }
+    upstairs_climates:
+      name: Upstairs thermostats
+      default: [ ]
+      selector:
+        entity:
+          domain: climate
+          multiple: true
+    upstairs_below:
+      name: Raise an upstairs room below (°C)
+      default: 19
+      selector:
+        number: { min: 15, max: 22, step: 0.5, unit_of_measurement: °C }
+    upstairs_setpoint:
+      name: Upstairs setpoint (°C)
+      default: 19.5
+      selector:
+        number: { min: 15, max: 22, step: 0.5, unit_of_measurement: °C }
+    outdoor_temperature:
+      name: Outdoor temperature
+      selector:
+        entity:
+          domain: sensor
+          device_class: temperature
+    outdoor_cold:
+      name: Cold outside below (°C)
+      default: 10
+      selector:
+        number: { min: -10, max: 20, step: 0.5, unit_of_measurement: °C }
+    upstairs_setpoint_cold:
+      name: Upstairs setpoint when cold outside (°C)
+      default: 20
+      selector:
+        number: { min: 15, max: 22, step: 0.5, unit_of_measurement: °C }
+
+variables:
+  zone_window: !input zone_window
+  upstairs: !input upstairs_climates
+  upstairs_below: !input upstairs_below
+  outdoor: !input outdoor_temperature
+  outdoor_cold: !input outdoor_cold
+  upstairs_setpoint: !input upstairs_setpoint
+  upstairs_setpoint_cold: !input upstairs_setpoint_cold
+
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.home_optimizer_dhw_status
+    from: "off"
+    to: "on"
+    id: dhw_start
+  - trigger: state
+    entity_id: binary_sensor.home_optimizer_zone_status
+    from: "off"
+    to: "on"
+    id: zone_start
+  - trigger: state
+    entity_id: binary_sensor.home_optimizer_zone_status
+    from: "on"
+    to: "off"
+    for: { minutes: 10 }
+    id: zone_stop
+
+conditions:
+  - condition: state
+    entity_id: !input optimizer
+    state: "on"
+
+actions:
+  - choose:
+      - alias: DHW start
+        conditions:
+          - condition: trigger
+            id: dhw_start
+          - condition: state
+            entity_id: binary_sensor.home_optimizer_dhw_status
+            state: "on"
+          - condition: state
+            entity_id: !input dhw_switch
+            state: "on"
+          - condition: time
+            after: !input dhw_after
+            before: !input dhw_before
+          - condition: numeric_state
+            entity_id: !input boiler_soc
+            below: !input boiler_soc_max
+        sequence:
+          - action: notify.notify
+            data:
+              message: Optimizer DHW start
+          - action: switch.turn_off
+            target:
+              entity_id: !input dhw_switch
+          # Heating planned right after DHW: set the thermostats now so they
+          # call for heat as soon as the tank is done and the compressor runs
+          # on, instead of stopping and starting again.
+          - if:
+              - condition: template
+                value_template: >-
+                  {% set start = states('sensor.home_optimizer_zone_start') %}
+                  {{ has_value('sensor.home_optimizer_zone_start')
+                     and has_value('sensor.home_optimizer_zone_setpoint')
+                     and as_datetime(start) - now() <= timedelta(minutes=zone_window | int) }}
+            then:
+              - action: notify.notify
+                data:
+                  message: >-
+                    Optimizer heating after DHW, living room
+                    {{ states('sensor.home_optimizer_zone_setpoint') }} °C
+              - action: climate.set_temperature
+                target:
+                  entity_id: !input living_climate
+                data:
+                  temperature: "{{ states('sensor.home_optimizer_zone_setpoint') | float }}"
+              - variables:
+                  upstairs_target: >-
+                    {{ upstairs_setpoint_cold
+                       if states(outdoor) | float(99) < outdoor_cold
+                       else upstairs_setpoint }}
+              - repeat:
+                  for_each: "{{ upstairs }}"
+                  sequence:
+                    # Only raise, never lower a higher setpoint.
+                    - if:
+                        - condition: template
+                          value_template: >-
+                            {{ state_attr(repeat.item, 'current_temperature') | float(99) < upstairs_below
+                               and state_attr(repeat.item, 'temperature') | float(0) < upstairs_target }}
+                      then:
+                        - action: climate.set_temperature
+                          target:
+                            entity_id: "{{ repeat.item }}"
+                          data:
+                            temperature: "{{ upstairs_target }}"
+      - alias: Zone start
+        conditions:
+          - condition: trigger
+            id: zone_start
+          - condition: state
+            entity_id: binary_sensor.home_optimizer_zone_status
+            state: "on"
+          - condition: time
+            after: !input zone_after
+            before: !input zone_before
+        sequence:
+          - action: notify.notify
+            data:
+              message: Optimizer zone start
+      - alias: Zone stop
+        conditions:
+          - condition: trigger
+            id: zone_stop
+          - condition: state
+            entity_id: binary_sensor.home_optimizer_zone_status
+            state: "off"
+        sequence:
+          - action: notify.notify
+            data:
+              message: Optimizer zone stop
+
+mode: single

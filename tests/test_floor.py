@@ -7,6 +7,7 @@ import pytest
 from domain.physics import (
     CP_WATER_J_PER_KG_K,
     RHO_WATER_KG_PER_L,
+    floor_circuit_conductance_w_per_k,
     floor_pipe_conductance_w_per_k,
 )
 from features.floor import FloorCircuitIdentifier
@@ -38,6 +39,8 @@ def _runs(lengths: list[int], rng: np.random.Generator) -> pd.DataFrame:
                     "T_out": outdoor,
                     "T_supply": supply,
                     "T_mass": mass,
+                    "open": 1.0,
+                    "floor_flow_lpm": 18.0,
                     "Q_floor_w": CONDUCTANCE_W_PER_K * (supply - mass),
                 }
             )
@@ -82,6 +85,34 @@ def test_split_keeps_runs_whole_and_the_only_run_for_training():
 
     assert set(rows.loc[identifier._in_test(rows), "run"]) == {5}
     assert not identifier._in_test(_runs([14], np.random.default_rng(6))).any()
+
+
+def test_a_run_through_part_of_the_loops_takes_their_share_of_the_pipes():
+    """Rooms that close their loops leave the water the rest of the floor:
+    half its pipes, with more of the pump's flow through each. The water
+    cools less along them, so half the loops pass more than half the heat -
+    and the pipes' own UA comes out, as the whole circuit at its flow."""
+
+    pipe_ua_w_per_k = 1500.0
+    rows = _runs([8, 12, 16, 10, 20, 6, 14, 18], np.random.default_rng(3))
+    half = rows["run"] % 2 == 0
+    rows.loc[half, "open"] = 0.5
+    rows.loc[half, "floor_flow_lpm"] = 16.0
+    capacity = RHO_WATER_KG_PER_L * rows["floor_flow_lpm"] / 60.0 * CP_WATER_J_PER_KG_K
+    rows["Q_floor_w"] = (
+        capacity
+        * (1.0 - np.exp(-rows["open"] * pipe_ua_w_per_k / capacity))
+        * (rows["T_supply"] - rows["T_mass"])
+    )
+
+    model = _identifier().fit(rows)
+    every_loop = floor_circuit_conductance_w_per_k(model)
+    half_open = floor_circuit_conductance_w_per_k(model, 0.5, 16.0)
+
+    assert model.pipe_ua_w_per_k == pytest.approx(pipe_ua_w_per_k, rel=0.01)
+    assert model.flow_lpm == 18.0
+    assert model.conductance_w_per_k == pytest.approx(every_loop)
+    assert 0.5 * every_loop < half_open < every_loop
 
 
 def test_cooling_fit_reads_runs_that_take_heat_from_the_floor():

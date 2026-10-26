@@ -159,6 +159,15 @@ class MPCInput:
     # (asleep, in the bedrooms - see physics.zone_state_space).
     zone_living_gain_w: tuple[float, ...] = ()
     zone_rest_gain_w: tuple[float, ...] = ()
+    # Each floor's open loop area the plan's runs go through, the living
+    # room's and the rest's, as shares of the zone's floor area (see
+    # Room.climate): the floor's heat lands only there, and the circuit
+    # passes that share of its conductance. Empty is every loop open.
+    zone_floor_open: tuple[float, ...] = ()
+    # The pump's flow through them (L/min, see
+    # physics.floor_circuit_conductance_w_per_k): fewer loops open, more
+    # through each. None is the flow its runs ran at.
+    zone_floor_flow_lpm: float | None = None
     # Whether the heat pump is serving the zone right now, the space-heating
     # counterpart of boiler_on_current.
     space_on_current: bool = False
