@@ -117,13 +117,10 @@ class Worker:
 def run_job(job: Job):
     # Imported here, in the job's process, so the web process never loads the
     # modelling libraries.
-    from joblib import parallel_backend
-
     from app.bootstrap import create_container
 
     try:
-        with parallel_backend("threading", n_jobs=1):
-            execute(create_container(), job)
+        execute(create_container(), job)
     except Exception:
         logging.exception("Job raised: id=%s type=%s", job.id[:6], job.type.value)
         sys.exit(1)
@@ -135,15 +132,6 @@ def execute(container, job: Job):
             container.config_repository.save(job.config)
         case JobType.UPDATE:
             container.state_manager.update()
-            container.backtest_repository.clear()
-        case JobType.FIT:
-            container.forecasting.fit(job.config)
-        case JobType.PREDICT:
-            container.forecasting.predict(job.config)
-        case JobType.TUNE:
-            container.forecasting.tune(job.config)
-        case JobType.BACKTEST:
-            container.forecasting.backtest(job.config)
         case JobType.CALIBRATE:
             container.identification.calibrate(job.config)
         case JobType.VALIDATE:

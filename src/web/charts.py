@@ -1,18 +1,16 @@
 from datetime import datetime, timedelta, timezone
 
-import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from domain.config import HeatPumpStates
 from domain.mpc import MPCConfig
 from domain.state import (
-    BacktestResult,
     Schedule,
     SeriesPoint,
     State,
 )
-from domain.time import local_day_start, to_local_series, to_local_time
+from domain.time import local_day_start, to_local_time
 
 
 def add_series(
@@ -263,19 +261,6 @@ def dashboard_chart(state: State, states: HeatPumpStates | None = None) -> str:
         col=1,
         line=dict(width=1, color="rgba(239, 85, 59, 0.5)", shape="spline"),
         legendgroup="baseload",
-    )
-
-    # The upper edge of the band the optimizer plans the surplus with (see
-    # MPCInput.baseload_p10_w): where the load may run up to.
-    series(
-        "Baseload p90",
-        state.predictions.baseload_p90,
-        line=dict(width=0.8, color="rgba(239, 85, 59, 0.45)", dash="dot"),
-        legendgroup="baseload",
-        showlegend=False,
-        unit="W",
-        row=1,
-        col=1,
     )
 
     series(
@@ -607,105 +592,6 @@ def dashboard_chart(state: State, states: HeatPumpStates | None = None) -> str:
         line_width=1,
         line_color="#ffffff",
         layer="above",
-    )
-
-    return fig.to_html(
-        full_html=False,
-        include_plotlyjs="cdn",
-    )
-
-
-def backtest_chart(result: BacktestResult | None) -> str:
-    if result is None:
-        return ""
-
-    fig = go.Figure()
-
-    for bp in result.points:
-        df = pd.DataFrame(bp.points)
-        df["x_time"] = to_local_series(pd.to_datetime(df["time"]))
-
-        fig.add_trace(
-            go.Scatter(
-                x=df["x_time"],
-                y=df["value"],
-                mode="lines",
-                name=bp.label,
-                legendgroup=bp.group,
-                showlegend=not bp.group,
-                line=dict(width=1, color=bp.color),
-                visible=True,
-                connectgaps=True,
-                hovertemplate=(
-                    f"%{{y:.1f}} {result.unit}<extra>%{{fullData.name}}</extra>"
-                ),
-            )
-        )
-
-    groups: set[str] = set()
-
-    for bp in result.points:
-        if bp.group not in groups and bp.group:
-            groups.add(bp.group)
-
-            fig.add_trace(
-                go.Scatter(
-                    x=[None],
-                    y=[None],
-                    mode="lines",
-                    name=bp.group,
-                    legendgroup=bp.group,
-                    showlegend=True,
-                    line=dict(width=1, color=bp.color),
-                )
-            )
-
-    fig.update_layout(
-        title=dict(
-            text=(
-                f"{result.name.capitalize()} backtest - "
-                f"MAE {result.mae:.3f}, RMSE {result.rmse:.3f}, R2 {result.r2:.3f}"
-            ),
-            x=0.01,
-            y=0.95,
-            font=dict(
-                size=22,
-                color="#eeeeee",
-            ),
-        ),
-        template="plotly_dark",
-        paper_bgcolor="#2b2b2b",
-        plot_bgcolor="#2b2b2b",
-        margin=dict(
-            l=70,
-            r=20,
-            t=60,
-            b=10,
-        ),
-        font=dict(
-            color="#cccccc",
-        ),
-        xaxis=dict(
-            showgrid=True,
-            gridcolor="rgba(255,255,255,0.08)",
-            zeroline=False,
-            tickfont=dict(size=12),
-        ),
-        yaxis=dict(
-            title=f"{result.label} ({result.unit})",
-            showgrid=True,
-            gridcolor="rgba(255,255,255,0.08)",
-            zeroline=False,
-        ),
-        legend=dict(
-            orientation="h",
-            y=-0.15,
-            x=0.5,
-            xanchor="center",
-            font=dict(size=12),
-            groupclick="togglegroup",
-        ),
-        hovermode="x unified",
     )
 
     return fig.to_html(

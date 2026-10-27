@@ -13,19 +13,15 @@ from app.settings import configure_logger, create_repositories, load_settings
 from app.worker import Worker
 from domain.config import Config
 from domain.jobs import (
-    BacktestConfig,
     CalibrateConfig,
-    FitConfig,
     Job,
     JobType,
     OptimizeConfig,
-    PredictConfig,
-    TuneConfig,
     UpdateConfig,
     ValidateConfig,
     WorkerState,
 )
-from web.charts import backtest_chart, dashboard_chart
+from web.charts import dashboard_chart
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -84,14 +80,12 @@ async def dashboard(request: Request):
         return templates.TemplateResponse(request=request, name="setup.html")
 
     state = repositories.state.load()
-    backtest = repositories.backtest.load()
 
     return templates.TemplateResponse(
         request=request,
         name="dashboard.html",
         context={
             "dashboard_chart": dashboard_chart(state, config.heat_pump.states),
-            "backtest_chart": backtest_chart(backtest),
         },
     )
 
@@ -121,54 +115,6 @@ async def config(request: Request, config: Config):
 @app.post("/api/update")
 async def update(request: Request, config: UpdateConfig):
     job = Job(type=JobType.UPDATE, config=config)
-
-    request.app.state.worker.submit(job)
-
-    return {
-        "job_id": job.id,
-        "state": WorkerState.QUEUED,
-    }
-
-
-@app.post("/api/fit")
-async def fit(request: Request, config: FitConfig):
-    job = Job(type=JobType.FIT, config=config)
-
-    request.app.state.worker.submit(job)
-
-    return {
-        "job_id": job.id,
-        "state": WorkerState.QUEUED,
-    }
-
-
-@app.post("/api/predict")
-async def predict(request: Request, config: PredictConfig):
-    job = Job(type=JobType.PREDICT, config=config)
-
-    request.app.state.worker.submit(job)
-
-    return {
-        "job_id": job.id,
-        "state": WorkerState.QUEUED,
-    }
-
-
-@app.post("/api/backtest")
-async def backtest(request: Request, config: BacktestConfig):
-    job = Job(type=JobType.BACKTEST, config=config)
-
-    request.app.state.worker.submit(job)
-
-    return {
-        "job_id": job.id,
-        "state": WorkerState.QUEUED,
-    }
-
-
-@app.post("/api/tune")
-async def tune(request: Request, config: TuneConfig):
-    job = Job(type=JobType.TUNE, config=config)
 
     request.app.state.worker.submit(job)
 

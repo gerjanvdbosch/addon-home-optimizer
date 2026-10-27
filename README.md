@@ -314,100 +314,6 @@ actions:
         } | to_json }}
 ```
 
-### Update API
-
-The `/api/update` endpoint is called from a Home Assistant automation using a
-`rest_command`.
-
-Example automation action:
-
-```yaml
-actions:
-  - action: rest_command.home_optimizer_api
-    data:
-      endpoint: update
-      payload: |
-        {{ {} | to_json }}
-```
-
-### Fit API
-
-The `/api/fit` endpoint is called from a Home Assistant automation using a
-`rest_command`.
-
-Example automation action:
-
-```yaml
-actions:
-  - action: rest_command.home_optimizer_api
-    data:
-      endpoint: fit
-      payload: |
-        {{ {
-          "target": "baseload"
-          "days": 365,
-        } | to_json }}
-```
-
-### Predict API
-
-The `/api/predict` endpoint is called from a Home Assistant automation using a
-`rest_command`.
-
-Example automation action:
-
-```yaml
-actions:
-  - action: rest_command.home_optimizer_api
-    data:
-      endpoint: predict
-      payload: |
-        {{ {
-          "target": "baseload",
-          "steps": 192
-        } | to_json }}
-```
-
-### Backtest API
-
-The `/api/backtest` endpoint is called from a Home Assistant automation using a
-`rest_command`.
-
-Example automation action:
-
-```yaml
-actions:
-  - action: rest_command.home_optimizer_api
-    data:
-      endpoint: backtest
-      payload: |
-        {{ {
-          "target": "baseload",
-          "days": 365,
-          "steps": 192
-        } | to_json }}
-```
-
-### Tune API
-
-The `/api/tune` endpoint is called from a Home Assistant automation using a
-`rest_command`.
-
-Example automation action:
-
-```yaml
-actions:
-  - action: rest_command.home_optimizer_api
-    data:
-      endpoint: tune
-      payload: |
-        {{ {
-          "target": "baseload",
-          "days": 365,
-          "trails": 5
-        } | to_json }}
-```
-
 ### Calibrate API
 
 The `/api/calibrate` endpoint is called from a Home Assistant automation using a
@@ -422,14 +328,13 @@ actions:
       endpoint: calibrate
       payload: |
         {{ {
-          "target": "boiler"
           "days": 365,
         } | to_json }}
 ```
 
-### Validate API
+### Update API
 
-The `/api/validate` endpoint is called from a Home Assistant automation using a
+The `/api/update` endpoint is called from a Home Assistant automation using a
 `rest_command`.
 
 Example automation action:
@@ -438,12 +343,9 @@ Example automation action:
 actions:
   - action: rest_command.home_optimizer_api
     data:
-      endpoint: validate
+      endpoint: update
       payload: |
-        {{ {
-          "target": "boiler"
-          "days": 365,
-        } | to_json }}
+        {{ {} | to_json }}
 ```
 
 ### Optimize API

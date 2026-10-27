@@ -4,11 +4,6 @@ from datetime import timedelta
 import numpy as np
 import pandas as pd
 from scipy.optimize import least_squares
-from sklearn.metrics import (
-    mean_absolute_error,
-    mean_squared_error,
-    r2_score,
-)
 
 from domain.config import Config, HeatPumpStates
 from domain.dataset import DatasetDefinition
@@ -24,6 +19,7 @@ from domain.physics import (
 )
 from features.dataset import DatasetBuilder
 from features.identifier import SystemIdentifier
+from features.metrics import mean_absolute_error, r2_score, root_mean_squared_error
 
 logger = logging.getLogger(__name__)
 
@@ -2132,9 +2128,9 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         measured = np.concatenate([window_measured[:, 0], window_measured[:, 1]])
         predicted = np.concatenate([simulated[:, 0], simulated[:, 1]])
 
-        r2 = float(r2_score(measured, predicted))
-        mae = float(mean_absolute_error(measured, predicted))
-        rmse = float(np.sqrt(mean_squared_error(measured, predicted)))
+        r2 = r2_score(measured, predicted)
+        mae = mean_absolute_error(measured, predicted)
+        rmse = root_mean_squared_error(measured, predicted)
 
         logger.info(
             "Boiler thermal validation (%.1fh receding-horizon rollout, %d windows): "
@@ -2160,9 +2156,9 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             seg_predicted = np.concatenate([simulated[mask, 0], simulated[mask, 1]])
 
             return {
-                "r2": float(r2_score(seg_measured, seg_predicted)),
-                "mae": float(mean_absolute_error(seg_measured, seg_predicted)),
-                "rmse": float(np.sqrt(mean_squared_error(seg_measured, seg_predicted))),
+                "r2": r2_score(seg_measured, seg_predicted),
+                "mae": mean_absolute_error(seg_measured, seg_predicted),
+                "rmse": root_mean_squared_error(seg_measured, seg_predicted),
             }
 
         idle_metrics = _segment_metrics(~window_boiler_on)

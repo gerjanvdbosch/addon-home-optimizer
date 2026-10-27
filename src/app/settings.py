@@ -16,7 +16,6 @@ from dotenv import load_dotenv
 from domain.config import Settings
 from infrastructure.home_assistant import HomeAssistant
 from infrastructure.repositories import (
-    BacktestRepository,
     ConfigRepository,
     StateRepository,
 )
@@ -27,14 +26,12 @@ from infrastructure.storage import JsonStorage
 class Repositories:
     config: ConfigRepository
     state: StateRepository
-    backtest: BacktestRepository
 
 
 def create_repositories(settings: Settings) -> Repositories:
     return Repositories(
         config=ConfigRepository(JsonStorage(settings.data_path / "config.json")),
         state=StateRepository(JsonStorage(settings.data_path / "state.json")),
-        backtest=BacktestRepository(JsonStorage(settings.data_path / "backtest.json")),
     )
 
 

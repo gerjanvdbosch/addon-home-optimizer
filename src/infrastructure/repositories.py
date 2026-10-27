@@ -3,7 +3,7 @@ import logging
 from pydantic import ValidationError
 
 from domain.config import Config
-from domain.state import BacktestResult, State
+from domain.state import State
 from infrastructure.storage import JsonStorage
 
 
@@ -42,27 +42,3 @@ class StateRepository:
             logging.warning("Invalid state: %s", e)
 
             return State()
-
-
-class BacktestRepository:
-    def __init__(self, storage: JsonStorage):
-        self.storage = storage
-
-    def save(self, df: BacktestResult):
-        self.storage.save(df)
-
-    def load(self) -> BacktestResult | None:
-        data = self.storage.load()
-
-        if not data:
-            return None
-
-        try:
-            return BacktestResult.model_validate(data)
-        except ValidationError as e:
-            logging.warning("Invalid backtest result: %s", e)
-
-            return None
-
-    def clear(self) -> None:
-        self.storage.remove()

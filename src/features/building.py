@@ -37,10 +37,10 @@ from domain.physics import (
     extension_shaded_fraction,
     floor_heat_moved_w,
     floor_heat_w,
-    night_share,
     floor_living_fraction,
     floor_loops_conductance_w_per_k,
     internal_gain_w,
+    night_share,
     solar_gain_w,
     zone_floor,
     zone_observation,
@@ -52,6 +52,7 @@ from domain.sensors import Aggregation, FillMethod, SensorReference
 from domain.time import LOCAL_TIMEZONE, to_local_time
 from features.dataset import DatasetBuilder
 from features.identifier import SystemIdentifier
+from features.metrics import mean_absolute_error, r2_score, root_mean_squared_error
 
 logger = logging.getLogger(__name__)
 
@@ -1660,14 +1661,12 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     ) -> float:
         """How much of persistence's error the model removes, 0 = no better."""
 
-        from sklearn.metrics import mean_absolute_error
-
-        baseline = float(mean_absolute_error(measured, persistence))
+        baseline = mean_absolute_error(measured, persistence)
 
         if baseline <= 0.0:
             return float("nan")
 
-        return 1.0 - float(mean_absolute_error(measured, predicted)) / baseline
+        return 1.0 - mean_absolute_error(measured, predicted) / baseline
 
     @staticmethod
     def _trend(error: np.ndarray, *drives: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1691,11 +1690,6 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         never evidence that the model is physically right.
         """
 
-        # Imported here, not at the top: the state update loads this module
-        # every few minutes for estimate() and forecast() alone, and sklearn
-        # was a third of its import time.
-        from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-
         model = self.get_model()
 
         df = self.prepare(df)
@@ -1715,9 +1709,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 np.nanmean(np.abs(measured_both[:, 1] - predicted_both[:, 1]))
             ),
             "scored_samples": float(len(predicted)),
-            "r2": float(r2_score(measured, predicted)),
-            "mae": float(mean_absolute_error(measured, predicted)),
-            "rmse": float(np.sqrt(mean_squared_error(measured, predicted))),
+            "r2": r2_score(measured, predicted),
+            "mae": mean_absolute_error(measured, predicted),
+            "rmse": root_mean_squared_error(measured, predicted),
             # A systematic offset is what matters for planning a setpoint, and
             # it is invisible in MAE alone.
             "bias_k": float(np.mean(predicted - measured)),
@@ -1732,7 +1726,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         anchors = measured.reshape(windows, horizon_samples)[:, :1]
         persistence = np.repeat(anchors, horizon_samples, axis=1).ravel()
 
-        metrics["mae_persistence"] = float(mean_absolute_error(measured, persistence))
+        metrics["mae_persistence"] = mean_absolute_error(measured, persistence)
         metrics["skill_vs_persistence"] = self._skill(measured, predicted, persistence)
 
         # The overall skill is an average over both regimes, and one of them
@@ -1748,14 +1742,14 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 continue
 
             metrics[f"samples_{label}"] = float(mask.sum())
-            metrics[f"mae_{label}"] = float(
-                mean_absolute_error(measured[mask], predicted[mask])
+            metrics[f"mae_{label}"] = mean_absolute_error(
+                measured[mask], predicted[mask]
             )
             metrics[f"bias_{label}_k"] = float(
                 np.mean(predicted[mask] - measured[mask])
             )
-            metrics[f"mae_persistence_{label}"] = float(
-                mean_absolute_error(measured[mask], persistence[mask])
+            metrics[f"mae_persistence_{label}"] = mean_absolute_error(
+                measured[mask], persistence[mask]
             )
             metrics[f"skill_{label}"] = self._skill(
                 measured[mask], predicted[mask], persistence[mask]

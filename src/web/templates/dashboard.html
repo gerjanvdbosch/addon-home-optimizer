@@ -8,14 +8,8 @@
 </head>
 <body>
 <h1>Home Optimizer</h1>
-{% if backtest_chart %}
-<div class="chart-container">
-    {{ backtest_chart | safe }}
-</div>
-{% else %}
 <div class="chart-container">
     {{ dashboard_chart | safe }}
 </div>
-{% endif %}
 </body>
 </html>

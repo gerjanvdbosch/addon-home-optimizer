@@ -5,11 +5,6 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from scipy.optimize import least_squares
-from sklearn.metrics import (
-    mean_absolute_error,
-    mean_squared_error,
-    r2_score,
-)
 
 from domain.config import Config, HeatPumpStates
 from domain.dataset import DatasetDefinition
@@ -19,6 +14,7 @@ from domain.physics import CP_WATER_J_PER_KG_K, RHO_WATER_KG_PER_L
 from features.boiler import BoilerThermalIdentifier, booster_active
 from features.dataset import DatasetBuilder
 from features.identifier import SystemIdentifier
+from features.metrics import mean_absolute_error, r2_score, root_mean_squared_error
 
 logger = logging.getLogger(__name__)
 
@@ -964,28 +960,9 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             self.model.cooling,
         )
 
-        r2 = float(
-            r2_score(
-                COP_measured,
-                COP_predicted,
-            )
-        )
-
-        mae = float(
-            mean_absolute_error(
-                COP_measured,
-                COP_predicted,
-            )
-        )
-
-        rmse = float(
-            np.sqrt(
-                mean_squared_error(
-                    COP_measured,
-                    COP_predicted,
-                )
-            )
-        )
+        r2 = r2_score(COP_measured, COP_predicted)
+        mae = mean_absolute_error(COP_measured, COP_predicted)
+        rmse = root_mean_squared_error(COP_measured, COP_predicted)
 
         logger.info(
             "Heat pump COP validation (%s): R2=%.4f, MAE=%.4f, RMSE=%.4f",

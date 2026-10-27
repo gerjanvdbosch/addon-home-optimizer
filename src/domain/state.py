@@ -9,8 +9,6 @@ from typing import Generic, TypeVar
 
 from pydantic import BaseModel, Field
 
-from domain.models import ForecasterType
-
 P = TypeVar("P")
 
 
@@ -130,6 +128,17 @@ class TapHabit(BaseModel):
     heavy_day_w: float | None
 
 
+class BaseloadHabit(BaseModel):
+    """The baseload's habit (see BaseloadForecaster.habit): its p10, median and
+    p90 per local quarter hour of the week from Monday 00:00 (W, 672 each).
+    Made once a day."""
+
+    day: date
+    p10_w: list[float]
+    p50_w: list[float]
+    p90_w: list[float]
+
+
 class Predictions(BaseModel):
     solar: list[SeriesPoint[float]] = Field(default_factory=list)
     # Calibrated p10/p90 band around `solar` (see features.solar.predict_solar_band),
@@ -137,7 +146,7 @@ class Predictions(BaseModel):
     solar_p10: list[SeriesPoint[float]] = Field(default_factory=list)
     solar_p90: list[SeriesPoint[float]] = Field(default_factory=list)
     baseload: list[SeriesPoint[float]] = Field(default_factory=list)
-    # The band around `baseload` (see BaseloadForecaster.band_quantiles), the
+    # The band around `baseload` (see BaseloadForecaster.BAND_QUANTILES), the
     # MPC's low and high baseload scenarios.
     baseload_p10: list[SeriesPoint[float]] = Field(default_factory=list)
     baseload_p90: list[SeriesPoint[float]] = Field(default_factory=list)
@@ -158,6 +167,7 @@ class Predictions(BaseModel):
     dew_point: list[SeriesPoint[float]] = Field(default_factory=list)
     zone_habit: ZoneHabit | None = None
     tap_habit: TapHabit | None = None
+    baseload_habit: BaseloadHabit | None = None
 
 
 class BoilerSchedule(BaseModel):
@@ -208,20 +218,3 @@ class State(BaseModel):
     forecast: Forecast = Field(default_factory=Forecast)
     predictions: Predictions = Field(default_factory=Predictions)
     schedule: Schedule = Field(default_factory=Schedule)
-
-
-class BacktestPoint(BaseModel):
-    label: str
-    points: list[dict[str, object]]
-    color: str | None = None
-    group: str | None = None
-
-
-class BacktestResult(BaseModel):
-    name: ForecasterType
-    label: str
-    unit: str
-    mae: float
-    rmse: float
-    r2: float
-    points: list[BacktestPoint]

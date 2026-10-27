@@ -11,7 +11,6 @@ from typing import ClassVar, Literal
 
 import numpy as np
 
-ForecasterType = Literal["baseload"]
 # The tank sensors report in steps of this (K; every reading on real data lies
 # on a 0.5 K grid), and at rest they flip between two neighbouring steps: a
 # difference of one step is no stratification the sensors can show.

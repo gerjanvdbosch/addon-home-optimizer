@@ -14,10 +14,9 @@ from infrastructure.loaders import (
     AttributeTimeSeriesLoader,
     TimeSeriesLoader,
 )
-from infrastructure.repositories import BacktestRepository, ConfigRepository
+from infrastructure.repositories import ConfigRepository
 
 if TYPE_CHECKING:
-    from app.forecasting import Forecasting
     from app.identification import Identification
     from app.optimization import Optimization
 
@@ -26,33 +25,15 @@ if TYPE_CHECKING:
 class Container:
     """What a job runs with. Every job starts a fresh process (see
     app.worker), so the services only some jobs use are built - and their
-    libraries imported - when a job first asks for them: forecasting's
-    skforecast, sklearn and optuna and the optimizer's pyomo took 1.9 of a
-    state update's 5 seconds while it used none of them."""
+    libraries imported - when a job first asks for them: the optimizer's
+    pyomo and the modelling libraries took 1.9 of a state update's 5 seconds
+    while it used none of them."""
 
     settings: Settings
     config_repository: ConfigRepository
     state_manager: StateManager
-    backtest_repository: BacktestRepository
     dataset_loader: DatasetLoader
     models_path: Path
-
-    @cached_property
-    def forecasting(self) -> "Forecasting":
-        from app.forecasting import Forecasting
-        from features.baseload import BaseloadForecaster
-
-        return Forecasting(
-            loader=self.dataset_loader,
-            backtest_repository=self.backtest_repository,
-            config_repository=self.config_repository,
-            state_manager=self.state_manager,
-            path=self.models_path,
-            study_storage=f"sqlite:///{self.models_path / 'optuna.db'}",
-            forecasters=[
-                BaseloadForecaster(),
-            ],
-        )
 
     @cached_property
     def identification(self) -> "Identification":
@@ -69,7 +50,6 @@ class Container:
 
         return Identification(
             loader=self.dataset_loader,
-            backtest_repository=self.backtest_repository,
             config_repository=self.config_repository,
             state_manager=self.state_manager,
             path=self.models_path,
@@ -153,7 +133,6 @@ def create_container() -> Container:
             latitude=settings.latitude,
             longitude=settings.longitude,
         ),
-        backtest_repository=repositories.backtest,
         dataset_loader=dataset_loader,
         models_path=models_path,
     )

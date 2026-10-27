@@ -9,16 +9,12 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from domain.config import Config
-from domain.models import ForecasterType, IdentificationType
+from domain.models import IdentificationType
 
 
 class JobType(str, Enum):
     CONFIG = "config"
     UPDATE = "update"
-    FIT = "fit"
-    PREDICT = "predict"
-    TUNE = "tune"
-    BACKTEST = "backtest"
     CALIBRATE = "calibrate"
     VALIDATE = "validate"
     OPTIMIZE = "optimize"
@@ -36,28 +32,6 @@ JsonType = dict[str, Any] | list[Any]
 
 
 class UpdateConfig(BaseModel): ...
-
-
-class FitConfig(BaseModel):
-    target: ForecasterType | None = Field(default=None)
-    days: int = Field(default=90)
-
-
-class PredictConfig(BaseModel):
-    target: ForecasterType | None = Field(default=None)
-    steps: int = Field(default=192)
-
-
-class BacktestConfig(BaseModel):
-    target: ForecasterType
-    days: int = Field(default=90)
-    # Same horizon as PredictConfig.steps, so backtest and tune measure the
-    # forecast the optimizer actually receives, not a shorter, easier one.
-    steps: int = Field(default=192)
-
-
-class TuneConfig(BacktestConfig):
-    trails: int = Field(default=10)
 
 
 class CalibrateConfig(BaseModel):
@@ -78,8 +52,8 @@ class ValidateConfig(BaseModel):
 
 
 class OptimizeConfig(BaseModel):
-    # The most the MPC horizon may span, in 15-minute steps (same convention
-    # as PredictConfig.steps); it ends at the end of tomorrow (see
+    # The most the MPC horizon may span, in 15-minute steps; it ends at the
+    # end of tomorrow (see
     # Optimization.run).
     steps: int = Field(default=192)
     # Also log the plan beside alternatives that finish its first run earlier
@@ -96,15 +70,5 @@ class OptimizeConfig(BaseModel):
 @dataclass
 class Job:
     type: JobType
-    config: (
-        Config
-        | UpdateConfig
-        | FitConfig
-        | PredictConfig
-        | TuneConfig
-        | BacktestConfig
-        | CalibrateConfig
-        | ValidateConfig
-        | OptimizeConfig
-    )
+    config: Config | UpdateConfig | CalibrateConfig | ValidateConfig | OptimizeConfig
     id: str = field(default_factory=lambda: uuid.uuid4().hex)

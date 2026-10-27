@@ -65,7 +65,6 @@ class _ConfigRepository:
 def _identification(identifiers, tmp_path) -> Identification:
     return Identification(
         loader=_Loader(),
-        backtest_repository=None,
         config_repository=_ConfigRepository(),
         state_manager=None,
         path=tmp_path,

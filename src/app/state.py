@@ -11,7 +11,7 @@ from domain.config import Config
 from domain.dataset import DatasetDefinition
 from domain.mpc import MPCConfig
 from domain.physics import tank_stratification_k
-from domain.state import SeriesPoint, State, TapHabit, ZoneHabit
+from domain.state import BaseloadHabit, SeriesPoint, State, TapHabit, ZoneHabit
 from domain.time import local_day_start, to_local_time
 from features.dataset import DatasetBuilder, DatasetLoader
 from features.solar import (
@@ -395,8 +395,11 @@ class StateManager:
 
         self.state_repository.save(state)
 
-    def update_habit(self, name: str, habit: ZoneHabit | TapHabit) -> None:
-        """A habit made today (see Predictions.zone_habit, tap_habit)."""
+    def update_habit(
+        self, name: str, habit: ZoneHabit | TapHabit | BaseloadHabit
+    ) -> None:
+        """A habit made today (see Predictions.zone_habit, tap_habit,
+        baseload_habit)."""
 
         state = self.load()
         setattr(state.predictions, name, habit)

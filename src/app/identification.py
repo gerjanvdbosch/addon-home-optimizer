@@ -6,7 +6,7 @@ from typing import Any
 from domain.jobs import CalibrateConfig, ValidateConfig
 from features.dataset import DatasetLoader
 from features.identifier import SystemIdentifier
-from infrastructure.repositories import BacktestRepository, ConfigRepository
+from infrastructure.repositories import ConfigRepository
 
 logger = logging.getLogger(__name__)
 
@@ -15,14 +15,12 @@ class Identification:
     def __init__(
         self,
         loader: DatasetLoader,
-        backtest_repository: BacktestRepository,
         config_repository: ConfigRepository,
         state_manager: Any,
         path: Path,
         identifiers: list[SystemIdentifier],
     ):
         self.loader = loader
-        self.backtest_repository = backtest_repository
         self.config_repository = config_repository
         self.state_manager = state_manager
         self.path = path

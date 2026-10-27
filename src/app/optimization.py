@@ -20,8 +20,9 @@ from domain.physics import (
     mains_water_temperature_c,
 )
 from domain.sensors import SensorReference
-from domain.state import SeriesPoint, State, TapHabit, ZoneHabit
+from domain.state import BaseloadHabit, SeriesPoint, State, TapHabit, ZoneHabit
 from domain.time import local_day_start, to_local_time
+from features.baseload import BaseloadForecaster
 from features.boiler import BoilerThermalIdentifier
 from features.building import BuildingThermalIdentifier
 from features.cop import HeatPumpCOPIdentifier
@@ -95,6 +96,13 @@ class Optimization:
             optimize_config.steps, (local_day_start(now, days=2) - first) // step
         )
         forecast_times = [first + i * step for i in range(steps)]
+
+        # The baseload ahead (see BaseloadForecaster), into the predictions the
+        # plan, the zone and the charts read.
+        for name, series in self._baseload(state, config, now, forecast_times).items():
+            self.state_manager.update_prediction(name, series)
+
+        state = self.state_manager.load()
 
         def extended(
             points: list[SeriesPoint], fallback: float | None = None
@@ -975,6 +983,32 @@ class Optimization:
         return max(
             candidates,
             key=lambda k: (covered[k] - covered[max(k - run_steps, 0)], k),
+        )
+
+    def _baseload(
+        self, state: State, config: Config, now: datetime, times: list[datetime]
+    ) -> pd.DataFrame:
+        """The baseload at `times` from its habit (see BaseloadForecaster.habit),
+        made once a day and kept in the state: its twelve weeks load in a
+        second or so, and a day moves the median one week in eight."""
+
+        baseload = BaseloadForecaster()
+        today = to_local_time(now).date()
+        habit = state.predictions.baseload_habit
+
+        if habit is None or habit.day != today:
+            p10, p50, p90 = baseload.habit(
+                self.loader.load(
+                    baseload.dataset(config),
+                    now - timedelta(weeks=BaseloadForecaster.BAND_WEEKS, days=1),
+                    now,
+                )
+            )
+            habit = BaseloadHabit(day=today, p10_w=p10, p50_w=p50, p90_w=p90)
+            self.state_manager.update_habit("baseload_habit", habit)
+
+        return baseload.predict(
+            (habit.p10_w, habit.p50_w, habit.p90_w), pd.DatetimeIndex(times)
         )
 
     def _tap_habit(
