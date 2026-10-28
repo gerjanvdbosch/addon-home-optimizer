@@ -126,7 +126,7 @@ def test_prepare_builds_the_target(tmp_path):
     assert (prepared["excess_loss_w"] < 0).any()
 
     # The same draws per kelvin above the mains: January's are some 30 K.
-    mains_c = [mains_water_temperature_c(day) for day in prepared.index.dayofyear]
+    mains_c = [mains_water_temperature_c(day) for day in prepared.index.day_of_year]
     np.testing.assert_allclose(
         prepared["draw_w_per_k"] * (40.0 - np.array(mains_c)),
         prepared["excess_loss_w"],

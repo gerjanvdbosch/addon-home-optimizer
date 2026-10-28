@@ -341,6 +341,8 @@ class StateManager:
         times: list[datetime],
         heat_w: Sequence[float] = (),
         now: datetime | None = None,
+        dhw_running: bool = False,
+        run_temperatures: Sequence[SeriesPoint] = (),
     ) -> None:
         state = self.load()
 
@@ -355,14 +357,24 @@ class StateManager:
 
         # The first is the tank the plan starts from now, not at its quarter's
         # start: drawn there, a heating tank's line ran up to 15 minutes ahead.
-        state.schedule.heat_pump.boiler.temperatures = [
-            SeriesPoint(time=t, value=float(val))
-            for t, val in zip(
+        # Through a DHW run under way it is left out: the line shows only the
+        # quarters, from the tank before the run (see _tank_temperature)
+        # through the quarters the run has ended, by its heat balance, to the
+        # plan's.
+        tank = list(
+            zip(
                 [now, *times[1:]] if now and times else times,
                 temperatures,
                 strict=False,
             )
+        )
+        state.schedule.heat_pump.boiler.temperatures = [
+            SeriesPoint(time=t, value=float(val))
+            for t, val in (tank[1:] if dhw_running else tank)
         ]
+
+        if dhw_running:
+            state.schedule.heat_pump.boiler.temperatures[:0] = run_temperatures
         state.schedule.heat_pump.boiler.on = [
             SeriesPoint(time=t, value=int(on))
             for t, on in zip(times, schedule, strict=False)
@@ -619,7 +631,8 @@ class StateManager:
         sensors lag the heat the plan starts from (see
         MPCOptimizer._initial_temperature), 3.3 K on average 15-30 minutes
         in over 19 runs in October, and the plan's line takes over from the
-        tank before it."""
+        tank before it - until the booster takes over, when the plan starts
+        from the sensors again."""
 
         top = pd.to_numeric(df["boiler_top_temperature"], errors="coerce")
         bottom = pd.to_numeric(df["boiler_bottom_temperature"], errors="coerce")
@@ -649,15 +662,29 @@ class StateManager:
             if i == 0 or (c.value == dhw) != (changes[i - 1].value == dhw)
         ]
 
+        frequency = pd.to_numeric(
+            df.get("heat_pump_compressor_frequency", pd.Series(index=df.index)),
+            errors="coerce",
+        )
+
         for i, change in enumerate(runs):
             if change.value != dhw:
                 continue
 
-            if i + 1 == len(runs):
-                tank[read > change.time] = float("nan")
-                continue
+            inside = read > change.time
 
-            inside = (read > change.time) & (read <= runs[i + 1].time)
+            if i + 1 < len(runs):
+                inside &= read <= runs[i + 1].time
+            else:
+                # At 0 Hz after the compressor has run, the booster has taken
+                # over and the plan starts from the sensors (see Optimization.
+                # dhw_timing): drawn as a run that has ended.
+                ran = frequency[inside].dropna()
+
+                if not ((ran > 0.0).any() and ran.iloc[-1] <= 0.0):
+                    tank[inside] = float("nan")
+                    continue
+
             before = tank[(read <= change.time) & tank.notna()].iloc[-1:]
             tank[inside] = (
                 pd.concat([before, tank[inside]]).cummax().iloc[len(before) :]

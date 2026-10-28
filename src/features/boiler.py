@@ -7,7 +7,7 @@ from scipy.optimize import least_squares
 
 from domain.config import Config, HeatPumpStates
 from domain.dataset import DatasetDefinition
-from domain.dynamics import discretize_zoh
+from domain.dynamics import discrete_steps, discretize_zoh
 from domain.models import TANK_SENSOR_RESOLUTION_K, BoilerThermalModel
 from domain.mpc import MPCConfig
 from domain.physics import (
@@ -85,27 +85,64 @@ def _model_from_parameters(
     )
 
 
-def _resolve_q_in(
+def _steps(
     model: BoilerThermalModel,
-    on: bool,
-    index: int,
-    q_in_override: np.ndarray | None,
-) -> float:
-    """The fitted Q_in_nominal_w is the default heat input while boiler_on; a
-    calorimetric override (real flow*deltaT power, NaN where unavailable/invalid -
-    see BoilerThermalIdentifier.prepare) takes precedence wherever it exists, since
-    it reflects genuine time-varying delivered power instead of one average value.
+    T_ambient: np.ndarray,
+    boiler_on: np.ndarray,
+    dt_seconds: np.ndarray,
+    q_in_override: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """(A_d, B_d u) of the step into each sample after the first, stacked.
+
+    Zero-order hold: the boiler_on/T_ambient value at the START of each interval
+    governs that interval, matching the standard ZOH convention used for the
+    discretization itself. While heating, a calorimetric override (real
+    flow*deltaT power, NaN where unavailable/invalid - see
+    BoilerThermalIdentifier.prepare) takes precedence over the fitted
+    q_in_nominal_w wherever it exists, since it reflects genuine time-varying
+    delivered power instead of one average value.
     """
 
-    if not on:
-        return 0.0
+    on = np.asarray(boiler_on[:-1], dtype=bool)
+    idle, active = (
+        discrete_steps(
+            *tank_state_space(
+                model.volume_l, model.ua_top_w_per_k, model.ua_bottom_w_per_k, ua_mix
+            ),
+            dt_seconds,
+        )
+        for ua_mix in (model.ua_mix_idle_w_per_k, model.ua_mix_active_w_per_k)
+    )
+    a_d = np.where(on[:, None, None], active[0], idle[0])
+    b_d = np.where(on[:, None, None], active[1], idle[1])
+
+    q_in = np.where(on, model.q_in_nominal_w, 0.0)
 
     if q_in_override is not None:
-        override = q_in_override[index]
-        if not np.isnan(override):
-            return float(override)
+        override = np.asarray(q_in_override[:-1], dtype=float)
+        q_in = np.where(on & ~np.isnan(override), override, q_in)
 
-    return model.q_in_nominal_w
+    u = np.column_stack([np.asarray(T_ambient[:-1], dtype=float), q_in])
+
+    return a_d, np.einsum("kij,kj->ki", b_d, u)
+
+
+def _simulate(
+    a_steps: np.ndarray, drives: np.ndarray, initial: np.ndarray
+) -> np.ndarray:
+    """x[i] = A_d x[i-1] + B_d u from `initial` - or many windows at once,
+    each along a leading axis."""
+
+    n = a_steps.shape[-3] + 1
+    simulated = np.empty((*initial.shape[:-1], n, 2))
+    simulated[..., 0, :] = initial
+
+    for i in range(1, n):
+        simulated[..., i, :] = (
+            a_steps[..., i - 1, :, :] @ simulated[..., i - 1, :, None]
+        )[..., 0] + drives[..., i - 1, :]
+
+    return simulated
 
 
 def _predict_next_states(
@@ -117,42 +154,12 @@ def _predict_next_states(
     dt_seconds: np.ndarray,
     q_in_override: np.ndarray | None = None,
 ) -> np.ndarray:
-    """One-step-ahead prediction: state[i-1] + input[i-1] held over dt_seconds[i].
+    """One-step-ahead prediction: state[i-1] + input[i-1] held over dt_seconds[i]."""
 
-    Zero-order hold: the boiler_on/T_ambient value at the START of each interval
-    governs that interval, matching the standard ZOH convention used for the
-    discretization itself.
-    """
+    a_d, drives = _steps(model, T_ambient, boiler_on, dt_seconds, q_in_override)
+    states = np.column_stack([T_top[:-1], T_bottom[:-1]])
 
-    n = len(T_top)
-
-    predictions = np.empty((n - 1, 2))
-
-    cache: dict[tuple[bool, float], tuple[np.ndarray, np.ndarray]] = {}
-
-    for i in range(1, n):
-        on = bool(boiler_on[i - 1])
-        dt = float(dt_seconds[i])
-        key = (on, round(dt, 3))
-
-        if key not in cache:
-            ua_mix = model.ua_mix_active_w_per_k if on else model.ua_mix_idle_w_per_k
-            a, b = tank_state_space(
-                model.volume_l,
-                model.ua_top_w_per_k,
-                model.ua_bottom_w_per_k,
-                ua_mix,
-            )
-            cache[key] = discretize_zoh(a, b, dt)
-
-        a_d, b_d = cache[key]
-        q_in = _resolve_q_in(model, on, i - 1, q_in_override)
-        state = np.array([T_top[i - 1], T_bottom[i - 1]])
-        u = np.array([T_ambient[i - 1], q_in])
-
-        predictions[i - 1] = a_d @ state + b_d @ u
-
-    return predictions
+    return np.einsum("kij,kj->ki", a_d, states) + drives
 
 
 def _rollout(
@@ -173,35 +180,9 @@ def _rollout(
     occurred - see BoilerThermalIdentifier.validate.
     """
 
-    n = len(T_ambient)
+    a_d, drives = _steps(model, T_ambient, boiler_on, dt_seconds, q_in_override)
 
-    simulated = np.empty((n, 2))
-    simulated[0] = [T_top_0, T_bottom_0]
-
-    cache: dict[tuple[bool, float], tuple[np.ndarray, np.ndarray]] = {}
-
-    for i in range(1, n):
-        on = bool(boiler_on[i - 1])
-        dt = float(dt_seconds[i])
-        key = (on, round(dt, 3))
-
-        if key not in cache:
-            ua_mix = model.ua_mix_active_w_per_k if on else model.ua_mix_idle_w_per_k
-            a, b = tank_state_space(
-                model.volume_l,
-                model.ua_top_w_per_k,
-                model.ua_bottom_w_per_k,
-                ua_mix,
-            )
-            cache[key] = discretize_zoh(a, b, dt)
-
-        a_d, b_d = cache[key]
-        q_in = _resolve_q_in(model, on, i - 1, q_in_override)
-        u = np.array([T_ambient[i - 1], q_in])
-
-        simulated[i] = a_d @ simulated[i - 1] + b_d @ u
-
-    return simulated
+    return _simulate(a_d, drives, np.array([T_top_0, T_bottom_0], dtype=float))
 
 
 class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
@@ -611,7 +592,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         q_in_override = train_df["q_in_override_w"].to_numpy(dtype=float)
         confirmed_away_settled = train_df["confirmed_away_settled"].to_numpy(dtype=bool)
 
-        # q_in_nominal_w is only ever USED (see _resolve_q_in) on heating
+        # q_in_nominal_w is only ever USED (see _steps) on heating
         # timesteps lacking a valid calorimetric override - wherever the
         # installation's own T_supply/T_return/flow sensors are configured and
         # valid, they determine Q_in directly and q_in_nominal_w's fitted value
@@ -627,7 +608,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         # real average delivered power - a better anchor for q_in_nominal_w than
         # letting least_squares fit it freely, since that fit is only ever
         # informed by the (typically very few) heating timesteps lacking a
-        # valid override (see _resolve_q_in and prepare()'s Q=0 handling for
+        # valid override (see _steps and prepare()'s Q=0 handling for
         # T_supply<=T_return): a small, arbitrary, sensor-limited remainder
         # (real flow reading missing entirely), not representative evidence
         # for the installation's real heating power. Below
@@ -733,28 +714,25 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             self.PASSIVE_DECAY_HORIZON_HOURS,
         )
 
+        measured = np.column_stack([T_top, T_bottom])
+        decay_starts = np.array([start for start, _ in decay_windows], dtype=int)
+        # See _clean_idle_decay_windows: each spans the same number of steps.
+        decay_length = decay_windows[0][1] - decay_windows[0][0] if decay_windows else 0
+
         def decay_residuals(parameters: np.ndarray) -> np.ndarray:
             if not decay_windows:
                 return np.empty(0)
 
             model = _model_from_parameters(parameters, self.volume_l)
-            pieces = []
+            a_d, drives = _steps(model, T_ambient, boiler_on, dt_seconds)
 
-            for start, end in decay_windows:
-                simulated = _rollout(
-                    model,
-                    T_top[start],
-                    T_bottom[start],
-                    T_ambient[start : end + 1],
-                    boiler_on[start : end + 1],
-                    dt_seconds[start : end + 1],
-                )
-                actual = np.column_stack(
-                    [T_top[start : end + 1], T_bottom[start : end + 1]]
-                )
-                pieces.append((simulated - actual)[1:].ravel())
+            # Every window the same length and independent of the others, so
+            # all simulated at once.
+            steps = decay_starts[:, None] + np.arange(decay_length)
+            simulated = _simulate(a_d[steps], drives[steps], measured[decay_starts])
+            actual = measured[decay_starts[:, None] + np.arange(decay_length + 1)]
 
-            return np.concatenate(pieces)
+            return (simulated - actual)[:, 1:].ravel()
 
         def row_residuals(parameters: np.ndarray) -> np.ndarray:
             model = _model_from_parameters(parameters, self.volume_l)
@@ -1748,10 +1726,12 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         # and the layer fills well before it (real data: 2.65 K against 7.5 K;
         # the tank's mean before a run within 0.86 K instead of 1.2 K on runs
         # left out of the fit).
+        # Never warmer than the top sensor, as mixed_temperature reads it.
         def residuals(p: np.ndarray) -> np.ndarray:
             f, layer, spread = p
             share = np.clip(stratification_k / spread, 0.0, 1.0)
-            return average_c - f * share * (above_ambient_c - layer) - mean_c
+            layer_c = np.minimum(ambient_c + layer, top_c)
+            return average_c - f * share * (average_c - layer_c) - mean_c
 
         max_spread_k = float(stratification_k.max())
         fit = least_squares(
@@ -1792,13 +1772,33 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         element with its own constant rating, identified separately.
         """
 
+        steady_values, runs = self._ramp_runs(df)
+
+        if len(runs) < self.MIN_RAMP_RUNS:
+            return None, None
+
+        steady = float(np.median(steady_values))
+        ramp = 2.0 * float(np.median([deficit for _, _, deficit in runs])) / steady
+
+        if not 0.0 < ramp <= self.MAX_RAMP_SECONDS:
+            return None, None
+
+        return steady, ramp
+
+    def _ramp_runs(
+        self, df: pd.DataFrame
+    ) -> tuple[list[float], list[tuple[int, float, float]]]:
+        """The steady heat (W) of every run that shows one, and (first row,
+        steady heat W, start-up shortfall J) of each that also shows its whole
+        start-up (see _identify_heat_input_ramp)."""
+
         q = df["q_in_override_w"].to_numpy(dtype=float)
         on = df["boiler_on"].to_numpy(dtype=bool)
         booster = df["booster_on"].to_numpy(dtype=bool)
         seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
 
         steady_values: list[float] = []
-        deficits: list[float] = []
+        runs: list[tuple[int, float, float]] = []
 
         for start in np.flatnonzero(on & ~np.r_[True, on[:-1]]):
             end = start
@@ -1830,18 +1830,11 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
             interval_s = np.diff(seconds[start : end + 1])[window[:-1]]
             delivered = float((heat[window] * interval_s).sum())
-            deficits.append(steady * float(interval_s.sum()) - delivered)
+            runs.append(
+                (int(start), steady, steady * float(interval_s.sum()) - delivered)
+            )
 
-        if len(deficits) < self.MIN_RAMP_RUNS:
-            return None, None
-
-        steady = float(np.median(steady_values))
-        ramp = 2.0 * float(np.median(deficits)) / steady
-
-        if not 0.0 < ramp <= self.MAX_RAMP_SECONDS:
-            return None, None
-
-        return steady, ramp
+        return steady_values, runs
 
     def _identify_booster(
         self, df: pd.DataFrame

@@ -503,6 +503,19 @@ def test_the_booster_is_no_compressor_run():
     ) == (True, None, 0.0)
 
 
+def test_a_compressor_pause_mid_run_keeps_the_run():
+    """0 Hz for two minutes mid-run, the compressor up again after (real
+    data, 17 Oct 2026): one run from its change into DHW, not a new one from
+    the restart."""
+
+    state = _changes(("09:00:00", "Uit"), ("11:45:45", "SWW"))
+    frequency = _changes(("11:49:00", 40.0), ("12:02:22", 0.0), ("12:04:32", 18.0))
+
+    assert Optimization.dhw_timing(
+        state, frequency, "SWW", DAY + pd.Timedelta("12:10:00")
+    ) == (True, DAY + pd.Timedelta("11:45:45"), 0.0)
+
+
 def test_the_pause_runs_from_the_change_that_ended_the_run():
     state = _changes(("13:15:38", "SWW"), ("13:53:30", "Uit"))
 

@@ -65,8 +65,10 @@ class Container:
                 # (see the class docstring).
                 HeatPumpCOPIdentifier(key="heating", models_path=self.models_path),
                 HeatPumpCOPIdentifier(key="cooling", models_path=self.models_path),
-                BuildingThermalIdentifier(latitude=latitude, longitude=longitude),
                 SolarBiasIdentifier(latitude=latitude, longitude=longitude),
+                # The building and its floor circuits next to each other: they
+                # load the same data, once (see Identification._prepare).
+                BuildingThermalIdentifier(latitude=latitude, longitude=longitude),
                 # After the building: it fits against that model's estimate of
                 # the floor's mass.
                 FloorCircuitIdentifier(

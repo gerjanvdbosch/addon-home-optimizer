@@ -117,6 +117,6 @@ class BaseloadForecaster:
         """The quarter hour of the local week, Monday 00:00 = 0."""
 
         return np.asarray(
-            (index.dayofweek * 24 + index.hour) * self.QUARTERS_PER_HOUR
+            (index.day_of_week * 24 + index.hour) * self.QUARTERS_PER_HOUR
             + index.minute // 15
         )

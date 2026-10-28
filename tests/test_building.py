@@ -15,12 +15,12 @@ from domain.physics import (
     Q_PERSON_SENSIBLE_W,
     RHO_AIR_KG_PER_M3,
     envelope_conductance_w_per_k,
-    night_share,
     extension_shaded_fraction,
     floor_heat_moved_w,
     floor_heat_w,
     floor_living_fraction,
     floor_loops_conductance_w_per_k,
+    night_share,
     solar_gain_w,
     zone_observation,
     zone_observations,
@@ -186,8 +186,22 @@ def _raw_frame() -> pd.DataFrame:
     )
 
 
+class _ShutWindows(BuildingThermalIdentifier):
+    """The synthetic house never opens its windows, so its fits hold them
+    shut at TRUE_MODEL's, as configured extensions are held: free, they are
+    six parameters this data cannot see, and the fit wanders through them -
+    three times the evaluations for the same other parameters."""
+
+    def _bounds(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        lower, initial, upper = super()._bounds()
+        shut = ["window" in name for name in self.PARAMETER_NAMES]
+        lower[shut] = initial[shut] = upper[shut] = self._parameters(TRUE_MODEL)[shut]
+
+        return lower, initial, upper
+
+
 def _identifier() -> BuildingThermalIdentifier:
-    identifier = BuildingThermalIdentifier(latitude=52.39, longitude=5.79)
+    identifier = _ShutWindows(latitude=52.39, longitude=5.79)
     identifier.room_areas_m2 = [
         TRUE_LIVING_AREA_M2,
         TRUE_ZONE_AREA_M2 - TRUE_LIVING_AREA_M2,
@@ -265,15 +279,14 @@ def _simulate(
 
 
 @functools.cache
-def _fitted(with_future: bool):
+def _fitted():
     """One fit, shared by every test that only needs a calibrated model: the
     fit is the slow part, and nothing these tests check depends on it being
-    their own."""
+    their own. `now` sits three quarters in, for the tests that need a frame
+    reaching past it, as the loader returns when asked for a forecast."""
 
-    if with_future:
-        df, now = _frame_with_future(np.random.default_rng(22))
-    else:
-        df, now = _simulate(np.random.default_rng(14)), None
+    df = _simulate(np.random.default_rng(14))
+    now = df["target_time"].iloc[len(df) * 3 // 4]
 
     identifier = _identifier()
     identifier.calibrate(df)
@@ -281,11 +294,11 @@ def _fitted(with_future: bool):
     return df, now, identifier.model, identifier.parameter_std_errors
 
 
-def _calibrated(with_future: bool = False):
+def _calibrated():
     """A calibrated identifier of its own - the model is copied, so a test may
-    break it - with the frame it was fitted on and, with_future, where now is."""
+    break it - with the frame it was fitted on and where now is in it."""
 
-    df, now, model, std_errors = _fitted(with_future)
+    df, now, model, std_errors = _fitted()
     identifier = _identifier()
     identifier.model = replace(model)
     identifier.parameter_std_errors = dict(std_errors or {})
@@ -328,9 +341,7 @@ def test_validate_reports_forward_simulation_accuracy():
 
 
 def test_validate_flags_a_parameter_pinned_at_a_bound(caplog):
-    identifier = _identifier()
-    df = _simulate(np.random.default_rng(2))
-    identifier.calibrate(df)
+    identifier, df, _ = _calibrated()
     # The synthetic sensor reads pure air, which is its own lower bound: the
     # fit sits on it by construction, so count only what pinning adds.
     before = identifier.validate(df)["pinned_parameters"]
@@ -896,19 +907,8 @@ def test_validate_reports_no_wind_trend_where_wind_changes_nothing(caplog):
     assert "with the wind" not in caplog.text
 
 
-def _frame_with_future(rng: np.random.Generator) -> tuple[pd.DataFrame, datetime]:
-    """A frame reaching past `now`, as the loader returns when asked for it."""
-
-    df = _simulate(rng)
-    # Every sensor column carries its last reading forward there, which is
-    # exactly what the loader's fill="previous" produces.
-    now = df["target_time"].iloc[len(df) * 3 // 4]
-
-    return df, now
-
-
 def test_forecast_starts_where_the_measurements_stop():
-    identifier, df, now = _calibrated(with_future=True)
+    identifier, df, now = _calibrated()
 
     forecast = identifier.forecast(df, now)
 
@@ -925,7 +925,7 @@ def test_trajectory_is_the_filter_until_now_and_the_forecast_after():
     """One filter pass for both halves: what a plan starts from, and the
     history the dashboard draws it against."""
 
-    identifier, df, now = _calibrated(with_future=True)
+    identifier, df, now = _calibrated()
 
     trajectory = identifier.trajectory(df, now)
     forecast = identifier.forecast(df, now)
@@ -942,7 +942,7 @@ def test_two_node_forecast_carries_the_thermostat_reading():
     """The curve drawn against the measurement has to be the same quantity:
     the thermostat reads part of its room's slab as well."""
 
-    identifier, df, now = _calibrated(with_future=True)
+    identifier, df, now = _calibrated()
     identifier.model = replace(identifier.model, sensor_mass_fraction=0.4)
 
     forecast = identifier.forecast(df, now)
@@ -958,7 +958,7 @@ def test_forecast_delivers_no_heat_to_the_zone():
     There is no decision in it, which is why it does not live in the optimizer.
     """
 
-    identifier, df, now = _calibrated(with_future=True)
+    identifier, df, now = _calibrated()
 
     # Cooling runs in the synthetic frame, so a forecast that used them would
     # visibly pull the zone down.
@@ -1004,7 +1004,7 @@ def test_forecast_takes_the_rooms_unexplained_heat_by_time_of_day():
 
 
 def test_forecast_needs_both_a_past_and_a_future():
-    identifier, df, _ = _calibrated(with_future=True)
+    identifier, df, _ = _calibrated()
 
     with pytest.raises(ValueError, match="No future rows"):
         identifier.forecast(df, df["target_time"].max())
@@ -1016,7 +1016,7 @@ def test_forecast_needs_both_a_past_and_a_future():
 def test_forecast_uses_a_supplied_baseload_curve():
     """The baseload forecaster's own curve beats carrying one reading forward."""
 
-    identifier, df, now = _calibrated(with_future=True)
+    identifier, df, now = _calibrated()
 
     prepared = identifier.prepare(df)
     high = pd.Series(5000.0, index=prepared["time"])
@@ -1033,7 +1033,7 @@ def test_forecast_shutters_hold_for_the_day_then_follow_the_time_of_day():
     is in - but says nothing about noon tomorrow: from then on it stands as it
     did on that weekday before."""
 
-    identifier, df, now = _calibrated(with_future=True)
+    identifier, df, now = _calibrated()
     identifier.model = replace(identifier.model, closed_shutter_gain_fraction=0.1)
     df = df.copy()
     df["shutter_0"] = 0.0
@@ -1061,7 +1061,7 @@ def test_forecast_shutters_follow_their_weekday_habit_while_shut():
     """Shut now, a shutter opens as it did on the same weekday the weeks
     before - the household's week, not the frame's last days."""
 
-    identifier, df, now = _calibrated(with_future=True)
+    identifier, df, now = _calibrated()
     identifier.model = replace(identifier.model, closed_shutter_gain_fraction=0.1)
     df = df.copy()
     df["shutter_0"] = 0.0
@@ -1097,7 +1097,7 @@ def test_forecast_presence_follows_its_weekday_habit():
     the weeks before - the household's week, not the frame's last days, from
     which a weekend morning was forecast as a weekday."""
 
-    identifier, df, now = _calibrated(with_future=True)
+    identifier, df, now = _calibrated()
     weeks = pd.date_range(now - timedelta(days=21), now, freq="15min")
     weekday = np.array([to_local_time(t).weekday() for t in weeks])
 
@@ -1135,7 +1135,7 @@ def test_forecast_takes_the_sky_ahead_from_the_pv_forecast():
     give twice what it gives at Open-Meteo's irradiance on its plane, it puts
     twice the sun on the zone."""
 
-    identifier, df, now = _calibrated(with_future=True)
+    identifier, df, now = _calibrated()
     identifier.pv_power_per_irradiance_m2 = 2.0
     # Asleep by floor area, as by day: the room's gain is its sun alone, also
     # around waking on a sunny morning.
@@ -1169,7 +1169,7 @@ def test_forecast_presence_follows_the_time_of_day_not_the_last_reading():
     """Home just now says nothing about tomorrow's afternoon: ahead the
     household is in as it was at that time of day before."""
 
-    identifier, df, now = _calibrated(with_future=True)
+    identifier, df, now = _calibrated()
     usual = identifier.forecast(df, now)
     df = df.copy()
     # Home in the reading at now and all of the carried-forward rows after it.
@@ -1498,6 +1498,35 @@ def test_a_constant_schedule_filters_as_the_constant_system():
     assert kalman_states(a, b, *arguments, schedule=schedule) == pytest.approx(
         kalman_states(a, b, *arguments)
     )
+
+
+def test_a_single_reading_is_filtered_without_a_step():
+    """One reading so far - a frame whose only known sample is its first -
+    is the filter's start, whether or not the envelope is scheduled."""
+
+    a, b = zone_state_space(TRUE_MODEL)
+    observation = zone_observations(TRUE_MODEL)
+    schedule = ScheduledSystem(
+        lambda ua: zone_state_space(TRUE_MODEL, ua),
+        np.array([TRUE_MODEL.ua_envelope_w_per_k]),
+    )
+
+    for system in (None, schedule):
+        estimates = kalman_states(
+            a,
+            b,
+            np.array([[20.0, 19.0]]),
+            np.zeros((1, b.shape[1])),
+            np.array([DT_SECONDS]),
+            30.0,
+            1e-3,
+            observation,
+            (2, 3, 4),
+            system,
+        )
+
+        assert estimates.shape == (1, a.shape[0])
+        np.testing.assert_allclose(observation @ estimates[0], [20.0, 19.0])
 
 
 def test_the_windows_open_overnight_on_warm_days_only():

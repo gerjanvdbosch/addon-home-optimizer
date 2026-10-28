@@ -25,7 +25,7 @@ def _history(weeks: int = 13) -> pd.DataFrame:
     time = pd.date_range(NOW - pd.Timedelta(weeks=weeks), NOW, freq="15min")
     local = time.tz_convert(LOCAL_TIMEZONE)
     midnight = pd.Timestamp(local[-1]).normalize()
-    hour = (local.weekday == 2) & (local.hour == 10)
+    hour = (local.day_of_week == 2) & (local.hour == 10)
     recent = local >= midnight - pd.DateOffset(weeks=8)
     power = np.full(len(time), 100.0)
     power[hour & (local.minute == 0) & recent] = 500.0

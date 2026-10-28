@@ -578,7 +578,9 @@ def test_cooling_fit_reads_the_heat_taken_from_the_water(tmp_path, monkeypatch):
     df["P_el"] = heat_w / cooling.cop(df["T_outdoor"], df["T_supply"])
 
     identifier = HeatPumpCOPIdentifier(key="cooling", models_path=tmp_path)
-    monkeypatch.setattr(identifier, "_start_up", lambda _: (530.0, 700.0, 0.0))
+    monkeypatch.setattr(
+        identifier, "_start_up", lambda _: (530.0, (0.0, 0.0), 700.0, 0.0)
+    )
     model = identifier.calibrate(df)
 
     assert model.cooling
@@ -606,22 +608,29 @@ def test_heat_input_is_flat_when_the_outdoor_temperature_does_not_vary():
     assert HeatPumpCOPIdentifier._fit_heat_input(df) == pytest.approx((6200.0, 0.0))
 
 
-def _start_up_rows(state, sign, before="Uit", frequency_before=0.0, at_speed=False):
+def _start_up_rows(
+    state,
+    sign,
+    before="Uit",
+    frequency_before=0.0,
+    at_speed=False,
+    ramps_s=(800.0,) * 12,
+):
     """Twelve 40-minute runs in this state at minute readings, 30 minutes of
-    `before` between them: their heat rising linearly to 6 kW over 800 s and
-    their power to 2 kW over the same time, or at_speed from the first
-    minute."""
+    `before` between them: their heat rising linearly to 6 kW over 800 s (or
+    each run's of ramps_s) and their power to 2 kW over the same time, or
+    at_speed from the first minute."""
 
     rows = []
     time = pd.Timestamp("2026-09-20 10:00", tz="UTC")
     water_w_per_k = (RHO_WATER_KG_PER_L / 60.0) * CP_WATER_J_PER_KG_K * FLOW_LPM
 
-    for _ in range(12):
+    for ramp_s in ramps_s:
         for minute in range(70):
             on = minute < 40
             # The minute's mean of a linear rise.
             rise = float(
-                np.minimum(1.0, (minute * 60.0 + np.arange(60)) / 800.0).mean()
+                np.minimum(1.0, (minute * 60.0 + np.arange(60)) / ramp_s).mean()
             )
             rise = 1.0 if at_speed else rise
             rows.append(
@@ -650,12 +659,31 @@ def test_the_start_up_is_read_from_the_readings_as_loaded(key, state, sign):
     (2 kW over 800 s at half, then full) 2000 * (1 - 400 / 900) = 1111 W.
     Cooling the same, with the heat taken from the water."""
 
-    ramp_s, power_w, _ = HeatPumpCOPIdentifier(key=key)._start_up(
+    ramp_s, _, power_w, _ = HeatPumpCOPIdentifier(key=key)._start_up(
         _start_up_rows(state, sign)
     )
 
     assert ramp_s == pytest.approx(800.0, rel=0.02)
     assert power_w == pytest.approx(2000.0 * (1.0 - 400.0 / 900.0), rel=0.01)
+
+
+def test_the_tanks_start_up_shortfall_is_a_line_in_the_outdoor_temperature():
+    """Runs whose start-up leaves 1.1 kWh short at 0 degC and 17 Wh less per
+    K warmer (6 kW steady, so a ramp of 2 * shortfall / 6 kW): that line, from
+    the outdoor temperature each run started at. DHW only."""
+
+    outdoor_c = np.linspace(8.0, 30.0, 12)
+    shortfall_j = (1100.0 - 17.0 * outdoor_c) * 3600.0
+    df = _start_up_rows(SWW_STATE, 1.0, ramps_s=tuple(2.0 * shortfall_j / 6000.0))
+    df["temperature"] = np.repeat(outdoor_c, 70)
+
+    at_zero_j, per_k_j = HeatPumpCOPIdentifier(key="dhw")._start_up(df)[1]
+
+    assert at_zero_j / 3600.0 == pytest.approx(1100.0, rel=0.02)
+    assert per_k_j / 3600.0 == pytest.approx(-17.0, rel=0.05)
+    assert HeatPumpCOPIdentifier(key="heating")._start_up(
+        df.assign(state=df["state"].replace(SWW_STATE, HeatPumpStates().heating))
+    )[1] == (0.0, 0.0)
 
 
 def test_the_loops_heat_is_read_from_heating_runs_hot_water_hands_over():
@@ -669,10 +697,10 @@ def test_the_loops_heat_is_read_from_heating_runs_hot_water_hands_over():
     first = (df.index % 70 < 15) & (df["state"] == HeatPumpStates().heating)
     df.loc[first, "T_supply"] += handover_j / 900.0 / water_w_per_k
 
-    assert HeatPumpCOPIdentifier(key="heating")._start_up(df)[2] == pytest.approx(
+    assert HeatPumpCOPIdentifier(key="heating")._start_up(df)[3] == pytest.approx(
         handover_j, rel=0.01
     )
-    assert HeatPumpCOPIdentifier(key="dhw")._start_up(df)[2] == 0.0
+    assert HeatPumpCOPIdentifier(key="dhw")._start_up(df)[3] == 0.0
 
 
 def test_the_start_up_is_read_only_from_runs_the_compressor_starts_for():
@@ -694,7 +722,7 @@ def test_the_start_up_is_read_only_from_runs_the_compressor_starts_for():
         ignore_index=True,
     )
 
-    ramp_s, power_w, _ = HeatPumpCOPIdentifier(key="heating")._start_up(df)
+    ramp_s, _, power_w, _ = HeatPumpCOPIdentifier(key="heating")._start_up(df)
 
     assert ramp_s == pytest.approx(800.0, rel=0.02)
     assert power_w == pytest.approx(2000.0 * (1.0 - 400.0 / 900.0), rel=0.01)

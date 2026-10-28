@@ -97,3 +97,28 @@ class SystemIdentifier(Generic[SystemModel]):
             return np.sqrt(np.diag(covariance))
         except np.linalg.LinAlgError:
             return np.full(len(fit_result.x), np.nan)
+
+    @staticmethod
+    def _forward_jacobian(
+        residuals, x: np.ndarray, lower: np.ndarray, upper: np.ndarray
+    ) -> np.ndarray:
+        """scipy.optimize.least_squares' own '2-point' Jacobian - the same
+        step, turned or shortened at a bound the same way - from one call of
+        `residuals` with every perturbed point along a leading axis: for a
+        model that is one long recursion, one pass instead of one per
+        parameter."""
+
+        step = (
+            np.sqrt(np.finfo(float).eps)
+            * np.where(x >= 0.0, 1.0, -1.0)
+            * np.maximum(1.0, np.abs(x))
+        )
+        below, above = x - lower, upper - x
+        fits = np.abs(step) <= np.maximum(below, above)
+        outside = (x + step < lower) | (x + step > upper)
+        step = np.where(outside & fits, -step, step)
+        step = np.where(fits, step, np.where(above >= below, above, -below))
+
+        values = residuals(np.vstack([x, x + np.diag(step)]))
+
+        return ((values[1:] - values[0]) / ((x + step) - x)[:, None]).T

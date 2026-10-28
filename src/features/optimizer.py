@@ -21,6 +21,7 @@ from domain.models import (
 from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.physics import (
     CP_WATER_J_PER_KG_K,
+    MIXED_TAP_WATER_C,
     RHO_WATER_KG_PER_L,
     ZONE_SCREED_STATES,
     ZONE_SLAB_STATES,
@@ -1366,6 +1367,16 @@ class MPCOptimizer:
         # unheated starts again from it: held to a tank never heated again, the
         # next day's evening showers were cut to nothing after a run at noon
         # (real plan, 18 Oct 2026: 1.07 of 4.47 kWh drawn).
+        # The forecast is water mixed to MIXED_TAP_WATER_C (V40). A draw takes
+        # it from the top: hotter water there, and the draw is mixed with the
+        # mains and takes its full heat until that hot water is gone (the mains
+        # cap above). Cooler, and the draw takes the hot side only, so its heat
+        # is V40 * (top - mains): a tank emptied to the mains and warming to its
+        # surroundings again loses almost nothing to it (real plan, 29 Oct
+        # 2026: draws took the planned tank 0.9 K down to the mains in three
+        # hours while the sensors, top at 15.5 degC, kept warming). The top
+        # (outlet) is followed from its sensor, cooling like the tank and
+        # never below the tank's mean.
         max_heat_w = max(max(heat_w), booster_heat_w or 0.0)
         heat_pump_limit_c = (
             min(heat_pump_max_c, max_tank_c)
@@ -1376,6 +1387,8 @@ class MPCOptimizer:
         if data.mains_water_temperature is not None:
             tap_w = list(tap_w)
             tank_c = ceiling_c = initial_temperature
+            outlet_c = max(float(data.current_temp_top), initial_temperature)
+            mains_c = data.mains_water_temperature
             hottest_c = max(
                 initial_temperature,
                 max_tank_c if booster_heat_w is not None else heat_pump_limit_c,
@@ -1384,10 +1397,16 @@ class MPCOptimizer:
             for k in range(num_steps):
                 tank_c = max(tank_c, min(float(target_c[k]), ceiling_c))
                 a_d, b_d = discretized(dt_hours[k])
+                outlet_c = max(outlet_c, tank_c)
+                usable = (outlet_c - mains_c) / (MIXED_TAP_WATER_C - mains_c)
                 coast_c = float(a_d[0, 0] * tank_c + b_d[0, 0] * ambient_c)
-                floor_c = min(data.mains_water_temperature, coast_c)
-                tap_w[k] = min(float(tap_w[k]), (coast_c - floor_c) / -b_d[0, 2])
+                floor_c = min(mains_c, coast_c)
+                tap_w[k] = min(
+                    float(tap_w[k]) * float(np.clip(usable, 0.0, 1.0)),
+                    (coast_c - floor_c) / -b_d[0, 2],
+                )
                 tank_c = coast_c + b_d[0, 2] * tap_w[k]
+                outlet_c = float(a_d[0, 0] * outlet_c + b_d[0, 0] * ambient_c)
                 ceiling_c = min(
                     hottest_c,
                     float(
@@ -1567,7 +1586,10 @@ class MPCOptimizer:
                 )
                 for k in range(num_steps)
             ],
-            ramp=[self._ramp_fraction(hours) for hours in dt_hours],
+            ramp=[
+                self._ramp_fraction(hours, outdoor_c[k] if outdoor_c else None)
+                for k, hours in enumerate(dt_hours)
+            ],
             start_power_w=(
                 self.cop_model.start_step_power_w if self.cop_model else 0.0
             ),
@@ -2030,8 +2052,7 @@ class MPCOptimizer:
 
             return (
                 model.q_heat_pump_w[k] / heat_w[k]
-                + (1.0 - self._ramp_fraction(dt_hours[k]))
-                * (model.tank_start[k] - model.tank_handover[k])
+                + (1.0 - tank.ramp[k]) * (model.tank_start[k] - model.tank_handover[k])
                 + model.q_booster_w[k] / booster_heat_w
             )
 
@@ -2043,8 +2064,7 @@ class MPCOptimizer:
             # _ramp_fraction).
             available = heat_w[k] * (
                 on
-                - (1.0 - self._ramp_fraction(dt_hours[k]))
-                * (model.tank_start[k] - model.tank_handover[k])
+                - (1.0 - tank.ramp[k]) * (model.tank_start[k] - model.tank_handover[k])
             )
 
             model.heat_source_constraints.add(model.q_heat_pump_w[k] <= available)
@@ -2183,7 +2203,7 @@ class MPCOptimizer:
 
                 reaching[k].append(j)
                 a_d, b_d = discretized(dt_hours[k])
-                ramp = self._ramp_fraction(dt_hours[k]) if k == j else 1.0
+                ramp = tank.ramp[k] if k == j else 1.0
                 rise_k = float(a_d[0, 0] * rise_k + b_d[0, 1] * heat_w[k] * ramp)
 
         model.run_length = pyo.ConstraintList()
@@ -2452,7 +2472,7 @@ class MPCOptimizer:
             # as the power at the tank unheated, so its excess over that is
             # priced as in any step - exact for the horizon's first run, which
             # has none. A hand-over from the zone runs on the power line.
-            ramp = self._ramp_fraction(dt_hours[k])
+            ramp = tank.ramp[k]
             unheated_w = alpha + beta * t_floor[k]
 
             if start_power_w:
@@ -2637,7 +2657,9 @@ class MPCOptimizer:
         )
         # The mean heat over the time run so far, its ramp included.
         if heat_j is None:
-            heat_w = self._heat_at(outdoor_c) * self._ramp_fraction(elapsed_hours)
+            heat_w = self._heat_at(outdoor_c) * self._ramp_fraction(
+                elapsed_hours, outdoor_c
+            )
         else:
             heat_w = (
                 heat_j
@@ -2661,8 +2683,8 @@ class MPCOptimizer:
 
         return min(estimate_c, limit_c) if limit_c is not None else estimate_c
 
-    def _ramp_fraction(self, dt_hours: float) -> float:
-        """Share of _heat_w a step delivers when the compressor starts in it.
+    def _ramp_fraction(self, dt_hours: float, outdoor_c: float | None) -> float:
+        """Share of _heat_at a step delivers when the compressor starts in it.
 
         A compressor rising linearly to full output over its ramp delivers half
         of it while still rising, so a step shorter than the ramp carries
@@ -2671,13 +2693,33 @@ class MPCOptimizer:
         replaced.
         """
 
-        # Timed from the run's own start where the COP model has it (see
-        # HeatPumpCOPModel.start_ramp_seconds).
-        return self._ramp_share(
-            dt_hours,
-            (self.cop_model and self.cop_model.start_ramp_seconds)
-            or self.thermal_model.q_in_ramp_seconds,
-        )
+        cop = self.cop_model
+
+        # At this outdoor temperature where the COP model has the start-up's
+        # shortfall and heat line there (see
+        # HeatPumpCOPModel.start_shortfall_at_zero_outdoor_j): the ramp that
+        # leaves that much short of that heat. Otherwise timed from the run's
+        # own start where it has a ramp (see start_ramp_seconds).
+        if (
+            cop is not None
+            and outdoor_c is not None
+            and cop.start_shortfall_at_zero_outdoor_j
+            and cop.q_in_at_zero_outdoor_w
+        ):
+            shortfall_j = (
+                cop.start_shortfall_at_zero_outdoor_j
+                + cop.start_shortfall_per_outdoor_j_per_k * outdoor_c
+            )
+            heat_w = (
+                cop.q_in_at_zero_outdoor_w + cop.q_in_per_outdoor_w_per_k * outdoor_c
+            )
+            ramp_seconds = max(2.0 * shortfall_j / heat_w, 0.0)
+        else:
+            ramp_seconds = (
+                cop and cop.start_ramp_seconds
+            ) or self.thermal_model.q_in_ramp_seconds
+
+        return self._ramp_share(dt_hours, ramp_seconds)
 
     @staticmethod
     def _ramp_share(dt_hours: float, ramp_seconds: float | None) -> float:

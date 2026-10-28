@@ -110,7 +110,13 @@ class BoilerThermalModel:
         (real data, 28 September 2026). The layer's temperature follows the
         tank's surroundings (ambient_c, deg C): read as one constant, it put
         the tank before October's runs 0.9 K too warm (2.6 K on 21 October)
-        while the surroundings cooled from 25 to 21 degC. Scalars or arrays."""
+        while the surroundings cooled from 25 to 21 degC. Never warmer than the
+        top sensor: a draw that took the top below the surroundings pushed the
+        warm water above it out through the outlet there, and the layer at the
+        surroundings put an emptied tank 3.4 K above its run's heat balance
+        (real data, 29 October 2026: sensors 15.25/14.75, balance 14.4 degC;
+        over the 5 runs from a top below its surroundings, Jun-Oct 2026,
+        +1.6 K against +0.0 K with the cap). Scalars or arrays."""
 
         average = (top_c + bottom_c) / 2.0
 
@@ -130,9 +136,9 @@ class BoilerThermalModel:
             1.0,
         )
 
-        return average - self.cold_layer_fraction * share * (
-            average - ambient_c - self.cold_layer_above_ambient_k
-        )
+        layer_c = np.minimum(ambient_c + self.cold_layer_above_ambient_k, top_c)
+
+        return average - self.cold_layer_fraction * share * (average - layer_c)
 
 
 @dataclass
@@ -455,6 +461,20 @@ class HeatPumpCOPModel:
     # minute). 0.0 until calibrated: DHW planning then uses the boiler's, a
     # floor run none (real cooling data: 530 s over 30 runs).
     start_ramp_seconds: float = 0.0
+    # The heat (J) a DHW run's start-up leaves short of the heat line above
+    # (q_in_at_zero_outdoor_w), at 0 degC outdoor and per K warmer - the
+    # energy start_ramp_seconds is read off, run by run (see
+    # HeatPumpCOPIdentifier._start_up). The compressor's speed rises the
+    # same way every run (firmware: 36 Hz at 5 min, 60 Hz at 20), but in
+    # colder air it delivers less heat on the way up (real data, 122 cold
+    # starts Jun-Oct 2026: 48% of its steady heat 6 minutes in at 14 degC,
+    # 62% at 22 degC; tank and loop temperature at the start explained
+    # nothing beyond it). One median over all seasons planned October's
+    # first step 0.15 kWh too warm; this line fitted on summer runs alone,
+    # 0.04 kWh. 0.0 until calibrated, and for the other modes: planning then
+    # uses start_ramp_seconds.
+    start_shortfall_at_zero_outdoor_j: float = 0.0
+    start_shortfall_per_outdoor_j_per_k: float = 0.0
     # The heat (J) a heating run handed over by hot water gets beyond the
     # compressor's own in its first planning step: the water in the heat
     # pump and the pipes it shares with the tank, at the tank's temperature as

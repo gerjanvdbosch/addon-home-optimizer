@@ -229,10 +229,23 @@ class Optimization:
                 run_start_stratification_k = stratification.get(before_top[-1].time)
                 run_start_ambient_c = ambient.get(before_top[-1].time)
 
-        # The heat the run under way has put in by now, as the plan starts
-        # from it.
+        # The quarters the run under way has ended so far, drawn by the heat
+        # balance the plan starts from (see MPCOptimizer.run_temperature): its
+        # sensors lag that heat (see StateManager._tank_temperature).
+        step = timedelta(hours=mpc_config.step_hours)
+        run_quarters = []
+
+        if run_start is not None:
+            time = forecast_times[0]
+
+            while time > run_start:
+                run_quarters.insert(0, time)
+                time -= step
+
+        # The heat the run under way has put in by those quarters and by now,
+        # as the plan starts from it.
         run_heat_j = (
-            self._run_heat_j(config, run_start, [now])
+            self._run_heat_j(config, run_start, [*run_quarters, now])
             if run_start is not None
             else None
         )
@@ -379,6 +392,20 @@ class Optimization:
             result.objective_value,
         )
 
+        run_tank = [
+            (
+                time,
+                optimizer.run_temperature(
+                    planned, (time - run_start).total_seconds() / 3600.0, heat_j
+                ),
+            )
+            for time, heat_j in zip(
+                # The heat by now, last, is the plan's start.
+                run_quarters,
+                run_heat_j or [None] * len(run_quarters),
+                strict=False,
+            )
+        ]
         self.state_manager.update_schedule(
             schedule=result.schedule,
             temperatures=result.temperatures,
@@ -386,6 +413,10 @@ class Optimization:
             times=forecast_times,
             heat_w=result.heat_w,
             now=now,
+            dhw_running=boiler_on_current,
+            run_temperatures=[
+                SeriesPoint(time=t, value=c) for t, c in run_tank if c is not None
+            ],
         )
 
         self.publish_dhw(result, forecast_times, thermal_model)
@@ -534,7 +565,8 @@ class Optimization:
         active), so counting that time would credit the minimum runtime with
         time the compressor did not run. A run's first minutes at 0 Hz, the
         pump circulating before the compressor comes up, are the run's own
-        start and count. Without a frequency the state is all there is, and
+        start and count, as does a pause the compressor comes up from again.
+        Without a frequency the state is all there is, and
         assuming the compressor ran keeps a real run protected. The pause is
         taken from the change that ended the last DHW run - from the first
         change loaded (the previous local midnight's, see _heat_pump_changes)
@@ -567,23 +599,15 @@ class Optimization:
                 {dhw_start}
                 | {p.time for p in compressor_frequency if dhw_start < p.time <= now}
             )
-            run_start = dhw_start
-            compressor_ran = False
+            running = [frequency_at(time) > 0.0 for time in changes]
+            # At 0 Hz after the compressor has run, the booster has taken over.
+            # A compressor that came up again had only paused, and its run goes
+            # on from the change into DHW (real data, 17, 23 and 26 Oct 2026: 2
+            # minutes at 0 Hz, the booster off, mid-run; taken from the restart
+            # the plan started 3-4 K cold, from the sensors that lag the heat).
+            booster = any(running) and not running[-1]
 
-            for time in changes:
-                running = frequency_at(time) > 0.0
-
-                if running:
-                    compressor_ran = True
-                elif compressor_ran:
-                    # The booster has taken over; the compressor may start again.
-                    run_start = None
-                    continue
-
-                if run_start is None:
-                    run_start = time
-
-            return True, run_start, 0.0
+            return True, None if booster else dhw_start, 0.0
 
         idle_start = heat_pump_state[-1].time
 

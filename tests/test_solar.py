@@ -592,7 +592,7 @@ def test_predict_solar_resamples_onto_the_shared_15_minute_grid():
     result = predict_solar(_UnitScaleModel(), p50, LATITUDE, LONGITUDE)
 
     assert not result.isna().any()
-    diffs = np.diff(result.index.values)
+    diffs = result.index.diff()[1:]
     assert all(diff == np.timedelta64(PREDICT_STEP_MINUTES, "m") for diff in diffs)
 
 
@@ -616,7 +616,7 @@ def test_predict_solar_band_scales_only_calibrated_lead_times():
     assert high[times[2]] == pytest.approx(2000.0)
     assert all(
         diff == np.timedelta64(PREDICT_STEP_MINUTES, "m")
-        for diff in np.diff(low.index.values)
+        for diff in low.index.diff()[1:]
     )
 
 

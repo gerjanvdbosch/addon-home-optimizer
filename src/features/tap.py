@@ -144,7 +144,7 @@ class TapForecaster:
         """How far drawn water is heated above the mains at each time (K)."""
 
         return MIXED_TAP_WATER_C - np.array(
-            [mains_water_temperature_c(day) for day in index.dayofyear]
+            [mains_water_temperature_c(day) for day in index.day_of_year]
         )
 
     @staticmethod

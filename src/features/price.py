@@ -131,11 +131,13 @@ def on_quarters(
         return np.full(len(times), np.nan)
 
     values = values[~values.index.duplicated(keep="last")]
-    starts = pd.DatetimeIndex(values.index).asi8
+    # In nanoseconds, the unit of period.value: pandas 3 keeps datetimes in
+    # the resolution they came in (microseconds from Python's).
+    starts = pd.DatetimeIndex(values.index).as_unit("ns").asi8
     spacing = np.diff(starts)
     held = np.append(spacing, spacing[-1] if len(spacing) else period.value)
     ends = starts + np.minimum(held, period.value)
-    at = pd.DatetimeIndex(times).asi8
+    at = pd.DatetimeIndex(times).as_unit("ns").asi8
     i = np.clip(np.searchsorted(starts, at, side="right") - 1, 0, None)
 
     return np.where(
@@ -150,7 +152,7 @@ def _slots(times: pd.DatetimeIndex) -> tuple[np.ndarray, np.ndarray]:
     local = times.tz_convert(LOCAL_TIMEZONE)
 
     return (
-        (local.weekday >= 5).astype(int),
+        (local.day_of_week >= 5).astype(int),
         np.asarray(local.hour * 4 + local.minute // 15),
     )
 

@@ -26,7 +26,12 @@ from scipy.optimize import least_squares
 
 from domain.config import Config, HeatPumpStates
 from domain.dataset import DatasetDefinition
-from domain.dynamics import ScheduledSystem, discretize_zoh, kalman_states
+from domain.dynamics import (
+    ScheduledSystem,
+    discrete_steps,
+    kalman_filter,
+    kalman_states,
+)
 from domain.models import BuildingThermalModel
 from domain.physics import (
     CP_AIR_J_PER_KG_K,
@@ -144,14 +149,13 @@ def _asleep_in_rest(model: BuildingThermalModel) -> float:
 
 
 def _rollout(
-    a: np.ndarray,
-    b: np.ndarray,
+    a_steps: np.ndarray,
+    b_steps: np.ndarray,
     initial_state: np.ndarray,
     inputs: np.ndarray,
-    dt_seconds: np.ndarray,
-    schedule: ScheduledSystem | None = None,
 ) -> np.ndarray:
-    """Forward-simulate a window from one initial state, for either structure.
+    """Forward-simulate a window from one initial state through the steps
+    discrete_steps() gives - or many windows at once, each along a leading axis.
 
     `inputs` holds u = [T_outdoor, Q_internal, Q_solar, Q_floor] per sample, and
     only the initial state is taken from measurements - no mid-window room
@@ -160,29 +164,16 @@ def _rollout(
     of each interval governs that interval, matching the discretization.
     """
 
-    n = len(dt_seconds)
+    n = a_steps.shape[-3] + 1
 
-    simulated = np.empty((n, len(initial_state)))
-    simulated[0] = initial_state
-
-    cache: dict[float, tuple[np.ndarray, np.ndarray]] = {}
-
-    if schedule is not None:
-        scheduled = schedule.steps(np.asarray(dt_seconds, float)[1:])
+    simulated = np.empty((*initial_state.shape[:-1], n, initial_state.shape[-1]))
+    simulated[..., 0, :] = initial_state
 
     for i in range(1, n):
-        dt = float(dt_seconds[i])
-        key = round(dt, 3)
-
-        if schedule is not None:
-            a_d, b_d = scheduled[0][i - 1], scheduled[1][i - 1]
-        else:
-            if key not in cache:
-                cache[key] = discretize_zoh(a, b, dt)
-
-            a_d, b_d = cache[key]
-
-        simulated[i] = a_d @ simulated[i - 1] + b_d @ inputs[i - 1]
+        simulated[..., i, :] = (
+            a_steps[..., i - 1, :, :] @ simulated[..., i - 1, :, None]
+            + b_steps[..., i - 1, :, :] @ inputs[..., i - 1, :, None]
+        )[..., 0]
 
     return simulated
 
@@ -921,11 +912,21 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         # A step's state is the one at its end and its readings their mean, as
         # they were before the samples were loaded (see dataset).
-        df["state"] = self._samples(df, "state").ffill(axis=1).iloc[:, -1]
+        # The last sample there is, column by column: ffill(axis=1) on these
+        # strings goes row by row in pandas (30 s on a year of data).
+        samples = self._samples(df, "state")
+        state = samples.iloc[:, 0]
+
+        for _, later in samples.iloc[:, 1:].items():
+            state = later.where(later.notna(), state)
+
+        df["state"] = state
 
         for name in ("T_supply", "T_return", "flow_lpm"):
             df[name] = (
-                self._samples(df, name).apply(pd.to_numeric, errors="coerce").mean(1)
+                self._samples(df, name)
+                .apply(pd.to_numeric, errors="coerce")
+                .mean(axis=1)
             )
 
         # Without a configured outdoor sensor, Open-Meteo's own temperature is
@@ -1132,7 +1133,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 usual = (
                     df["occupants"]
                     .where(reported)
-                    .groupby([local.weekday, local.hour * 60 + local.minute])
+                    .groupby([local.day_of_week, local.hour * 60 + local.minute])
                     .transform("median")
                     .fillna(df.loc[reported, "occupants"].median())
                 )
@@ -1285,7 +1286,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         """Forward-simulate every scored window; returns (predicted, measured,
         active, row indices), predicted and measured with a column per
         thermometer (see physics.zone_observations): the thermostat's room
-        first, the rest of the house second.
+        first, the rest of the house second. Several parameter vectors along a
+        leading axis of `x` are simulated at once, `predicted` then carrying
+        that axis too - one pass of the filter for a fit's whole Jacobian.
 
         `active` marks the samples where the floor circuit was actually serving
         the space, so calibration diagnostics and validation can report the
@@ -1299,10 +1302,13 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         runs, warmup_samples, horizon_samples = plan
 
-        model = self._model_from_parameters(x)
-        inputs = self._inputs(model, df)
-        a, b = zone_state_space(model)
-        schedule = self._schedule(model, df)
+        sets = np.atleast_2d(x)
+        models = [self._model_from_parameters(parameters) for parameters in sets]
+        inputs = np.stack([self._inputs(model, df) for model in models])
+        systems = [
+            (*zone_state_space(model), self._schedule(model, df)) for model in models
+        ]
+        observation = np.stack([zone_observations(model) for model in models])
 
         measured = df[["T_living", "T_rest"]].to_numpy(dtype=float)
         dt_seconds = df["dt_seconds"].to_numpy(dtype=float)
@@ -1314,50 +1320,66 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         index_parts: list[np.ndarray] = []
 
         measurement_variance = self.SENSOR_RESOLUTION_K**2 / 12.0
-        observation = zone_observations(model)
 
         for run_start, run_end in runs:
+            # The run's whole windows past the warm-up, independent of each
+            # other once the filter gave their start, so simulated at once.
+            offsets = np.arange(
+                0, run_end - run_start - horizon_samples + 1, horizon_samples
+            )
+            offsets = offsets[offsets >= warmup_samples]
+
+            if not len(offsets):
+                continue
+
+            run_steps = [
+                discrete_steps(
+                    a,
+                    b,
+                    dt_seconds[run_start:run_end],
+                    _window(schedule, run_start, run_end),
+                )
+                for a, b, schedule in systems
+            ]
+            a_steps = np.stack([a_d for a_d, _ in run_steps])
+            b_steps = np.stack([b_d for _, b_d in run_steps])
+
             # Every window starts from the filter's estimate of the WHOLE state
             # at that moment, so its measured and unmeasured parts stay
             # consistent with each other. For a single-state model that is the
             # measurement, lightly smoothed; for a two-state one it is the only
             # principled way to know where the mass node is.
-            estimates = kalman_states(
-                a,
-                b,
+            estimates = kalman_filter(
+                a_steps,
+                b_steps,
                 measured[run_start:run_end],
-                inputs[run_start:run_end],
-                dt_seconds[run_start:run_end],
+                inputs[:, run_start:run_end],
                 self.PROCESS_NOISE_W,
                 measurement_variance,
                 observation,
                 self.DISTURBANCE_INPUTS,
-                _window(schedule, run_start, run_end),
             )
 
-            window_start = run_start
+            steps = offsets[:, None] + np.arange(horizon_samples - 1)
+            rows = run_start + offsets[:, None] + np.arange(horizon_samples)
 
-            while window_start + horizon_samples <= run_end:
-                window_end = window_start + horizon_samples
+            simulated = _rollout(
+                a_steps[:, steps],
+                b_steps[:, steps],
+                estimates[:, offsets],
+                inputs[:, rows],
+            )
 
-                simulated = _rollout(
-                    a,
-                    b,
-                    initial_state=estimates[window_start - run_start],
-                    inputs=inputs[window_start:window_end],
-                    dt_seconds=dt_seconds[window_start:window_end],
-                    schedule=_window(schedule, window_start, window_end),
+            # What the thermostat would have read, which is what the residual
+            # is measured against.
+            predicted_parts.append(
+                np.einsum("s...n,skn->s...k", simulated, observation).reshape(
+                    len(sets), rows.size, -1
                 )
-
-                if window_start - run_start >= warmup_samples:
-                    # What the thermostat would have read, which is what the
-                    # residual is measured against.
-                    predicted_parts.append(simulated @ observation.T)
-                    measured_parts.append(measured[window_start:window_end])
-                    active_parts.append(floor_heat[window_start:window_end] != 0.0)
-                    index_parts.append(np.arange(window_start, window_end))
-
-                window_start = window_end
+            )
+            measured_parts.append(measured[rows.ravel()])
+            active_parts.append(floor_heat[rows.ravel()] != 0.0)
+            index_parts.append(rows.ravel())
 
         if not predicted_parts:
             raise ValueError(
@@ -1365,8 +1387,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 f"{self.MASS_WARMUP_HOURS:.0f} hour warm-up."
             )
 
+        predicted = np.concatenate(predicted_parts, axis=1)
+
         return (
-            np.concatenate(predicted_parts),
+            predicted if np.ndim(x) > 1 else predicted[0],
             np.concatenate(measured_parts),
             np.concatenate(active_parts),
             np.concatenate(index_parts),
@@ -1383,7 +1407,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # Both thermometers, each in its own right: the rest of the house is
         # what pins down how the rooms share the dwelling's heat. A reading
         # that is missing has nothing to say.
-        return np.nan_to_num((predicted - measured).ravel())
+        return np.nan_to_num((predicted - measured).reshape(*predicted.shape[:-2], -1))
 
     def _bounds(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """(lower, initial, upper) for the parameter vector.
@@ -1579,8 +1603,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         free = lower < upper
 
         def full(x_free: np.ndarray) -> np.ndarray:
-            x = initial.copy()
-            x[free] = x_free
+            x = np.broadcast_to(initial, (*np.shape(x_free)[:-1], len(initial))).copy()
+            x[..., free] = x_free
 
             return x
 
@@ -1594,11 +1618,18 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         def residuals(x_free: np.ndarray) -> np.ndarray:
             return self._window_residuals(full(x_free), train_df, plan)
 
+        def jacobian(x_free: np.ndarray) -> np.ndarray:
+            return self._forward_jacobian(residuals, x_free, lower[free], upper[free])
+
         # x_scale="jac": the parameters span conductances (10^2 W/K) and heat
         # capacities (10^7 J/K), so an unscaled trust region would step
         # meaninglessly in one or the other.
         ordinary = least_squares(
-            residuals, initial[free], bounds=(lower[free], upper[free]), x_scale="jac"
+            residuals,
+            initial[free],
+            jac=jacobian,
+            bounds=(lower[free], upper[free]),
+            x_scale="jac",
         )
 
         # Robust loss scaled by the data's own residual spread, so a window
@@ -1610,6 +1641,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         result = least_squares(
             residuals,
             ordinary.x,
+            jac=jacobian,
             bounds=(lower[free], upper[free]),
             loss="soft_l1",
             f_scale=f_scale,
@@ -2078,7 +2110,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         usable = (
             (prepared["time"] >= now - timedelta(days=self.HABIT_HISTORY_DAYS))
             & (prepared["Q_floor_w"] == 0.0)
-        ).to_numpy()
+        ).to_numpy(copy=True)
         # The filter's first step has no prediction to differ from.
         usable[0] = False
         local = prepared["time"].map(to_local_time)
@@ -2104,30 +2136,17 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         whole state read back as the heat flows it lets in (see
         DISTURBANCE_INPUTS) - a room's loss also cools the floor under it."""
 
-        a, b = zone_state_space(model)
+        a_steps, b_steps = discrete_steps(
+            *zone_state_space(model), dt_seconds, schedule
+        )
+        correction = (
+            estimates[1:, :, None]
+            - a_steps @ estimates[:-1, :, None]
+            - b_steps @ inputs[: len(estimates) - 1, :, None]
+        )
+        back = np.linalg.pinv(b_steps[:, :, list(self.DISTURBANCE_INPUTS)])
         heat = np.zeros((len(estimates), len(self.DISTURBANCE_INPUTS)))
-        cache: dict[float, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-
-        for i in range(1, len(estimates)):
-            dt = float(dt_seconds[i])
-            key = round(dt, 3)
-
-            if schedule is not None:
-                a_d, b_d = schedule.discrete(i - 1, dt)
-                back = np.linalg.pinv(b_d[:, self.DISTURBANCE_INPUTS])
-            else:
-                if key not in cache:
-                    a_d, b_d = discretize_zoh(a, b, dt)
-                    cache[key] = (
-                        a_d,
-                        b_d,
-                        np.linalg.pinv(b_d[:, self.DISTURBANCE_INPUTS]),
-                    )
-
-                a_d, b_d, back = cache[key]
-            heat[i] = back @ (
-                estimates[i] - a_d @ estimates[i - 1] - b_d @ inputs[i - 1]
-            )
+        heat[1:] = (back @ correction)[..., 0]
 
         # The rooms' own channels; the floor's is the floor's error.
         return heat[:, :2]
@@ -2547,7 +2566,15 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         )
 
         def usual(values, last):
-            return values.groupby(habit).median().reindex(ahead).fillna(last).to_numpy()
+            # A copy: the shutters' is written into below, and pandas 3 hands
+            # out read-only views.
+            return (
+                values.groupby(habit)
+                .median()
+                .reindex(ahead)
+                .fillna(last)
+                .to_numpy(copy=True)
+            )
 
         # An open shutter as it stands for the rest of today.
         if self.shutter_columns:
@@ -2621,12 +2648,11 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             )
 
         simulated = _rollout(
-            a,
-            b,
+            *discrete_steps(
+                a, b, dt_seconds[last:], _window(schedule, last, len(prepared))
+            ),
             initial_state=estimates[-1],
             inputs=inputs[last:],
-            dt_seconds=dt_seconds[last:],
-            schedule=_window(schedule, last, len(prepared)),
         )
 
         # The rollout starts from the filter's last estimate, so the two join

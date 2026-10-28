@@ -1189,6 +1189,32 @@ def test_heating_hands_the_compressor_from_the_zone_to_the_tank():
     assert _compressor_starts(result) == 1, "the run under way stopped"
 
 
+def test_the_tanks_start_up_follows_the_outdoor_temperature():
+    """With the start-up's shortfall as a line in the outdoor temperature,
+    a step starting the compressor delivers the heat line less that shortfall
+    there - more short when colder; without a forecast, the single ramp."""
+
+    cop_model = replace(
+        COP_MODEL,
+        start_ramp_seconds=884.0,
+        q_in_at_zero_outdoor_w=5400.0,
+        q_in_per_outdoor_w_per_k=50.0,
+        start_shortfall_at_zero_outdoor_j=1100.0 * 3600.0,
+        start_shortfall_per_outdoor_j_per_k=-17.0 * 3600.0,
+    )
+    optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig(), cop_model=cop_model)
+
+    for outdoor_c in (12.0, 20.0):
+        heat_w = 5400.0 + 50.0 * outdoor_c
+        shortfall_j = (1100.0 - 17.0 * outdoor_c) * 3600.0
+        assert heat_w * 1800.0 * optimizer._ramp_fraction(0.5, outdoor_c) == (
+            pytest.approx(heat_w * 1800.0 - shortfall_j)
+        )
+
+    assert optimizer._ramp_fraction(0.25, 12.0) < optimizer._ramp_fraction(0.25, 20.0)
+    assert optimizer._ramp_fraction(0.25, None) == pytest.approx(1.0 - 884.0 / 1800.0)
+
+
 def test_a_tank_handed_the_compressor_by_the_zone_carries_no_ramp():
     """The ramp is the compressor's own rise to full output: a tank block that
     starts it heats less in its first step, one the zone hands over to heats in

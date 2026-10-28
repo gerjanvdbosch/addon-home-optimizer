@@ -1155,7 +1155,7 @@ def test_flow_reporting_gap_bridges_while_active_but_zeroes_when_idle():
 def test_calibration_anchors_q_in_to_calorimetric_mean_not_free_fit():
     """Regression test for a real finding: q_in_nominal_w is only ever fit from
     the (typically few) heating timesteps lacking a valid calorimetric override
-    (see _resolve_q_in) - an arbitrary, unrepresentative subset (e.g. the first
+    (see _steps) - an arbitrary, unrepresentative subset (e.g. the first
     couple of samples of a cycle before flow ramps up). Left entirely free, the
     fit can land far from the real average delivered power (observed on real
     data: fit landed at ~1615 W against a calorimetric mean of ~5450 W).

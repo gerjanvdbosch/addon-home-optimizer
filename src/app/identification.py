@@ -3,6 +3,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
 from domain.jobs import CalibrateConfig, ValidateConfig
 from features.dataset import DatasetLoader
 from features.identifier import SystemIdentifier
@@ -25,8 +27,17 @@ class Identification:
         self.state_manager = state_manager
         self.path = path
         self.identifiers = identifiers
+        # The last frame loaded, and what for: models that ask for the same
+        # data over the same window - the COP of each mode, the building and
+        # its floor circuits - share one load. Only the last, so memory holds
+        # no more than one frame at a time, as before.
+        self._loaded: tuple[Any, pd.DataFrame] | None = None
 
     def calibrate(self, config: CalibrateConfig) -> None:
+        # One window for the whole job, so models asking for the same data
+        # ask for the same rows.
+        end = datetime.now(timezone.utc)
+
         for identifier in self.identifiers:
             if config.target and identifier.name != config.target:
                 continue
@@ -41,7 +52,7 @@ class Identification:
             # day that wording changed.
             for attempt in range(2):
                 try:
-                    identifier, df = self._prepare(identifier, config.days)
+                    identifier, df = self._prepare(identifier, config.days, end)
                     identifier.calibrate(df)
                     identifier.save(self.path)
                     break
@@ -79,12 +90,14 @@ class Identification:
         # Without a target every model, as calibrate() does - and as a batch
         # too: one model that cannot be validated (never calibrated, no runs in
         # the window) is reported and the rest still run.
+        end = config.end or datetime.now(timezone.utc)
+
         for identifier in self.identifiers:
             if config.target and identifier.name != config.target:
                 continue
 
             try:
-                identifier, df = self._prepare(identifier, config.days, end=config.end)
+                identifier, df = self._prepare(identifier, config.days, end)
                 result = identifier.validate(df)
             except Exception as error:
                 if config.target:
@@ -107,16 +120,20 @@ class Identification:
         self,
         identifier: SystemIdentifier,
         days: int,
-        end: datetime | None = None,
-    ) -> tuple[SystemIdentifier, Any]:
+        end: datetime,
+    ) -> tuple[SystemIdentifier, pd.DataFrame]:
         identifier.load(self.path)
 
         config = self.config_repository.load()
 
-        end = end or datetime.now(timezone.utc)
         start = end - timedelta(days=days)
+        key = (identifier.dataset(config), start, end)
 
-        dataset = identifier.dataset(config)
-        df = self.loader.load(dataset, start, end)
+        if self._loaded is None or self._loaded[0] != key:
+            # The old frame goes before the new one comes.
+            self._loaded = None
+            self._loaded = (key, self.loader.load(*key))
 
-        return identifier, df
+        # Shallow: under copy-on-write what one model adds or changes in its
+        # frame never reaches the next one's.
+        return identifier, self._loaded[1].copy(deep=False)

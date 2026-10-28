@@ -79,11 +79,19 @@ class ScheduledSystem:
         values = self.values[start : start + len(dt_seconds)]
         low = np.floor(values).astype(int)
         weight = (values - low)[:, None, None]
-        dt = np.round(np.asarray(dt_seconds, dtype=float), 3)
-        # Each whole value and interval once, then gathered per step.
-        keys = np.column_stack([np.concatenate([low, low + 1]), np.tile(dt, 2)])
-        unique, index = np.unique(keys, axis=0, return_inverse=True)
-        wholes = [self._whole(int(value), float(step)) for value, step in unique]
+        intervals, interval = np.unique(
+            np.round(np.asarray(dt_seconds, dtype=float), 3), return_inverse=True
+        )
+        # Each whole value and interval once, then gathered per step - as one
+        # integer per pair, which np.unique sorts far faster than rows.
+        keys = np.concatenate([low, low + 1]) * len(intervals) + np.tile(interval, 2)
+        unique, index = np.unique(keys, return_inverse=True)
+        wholes = [
+            self._whole(
+                int(key // len(intervals)), float(intervals[key % len(intervals)])
+            )
+            for key in unique
+        ]
         a_all = np.stack([a for a, _ in wholes])[index.ravel()]
         b_all = np.stack([b for _, b in wholes])[index.ravel()]
         n = len(values)
@@ -101,6 +109,35 @@ class ScheduledSystem:
             self._cache[key] = discretize_zoh(*self.system_at(float(value)), dt_seconds)
 
         return self._cache[key]
+
+
+def discrete_steps(
+    a: np.ndarray,
+    b: np.ndarray,
+    dt_seconds: np.ndarray,
+    schedule: ScheduledSystem | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """The discrete (A, B) of the step into each sample after the first,
+    stacked - the schedule's, or (a, b)'s once per interval length."""
+
+    dt_seconds = np.asarray(dt_seconds, float)[1:]
+
+    # A single sample takes no step.
+    if not len(dt_seconds):
+        return np.empty((0, *a.shape)), np.empty((0, *b.shape))
+
+    if schedule is not None:
+        return schedule.steps(dt_seconds)
+
+    _, first, index = np.unique(
+        np.round(dt_seconds, 3), return_index=True, return_inverse=True
+    )
+    steps = [discretize_zoh(a, b, dt) for dt in dt_seconds[first]]
+
+    return (
+        np.stack([a_d for a_d, _ in steps])[index],
+        np.stack([b_d for _, b_d in steps])[index],
+    )
 
 
 def kalman_states(
@@ -151,70 +188,96 @@ def kalman_states(
     n = a.shape[0]
     # Default: the first state alone, the one a thermometer normally reads.
     h = np.atleast_2d(np.eye(1, n)[0] if observation is None else observation)
+    a_steps, b_steps = discrete_steps(a, b, dt_seconds, schedule)
+
+    return kalman_filter(
+        a_steps,
+        b_steps,
+        measured,
+        inputs,
+        process_noise_w,
+        measurement_variance,
+        h,
+        disturbance_inputs,
+    )
+
+
+def kalman_filter(
+    a_steps: np.ndarray,
+    b_steps: np.ndarray,
+    measured: np.ndarray,
+    inputs: np.ndarray,
+    process_noise_w: float,
+    measurement_variance: float,
+    observation: np.ndarray,
+    disturbance_inputs: tuple[int, ...],
+) -> np.ndarray:
+    """kalman_states over steps discrete_steps() gives - or over many systems
+    at once against the same readings, each along a leading axis of the steps,
+    the inputs and the observation (a fit's parameter sets, say)."""
+
+    h = observation
+    n = a_steps.shape[-1]
     readings = np.asarray(measured, float).reshape(len(measured), -1)
 
     # Unmeasured parts start where the readings put them on average, and each
-    # reading's departure from that is spread over the states it sees.
+    # reading's departure from that is spread over the states it sees. States
+    # are columns, so one product serves one system or many.
     first = readings[0]
     level = float(np.nanmean(first))
-    state = np.full(n, level) + np.linalg.pinv(h) @ np.nan_to_num(first - level)
-    covariance = np.eye(n) * measurement_variance
+    state = level + np.linalg.pinv(h) @ np.nan_to_num(first - level)[:, None]
+    covariance = np.broadcast_to(
+        np.eye(n) * measurement_variance, state.shape[:-2] + (n, n)
+    )
 
-    estimates = np.empty((len(readings), n))
+    # The disturbances enter where unmodelled heat flows would, and their
+    # effect on the state is what the DISCRETE input matrix says inputs of
+    # that size do over one step. Building it from the continuous B instead
+    # understates it by a factor dt^2 - here about a million - which silently
+    # turns the filter into a free-running simulation that ignores the
+    # measurement. Independent channels, so their covariances add.
+    disturbances = b_steps[..., list(disturbance_inputs)]
+    # Everything that does not depend on the previous step, for all steps at
+    # once, step first: only the recursion itself is left to the loop.
+    process_covariances = np.moveaxis(
+        (process_noise_w**2) * disturbances @ np.swapaxes(disturbances, -1, -2), -3, 0
+    )
+    drives = np.moveaxis(b_steps @ inputs[..., : len(readings) - 1, :, None], -3, 0)
+    a_steps = np.moveaxis(a_steps, -3, 0)
+    a_transposed = np.swapaxes(a_steps, -1, -2)
+    h_transposed = np.swapaxes(h, -1, -2)
+
+    estimates = np.empty((len(readings), *state.shape))
     estimates[0] = state
 
-    cache: dict[float, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-
-    if schedule is not None:
-        scheduled_a, scheduled_b = schedule.steps(np.asarray(dt_seconds, float)[1:])
-        disturbances = scheduled_b[:, :, list(disturbance_inputs)]
-        scheduled_covariance = (process_noise_w**2) * np.einsum(
-            "kij,klj->kil", disturbances, disturbances
-        )
+    seen_rows = ~np.isnan(readings)
+    all_seen = seen_rows.all(axis=1).tolist()
+    any_seen = seen_rows.any(axis=1).tolist()
+    noise = np.eye(h.shape[-2]) * measurement_variance
 
     for i in range(1, len(readings)):
-        dt = float(dt_seconds[i])
-        key = round(dt, 3)
+        a_d = a_steps[i - 1]
+        state = a_d @ state + drives[i - 1]
+        covariance = a_d @ covariance @ a_transposed[i - 1] + process_covariances[i - 1]
 
-        if key not in cache and schedule is None:
-            a_d, b_d = discretize_zoh(a, b, dt)
-            # The disturbances enter where unmodelled heat flows would, and
-            # their effect on the state is what the DISCRETE input matrix says
-            # inputs of that size do over one step. Building it from the
-            # continuous B instead understates it by a factor dt^2 - here about
-            # a million - which silently turns the filter into a free-running
-            # simulation that ignores the measurement. Independent channels, so
-            # their covariances add.
-            disturbance = b_d[:, list(disturbance_inputs)]
-            cache[key] = (
-                a_d,
-                b_d,
-                (process_noise_w**2) * (disturbance @ disturbance.T),
-            )
+        if any_seen[i]:
+            if all_seen[i]:
+                h_seen, h_seen_t, noise_seen = h, h_transposed, noise
+                reading = readings[i][:, None]
+            else:
+                seen = seen_rows[i]
+                h_seen, h_seen_t = h[..., seen, :], h_transposed[..., seen]
+                noise_seen = noise[np.ix_(seen, seen)]
+                reading = readings[i][seen][:, None]
 
-        if schedule is None:
-            a_d, b_d, process_covariance = cache[key]
-        else:
-            a_d, b_d = scheduled_a[i - 1], scheduled_b[i - 1]
-            process_covariance = scheduled_covariance[i - 1]
-
-        state = a_d @ state + b_d @ inputs[i - 1]
-        covariance = a_d @ covariance @ a_d.T + process_covariance
-
-        seen = ~np.isnan(readings[i])
-
-        if seen.any():
-            h_seen = h[seen]
-            innovation = readings[i][seen] - h_seen @ state
-            innovation_covariance = (
-                h_seen @ covariance @ h_seen.T
-                + np.eye(int(seen.sum())) * measurement_variance
-            )
-            gain = covariance @ h_seen.T @ np.linalg.inv(innovation_covariance)
+            innovation = reading - h_seen @ state
+            covariance_h = covariance @ h_seen_t
+            gain = covariance_h @ np.linalg.inv(h_seen @ covariance_h + noise_seen)
 
             state = state + gain @ innovation
             covariance = covariance - gain @ h_seen @ covariance
 
         estimates[i] = state
 
-    return estimates
+    # Back to the systems first, a row per reading.
+    return np.moveaxis(estimates[..., 0], 0, -2)

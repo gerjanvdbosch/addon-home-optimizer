@@ -30,7 +30,7 @@ def _prices(times: pd.DatetimeIndex, solar_kw: np.ndarray, wind_kmh: np.ndarray)
     local = times.tz_convert("Europe/Amsterdam")
     hour = np.asarray(local.hour + local.minute / 60)
     clock = 0.22 + 0.08 * np.exp(-(((hour - 18.5) / 1.5) ** 2))
-    weekend = np.where(np.asarray(local.weekday) >= 5, -0.03, 0.0)
+    weekend = np.where(np.asarray(local.day_of_week) >= 5, -0.03, 0.0)
 
     return (
         clock

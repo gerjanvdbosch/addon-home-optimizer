@@ -374,3 +374,43 @@ def test_the_plan_line_starts_at_the_tank_now(tmp_path):
     boiler = manager.load().schedule.heat_pump.boiler
     assert [p.time for p in boiler.temperatures] == [NOW, *times[1:]]
     assert [p.time for p in boiler.on] == times
+
+
+def test_through_a_dhw_run_the_plan_line_shows_only_quarters(tmp_path):
+    manager = _state_manager()
+    manager.state_repository = StateRepository(JsonStorage(tmp_path / "state.json"))
+    times = [NOW.replace(minute=30) + timedelta(minutes=15 * i) for i in range(3)]
+
+    manager.update_schedule(
+        schedule=[1, 1, 0],
+        temperatures=[40.0, 44.0, 47.0],
+        power_w=[1500.0] * 3,
+        times=times,
+        now=NOW,
+        dhw_running=True,
+        run_temperatures=[SeriesPoint(time=times[0], value=42.0)],
+    )
+
+    boiler = manager.load().schedule.heat_pump.boiler
+    assert [(p.time, p.value) for p in boiler.temperatures] == [
+        (times[0], 42.0),
+        (times[1], 44.0),
+        (times[2], 47.0),
+    ]
+
+
+def test_a_run_the_booster_finishes_is_drawn_as_ended():
+    """The compressor ran and is at 0 Hz in the run under way: the booster has
+    taken over and the plan starts from the sensors, so they are drawn, never
+    below the tank before the run."""
+
+    changes = [SeriesPoint(time=RUN_START, value="SWW")]
+    tank = TANK.assign(heat_pump_compressor_frequency=[0.0, 52.0, 60.0, 30.0, 0.0])
+
+    assert _state_manager()._tank_temperature(tank, changes, "SWW").tolist() == [
+        30.0,
+        30.0,
+        34.25,
+        44.0,
+        48.5,
+    ]

@@ -415,7 +415,12 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         # From the raw readings: prepare() leaves the start-up out. DHW
         # planning uses both, a floor run its ramp (see
         # MPCOptimizer._add_space_heating).
-        start_ramp_seconds, start_step_power_w, handover_heat_j = self._start_up(df)
+        (
+            start_ramp_seconds,
+            (shortfall_at_zero_j, shortfall_per_k_j),
+            start_step_power_w,
+            handover_heat_j,
+        ) = self._start_up(df)
         df = self.prepare(df)
 
         if len(df) < 10:
@@ -558,6 +563,8 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             cooling=self.cooling,
             start_step_power_w=start_step_power_w,
             start_ramp_seconds=start_ramp_seconds,
+            start_shortfall_at_zero_outdoor_j=shortfall_at_zero_j,
+            start_shortfall_per_outdoor_j_per_k=shortfall_per_k_j,
             handover_heat_j=handover_heat_j,
         )
 
@@ -578,11 +585,14 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         # a line fitted at ~25-30 degC floor supply extrapolated to 60 degC
         # would mean nothing.
         logger.info(
-            "Heat pump COP calibration (%s): a %.0f s ramp and %.0f W "
+            "Heat pump COP calibration (%s): a %.0f s ramp (start-up short "
+            "%.2f kWh at 0 degC outdoor, %+.4f kWh per K) and %.0f W "
             "electrical over a run's first step, %.2f kWh from the loop "
             "handed over by hot water",
             self.mode,
             self.model.start_ramp_seconds,
+            self.model.start_shortfall_at_zero_outdoor_j / 3.6e6,
+            self.model.start_shortfall_per_outdoor_j_per_k / 3.6e6,
             self.model.start_step_power_w,
             self.model.handover_heat_j / 3.6e6,
         )
@@ -756,15 +766,19 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             float(q_outdoor),
         )
 
-    def _start_up(self, df: pd.DataFrame) -> tuple[float, float, float]:
-        """(ramp s, electrical power over the first planning step W, loop heat
-        handed over J) of how runs in this mode begin, from the readings as
-        loaded - minute readings, so a run starts within a minute of when it
-        really did, and prepare() has not yet left the start-up out.
+    def _start_up(
+        self, df: pd.DataFrame
+    ) -> tuple[float, tuple[float, float], float, float]:
+        """(ramp s, start-up shortfall line (J at 0 degC outdoor, J per K),
+        electrical power over the first planning step W, loop heat handed over
+        J) of how runs in this mode begin, from the readings as loaded - minute
+        readings, so a run starts within a minute of when it really did, and
+        prepare() has not yet left the start-up out.
 
         Of the runs the compressor starts for: the ramp as the boiler reads it
         (see BoilerThermalIdentifier._identify_heat_input_ramp), from the
-        calorimetric heat in the direction this mode moves it; the power the
+        calorimetric heat in the direction this mode moves it, and for DHW its
+        shortfall as a line in the outdoor temperature; the power the
         median, over runs that lasted past their first step
         (MPCConfig.step_hours) without the booster, of their mean power over
         it. Of the heating runs hot water hands over: the median of the heat
@@ -804,7 +818,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         previous = np.r_[None, df["state"].to_numpy()[:-1]]
         handed_over = starts & (previous == self.states.dhw)
         in_mode = running.copy()
-        running &= np.isin(run_id, run_id[cold])
+        running = running & np.isin(run_id, run_id[cold])
         booster = booster_active(df, self.mode).to_numpy(dtype=bool)
         heat_w = (
             (RHO_WATER_KG_PER_L / 60.0)
@@ -818,16 +832,36 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
                 )
             ).clip(lower=0.0)
         )
-        _, ramp_seconds = BoilerThermalIdentifier()._identify_heat_input_ramp(
-            pd.DataFrame(
-                {
-                    "time": df["time"],
-                    "boiler_on": running,
-                    "booster_on": booster,
-                    "q_in_override_w": heat_w.where(running),
-                }
-            )
+        boiler = BoilerThermalIdentifier()
+        ramp_frame = pd.DataFrame(
+            {
+                "time": df["time"],
+                "boiler_on": running,
+                "booster_on": booster,
+                "q_in_override_w": heat_w.where(running),
+            }
         )
+        _, ramp_seconds = boiler._identify_heat_input_ramp(ramp_frame)
+
+        # The tank's start-up shortfall per run against the outdoor
+        # temperature it started at (see
+        # HeatPumpCOPModel.start_shortfall_at_zero_outdoor_j). A run whose own
+        # ramp lies outside (0, MAX_RAMP_SECONDS] is a tap draw or a
+        # mis-detected start, as for the median.
+        shortfall_line = (0.0, 0.0)
+
+        if self.key == "dhw" and ramp_seconds and "temperature" in df:
+            outdoor_c = pd.to_numeric(df["temperature"], errors="coerce").ffill()
+            runs = [
+                (outdoor_c.iloc[start], shortfall_j)
+                for start, steady_w, shortfall_j in boiler._ramp_runs(ramp_frame)[1]
+                if not np.isnan(outdoor_c.iloc[start])
+                and 0.0 < 2.0 * shortfall_j / steady_w <= boiler.MAX_RAMP_SECONDS
+            ]
+
+            if len(runs) >= boiler.MIN_RAMP_RUNS:
+                at_c, shortfall_j = np.array(runs).T
+                shortfall_line = self._outdoor_line(at_c, shortfall_j)
 
         power_w = df["P_el"].to_numpy(dtype=float)
         seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
@@ -884,6 +918,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
 
         return (
             ramp_seconds or 0.0,
+            shortfall_line,
             float(np.median(powers)) if powers else 0.0,
             float(np.median(excess_j))
             if len(excess_j) >= BoilerThermalIdentifier.MIN_RAMP_RUNS
@@ -898,15 +933,22 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         modulation included. Flat, at the mean, where the outdoor temperature
         barely varies: the slope is then not identifiable."""
 
-        heat_w = df["Q_th"].to_numpy(dtype=float)
-        outdoor_c = df["T_outdoor"].to_numpy(dtype=float)
+        return HeatPumpCOPIdentifier._outdoor_line(
+            df["T_outdoor"].to_numpy(dtype=float), df["Q_th"].to_numpy(dtype=float)
+        )
+
+    @staticmethod
+    def _outdoor_line(outdoor_c: np.ndarray, values: np.ndarray) -> tuple[float, float]:
+        """(value at 0 degC outdoor, its rise per K) by least squares; flat, at
+        the mean, where the outdoor temperature barely varies."""
+
         design = np.column_stack([np.ones_like(outdoor_c), outdoor_c])
-        (at_zero_w, per_k_w), _, rank, _ = np.linalg.lstsq(design, heat_w, rcond=None)
+        (at_zero, per_k), _, rank, _ = np.linalg.lstsq(design, values, rcond=None)
 
         if rank < 2:
-            return float(np.mean(heat_w)), 0.0
+            return float(np.mean(values)), 0.0
 
-        return float(at_zero_w), float(per_k_w)
+        return float(at_zero), float(per_k)
 
     def _planned_power_w(self, df: pd.DataFrame) -> np.ndarray:
         """The electrical power MPCOptimizer plans with at each row's real
