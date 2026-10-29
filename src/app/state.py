@@ -546,11 +546,20 @@ class StateManager:
                     c.value == dhw for c in changes if start < c.time < start + quarter
                 )
 
+            held_before = {
+                p.time: p.value
+                for p in (
+                    existing.measurements.heat_pump.boiler.stratification
+                    if existing is not None
+                    else []
+                )
+            }
             df = df.assign(
                 boiler_stratification=tank_stratification_k(
                     pd.to_numeric(df["boiler_top_temperature"], errors="coerce"),
                     pd.to_numeric(df["boiler_bottom_temperature"], errors="coerce"),
                     (df["heat_pump_state"] == dhw) | df["time"].map(saw_dhw),
+                    pd.to_numeric(df["time"].map(held_before), errors="coerce"),
                 )
             )
             state.measurements.heat_pump.boiler.stratification = self._parse_series(

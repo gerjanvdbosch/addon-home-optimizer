@@ -176,7 +176,7 @@ def dashboard_chart(state: State, states: HeatPumpStates | None = None) -> str:
         cols=1,
         shared_xaxes=True,
         vertical_spacing=0.06,
-        subplot_titles=("Power", "Climate", "Boiler"),
+        subplot_titles=("Power", "Zone", "Boiler"),
         row_heights=[0.4, 0.3, 0.3],
     )
 
@@ -284,7 +284,7 @@ def dashboard_chart(state: State, states: HeatPumpStates | None = None) -> str:
         state.schedule.building.minimum_temperature,
         state.schedule.building.maximum_temperature,
         fillcolor="rgba(255, 255, 255, 0.03)",
-        legendgroup="climate",
+        legendgroup="zone",
         row=2,
         edge_line=dict(width=0.5, color="rgba(255, 255, 255, 0.2)"),
     )
@@ -317,12 +317,12 @@ def dashboard_chart(state: State, states: HeatPumpStates | None = None) -> str:
     )
 
     series(
-        "Climate target",
+        "Zone target",
         state.schedule.building.target_temperature,
         row=2,
         col=1,
         line=dict(width=1, color="rgba(254, 203, 82, 0.5)", dash="dash"),
-        legendgroup="climate",
+        legendgroup="zone",
         unit="°C",
         decimal=1,
     )
@@ -330,7 +330,7 @@ def dashboard_chart(state: State, states: HeatPumpStates | None = None) -> str:
     # The thermostat's room, which comfort is set in and the plan is judged
     # on: measured, then where the plan takes it (see zone_observation).
     series(
-        "Living room",
+        "Zone temp",
         joined(
             state.measurements.building.zone_temperature,
             state.schedule.building.temperatures,
@@ -383,7 +383,7 @@ def dashboard_chart(state: State, states: HeatPumpStates | None = None) -> str:
     )
 
     # The tank as the optimizer plans from it (see BoilerMeasurement.
-    # temperature), then as planned: one "Boiler temperature" line. The two
+    # temperature), then as planned: one "Boiler temp" line. The two
     # sensors are drawn beside it: their stratification is what the mixed
     # temperature is read from.
     boiler = state.measurements.heat_pump.boiler
@@ -415,7 +415,7 @@ def dashboard_chart(state: State, states: HeatPumpStates | None = None) -> str:
     )
 
     series(
-        "Boiler temperature",
+        "Boiler temp",
         joined(
             read_at(boiler.temperature, state.updated),
             state.schedule.heat_pump.boiler.temperatures,

@@ -296,6 +296,44 @@ def test_a_run_the_quarters_miss_still_mixes_the_tank():
     ]
 
 
+def test_a_quarters_stratification_is_held_across_updates():
+    """29 October 2026 at rest after a tap: the quarter's last reading so far
+    showed 46.0/44.0 degC at 21:05, 45.5/44.0 at 21:10. The 2.0 K the first
+    update held stays: the layer did not shrink, only the top stepped down."""
+
+    times = [
+        datetime(2026, 10, 29, 19, 45, tzinfo=UTC),
+        datetime(2026, 10, 29, 20, 0, tzinfo=UTC),
+    ]
+    config = SimpleNamespace(
+        heat_pump=SimpleNamespace(
+            states=HeatPumpStates(),
+            boiler=SimpleNamespace(target_temperature=45.0),
+            mode=None,
+        ),
+        building=SimpleNamespace(comfort=lambda cooling: None),
+    )
+
+    def update(top: float, bottom: float, existing: State) -> State:
+        df = pd.DataFrame(
+            {
+                "time": times,
+                "heat_pump_state": ["Uit"] * 2,
+                "boiler_top_temperature": [46.5, top],
+                "boiler_bottom_temperature": [45.5, bottom],
+            }
+        )
+
+        return _state_manager()._map(df, existing, config=config)  # type: ignore[arg-type]
+
+    state = update(45.5, 44.0, update(46.0, 44.0, State()))
+
+    assert [p.value for p in state.measurements.heat_pump.boiler.stratification] == [
+        1.0,
+        2.0,
+    ]
+
+
 RUN_START = datetime(2026, 10, 27, 10, 0, 49, tzinfo=UTC)
 # 27 Oct 2026, the quarters around a run from 10:00:49 to 10:53:06, each read
 # at its end: as it starts its circulation stirs the cold layer up and the top

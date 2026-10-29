@@ -81,7 +81,7 @@ def tank_state_space(
     return a, b
 
 
-def tank_stratification_k(top_c, bottom_c, mixing) -> np.ndarray:
+def tank_stratification_k(top_c, bottom_c, mixing, held_before=None) -> np.ndarray:
     """The stratification the cold layer below the tank's sensors is read from
     (K, see BoilerThermalModel.mixed_temperature): the top sensor less the
     bottom one, held at its largest since the tank was last mixed. Arrays in
@@ -97,10 +97,22 @@ def tank_stratification_k(top_c, bottom_c, mixing) -> np.ndarray:
     where the layer starts from after it. Before the first mixing the readings
     show, held from the first reading: the layer before them is not known.
     Missing readings hold what was held.
+
+    held_before is what an earlier update held at the same readings (NaN where
+    none): a quarter's reading is its last so far, so the larger difference an
+    earlier one showed is otherwise lost and the tank warms again when the
+    sensors step back (real data, 29 October 2026 at rest after a tap: 2.0 K,
+    then 1.5 K on the next update, the SoC 74 -> 80 %).
     """
 
     spread = np.asarray(top_c, dtype=float) - np.asarray(bottom_c, dtype=float)
     mixing = np.asarray(mixing, dtype=bool)
+
+    if held_before is not None:
+        spread = np.where(
+            mixing, spread, np.fmax(spread, np.asarray(held_before, dtype=float))
+        )
+
     held = spread.copy()
 
     for i in range(1, len(held)):

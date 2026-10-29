@@ -201,6 +201,51 @@ def test_no_planned_run_leaves_the_start_and_setpoint_unknown():
     }
 
 
+def test_the_tank_level_is_its_heat_above_the_mains():
+    """200 l at 31 degC over 15 degC mains: half of a tank at its 47 degC
+    setpoint, 16 K x 200 kg x 4186 J/kg/K = 3.72 kWh; above the setpoint
+    full, below the mains empty, and no share without a setpoint."""
+
+    level = Optimization.tank_level(31.0, 15.0, 47.0, 200.0, 1.8e6)
+
+    assert level == (50.0, {"available_kwh": 3.72, "drawn_today_kwh": 0.5})
+    assert Optimization.tank_level(48.5, 15.0, 47.0, 200.0, 0.0)[0] == 100.0
+    assert (
+        Optimization.tank_level(14.5, 15.0, 47.0, 200.0, 0.0)[1]["available_kwh"] == 0.0
+    )
+    assert Optimization.tank_level(31.0, 15.0, None, 200.0, 0.0)[0] is None
+
+
+def test_the_tank_level_is_its_own_sensor():
+    home_assistant = _RecordingHomeAssistant()
+    optimization = Optimization(
+        loader=None,  # type: ignore[arg-type]
+        state_manager=None,  # type: ignore[arg-type]
+        config_repository=None,  # type: ignore[arg-type]
+        models_path=Path("."),
+        home_assistant=home_assistant,  # type: ignore[arg-type]
+    )
+    result = MPCResult(
+        schedule=(0, 0, 0, 0),
+        temperatures=TEMPERATURES,
+        electrical_power_w=(0.0,) * 4,
+        heat_w=(0.0,) * 4,
+        objective_value=0.0,
+        solver_status="optimal",
+        termination_condition="optimal",
+    )
+
+    optimization.publish_dhw(result, TIMES, tank_level=(50.0, {"available_kwh": 3.72}))
+
+    state, attributes = home_assistant.states[Optimization.DHW_SOC_ENTITY]
+    assert state == "50.0"
+    assert attributes["unit_of_measurement"] == "%"
+    assert attributes["available_kwh"] == 3.72
+    assert (
+        "available_kwh" not in home_assistant.states[Optimization.DHW_STATUS_ENTITY][1]
+    )
+
+
 def test_the_setpoint_is_the_planned_end_temperature_rounded_to_the_nearest():
     """The tank is at 48.2 degC after the run's last step, 48.3 degC after a
     one-step run - each to the heat pump's nearest half degree."""

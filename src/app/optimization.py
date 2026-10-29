@@ -53,6 +53,7 @@ class Optimization:
     DHW_STATUS_ENTITY = "binary_sensor.home_optimizer_dhw_status"
     DHW_START_ENTITY = "sensor.home_optimizer_dhw_start"
     DHW_SETPOINT_ENTITY = "sensor.home_optimizer_dhw_setpoint"
+    DHW_SOC_ENTITY = "sensor.home_optimizer_dhw_soc"
     # The floor's, published the same way while the plan drives it (see
     # publish_zone).
     ZONE_STATUS_ENTITY = "binary_sensor.home_optimizer_zone_status"
@@ -255,7 +256,7 @@ class Optimization:
         # looked at; no draws assumed beyond it, the assumption made before
         # it existed.
         tap = TapForecaster(self.models_path)
-        tap_w = tap.predict(
+        draws = tap.prepare(
             # From a reading before midnight: the boiler's prepare() drops the
             # first, which has no interval of its own.
             self.loader.load(
@@ -263,7 +264,10 @@ class Optimization:
                 local_day_start(now).astimezone(timezone.utc)
                 - 2 * pd.Timedelta(BoilerThermalIdentifier.SAMPLE_INTERVAL),
                 now,
-            ),
+            )
+        )
+        tap_w = tap.predict(
+            draws,
             steps=len(forecast_times),
             habit=self._tap_habit(state, config, tap, now),
         )
@@ -419,7 +423,20 @@ class Optimization:
             ],
         )
 
-        self.publish_dhw(result, forecast_times, thermal_model)
+        self.publish_dhw(
+            result,
+            forecast_times,
+            thermal_model,
+            self.tank_level(
+                # The tank the plan starts from: mixed, or by its heat balance
+                # through a run under way (see MPCOptimizer._initial_temperature).
+                result.temperatures[0],
+                data.mains_water_temperature,
+                self._dhw_setpoint_c(config, now),
+                thermal_model.volume_l,
+                tap.drawn_today_j(draws),
+            ),
+        )
         self.log_dhw_plan(result, forecast_times, optimizer, planned)
 
         if optimize_config.explain:
@@ -1624,16 +1641,66 @@ class Optimization:
             },
         )
 
+    def _dhw_setpoint_c(self, config: Config, now: datetime) -> float | None:
+        """The heat pump's DHW setpoint now (deg C), None without a reading."""
+
+        frame = self.loader.load(
+            DatasetBuilder()
+            .timeseries(
+                "setpoint",
+                config.heat_pump.boiler.setpoint,
+                aggregation="last",
+                interval="15m",
+                fill="previous",
+            )
+            .build(),
+            now - timedelta(minutes=15),
+            now,
+        )
+        readings = pd.to_numeric(frame.get("setpoint"), errors="coerce").dropna()
+
+        return float(readings.iloc[-1]) if not readings.empty else None
+
+    @staticmethod
+    def tank_level(
+        tank_c: float,
+        mains_c: float,
+        setpoint_c: float | None,
+        volume_l: float,
+        drawn_today_j: float,
+    ) -> tuple[float | None, dict[str, float]]:
+        """What the tank holds, for its SoC sensor: the share of a tank at its
+        setpoint (%, at most 100; None without a setpoint above the mains),
+        and as attributes the heat above the mains water (kWh) - what tapping
+        can take out, every litre replaced from the mains - and the heat drawn
+        today (kWh). Heat, not litres: litres of mixed tap water rest on a tap
+        temperature assumed, and the tank's own water leaves at a temperature
+        that falls as it empties."""
+
+        heat_capacity_j_per_k = RHO_WATER_KG_PER_L * volume_l * CP_WATER_J_PER_KG_K
+        above_mains_k = max(tank_c - mains_c, 0.0)
+        soc = (
+            round(min(100.0 * above_mains_k / (setpoint_c - mains_c), 100.0), 1)
+            if setpoint_c is not None and setpoint_c > mains_c
+            else None
+        )
+
+        return soc, {
+            "available_kwh": round(above_mains_k * heat_capacity_j_per_k / 3.6e6, 2),
+            "drawn_today_kwh": round(drawn_today_j / 3.6e6, 2),
+        }
+
     def publish_dhw(
         self,
         result: MPCResult,
         times: list[datetime],
         thermal_model: BoilerThermalModel | None = None,
+        tank_level: tuple[float | None, dict[str, float]] | None = None,
     ) -> None:
         """Writes the plan's hot water decision to Home Assistant: on/off for the
         quarter hour running now, and the start and SWW setpoint of the next
         planned run (the current one if it is heating now, 'unknown' without
-        any).
+        any); and the tank's level (see tank_level()) where given.
 
         The heat pump heats until its setpoint and stops by itself; the heat
         left in the plate exchanger and the loops then still mixes through, and the
@@ -1676,6 +1743,20 @@ class Optimization:
             "on" if heating_now else "off",
             {"friendly_name": "Home Optimizer DHW status"},
         )
+
+        if tank_level is not None:
+            soc, attributes = tank_level
+            self.home_assistant.set_state(
+                self.DHW_SOC_ENTITY,
+                "unknown" if soc is None else str(soc),
+                {
+                    "friendly_name": "Home Optimizer DHW SoC",
+                    "unit_of_measurement": "%",
+                    "state_class": "measurement",
+                    **attributes,
+                },
+            )
+
         self.home_assistant.set_state(
             self.DHW_START_ENTITY,
             next_start,

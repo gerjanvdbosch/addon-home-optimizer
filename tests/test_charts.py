@@ -133,7 +133,7 @@ def test_the_dashboard_draws_the_comfort_band():
 
     html = dashboard_chart(state)
 
-    assert html.count('"legendgroup":"climate"') == 3
+    assert html.count('"legendgroup":"zone"') == 3
     # Filled up to the band's upper edge, as Solcast's is.
     assert html.count('"fill":"tonexty"') == 2
 

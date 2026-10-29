@@ -152,7 +152,8 @@ def test_draws_are_forecast_where_the_past_weeks_drew(tmp_path):
     rng = np.random.default_rng(3)
     df = _simulate_with_draws_when_present(rng, days=30)
 
-    prediction = TapForecaster(models_path=tmp_path).predict(df, steps=SAMPLES_PER_DAY)
+    forecaster = TapForecaster(models_path=tmp_path)
+    prediction = forecaster.predict(forecaster.prepare(df), steps=SAMPLES_PER_DAY)
 
     assert len(prediction) == SAMPLES_PER_DAY
     assert (prediction >= 0).all()

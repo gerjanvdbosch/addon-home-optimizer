@@ -78,14 +78,14 @@ class TapForecaster:
 
     def predict(
         self,
-        df: pd.DataFrame,
+        prepared: pd.DataFrame,
         steps: int = 48,
         habit: tuple[pd.Series, float | None] | None = None,
     ) -> pd.Series:
-        """The draws ahead from `habit` (see habit()), made from `df` without
-        one - which then need only reach back to today's midnight."""
+        """The draws ahead from `habit` (see habit()), made from `prepared`
+        (see prepare()) without one - which then need only reach back to
+        today's midnight."""
 
-        prepared = self.prepare(df)
         profile, heavy_day_w = habit if habit is not None else self._habit(prepared)
         future_index = pd.date_range(
             start=prepared.index[-1], periods=steps + 1, freq="15min"
@@ -146,6 +146,22 @@ class TapForecaster:
         return MIXED_TAP_WATER_C - np.array(
             [mains_water_temperature_c(day) for day in index.day_of_year]
         )
+
+    @staticmethod
+    def drawn_today_j(prepared: pd.DataFrame) -> float:
+        """The heat drawn since the local midnight (J), from `prepared` (see
+        prepare()): signed per quarter hour, so sensor noise averages out, and
+        none while the tank heats - a draw then is not told from the heat put
+        in."""
+
+        y = prepared["excess_loss_w"].dropna()
+
+        if y.empty:
+            return 0.0
+
+        quarter_s = 24 * 3600 / TapForecaster.QUARTERS_PER_DAY
+
+        return max(float(y[y.index >= y.index[-1].normalize()].sum()) * quarter_s, 0.0)
 
     @staticmethod
     def _within_todays_budget(

@@ -375,6 +375,7 @@ Home Optimizer writes the following entities to Home Assistant:
 | `binary_sensor.home_optimizer_dhw_status`  | `on` while the current quarter hour is planned to heat DHW                  |
 | `sensor.home_optimizer_dhw_start`          | Start of the next planned DHW run (`unknown` if none)                       |
 | `sensor.home_optimizer_dhw_setpoint`       | DHW setpoint (°C) for that run (`unknown` if none)                          |
+| `sensor.home_optimizer_dhw_soc`            | DHW tank state of charge (%)                                                |
 | `binary_sensor.home_optimizer_zone_status` | `on` while the current quarter hour is planned to heat or cool the zone     |
 | `sensor.home_optimizer_zone_start`         | Start of the zone run under way or the next one planned (`unknown` if none) |
 | `sensor.home_optimizer_zone_setpoint`      | Room temperature (°C) that run heats or cools to (`unknown` if none)        |
