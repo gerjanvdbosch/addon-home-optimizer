@@ -343,6 +343,8 @@ class StateManager:
         now: datetime | None = None,
         dhw_running: bool = False,
         run_temperatures: Sequence[SeriesPoint] = (),
+        top_temperatures: Sequence[float] = (),
+        bottom_temperatures: Sequence[float] = (),
     ) -> None:
         state = self.load()
 
@@ -361,17 +363,20 @@ class StateManager:
         # quarters, from the tank before the run (see _tank_temperature)
         # through the quarters the run has ended, by its heat balance, to the
         # plan's.
-        tank = list(
-            zip(
-                [now, *times[1:]] if now and times else times,
-                temperatures,
-                strict=False,
-            )
-        )
-        state.schedule.heat_pump.boiler.temperatures = [
-            SeriesPoint(time=t, value=float(val))
-            for t, val in (tank[1:] if dhw_running else tank)
-        ]
+        tank_times = [now, *times[1:]] if now and times else times
+        boiler = state.schedule.heat_pump.boiler
+
+        def tank_line(values: Sequence[float]) -> list[SeriesPoint]:
+            tank = list(zip(tank_times, values, strict=False))
+
+            return [
+                SeriesPoint(time=t, value=float(val))
+                for t, val in (tank[1:] if dhw_running else tank)
+            ]
+
+        boiler.temperatures = tank_line(temperatures)
+        boiler.top_temperatures = tank_line(top_temperatures)
+        boiler.bottom_temperatures = tank_line(bottom_temperatures)
 
         if dhw_running:
             state.schedule.heat_pump.boiler.temperatures[:0] = run_temperatures
@@ -554,13 +559,23 @@ class StateManager:
                     else []
                 )
             }
+            top = pd.to_numeric(df["boiler_top_temperature"], errors="coerce")
+            bottom = pd.to_numeric(df["boiler_bottom_temperature"], errors="coerce")
+            # Kept only where the sensors read: held on into the forecast's
+            # quarters, it came back as held_before once they were measured,
+            # past the run that had mixed the tank meanwhile (real data, 30
+            # Oct 2026: 8 K from before a run at 14:45 held again from 15:00,
+            # the tank read 36 degC at 48/48).
             df = df.assign(
-                boiler_stratification=tank_stratification_k(
-                    pd.to_numeric(df["boiler_top_temperature"], errors="coerce"),
-                    pd.to_numeric(df["boiler_bottom_temperature"], errors="coerce"),
-                    (df["heat_pump_state"] == dhw) | df["time"].map(saw_dhw),
-                    pd.to_numeric(df["time"].map(held_before), errors="coerce"),
-                )
+                boiler_stratification=pd.Series(
+                    tank_stratification_k(
+                        top,
+                        bottom,
+                        (df["heat_pump_state"] == dhw) | df["time"].map(saw_dhw),
+                        pd.to_numeric(df["time"].map(held_before), errors="coerce"),
+                    ),
+                    index=df.index,
+                ).where(top.notna() & bottom.notna())
             )
             state.measurements.heat_pump.boiler.stratification = self._parse_series(
                 df, "boiler_stratification"

@@ -384,20 +384,25 @@ def dashboard_chart(state: State, states: HeatPumpStates | None = None) -> str:
 
     # The tank as the optimizer plans from it (see BoilerMeasurement.
     # temperature), then as planned: one "Boiler temp" line. The two
-    # sensors are drawn beside it: their stratification is what the mixed
-    # temperature is read from.
+    # sensors are drawn beside it, measured and then as planned: their
+    # stratification is what the mixed temperature is read from.
     boiler = state.measurements.heat_pump.boiler
+    planned_boiler = state.schedule.heat_pump.boiler
 
-    for name, points in (
-        ("Boiler bottom", boiler.bottom_temperature),
-        ("Boiler top", boiler.top_temperature),
+    for name, points, plan in (
+        (
+            "Boiler bottom",
+            boiler.bottom_temperature,
+            planned_boiler.bottom_temperatures,
+        ),
+        ("Boiler top", boiler.top_temperature, planned_boiler.top_temperatures),
     ):
         series(
             name,
-            read_at(points, state.updated),
+            joined(read_at(points, state.updated), plan),
             row=3,
             col=1,
-            line=dict(width=1, color="#636EFA", dash="dot"),
+            line=dict(width=1, color="rgba(99, 110, 250, 0.7)"),
             legendgroup="boiler_temperature",
             showlegend=False,
             unit="°C",

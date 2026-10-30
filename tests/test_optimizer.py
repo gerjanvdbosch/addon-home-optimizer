@@ -8,18 +8,20 @@ from pyomo.contrib.appsi.solvers.highs import Highs
 
 from domain.dynamics import discretize_zoh
 from domain.models import (
+    TANK_SENSOR_RESOLUTION_K,
     BoilerThermalModel,
     BuildingThermalModel,
     FloorCircuitModel,
     HeatPumpCOPModel,
 )
-from domain.mpc import MPCConfig, MPCInput
+from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.physics import (
     CP_WATER_J_PER_KG_K,
     RHO_WATER_KG_PER_L,
     floor_circuit_conductance_w_per_k,
     lumped_tank_state_space,
     mains_water_temperature_c,
+    tank_sensor_temperatures,
     zone_observation,
     zone_state_space,
 )
@@ -2724,3 +2726,73 @@ def test_the_mains_follow_the_year_damped_and_late():
         mains_water_temperature_c(day) < bound
         for day, bound in ((227, 17.5), (258, 17.8), (288, 16.5))
     )
+
+
+# Fitted on Jun - Oct 2026 (see BoilerThermalIdentifier._identify_thermocline).
+THERMOCLINE_MODEL = replace(
+    THERMAL_MODEL,
+    top_sensor_volume_l=139.0,
+    bottom_sensor_volume_l=104.0,
+    thermocline_width_l=34.0,
+)
+
+
+def test_the_sensors_hold_until_the_drawn_water_reaches_them():
+    """A draw lets mains water in at the bottom: a mixed tank reads its
+    temperature at both sensors, a fifth of its heat drawn the bottom has
+    hardly moved, and the bottom goes before the top."""
+
+    def read(mixed_c: float) -> tuple[float, float]:
+        top_c, bottom_c = tank_sensor_temperatures(
+            THERMOCLINE_MODEL, 48.0, mixed_c, 15.0
+        )
+        return float(top_c), float(bottom_c)
+
+    # Within a sensor step: the front's tail reaches below the tank's bottom.
+    assert read(48.0) == pytest.approx((48.0, 48.0), abs=TANK_SENSOR_RESOLUTION_K)
+    assert read(48.0 - 33.0 / 5.0)[1] > 46.0
+    top_c, bottom_c = read(48.0 - 33.0 * 0.6)
+    assert bottom_c < 30.0 < top_c
+
+
+def test_the_planned_sensors_start_at_their_readings_and_a_run_stirs_them():
+    """The plan's sensors start from the hot water their readings show and
+    read the tank itself once a run has stirred it."""
+
+    top_c, bottom_c = (
+        float(c) for c in tank_sensor_temperatures(THERMOCLINE_MODEL, 50.0, 30.0, 15.0)
+    )
+    data = _make_input(
+        current_temp_top=top_c,
+        current_temp_bottom=bottom_c,
+        mains_water_temperature=15.0,
+    )
+    result = MPCResult(
+        schedule=(0, 1, 0, 0),
+        temperatures=(30.0, 29.9, 45.0, 44.9),
+        electrical_power_w=(0.0,) * 4,
+        heat_w=(0.0,) * 4,
+        objective_value=0.0,
+        solver_status="ok",
+        termination_condition="optimal",
+    )
+
+    top, bottom = MPCOptimizer(THERMOCLINE_MODEL, MPCConfig()).sensor_temperatures(
+        data, result
+    )
+
+    assert (top[0], bottom[0]) == pytest.approx((top_c, bottom_c), abs=0.05)
+    assert bottom[1] < top[1]
+    assert (top[2], bottom[2]) == pytest.approx(
+        (45.0, 45.0), abs=TANK_SENSOR_RESOLUTION_K
+    )
+    assert top[3] == pytest.approx(bottom[3], abs=0.1)
+
+
+def test_no_planned_sensors_without_a_thermocline():
+    result = MPCResult((0,), (30.0,), (0.0,), (0.0,), 0.0, "ok", "optimal")
+    data = _make_input(mains_water_temperature=15.0)
+
+    assert MPCOptimizer(THERMAL_MODEL, MPCConfig()).sensor_temperatures(
+        data, result
+    ) == ((), ())

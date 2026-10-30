@@ -173,6 +173,10 @@ class Predictions(BaseModel):
 class BoilerSchedule(BaseModel):
     target_temperature: list[SeriesPoint[float]] = Field(default_factory=list)
     temperatures: list[SeriesPoint[float]] = Field(default_factory=list)
+    # What the tank's sensors read along the plan (see
+    # MPCOptimizer.sensor_temperatures), on the same times as temperatures.
+    top_temperatures: list[SeriesPoint[float]] = Field(default_factory=list)
+    bottom_temperatures: list[SeriesPoint[float]] = Field(default_factory=list)
     # Whether the plan heats the tank (1/0): the next plan starts from it (see
     # MPCInput.previous_tank_on).
     on: list[SeriesPoint[int]] = Field(default_factory=list)

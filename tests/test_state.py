@@ -334,6 +334,52 @@ def test_a_quarters_stratification_is_held_across_updates():
     ]
 
 
+def test_a_run_ends_the_stratification_held_before_it():
+    """30 October 2026: the 8 K before a run was held on into the forecast's
+    quarters and came back once they were measured, after the run had mixed
+    the tank - 36 degC read at 48/48. Only measured quarters are kept."""
+
+    times = [
+        datetime(2026, 10, 30, 12, 15, tzinfo=UTC) + timedelta(minutes=15 * i)
+        for i in range(3)
+    ]
+    config = SimpleNamespace(
+        heat_pump=SimpleNamespace(
+            states=HeatPumpStates(),
+            boiler=SimpleNamespace(target_temperature=45.0),
+            mode=None,
+        ),
+        building=SimpleNamespace(comfort=lambda cooling: None),
+    )
+
+    def update(state: list[str], top: list[float], bottom: list[float], existing):
+        df = pd.DataFrame(
+            {
+                "time": times,
+                "heat_pump_state": state,
+                "boiler_top_temperature": top,
+                "boiler_bottom_temperature": bottom,
+            }
+        )
+
+        return _state_manager()._map(df, existing, config=config)  # type: ignore[arg-type]
+
+    nan = float("nan")
+    before = update(["Uit"] * 3, [22.0, nan, nan], [14.0, nan, nan], State())
+    state = update(
+        ["Uit", "SWW", "Uit"], [22.0, 48.5, 48.0], [14.0, 48.5, 48.0], before
+    )
+
+    assert [p.value for p in before.measurements.heat_pump.boiler.stratification] == [
+        8.0
+    ]
+    assert [p.value for p in state.measurements.heat_pump.boiler.stratification] == [
+        8.0,
+        0.0,
+        0.0,
+    ]
+
+
 RUN_START = datetime(2026, 10, 27, 10, 0, 49, tzinfo=UTC)
 # 27 Oct 2026, the quarters around a run from 10:00:49 to 10:53:06, each read
 # at its end: as it starts its circulation stirs the cold layer up and the top

@@ -9,9 +9,14 @@ that estimates their states and to the planner that acts on them.
 """
 
 import numpy as np
-from scipy.special import expit
+from scipy.special import expit, ndtr
 
-from domain.models import BuildingThermalModel, DewPointModel, FloorCircuitModel
+from domain.models import (
+    BoilerThermalModel,
+    BuildingThermalModel,
+    DewPointModel,
+    FloorCircuitModel,
+)
 
 # Physical constants (water), not fit parameters.
 RHO_WATER_KG_PER_L = 1.0
@@ -120,6 +125,41 @@ def tank_stratification_k(top_c, bottom_c, mixing, held_before=None) -> np.ndarr
             held[i] = np.fmax(held[i - 1], spread[i])
 
     return held
+
+
+def tank_sensor_temperatures(
+    model: BoilerThermalModel, hot_c, mixed_c, mains_c
+) -> tuple[np.ndarray, np.ndarray]:
+    """(top, bottom) the tank's sensors read (deg C) with its heat at mixed_c:
+    water at hot_c above the mains water (mains_c) that draws let in at the
+    bottom, as much of it as the heat drawn says - the mixed temperature is
+    the volumes' mean - and the two apart over a front (thermocline)
+    model.thermocline_width_l thick, the water mixed there as it came in. A
+    sensor reads the water at its height: the volume below it
+    (model.top/bottom_sensor_volume_l). A run stirs the tank to one
+    temperature, which is hot_c = mixed_c here.
+
+    Between runs the sensors stay where the run left them until the front
+    reaches them: over 116 rests after runs (Jun-Oct 2026) the bottom first
+    fell with 40-60 % of the tank's heat drawn, the top with 60-80 %. Read
+    off the plan's tank this way, the sensors came out 0.9 K off on rests
+    the fit had not seen, against 5.7 (top) and 2.3 K (bottom) for the mixed
+    temperature itself. Scalars or arrays."""
+
+    hot = np.asarray(hot_c, dtype=float)
+    span = hot - mains_c
+    cold_l = model.volume_l * np.clip(
+        np.divide(hot - mixed_c, span, out=np.zeros_like(span), where=span > 0),
+        0.0,
+        1.0,
+    )
+
+    def at(volume_below_l):
+        return mains_c + span * ndtr(
+            (volume_below_l - cold_l) / model.thermocline_width_l
+        )
+
+    return at(model.top_sensor_volume_l), at(model.bottom_sensor_volume_l)
 
 
 # A start dead time was tried for this planning model and rejected: no heat into

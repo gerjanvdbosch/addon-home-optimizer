@@ -1,4 +1,5 @@
 import logging
+from dataclasses import replace
 from datetime import timedelta
 
 import numpy as np
@@ -14,6 +15,8 @@ from domain.physics import (
     CP_WATER_J_PER_KG_K,
     RHO_WATER_KG_PER_L,
     lumped_tank_state_space,
+    mains_water_temperature_c,
+    tank_sensor_temperatures,
     tank_state_space,
     tank_stratification_k,
 )
@@ -1187,6 +1190,21 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         ) = self._identify_cold_layer(df)
         # Against the mixed tank, so after the cold layer.
         self.model.supply_margin_k = self._identify_supply_margin(df)
+        (
+            self.model.top_sensor_volume_l,
+            self.model.bottom_sensor_volume_l,
+            self.model.thermocline_width_l,
+        ) = self._identify_thermocline(df)
+
+        if self.model.thermocline_width_l is not None:
+            logger.info(
+                "Boiler thermal calibration: top sensor above %.0f l, bottom "
+                "sensor above %.0f l, the front of the water drawn in %.0f l "
+                "thick.",
+                self.model.top_sensor_volume_l,
+                self.model.bottom_sensor_volume_l,
+                self.model.thermocline_width_l,
+            )
 
         if self.model.cold_layer_fraction is not None:
             logger.info(
@@ -1476,6 +1494,107 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         )
 
         return float(fit.x[0]), float(self._parameter_std_errors(fit)[0])
+
+    def _identify_thermocline(
+        self, df: pd.DataFrame
+    ) -> tuple[float | None, float | None, float | None]:
+        """(the volume below the top sensor l, below the bottom sensor l, the
+        thickness of the front between the hot water and the mains water
+        drawn in l; see physics.tank_sensor_temperatures), fitted on the
+        sensors over the rests between runs, every quarter hour. The hot
+        water is the tank as its run left it, settled and mixed, cooling on
+        the standing loss the plan coasts with; the tank's heat is its mixed
+        temperature, the draws' share of it the cold water's. Nones with
+        fewer rests than the standing loss needs or no cold layer
+        identified.
+
+        The front, not the cold layer's share, sets what the sensors read: a
+        draw takes hot water from the top and lets mains water in at the
+        bottom, so a sensor holds until the front reaches it. Fitted on Jun -
+        Oct 2026: the bottom sensor above 103 l, the top above 136 l, the
+        front 33 l - the top below the outlet, which a run's circulation
+        leaves warmer water above (see _identify_calorimetric_gain)."""
+
+        model = self.model
+
+        if model is None or model.cold_layer_fraction is None:
+            return None, None, None
+
+        boiler_on = df["boiler_on"].to_numpy(dtype=bool)
+        top = df["T_top"].to_numpy(dtype=float)
+        bottom = df["T_bottom"].to_numpy(dtype=float)
+        ambient = df["T_ambient"].to_numpy(dtype=float)
+        seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
+        mixed_c = model.mixed_temperature(
+            top, bottom, ambient, tank_stratification_k(top, bottom, boiler_on)
+        )
+        (rate,) = lumped_tank_state_space(
+            model.volume_l, model.ua_top_w_per_k + model.ua_bottom_w_per_k
+        )[0][0]
+        step_s = MPCConfig().step_hours * 3600.0
+        rows, hot_c, mains_c = [], [], []
+
+        for _, _, settled in self._run_balance_spans(df):
+            end = settled
+
+            while end + 1 < len(df) and not boiler_on[end + 1]:
+                end += 1
+
+            rest = np.unique(
+                np.searchsorted(
+                    seconds, np.arange(seconds[settled], seconds[end], step_s)
+                )
+            )
+
+            if len(rest) < 2:
+                continue
+
+            decay = np.exp(rate * (seconds[rest] - seconds[settled]))
+            rows.append(rest)
+            hot_c.append(
+                np.maximum(
+                    ambient[rest] + (mixed_c[settled] - ambient[rest]) * decay,
+                    mixed_c[rest],
+                )
+            )
+            mains_c.append(
+                np.full(
+                    len(rest),
+                    mains_water_temperature_c(df["time"].iloc[settled].dayofyear),
+                )
+            )
+
+        if len(rows) < self.MIN_STANDING_LOSS_RUNS:
+            return None, None, None
+
+        rest = np.concatenate(rows)
+        hot = np.concatenate(hot_c)
+        mains = np.concatenate(mains_c)
+        volume_l = model.volume_l
+
+        def residuals(p: np.ndarray) -> np.ndarray:
+            fitted = replace(
+                model,
+                top_sensor_volume_l=p[0],
+                bottom_sensor_volume_l=p[1],
+                thermocline_width_l=p[2],
+            )
+            top_c, bottom_c = tank_sensor_temperatures(
+                fitted, hot, mixed_c[rest], mains
+            )
+
+            return np.concatenate([top_c - top[rest], bottom_c - bottom[rest]])
+
+        # Both sensors somewhere in the tank; the front thinner than the tank
+        # and thicker than a litre, below which it is a step the quarter
+        # hours cannot tell from one.
+        fit = least_squares(
+            residuals,
+            [0.75 * volume_l, 0.5 * volume_l, 0.1 * volume_l],
+            bounds=([0.0, 0.0, 1.0], [volume_l, volume_l, volume_l]),
+        )
+
+        return float(fit.x[0]), float(fit.x[1]), float(fit.x[2])
 
     def _run_balance_spans(self, df: pd.DataFrame) -> list[tuple[int, int, int]]:
         """(onset, stop, settled) rows of each heat pump run a heat balance can

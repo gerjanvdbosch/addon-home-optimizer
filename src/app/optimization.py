@@ -410,9 +410,12 @@ class Optimization:
                 strict=False,
             )
         ]
+        top_c, bottom_c = optimizer.sensor_temperatures(planned, result)
         self.state_manager.update_schedule(
             schedule=result.schedule,
             temperatures=result.temperatures,
+            top_temperatures=top_c,
+            bottom_temperatures=bottom_c,
             power_w=result.electrical_power_w,
             times=forecast_times,
             heat_w=result.heat_w,

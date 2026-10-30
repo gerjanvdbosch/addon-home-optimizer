@@ -10,6 +10,7 @@ import numpy as np
 import pyomo.environ as pyo
 from pyomo.contrib.appsi.base import TerminationCondition
 from pyomo.contrib.appsi.solvers.highs import Highs
+from scipy.optimize import minimize_scalar
 
 from domain.dynamics import ScheduledSystem, discretize_zoh
 from domain.models import (
@@ -29,6 +30,7 @@ from domain.physics import (
     floor_heat_moved_w,
     floor_living_fraction,
     lumped_tank_state_space,
+    tank_sensor_temperatures,
     zone_floor,
     zone_observation,
     zone_state_space,
@@ -2682,6 +2684,77 @@ class MPCOptimizer:
         limit_c = self.thermal_model.heat_pump_max_tank_temperature_c
 
         return min(estimate_c, limit_c) if limit_c is not None else estimate_c
+
+    def sensor_temperatures(
+        self, data: MPCInput, result: MPCResult
+    ) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        """The tank's top and bottom sensors along the plan (deg C, see
+        physics.tank_sensor_temperatures): the plan's tank, its hot water
+        cooling on the standing loss and stirred to the tank's temperature by
+        each run. From the hot water the sensors read now, or through a run
+        under way the tank itself, which it stirs. Empty without a
+        thermocline identified or the mains temperature.
+
+        The hot water read from both sensors, not the top alone: where the
+        front had passed the top, the top put it too cold and the bottom 2 K
+        too warm an hour on (replayed with the tap forecast from every second
+        hour, Sep - Oct 2026, 480 starts), 0.3 K reading both. An hour on the
+        sensors are 0.9 K off, six hours on 2.5 (top) and 3.6 K (bottom), as
+        the forecast's draws fall at other times than the real ones; the
+        sensors held as they are, 4.4 and 7.5 K."""
+
+        model = self.thermal_model
+        mains_c = data.mains_water_temperature
+
+        if model.thermocline_width_l is None or mains_c is None:
+            return (), ()
+
+        tank_c = np.asarray(result.temperatures, dtype=float)
+        hottest_c = model.max_tank_temperature_c or DEFAULT_MAX_TANK_TEMPERATURE_C
+        lowest_c = max(float(data.current_temp_top), float(tank_c[0]))
+
+        def misfit(hot_c: float) -> float:
+            top_c, bottom_c = tank_sensor_temperatures(model, hot_c, tank_c[0], mains_c)
+
+            return float(
+                (top_c - data.current_temp_top) ** 2
+                + (bottom_c - data.current_temp_bottom) ** 2
+            )
+
+        if data.boiler_on_current or lowest_c >= hottest_c:
+            hot_c = [float(tank_c[0]) if data.boiler_on_current else lowest_c]
+        else:
+            hot_c = [
+                float(
+                    minimize_scalar(
+                        misfit, bounds=(lowest_c, hottest_c), method="bounded"
+                    ).x
+                )
+            ]
+
+        a, b = lumped_tank_state_space(
+            model.volume_l, model.ua_top_w_per_k + model.ua_bottom_w_per_k
+        )
+
+        for k in range(len(tank_c) - 1):
+            hours = (
+                data.first_step_hours
+                if k == 0 and data.first_step_hours is not None
+                else self.config.step_hours
+            )
+            a_d, b_d = discretize_zoh(a, b, hours * 3600.0)
+            coast_c = float(
+                a_d[0, 0] * hot_c[-1] + b_d[0, 0] * data.ambient_temperature
+            )
+            hot_c.append(
+                float(tank_c[k + 1])
+                if result.schedule[k]
+                else max(coast_c, float(tank_c[k + 1]))
+            )
+
+        top_c, bottom_c = tank_sensor_temperatures(model, hot_c, tank_c, mains_c)
+
+        return tuple(top_c.tolist()), tuple(bottom_c.tolist())
 
     def _ramp_fraction(self, dt_hours: float, outdoor_c: float | None) -> float:
         """Share of _heat_at a step delivers when the compressor starts in it.

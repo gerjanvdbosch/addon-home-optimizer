@@ -98,6 +98,14 @@ class BoilerThermalModel:
     cold_layer_fraction: float | None = None
     cold_layer_above_ambient_k: float | None = None
     cold_layer_spread_k: float | None = None
+    # Where the sensors sit, as the water volume below each (l), and how
+    # thick the front between the hot water and the mains water draws let in
+    # is (l): what turns the tank's heat into what its sensors read (see
+    # physics.tank_sensor_temperatures; BoilerThermalIdentifier.
+    # _identify_thermocline). None until rests after runs have shown them.
+    top_sensor_volume_l: float | None = None
+    bottom_sensor_volume_l: float | None = None
+    thermocline_width_l: float | None = None
 
     def mixed_temperature(self, top_c, bottom_c, ambient_c, stratification_k=None):
         """The tank's mean temperature (deg C): what mixing it gives, and so
