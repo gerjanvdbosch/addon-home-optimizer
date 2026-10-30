@@ -285,12 +285,7 @@ def zone_state_space(
 
     share = model.living_area_fraction
     shares = np.array([share, 1.0 - share])
-    c_room = model.c_air_j_per_k * shares
-    c_screed = model.screed_capacity_j_per_k * shares
-    c_slab = model.c_mass_j_per_k * shares - c_screed
-
-    if np.any(c_slab <= 0.0):
-        raise ValueError("The screed holds more heat than the slabs it lies on.")
+    c = zone_heat_capacities(model)
 
     ua_surface = model.ua_air_mass_w_per_k * shares
     ua_down = model.screed_to_slab_w_per_k * shares
@@ -311,18 +306,17 @@ def zone_state_space(
         top = room + 4 if screed else slab
         # Where the water's heat enters and the concrete takes it on.
         pipes = room + 6 if layered else top
-        c_top = c_screed[room] * (0.5 if layered else 1.0) if screed else c_slab[room]
-        c_pipes = c_top
+        c_room, c_slab, c_top, c_pipes = c[room], c[slab], c[top], c[pipes]
 
-        a[room, room] = -(ua_env[room] + ua_rooms + ua_surface[room]) / c_room[room]
-        a[room, other] = ua_rooms / c_room[room]
-        a[room, top] = ua_surface[room] / c_room[room]
+        a[room, room] = -(ua_env[room] + ua_rooms + ua_surface[room]) / c_room
+        a[room, other] = ua_rooms / c_room
+        a[room, top] = ua_surface[room] / c_room
         a[top, room] = ua_surface[room] / c_top
         a[top, top] = -ua_surface[room] / c_top
 
-        b[room, 0] = ua_env[room] / c_room[room]
-        b[room, 1] = shares[room] / c_room[room]
-        b[room, 2 + room] = 1.0 / c_room[room]
+        b[room, 0] = ua_env[room] / c_room
+        b[room, 1] = shares[room] / c_room
+        b[room, 2 + room] = 1.0 / c_room
         b[pipes, 4] = shares[room] / c_pipes
         b[pipes, 5] = (1.0 if room == 0 else -1.0) / c_pipes
 
@@ -335,16 +329,40 @@ def zone_state_space(
         if screed:
             a[pipes, pipes] -= ua_down[room] / c_pipes
             a[pipes, slab] = ua_down[room] / c_pipes
-            a[slab, pipes] = ua_down[room] / c_slab[room]
-            a[slab, slab] = -ua_down[room] / c_slab[room]
+            a[slab, pipes] = ua_down[room] / c_slab
+            a[slab, slab] = -ua_down[room] / c_slab
 
     ceiling = model.ua_ceiling_w_per_k
-    a[0, 0] -= ceiling / c_room[0]
-    a[0, 3] += ceiling / c_room[0]
-    a[3, 3] -= ceiling / c_slab[1]
-    a[3, 0] += ceiling / c_slab[1]
+    a[0, 0] -= ceiling / c[0]
+    a[0, 3] += ceiling / c[0]
+    a[3, 3] -= ceiling / c[3]
+    a[3, 0] += ceiling / c[3]
 
     return a, b
+
+
+def zone_heat_capacities(model: BuildingThermalModel) -> np.ndarray:
+    """Each of the zone's states' heat capacity (J/K, see zone_state_space):
+    the rooms, the slabs less their screeds, and the screeds - in halves
+    where they have two."""
+
+    share = model.living_area_fraction
+    shares = np.array([share, 1.0 - share])
+    c_screed = model.screed_capacity_j_per_k * shares
+    c_slab = model.c_mass_j_per_k * shares - c_screed
+
+    if np.any(c_slab <= 0.0):
+        raise ValueError("The screed holds more heat than the slabs it lies on.")
+
+    parts = [model.c_air_j_per_k * shares, c_slab]
+    size = zone_size(model)
+
+    if size == 6:
+        parts.append(c_screed)
+    elif size == 8:
+        parts += [0.5 * c_screed, 0.5 * c_screed]
+
+    return np.concatenate(parts)
 
 
 def zone_size(model: BuildingThermalModel) -> int:

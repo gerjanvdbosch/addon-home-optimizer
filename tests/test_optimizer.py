@@ -23,8 +23,10 @@ from domain.physics import (
     mains_water_temperature_c,
     tank_sensor_temperatures,
     zone_observation,
+    zone_size,
     zone_state_space,
 )
+from features import optimizer as optimizer_module
 from features.optimizer import (
     MIP_ABSOLUTE_GAP_EUR,
     MPCOptimizer,
@@ -2796,3 +2798,31 @@ def test_no_planned_sensors_without_a_thermocline():
     assert MPCOptimizer(THERMAL_MODEL, MPCConfig()).sensor_temperatures(
         data, result
     ) == ((), ())
+
+
+def test_heat_left_in_the_floor_at_the_end_is_worth_what_it_saves(monkeypatch):
+    """The heat a plan leaves in the zone at its end, up to what the zone
+    left alone would fall short of its wanted temperature, is worth what the
+    next plan would pay to make it: a plan ends with a warmer floor than one
+    that counts it as nothing - and leaves none where the zone ends warm
+    enough anyway (see test_heating_the_zone_is_not_free)."""
+
+    def plan():
+        return MPCOptimizer(
+            THERMAL_MODEL,
+            MPCConfig(),
+            cop_model=COP_MODEL,
+            building_model=TWO_NODE,
+            floor_circuit_model=HEATING,
+            space_cop_model=COP_MODEL,
+        ).solve(_cold_day(steps=48))
+
+    valued = plan()
+    monkeypatch.setattr(
+        optimizer_module,
+        "zone_heat_capacities",
+        lambda model: np.zeros(zone_size(model)),
+    )
+    worthless = plan()
+
+    assert valued.zone_mass_temperatures[-1] > worthless.zone_mass_temperatures[-1]

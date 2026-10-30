@@ -33,6 +33,7 @@ from domain.physics import (
     lumped_tank_state_space,
     tank_sensor_temperatures,
     zone_floor,
+    zone_heat_capacities,
     zone_observation,
     zone_state_space,
 )
@@ -3336,6 +3337,29 @@ class MPCOptimizer:
         reachable_c = [float(observation @ state) for state in warmest]
         unheated_c = [float(observation @ state) for state in coolest]
 
+        # The heat a plan leaves in the zone at its end beyond what the zone
+        # left alone would hold (J): it makes up heat the next plan would
+        # otherwise have to make, so it is worth what making it then costs
+        # (see _build_objective) - but only as much as the zone left alone
+        # falls short of its wanted temperature at the end, the heat the next
+        # plan needs to bring every part of it there. Beyond that no plan
+        # needs it, and none where the zone ends warm enough. Left at
+        # nothing, a plan let the floor run down towards its end whatever
+        # the day after needs. Heating only.
+        if not cooling:
+            last = num_steps - 1
+            capacities = zone_heat_capacities(building)
+            short_j = float(capacities @ (float(target_c[last]) - unheated[last]))
+            model.zone_end_heat_j = pyo.Var(bounds=(0.0, max(short_j, 0.0)))
+            model.zone_constraints.add(
+                model.zone_end_heat_j
+                <= sum(
+                    float(capacities[i])
+                    * (model.zone_state[last, i] - float(unheated[last][i]))
+                    for i in model.ZONE_STATES
+                )
+            )
+
         # Comfort at both ends of a step, for the same reason the tank's target
         # is checked at both: T[k] is the value at a step's START.
         for k in range(num_steps):
@@ -3731,6 +3755,12 @@ class MPCOptimizer:
                     * dt_hours[k]
                     * model.zone_discomfort_k2[k]
                 )
+
+        # The heat left in the zone at the plan's end, at what heat costs the
+        # zone then: the grid's price over the horizon by its COP at the end.
+        if hasattr(model, "zone_end_heat_j"):
+            price = sum(import_price_eur_per_kwh) / len(import_price_eur_per_kwh)
+            objective -= price / model.space_cop[-1] * model.zone_end_heat_j / 3.6e6
 
         return objective
 
