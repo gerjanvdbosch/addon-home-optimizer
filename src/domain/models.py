@@ -290,6 +290,17 @@ class BuildingThermalModel:
     # then enters the slabs directly - and a model saved before it.
     screed_capacity_j_per_k: float = 0.0
     screed_to_slab_w_per_k: float = 0.0
+    # Between the screed's lower half, the pipes', and its upper half, the
+    # floor's surface (W/K, the whole floor): the pipes lie low in the screed,
+    # so their heat crosses it before the rooms see it (real data, 15 runs Oct
+    # 2026: one screed node had the living room +0.17 K an hour into a run
+    # against +0.04 K measured). Two equal halves, the simplest discretization
+    # of conduction through a layer: about 2 lambda A / d - for 8.7 cm of
+    # cement screed (lambda 1.3 W/mK) over 84 m2 some 2500 W/K. Fitted on the
+    # rooms, where the delay shows; the water sees the screed as one node
+    # above some 2000 W/K (see BuildingThermalIdentifier._fit_screed). 0.0 is
+    # one node - and a model saved before it.
+    screed_layer_w_per_k: float = 0.0
     # From the rest's slab down to the living room through its ceiling (W/K):
     # the upper floor's screed, with the floor heating in it, lies on the
     # concrete floor that is the living room's ceiling. Zero is no floor of

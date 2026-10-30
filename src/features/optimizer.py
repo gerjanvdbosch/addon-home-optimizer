@@ -24,6 +24,7 @@ from domain.physics import (
     CP_WATER_J_PER_KG_K,
     MIXED_TAP_WATER_C,
     RHO_WATER_KG_PER_L,
+    ZONE_PIPE_STATES,
     ZONE_SCREED_STATES,
     ZONE_SLAB_STATES,
     floor_circuit_conductance_w_per_k,
@@ -3424,8 +3425,10 @@ class MPCOptimizer:
         if cooling and data.zone_mass_minimum_c:
             mass_minimum_c = data.zone_mass_minimum_c
 
-            # The screeds too, where the floor has them: its surface.
+            # The screeds too, where the floor has them: its surface - and
+            # the pipes' halves, colder still while cooling.
             layers = ZONE_SLAB_STATES + (ZONE_SCREED_STATES if num_states > 4 else ())
+            layers += ZONE_PIPE_STATES if num_states > 6 else ()
 
             for k in range(num_steps):
                 for i in layers:
@@ -3803,9 +3806,19 @@ class MPCOptimizer:
                 for k in range(num_steps)
             )
 
-            if ZONE_SCREED_STATES[0] in model.ZONE_STATES:
+            # The pipes' half where the screed has two: what the water heats.
+            screed = next(
+                (
+                    i
+                    for i in (ZONE_PIPE_STATES[0], ZONE_SCREED_STATES[0])
+                    if i in model.ZONE_STATES
+                ),
+                None,
+            )
+
+            if screed is not None:
                 zone_screed_temperatures = tuple(
-                    float(pyo.value(model.zone_state[k, ZONE_SCREED_STATES[0]]))
+                    float(pyo.value(model.zone_state[k, screed]))
                     for k in range(num_steps)
                 )
             # The electricity that heat costs, as the objective prices it:

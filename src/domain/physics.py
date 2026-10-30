@@ -257,15 +257,19 @@ def zone_state_space(
     Kalman filter, a rollout and the MPC all drive (see BuildingThermalModel).
 
     x = [T_living, T_rest, T_slab_living, T_slab_rest] and, where the floor
-    has a screed, [T_screed_living, T_screed_rest] after them;
+    has a screed, [T_screed_living, T_screed_rest] after them - the screed's
+    upper halves, where it has two (see
+    BuildingThermalModel.screed_layer_w_per_k), and its lower halves, the
+    pipes', [T_pipes_living, T_pipes_rest] last;
     u = [T_outdoor, Q_internal, Q_living, Q_rest, Q_floor, Q_floor_moved].
 
     Q_internal and Q_floor are the dwelling's, divided by floor area; Q_living
     and Q_rest land in that room alone: its own glazing's sun, and the
     occupants' heat that is there beyond its floor area's share (asleep, in the
-    bedrooms). The floor's heat enters each floor's top
-    layer - its screed, or without one its slab - which is the surface its
-    room sees; a screed passes it on to the concrete below. Q_floor_moved is
+    bedrooms). The floor's heat enters each floor's screed - its pipes'
+    half where it has two, which passes it up to the half its room sees and
+    down to the concrete - or without one its slab, the surface its room
+    sees. Q_floor_moved is
     the floor's heat that lands under the living room beyond its area share,
     out of the rest's: where rooms have closed their loops, the water heats
     only the floors still open (see floor_heat_moved_w) - zero with every loop
@@ -295,7 +299,9 @@ def zone_state_space(
     )
     ua_rooms = model.ua_rooms_w_per_k
     screed = bool(model.screed_capacity_j_per_k)
-    size = 6 if screed else 4
+    layer = model.screed_layer_w_per_k * shares if screed else np.zeros(2)
+    layered = bool(layer[0])
+    size = zone_size(model)
 
     a = np.zeros((size, size))
     b = np.zeros((size, 6))
@@ -303,7 +309,10 @@ def zone_state_space(
     for room, other in ((0, 1), (1, 0)):
         slab = room + 2
         top = room + 4 if screed else slab
-        c_top = c_screed[room] if screed else c_slab[room]
+        # Where the water's heat enters and the concrete takes it on.
+        pipes = room + 6 if layered else top
+        c_top = c_screed[room] * (0.5 if layered else 1.0) if screed else c_slab[room]
+        c_pipes = c_top
 
         a[room, room] = -(ua_env[room] + ua_rooms + ua_surface[room]) / c_room[room]
         a[room, other] = ua_rooms / c_room[room]
@@ -314,13 +323,19 @@ def zone_state_space(
         b[room, 0] = ua_env[room] / c_room[room]
         b[room, 1] = shares[room] / c_room[room]
         b[room, 2 + room] = 1.0 / c_room[room]
-        b[top, 4] = shares[room] / c_top
-        b[top, 5] = (1.0 if room == 0 else -1.0) / c_top
+        b[pipes, 4] = shares[room] / c_pipes
+        b[pipes, 5] = (1.0 if room == 0 else -1.0) / c_pipes
+
+        if layered:
+            a[top, top] -= layer[room] / c_top
+            a[top, pipes] = layer[room] / c_top
+            a[pipes, top] = layer[room] / c_pipes
+            a[pipes, pipes] = -layer[room] / c_pipes
 
         if screed:
-            a[top, top] -= ua_down[room] / c_top
-            a[top, slab] = ua_down[room] / c_top
-            a[slab, top] = ua_down[room] / c_slab[room]
+            a[pipes, pipes] -= ua_down[room] / c_pipes
+            a[pipes, slab] = ua_down[room] / c_pipes
+            a[slab, pipes] = ua_down[room] / c_slab[room]
             a[slab, slab] = -ua_down[room] / c_slab[room]
 
     ceiling = model.ua_ceiling_w_per_k
@@ -335,7 +350,10 @@ def zone_state_space(
 def zone_size(model: BuildingThermalModel) -> int:
     """How many states the zone has (see zone_state_space)."""
 
-    return 6 if model.screed_capacity_j_per_k else 4
+    if not model.screed_capacity_j_per_k:
+        return 4
+
+    return 8 if model.screed_layer_w_per_k else 6
 
 
 def _surfaces(model: BuildingThermalModel) -> tuple[int, int]:
@@ -388,12 +406,14 @@ def zone_floor(
 ) -> np.ndarray:
     """Row vector of the temperature the floor circuit delivers its heat
     against, the one water running through both floors: their screeds' mean
-    by the share of the water under each (see floor_living_fraction; by floor
-    area, every loop open, without one), or without screeds their slabs'."""
+    - the pipes' halves where they have two - by the share of the water under
+    each (see floor_living_fraction; by floor area, every loop open, without
+    one), or without screeds their slabs'."""
 
     share = model.living_area_fraction if living_fraction is None else living_fraction
     row = np.zeros(zone_size(model))
-    row[list(_surfaces(model))] = [share, 1.0 - share]
+    pipes = ZONE_PIPE_STATES if zone_size(model) == 8 else _surfaces(model)
+    row[list(pipes)] = [share, 1.0 - share]
 
     return row
 
@@ -428,6 +448,8 @@ def floor_heat_moved_w(floor_w, living_fraction, living_area_fraction: float):
 # rest's slab the living room's ceiling.
 ZONE_SLAB_STATES = (2, 3)
 ZONE_SCREED_STATES = (4, 5)
+# The screed's lower halves, the pipes', where it has two.
+ZONE_PIPE_STATES = (6, 7)
 
 
 def floor_heat_w(

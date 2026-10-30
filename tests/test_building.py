@@ -1392,6 +1392,73 @@ def test_a_screed_holds_part_of_the_slabs_heat_at_the_floors_surface():
     assert zone_state_space(TRUE_MODEL)[0].shape == (4, 4)
 
 
+def test_a_screed_in_halves_holds_the_same_heat_and_shows_it_later():
+    """With the screed in halves the water heats the pipes' half, which
+    passes it down to the concrete and up through the other half to the
+    room: the zone stores the same heat and settles where one screed node
+    does, but the room sees a run later."""
+
+    single = replace(
+        TRUE_MODEL, screed_capacity_j_per_k=6.0e6, screed_to_slab_w_per_k=1900.0
+    )
+    halves = replace(single, screed_layer_w_per_k=600.0)
+    a, b = zone_state_space(halves)
+    share = halves.living_area_fraction
+    shares = np.array([share, 1.0 - share])
+    capacity = np.concatenate(
+        [
+            halves.c_air_j_per_k * shares,
+            (halves.c_mass_j_per_k - 6.0e6) * shares,
+            3.0e6 * shares,
+            3.0e6 * shares,
+        ]
+    )
+    heat = np.array([20.0, 0.0, 0.0, 0.0, 1000.0, 0.0])
+
+    assert a.shape == (8, 8)
+    assert np.nonzero(b[:, 4])[0].tolist() == [6, 7]
+    assert capacity @ (a @ np.full(8, 20.0) + b @ heat) == pytest.approx(1000.0)
+    # Conduction both ways alike: C A symmetric.
+    assert capacity[:, None] * a == pytest.approx((capacity[:, None] * a).T)
+
+    def room_after(model, seconds):
+        a_d, b_d = discretize_zoh(*zone_state_space(model), seconds)
+        x = a_d @ np.full(len(a_d), 20.0) + b_d @ heat
+        return x[0]
+
+    assert room_after(halves, 3600.0) < room_after(single, 3600.0) - 0.005
+
+    def room_settled(model):
+        a_m, b_m = zone_state_space(model)
+        return -np.linalg.solve(a_m, b_m @ heat)[0]
+
+    assert room_settled(halves) == pytest.approx(room_settled(single))
+
+
+def test_a_screed_in_halves_takes_the_waters_heat_as_one_when_closely_coupled():
+    """The water's heat into a screed in halves (_layered_screed_heat) is one
+    node's as the conductance between the halves grows."""
+
+    capacity, down, surface, dt = 9.0e6, 1900.0, 650.0, 900.0
+    loops = water = np.full(8, 1600.0)
+    supply, slab, room = np.full(8, 28.0), np.full(8, 21.0), np.full(8, 20.0)
+    heat = BuildingThermalIdentifier._layered_screed_heat(
+        loops, water, supply, slab, room, capacity, down, 1.0e8, surface, dt
+    )
+    total = water[0] + down + surface
+    balance = (water[0] * 28.0 + down * 21.0 + surface * 20.0) / total
+    decay = np.exp(-total / capacity * dt)
+    mean = (1.0 - decay) / (total / capacity * dt)
+    screed = (down * 21.0 + surface * 20.0) / (down + surface)
+    expected = []
+
+    for _ in range(8):
+        expected.append(1600.0 * (28.0 - balance - (screed - balance) * mean))
+        screed = balance + (screed - balance) * decay
+
+    assert heat == pytest.approx(expected, rel=1e-3)
+
+
 def test_the_screed_is_read_off_how_runs_fall_off():
     """A run's heat at one supply falls as its screed warms: from the start
     and how fast and how far it falls, the screed's capacity and its

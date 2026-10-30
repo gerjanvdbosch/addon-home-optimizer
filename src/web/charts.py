@@ -402,7 +402,7 @@ def dashboard_chart(state: State, states: HeatPumpStates | None = None) -> str:
             joined(read_at(points, state.updated), plan),
             row=3,
             col=1,
-            line=dict(width=1, color="rgba(99, 110, 250, 0.7)"),
+            line=dict(width=1, color="rgba(99, 110, 250, 0.6)"),
             legendgroup="boiler_temperature",
             showlegend=False,
             unit="°C",

@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 from pvlib import irradiance, solarposition
+from scipy.linalg import expm
 from scipy.optimize import least_squares
 
 from domain.config import Config, HeatPumpStates
@@ -50,6 +51,7 @@ from domain.physics import (
     zone_floor,
     zone_observation,
     zone_observations,
+    zone_size,
     zone_slab,
     zone_state_space,
 )
@@ -286,6 +288,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # From the floor slab's surface to the room, per m2 of floor: EN 1264's
     # surface coefficient (about 7 W/m2K cooling, 10.8 heating) in series with
     # the screed and covering above the pipes, which take it down to some 2.5.
+    # With the screed in halves those lie between them (see
+    # screed_layer_w_per_k), and it fits at the coefficient itself, its upper
+    # bound (Oct 2026: 924 W/K, the halves 516-627 W/K, R 0.13-0.16 m2K/W -
+    # half a screed and a covering).
     MIN_UA_AIR_MASS_W_PER_M2_K = 2.5
     MAX_UA_AIR_MASS_W_PER_M2_K = 11.0
     INITIAL_UA_AIR_MASS_W_PER_M2_K = 6.0
@@ -469,6 +475,13 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     MAX_SCREED_W_PER_M2_K = 100.0
     INITIAL_SCREED_WATER_W_PER_M2_K = 10.0
     INITIAL_SCREED_DOWN_W_PER_M2_K = 20.0
+    # Between the screed's halves (see
+    # BuildingThermalModel.screed_layer_w_per_k), per m2 of floor: 2 lambda / d
+    # for lambda 0.5-2.5 W/mK (screeds, anhydrite to dense cement) over 1-15 cm
+    # of it - 7 to 500 - started at 1.3 W/mK over 8.7 cm.
+    MIN_SCREED_LAYER_W_PER_M2_K = 2.0
+    MAX_SCREED_LAYER_W_PER_M2_K = 500.0
+    INITIAL_SCREED_LAYER_W_PER_M2_K = 30.0
     # Three parameters, each read off a different part of a run - its start,
     # how fast that falls, where it settles: a few runs before they separate.
     MIN_SCREED_RUNS = 5
@@ -658,6 +671,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         "window_open_hour",
         "window_close_hour",
         "window_hour_spread_h",
+        "screed_layer_w_per_k",
     )
 
     @staticmethod
@@ -685,6 +699,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 model.window_open_hour,
                 model.window_close_hour,
                 model.window_hour_spread_h,
+                model.screed_layer_w_per_k,
             ]
         )
 
@@ -729,6 +744,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             asleep_spread_h=self.sleep[2],
             screed_capacity_j_per_k=self.screed[0],
             screed_to_slab_w_per_k=self.screed[1],
+            screed_layer_w_per_k=float(x[21]),
         )
 
     def load(self, path) -> None:
@@ -1473,6 +1489,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.MIN_WINDOW_OPEN_HOUR,
                 self.MIN_WINDOW_CLOSE_HOUR,
                 self.MIN_WINDOW_HOUR_SPREAD_H,
+                self.MIN_SCREED_LAYER_W_PER_M2_K * floor_m2,
             ]
         )
 
@@ -1499,6 +1516,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.MAX_WINDOW_OPEN_HOUR,
                 self.MAX_WINDOW_CLOSE_HOUR,
                 self.MAX_WINDOW_HOUR_SPREAD_H,
+                self.MAX_SCREED_LAYER_W_PER_M2_K * floor_m2,
             ]
         )
 
@@ -1527,6 +1545,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.INITIAL_WINDOW_OPEN_HOUR,
                 self.INITIAL_WINDOW_CLOSE_HOUR,
                 self.INITIAL_WINDOW_HOUR_SPREAD_H,
+                self.INITIAL_SCREED_LAYER_W_PER_M2_K * floor_m2,
             ]
         )
 
@@ -1534,6 +1553,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         for index, side in ((11, "east"), (12, "west")):
             if side in self.extensions:
                 lower[index] = upper[index] = self.extensions[side]
+
+        # No screed, no halves to it.
+        if not self.screed[0]:
+            lower[21] = upper[21] = 0.0
 
         return lower, np.clip(initial, lower, upper), upper
 
@@ -2284,6 +2307,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         floor_m2 = sum(self.room_areas_m2)
         dt_s = float(df["dt_seconds"].median())
         surface = saved.ua_air_mass_w_per_k
+        # The screed in two halves where the saved model has them, the
+        # water against the pipes' (see BuildingThermalModel.screed_layer_w_per_k).
+        layer = saved.screed_layer_w_per_k
 
         def residuals(log_x: np.ndarray) -> np.ndarray:
             pipes, capacity, down = np.exp(log_x)
@@ -2300,6 +2326,26 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 water = np.divide(
                     loops, open_, out=np.zeros_like(loops), where=open_ > 0.0
                 )
+                if layer:
+                    heat = self._layered_screed_heat(
+                        loops,
+                        water,
+                        supply,
+                        slab_c,
+                        room_c,
+                        capacity,
+                        down,
+                        layer,
+                        surface,
+                        dt_s,
+                    )
+                    errors.append(
+                        (heat - run["heat"].to_numpy(dtype=float))[
+                            run["settled"].to_numpy(dtype=bool)
+                        ]
+                    )
+                    continue
+
                 total = water + down + surface
                 decay = np.exp(-total / capacity * dt_s)
                 mean = (1.0 - decay) / (total / capacity * dt_s)
@@ -2367,17 +2413,54 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         return capacity, down
 
+    @staticmethod
+    def _layered_screed_heat(
+        loops, water, supply, slab_c, room_c, capacity, down, layer, surface, dt_s
+    ) -> np.ndarray:
+        """The water's heat (W) into a screed in two equal halves over a run,
+        each step exactly: the pipes' half takes it from the water and gives
+        it down to the slab and up to the surface's half, which gives it to
+        the room. Both start where slab and room hold them through the three
+        conductances in series while nothing heats them."""
+
+        half = 0.5 * capacity
+        flux = (slab_c[0] - room_c[0]) / (1.0 / down + 1.0 / layer + 1.0 / surface)
+        x = np.array([slab_c[0] - flux / down, room_c[0] + flux / surface])
+        heat = np.empty(len(supply))
+
+        for k in range(len(supply)):
+            a = np.array(
+                [
+                    [-(water[k] + down + layer) / half, layer / half],
+                    [layer / half, -(layer + surface) / half],
+                ]
+            )
+            b = np.array(
+                [
+                    (water[k] * supply[k] + down * slab_c[k]) / half,
+                    surface * room_c[k] / half,
+                ]
+            )
+            # x' = A x + b: the step exact, and its mean from the same balance.
+            step = expm(a * dt_s)
+            following = step @ x + np.linalg.solve(a, (step - np.eye(2)) @ b)
+            mean = np.linalg.solve(a, (following - x) / dt_s - b)
+            heat[k] = loops[k] * (supply[k] - mean[0])
+            x = following
+
+        return heat
+
     STATE_NAMES = ("living", "rest", "slab_living", "slab_rest")
     SCREED_NAMES = ("screed_living", "screed_rest")
+    PIPE_NAMES = ("pipes_living", "pipes_rest")
 
     @classmethod
     def state_names(cls, model: BuildingThermalModel) -> tuple[str, ...]:
         """The zone's states by name (see physics.zone_state_space)."""
 
-        if model.screed_capacity_j_per_k:
-            return cls.STATE_NAMES + cls.SCREED_NAMES
+        names = (cls.STATE_NAMES, cls.SCREED_NAMES, cls.PIPE_NAMES)
 
-        return cls.STATE_NAMES
+        return sum(names[: {4: 1, 6: 2, 8: 3}[zone_size(model)]], ())
 
     @classmethod
     def _states_frame(

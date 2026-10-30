@@ -1216,7 +1216,8 @@ class Optimization:
         self.state_manager.update_zone(
             temperature=zone["measured"].dropna(),
             thermal_mass=zone["slab_living"],
-            screed=zone.get("screed_living"),
+            # The pipes' half where the screed has two: what the water heats.
+            screed=zone.get("pipes_living", zone.get("screed_living")),
         )
 
         # The heat pump's own mode unless this run asks for one (see

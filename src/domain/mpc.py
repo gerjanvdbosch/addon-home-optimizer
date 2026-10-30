@@ -263,7 +263,8 @@ class MPCResult:
     # The slab under the thermostat's room the plan heats (deg C): the thermal
     # mass the floor's heat lands in, as planned rather than left alone.
     zone_mass_temperatures: tuple[float, ...] = ()
-    # The screed above that slab (deg C), empty where the floor has none.
+    # The screed above that slab (deg C) - its pipes' half where it has two -
+    # empty where the floor has none.
     zone_screed_temperatures: tuple[float, ...] = ()
     # The supply each step runs the floor at (deg C), NaN where it does not:
     # the heat pump's own curve while heating, the plan's choice while cooling
