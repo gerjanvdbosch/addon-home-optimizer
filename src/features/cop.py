@@ -420,6 +420,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             (shortfall_at_zero_j, shortfall_per_k_j),
             start_step_power_w,
             handover_heat_j,
+            defrost_restart_share,
         ) = self._start_up(df)
         df = self.prepare(df)
 
@@ -566,6 +567,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             start_shortfall_at_zero_outdoor_j=shortfall_at_zero_j,
             start_shortfall_per_outdoor_j_per_k=shortfall_per_k_j,
             handover_heat_j=handover_heat_j,
+            defrost_restart_share=defrost_restart_share,
         )
 
         # Cooling is planned down to a lift of a kelvin or two - water just
@@ -588,13 +590,17 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             "Heat pump COP calibration (%s): a %.0f s ramp (start-up short "
             "%.2f kWh at 0 degC outdoor, %+.4f kWh per K) and %.0f W "
             "electrical over a run's first step, %.2f kWh from the loop "
-            "handed over by hot water",
+            "handed over by hot water, %s of the start-up short again after a "
+            "defrost",
             self.mode,
             self.model.start_ramp_seconds,
             self.model.start_shortfall_at_zero_outdoor_j / 3.6e6,
             self.model.start_shortfall_per_outdoor_j_per_k / 3.6e6,
             self.model.start_step_power_w,
             self.model.handover_heat_j / 3.6e6,
+            "unknown"
+            if self.model.defrost_restart_share is None
+            else f"{self.model.defrost_restart_share:.2f}",
         )
 
         if self.key != "dhw":
@@ -768,10 +774,11 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
 
     def _start_up(
         self, df: pd.DataFrame
-    ) -> tuple[float, tuple[float, float], float, float]:
+    ) -> tuple[float, tuple[float, float], float, float, float | None]:
         """(ramp s, start-up shortfall line (J at 0 degC outdoor, J per K),
         electrical power over the first planning step W, loop heat handed over
-        J) of how runs in this mode begin, from the readings as loaded - minute
+        J, share of the shortfall a defrost's restart repeats) of how runs in
+        this mode begin, from the readings as loaded - minute
         readings, so a run starts within a minute of when it really did, and
         prepare() has not yet left the start-up out.
 
@@ -839,6 +846,9 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
                 "boiler_on": running,
                 "booster_on": booster,
                 "q_in_override_w": heat_w.where(running),
+                "defrost": pd.to_numeric(
+                    df.get("defrost", pd.Series(0.0, index=df.index)), errors="coerce"
+                ),
             }
         )
         _, ramp_seconds = boiler._identify_heat_input_ramp(ramp_frame)
@@ -849,12 +859,14 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         # ramp lies outside (0, MAX_RAMP_SECONDS] is a tap draw or a
         # mis-detected start, as for the median.
         shortfall_line = (0.0, 0.0)
+        restart_share = None
 
         if self.key == "dhw" and ramp_seconds and "temperature" in df:
             outdoor_c = pd.to_numeric(df["temperature"], errors="coerce").ffill()
+            _, started, restarted = boiler._ramp_runs(ramp_frame)
             runs = [
                 (outdoor_c.iloc[start], shortfall_j)
-                for start, steady_w, shortfall_j in boiler._ramp_runs(ramp_frame)[1]
+                for start, steady_w, shortfall_j in started
                 if not np.isnan(outdoor_c.iloc[start])
                 and 0.0 < 2.0 * shortfall_j / steady_w <= boiler.MAX_RAMP_SECONDS
             ]
@@ -862,6 +874,18 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             if len(runs) >= boiler.MIN_RAMP_RUNS:
                 at_c, shortfall_j = np.array(runs).T
                 shortfall_line = self._outdoor_line(at_c, shortfall_j)
+
+            # After a defrost, the share of the start-up's shortfall at that
+            # outdoor temperature (see HeatPumpCOPModel.defrost_restart_share).
+            shares = [
+                shortfall_j
+                / (shortfall_line[0] + shortfall_line[1] * outdoor_c.iloc[start])
+                for start, _, shortfall_j in restarted
+                if not np.isnan(outdoor_c.iloc[start])
+            ]
+
+            if len(shares) >= boiler.MIN_RAMP_RUNS and shortfall_line[0]:
+                restart_share = float(np.median(shares))
 
         power_w = df["P_el"].to_numpy(dtype=float)
         seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
@@ -923,6 +947,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             float(np.median(excess_j))
             if len(excess_j) >= BoilerThermalIdentifier.MIN_RAMP_RUNS
             else 0.0,
+            restart_share,
         )
 
     @staticmethod
@@ -1297,6 +1322,24 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             on=("time",),
             how="left",
         )
+
+        # Optional: a defrost stops the compressor and takes heat from the
+        # water, so a start-up with one in it is no start-up (see
+        # BoilerThermalIdentifier._ramp_runs). Any defrost in the minute (see
+        # BoilerThermalIdentifier.dataset).
+        if config.heat_pump.defrost is not None:
+            builder = builder.timeseries(
+                "defrost",
+                config.heat_pump.defrost,
+                interval="1m",
+                aggregation="time_mean",
+                fill="previous",
+            ).join(
+                left="T_supply",
+                right="defrost",
+                on=("time",),
+                how="left",
+            )
 
         # Optional: only some installations report this separately (see
         # HeatPumpConfig.booster). An event-driven on/off state, same

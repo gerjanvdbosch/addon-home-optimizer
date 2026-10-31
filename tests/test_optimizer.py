@@ -2866,3 +2866,63 @@ def test_heat_left_in_the_floor_at_the_end_is_worth_what_it_saves(monkeypatch):
     worthless = plan()
 
     assert valued.zone_mass_temperatures[-1] > worthless.zone_mass_temperatures[-1]
+
+
+def test_a_run_above_todays_target_still_lets_a_later_block_heat():
+    """A run under way that has taken the tank above the next target ends
+    resting until that target, not until a later one it would then have to
+    heat for as well (real data, 31 Oct 2026: planned on to the heat pump's
+    limit, 15.9 K short the next evening). A heavy draw between the targets
+    leaves the second one to a block of its own."""
+
+    horizon = len(SOLAR_FORECAST_W)
+    target = [10.0] * horizon
+    target[6] = target[horizon - 2] = 45.0
+    tap = [0.0] * horizon
+    tap[8:12] = [8000.0] * 4
+    data = _make_input(
+        target_temperature_top=tuple(target),
+        tap_forecast_w=tuple(tap),
+        current_temp_top=47.0,
+        current_temp_bottom=47.0,
+        boiler_on_current=True,
+        compressor_elapsed_hours=1.0,
+    )
+    optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig(), cop_model=COP_MODEL)
+    plan = plan_tank(optimizer._tank_setting(data))
+
+    assert not any(plan.heat_pump_w[:6])
+    assert any(plan.heat_pump_w[12:])
+    assert plan.temperatures[horizon - 1] >= 45.0 - 0.01
+
+
+def test_a_run_under_way_is_planned_on_the_rest_of_its_ramp():
+    """Three minutes into a run, its next quarter delivers what the ramp has
+    left, not full heat; past the ramp, full heat. After a defrost the rise
+    starts again, by the share of a start's shortfall it repeats."""
+
+    cop = replace(COP_MODEL, start_ramp_seconds=900.0)
+    optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig(), cop_model=cop)
+    data = _make_input(boiler_on_current=True, compressor_elapsed_hours=0.05)
+    full_w = optimizer._heat_at(None)
+
+    def delivered_h(hours: float, ramp_s: float = 900.0) -> float:
+        return hours * MPCOptimizer._ramp_share(hours, ramp_s)
+
+    heat_w = optimizer._tank_setting(data).heat_w
+
+    assert heat_w[0] == pytest.approx(
+        full_w * (delivered_h(0.3) - delivered_h(0.05)) / 0.25
+    )
+    assert heat_w[1] == pytest.approx(full_w)
+
+    restarted = replace(data, compressor_elapsed_hours=1.0, defrost_ended_hours=0.0)
+    heat_w = optimizer._tank_setting(restarted).heat_w
+    assert heat_w[0] == pytest.approx(full_w * delivered_h(0.25) / 0.25)
+
+    halved = MPCOptimizer(
+        THERMAL_MODEL, MPCConfig(), cop_model=replace(cop, defrost_restart_share=0.5)
+    )
+    assert halved._tank_setting(restarted).heat_w[0] == pytest.approx(
+        full_w * delivered_h(0.25, 450.0) / 0.25
+    )

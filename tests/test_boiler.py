@@ -13,6 +13,8 @@ import pytest
 from domain.dynamics import discretize_zoh
 from domain.models import BoilerThermalModel
 from domain.physics import (
+    CP_WATER_J_PER_KG_K,
+    RHO_WATER_KG_PER_L,
     lumped_tank_state_space,
     tank_state_space,
 )
@@ -1152,6 +1154,36 @@ def test_flow_reporting_gap_bridges_while_active_but_zeroes_when_idle():
     assert bridged["flow_lpm"].iloc[3] == 0.0
 
 
+def test_a_defrost_takes_its_heat_from_the_tank():
+    """Supply below return in a defrost is heat the reversed cycle took from
+    the water, so from the tank (real data, 31 Oct 2026: 13.5 over 18.5 degC
+    at 14 L/min): negative, not clipped to zero as at a run's first sample."""
+
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    df = pd.DataFrame(
+        {
+            "time": pd.to_datetime(
+                [start + timedelta(seconds=DT_SECONDS * i) for i in range(3)],
+                utc=True,
+            ),
+            "T_ambient": 20.0,
+            "T_top": 30.0,
+            "T_bottom": 30.0,
+            "state": "SWW",
+            "flow_lpm": 14.0,
+            "T_supply": [13.5, 13.5, 13.5],
+            "T_return": 18.5,
+            "defrost": [0.0, 1.0, 0.0],
+        }
+    )
+
+    q_in_override = BoilerThermalIdentifier().prepare(df)["q_in_override_w"]
+
+    assert q_in_override.tolist() == pytest.approx(
+        [-RHO_WATER_KG_PER_L * CP_WATER_J_PER_KG_K * 14.0 / 60.0 * 5.0, 0.0]
+    )
+
+
 def test_calibration_anchors_q_in_to_calorimetric_mean_not_free_fit():
     """Regression test for a real finding: q_in_nominal_w is only ever fit from
     the (typically few) heating timesteps lacking a valid calorimetric override
@@ -1409,6 +1441,38 @@ def test_identify_heat_input_ramp_recovers_a_known_ramp():
 
     assert steady_w == pytest.approx(6000.0, rel=0.01)
     assert ramp_seconds == pytest.approx(800.0, rel=0.02)
+
+
+def test_a_defrost_leaves_the_start_up_out_and_shows_its_restart():
+    """A defrost 15 minutes into a run stops the compressor, takes heat from
+    the tank and is followed by a rise of its own: that run shows no start-up
+    (its window holds the defrost), and its shortfall after the defrost -
+    steady heat times half the 400 s rise - is read from where it ended."""
+
+    minutes = np.arange(-1, 70)
+    seconds = minutes * 60.0 + 30.0
+    after = seconds - 18 * 60.0
+    defrost = (minutes >= 15) & (minutes < 18)
+    heat_w = np.where(
+        minutes < 15,
+        6000.0 * np.minimum(1.0, seconds / 800.0),
+        np.where(defrost, -3000.0, 6000.0 * np.minimum(1.0, after / 400.0)),
+    )
+    frame = pd.DataFrame(
+        {
+            "time": pd.Timestamp("2026-10-31", tz="UTC")
+            + pd.to_timedelta(minutes, unit="min"),
+            "boiler_on": minutes >= 0,
+            "booster_on": False,
+            "q_in_override_w": heat_w,
+            "defrost": defrost.astype(float),
+        }
+    )
+
+    _, started, restarted = BoilerThermalIdentifier()._ramp_runs(frame)
+
+    assert started == []
+    assert restarted == [(1, 6000.0, pytest.approx(6000.0 * 200.0, rel=0.05))]
 
 
 def test_identify_heat_input_ramp_needs_enough_runs():

@@ -423,8 +423,17 @@ def plan_tank(
     # Hot water in one block per target: once a block has heated the tank, it
     # rests until the target it heated for comes - a step the tank left alone
     # misses its target in. Not to the end of that target: taps may draw a
-    # tank below a long one, and heating again there is a new block's.
-    targets = [tank.required_c[k] > tank.floor_c[k] for k in range(num_steps)]
+    # tank below a long one, and heating again there is a new block's. A
+    # target counts where it asks anything of the tank: one the tank would
+    # miss left alone, or one above its surroundings even though the tank
+    # holds it now. Without the latter a run under way that took the tank
+    # above today's target rested until tomorrow's, which it then had to
+    # heat for today (real data, 31 Oct 2026 13:45: the run planned on to
+    # 55.4 degC, 15.9 K short the next evening).
+    targets = [
+        tank.required_c[k] > min(tank.floor_c[k], tank.ambient_c)
+        for k in range(num_steps)
+    ]
     handover_eur = [
         tank.weight_switching
         if not cooling and k + 1 < num_steps and zone[k + 1] and not zone[k]
@@ -1341,6 +1350,39 @@ class MPCOptimizer:
         heat_w = [
             self._heat_at(outdoor_c[k] if outdoor_c else None) for k in range(num_steps)
         ]
+
+        # A run under way is still on its ramp (see _ramp_fraction): from its
+        # start, or from a defrost in it, after which the compressor rises
+        # again - by a share of a start's shortfall (see HeatPumpCOPModel.
+        # defrost_restart_share). At full heat, its next quarter came out
+        # 1.3 K too warm from 5-10 minutes into a run, 0.15 K on the ramp
+        # (136 runs, Aug-Oct 2026), and right after a defrost 2.4 K, 1.1 K on
+        # the restart's (5 runs).
+        if data.boiler_on_current and data.compressor_elapsed_hours > 0.0:
+            restarted = data.defrost_ended_hours is not None
+            since_h = (
+                data.defrost_ended_hours if restarted else data.compressor_elapsed_hours
+            )
+            share = (
+                (self.cop_model and self.cop_model.defrost_restart_share or 1.0)
+                if restarted
+                else 1.0
+            )
+
+            for k in range(num_steps):
+                ramp_s = share * (
+                    self._ramp_seconds(outdoor_c[k] if outdoor_c else None) or 0.0
+                )
+                begin_h = since_h + step_start_h[k]
+
+                if begin_h * 3600.0 >= ramp_s:
+                    break
+
+                end_h = begin_h + dt_hours[k]
+                heat_w[k] *= (
+                    end_h * self._ramp_share(end_h, ramp_s)
+                    - begin_h * self._ramp_share(begin_h, ramp_s)
+                ) / dt_hours[k]
         target_c = data.target_temperature_top
         overall_target_max = max(data.target_temperature_top)
         heat_pump_max_c = self.thermal_model.heat_pump_max_tank_temperature_c
@@ -2825,6 +2867,12 @@ class MPCOptimizer:
         replaced.
         """
 
+        return self._ramp_share(dt_hours, self._ramp_seconds(outdoor_c))
+
+    def _ramp_seconds(self, outdoor_c: float | None) -> float | None:
+        """How long a starting compressor takes to its heat (s), see
+        _ramp_fraction."""
+
         cop = self.cop_model
 
         # At this outdoor temperature where the COP model has the start-up's
@@ -2845,13 +2893,9 @@ class MPCOptimizer:
             heat_w = (
                 cop.q_in_at_zero_outdoor_w + cop.q_in_per_outdoor_w_per_k * outdoor_c
             )
-            ramp_seconds = max(2.0 * shortfall_j / heat_w, 0.0)
-        else:
-            ramp_seconds = (
-                cop and cop.start_ramp_seconds
-            ) or self.thermal_model.q_in_ramp_seconds
+            return max(2.0 * shortfall_j / heat_w, 0.0)
 
-        return self._ramp_share(dt_hours, ramp_seconds)
+        return (cop and cop.start_ramp_seconds) or self.thermal_model.q_in_ramp_seconds
 
     @staticmethod
     def _ramp_share(dt_hours: float, ramp_seconds: float | None) -> float:

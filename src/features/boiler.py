@@ -43,6 +43,13 @@ def booster_active(df: pd.DataFrame, active_state: str) -> pd.Series:
     this run, as the booster takes over from it - and its last row, where the
     pump overruns after the compressor stops - so the run must continue, unless
     the row before was already the booster.
+
+    Nor a defrost, where one is reported: it stops the compressor mid-run too,
+    and the sensor may report the booster meanwhile, but the compressor comes
+    up again after it. Read as the booster, a run split there and its second
+    part started from sensors the run had already stirred (real data, 23 and
+    31 Oct 2026: 24.5/21.5 degC thirteen minutes in), which moved the cold
+    layer's fit (see BoilerThermalIdentifier._identify_cold_layer).
     """
 
     active = pd.Series(False, index=df.index)
@@ -68,6 +75,9 @@ def booster_active(df: pd.DataFrame, active_state: str) -> pd.Series:
         active |= candidate & (
             in_state.shift(-1, fill_value=False) | candidate.shift(fill_value=False)
         )
+
+    if "defrost" in df.columns:
+        active &= ~(pd.to_numeric(df["defrost"], errors="coerce").fillna(0.0) > 0.0)
 
     return active
 
@@ -446,6 +456,12 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         # apply the *rest* of the cycle's steady, well-measured average to
         # this brief, physically distinct startup instant.
         #
+        # Except in a defrost: the reversed cycle takes its heat from the
+        # water, which the plate exchanger takes from the tank, so the heat is
+        # negative (real data, 31 Oct 2026: supply 13.5 degC over a 18.5
+        # return at 14 L/min mid-run; clipped, the run's heat balance came out
+        # 0.6 K warm).
+        #
         # Falls back to the fitted Q_in_nominal_w (see calibrate()) only
         # wherever flow itself is absent/non-positive, or these columns are
         # not configured at all - NaN here means "no override", not "no
@@ -456,7 +472,13 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             T_supply = pd.to_numeric(df["T_supply"], errors="coerce")
             T_return = pd.to_numeric(df["T_return"], errors="coerce")
             flow_lpm = pd.to_numeric(df["flow_lpm"], errors="coerce")
-            delta_t_water = (T_supply - T_return).clip(lower=0.0)
+            delta_t_water = T_supply - T_return
+            defrost = pd.to_numeric(
+                df.get("defrost", pd.Series(0.0, index=df.index)), errors="coerce"
+            )
+            delta_t_water = delta_t_water.where(
+                defrost > 0.0, delta_t_water.clip(lower=0.0)
+            )
 
             # The interval a run stops in counts too (see _stop_interval): its
             # heat is real, and after the stop the loop carries no temperature
@@ -1891,7 +1913,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         element with its own constant rating, identified separately.
         """
 
-        steady_values, runs = self._ramp_runs(df)
+        steady_values, runs, _ = self._ramp_runs(df)
 
         if len(runs) < self.MIN_RAMP_RUNS:
             return None, None
@@ -1906,18 +1928,33 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
     def _ramp_runs(
         self, df: pd.DataFrame
-    ) -> tuple[list[float], list[tuple[int, float, float]]]:
-        """The steady heat (W) of every run that shows one, and (first row,
-        steady heat W, start-up shortfall J) of each that also shows its whole
-        start-up (see _identify_heat_input_ramp)."""
+    ) -> tuple[
+        list[float], list[tuple[int, float, float]], list[tuple[int, float, float]]
+    ]:
+        """The steady heat (W) of every run that shows one, (first row, steady
+        heat W, start-up shortfall J) of each that also shows its whole
+        start-up (see _identify_heat_input_ramp), and the same of each that
+        shows its whole rise again after its last defrost, measured from where
+        the defrost ended."""
 
         q = df["q_in_override_w"].to_numpy(dtype=float)
         on = df["boiler_on"].to_numpy(dtype=bool)
         booster = df["booster_on"].to_numpy(dtype=bool)
+        # Nor a defrost: the compressor stops, the heat is the tank's own and
+        # the output rises again after it. A start-up with one in it read as
+        # some 1 kWh short (real data, Oct 2026: 5 runs, 4.5 K behind the
+        # plan by 30 minutes); counted, they put the start-up line 25 Wh
+        # higher at 15 degC.
+        defrost = (
+            pd.to_numeric(df["defrost"], errors="coerce").fillna(0.0).to_numpy() > 0.0
+            if "defrost" in df
+            else np.zeros(len(df), dtype=bool)
+        )
         seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
 
         steady_values: list[float] = []
         runs: list[tuple[int, float, float]] = []
+        restarts: list[tuple[int, float, float]] = []
 
         for start in np.flatnonzero(on & ~np.r_[True, on[:-1]]):
             end = start
@@ -1927,7 +1964,9 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
             since = seconds[start : end + 1] - seconds[start]
             heat = q[start : end + 1]
-            usable = ~np.isnan(heat) & ~booster[start : end + 1]
+            usable = (
+                ~np.isnan(heat) & ~booster[start : end + 1] & ~defrost[start : end + 1]
+            )
             settled = usable & (since >= self.RAMP_STEADY_AFTER_SECONDS)
 
             if settled.sum() < 2:
@@ -1942,18 +1981,30 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             # first reading and the full last one, which put the shortfall
             # about 0.2 kWh low on real data. A run with a reading missing
             # inside the window is left out: the gap would count as shortfall.
-            window = since < self.RAMP_DEFICIT_AT_SECONDS
-
-            if since.max() < self.RAMP_DEFICIT_AT_SECONDS or not usable[window].all():
-                continue
-
-            interval_s = np.diff(seconds[start : end + 1])[window[:-1]]
-            delivered = float((heat[window] * interval_s).sum())
-            runs.append(
-                (int(start), steady, steady * float(interval_s.sum()) - delivered)
+            # From the run's start, and from where its last defrost ended.
+            defrosts = np.flatnonzero(defrost[start : end + 1])
+            origins = [(start, runs)] + (
+                [(start + int(defrosts[-1]) + 1, restarts)]
+                if defrosts.size and start + defrosts[-1] < end
+                else []
             )
 
-        return steady_values, runs
+            for first, found in origins:
+                elapsed = seconds[first : end + 1] - seconds[first]
+                window = elapsed < self.RAMP_DEFICIT_AT_SECONDS
+
+                if (
+                    elapsed.max() < self.RAMP_DEFICIT_AT_SECONDS
+                    or not usable[first - start :][window].all()
+                ):
+                    continue
+
+                interval_s = np.diff(seconds[first : end + 1])[window[:-1]]
+                delivered = float((heat[first - start :][window] * interval_s).sum())
+                shortfall_j = steady * float(interval_s.sum()) - delivered
+                found.append((int(start), steady, shortfall_j))
+
+        return steady_values, runs, restarts
 
     def _identify_booster(
         self, df: pd.DataFrame
@@ -2642,6 +2693,19 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             aggregation="mean",
             fill="none",
         )
+
+        # Optional defrost sensor: its heat is taken from the tank (see
+        # prepare). The share of each minute it lasted, any of it counted: the
+        # minute's largest reading missed one it ended in, held on from before
+        # (real data, 31 Oct 2026: off at 12:59:53, read as the booster).
+        if config.heat_pump.defrost is not None:
+            builder = builder.timeseries(
+                "defrost",
+                config.heat_pump.defrost,
+                interval=self.SAMPLE_INTERVAL,
+                aggregation="time_mean",
+                fill="previous",
+            )
 
         # Optional booster sensor, an event-driven on/off state like "state".
         if config.heat_pump.booster is not None:

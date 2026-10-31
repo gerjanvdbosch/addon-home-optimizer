@@ -1,6 +1,7 @@
 import dataclasses
 import logging
 import math
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
@@ -187,10 +188,26 @@ class Optimization:
         )
         heat_pump_changes = self._heat_pump_changes(config, now)
         boiler_on_current, run_start, idle_elapsed_hours = self.dhw_timing(
-            *heat_pump_changes, dhw_state, now
+            *heat_pump_changes,
+            dhw_state,
+            now,
+            state.measurements.heat_pump.defrost,
         )
         compressor_elapsed_hours = (
             (now - run_start).total_seconds() / 3600.0 if run_start else 0.0
+        )
+        # The last defrost in the run under way: the compressor rises again
+        # from its end (see MPCInput.defrost_ended_hours).
+        defrosts = [
+            p
+            for p in state.measurements.heat_pump.defrost
+            if run_start is not None and p.time >= run_start
+        ]
+        defrost_ended_hours = (
+            (0.0 if defrosts[-1].value else (now - defrosts[-1].time).total_seconds())
+            / 3600.0
+            if any(p.value for p in defrosts)
+            else None
         )
         # The plan starts now, partway into the quarter its first step belongs
         # to (see MPCInput.first_step_hours).
@@ -205,6 +222,10 @@ class Optimization:
         stratification = {
             p.time: p.value for p in state.measurements.heat_pump.boiler.stratification
         }
+
+        run_minutes = (
+            self._run_minutes(config, run_start, now) if run_start is not None else None
+        )
 
         if run_start is not None:
             # The tank as the run found it: the last sensor reading of a
@@ -230,6 +251,27 @@ class Optimization:
                 run_start_stratification_k = stratification.get(before_top[-1].time)
                 run_start_ambient_c = ambient.get(before_top[-1].time)
 
+            # Better the minute before the run began: a tap after that
+            # quarter's last reading took its heat from the tank before the
+            # run (real data, 31 Oct 2026: 35.5/25.0 degC at 12:29, a tap at
+            # 12:33 to 33.0/22.5, the run at 12:43 - the plan 1.25 K warm).
+            # The stratification is held through it, as at rest (see
+            # physics.tank_stratification_k).
+            before = (
+                run_minutes[run_minutes["time"] + pd.Timedelta("1min") <= run_start]
+                if run_minutes is not None
+                else pd.DataFrame()
+            )
+
+            if not before.empty:
+                run_start_temp_top = float(before["T_top"].iloc[-1])
+                run_start_temp_bottom = float(before["T_bottom"].iloc[-1])
+                run_start_ambient_c = float(before["T_ambient"].iloc[-1])
+                run_start_stratification_k = max(
+                    run_start_stratification_k or 0.0,
+                    run_start_temp_top - run_start_temp_bottom,
+                )
+
         # The quarters the run under way has ended so far, drawn by the heat
         # balance the plan starts from (see MPCOptimizer.run_temperature): its
         # sensors lag that heat (see StateManager._tank_temperature).
@@ -246,8 +288,8 @@ class Optimization:
         # The heat the run under way has put in by those quarters and by now,
         # as the plan starts from it.
         run_heat_j = (
-            self._run_heat_j(config, run_start, [*run_quarters, now])
-            if run_start is not None
+            self._run_heat_j(run_minutes, run_start, [*run_quarters, now])
+            if run_minutes is not None
             else None
         )
 
@@ -317,6 +359,7 @@ class Optimization:
             solar_p10_w=solar_p10,
             solar_p90_w=solar_p90,
             compressor_elapsed_hours=compressor_elapsed_hours,
+            defrost_ended_hours=defrost_ended_hours,
             run_start_temp_top=run_start_temp_top,
             run_start_ambient_c=run_start_ambient_c,
             run_heat_j=run_heat_j[-1] if run_heat_j else None,
@@ -486,27 +529,35 @@ class Optimization:
             now,
         )
 
-    def _run_heat_j(
-        self, config: Config, run_start: datetime, times: list[datetime]
-    ) -> list[float] | None:
-        """The heat the DHW run under way had carried to the tank by each of
-        `times` (J): its calorimetry as the boiler model is identified on (see
-        BoilerThermalIdentifier.prepare), each minute's reading held until the
-        next. None where it shows none - no flow reported yet, say - and the
-        plan's own heat input stands in. Taken from the minutes, not the
-        state's quarter hours: the heat is flow times temperature rise, and
-        the product of two quarter-hour means is not the quarter's heat."""
+    def _run_minutes(
+        self, config: Config, run_start: datetime, now: datetime
+    ) -> pd.DataFrame:
+        """The DHW run under way per minute, as the boiler model is identified
+        on (see BoilerThermalIdentifier.prepare), from the minute before it
+        began: the tank as the run found it and the heat it has put in."""
 
         boiler = BoilerThermalIdentifier()
-        # From one reading before the run: prepare() drops the first, which has
-        # no interval of its own.
-        df = boiler.prepare(
+        # prepare() drops the first reading, which has no interval of its own.
+        return boiler.prepare(
             self.loader.load(
                 boiler.dataset(config),
-                run_start - 2 * pd.Timedelta(boiler.SAMPLE_INTERVAL),
-                times[-1],
+                run_start - 3 * pd.Timedelta(boiler.SAMPLE_INTERVAL),
+                now,
             )
         )
+
+    @staticmethod
+    def _run_heat_j(
+        df: pd.DataFrame, run_start: datetime, times: list[datetime]
+    ) -> list[float] | None:
+        """The heat the DHW run under way had carried to the tank by each of
+        `times` (J): its calorimetry (see _run_minutes), each minute's reading
+        held until the next. None where it shows none - no flow reported yet,
+        say - and the plan's own heat input stands in. Taken from the minutes,
+        not the state's quarter hours: the heat is flow times temperature
+        rise, and the product of two quarter-hour means is not the quarter's
+        heat."""
+
         heat_w = pd.to_numeric(df["q_in_override_w"], errors="coerce")
 
         if heat_w.isna().all():
@@ -593,6 +644,7 @@ class Optimization:
         compressor_frequency: list[SeriesPoint],
         dhw_state: str,
         now: datetime,
+        defrost: Sequence[SeriesPoint] = (),
     ) -> tuple[bool, datetime | None, float]:
         """(whether a DHW run is under way, when its compressor run began, None
         without one, hours since the last DHW run ended - 0 while one runs),
@@ -605,7 +657,8 @@ class Optimization:
         active), so counting that time would credit the minimum runtime with
         time the compressor did not run. A run's first minutes at 0 Hz, the
         pump circulating before the compressor comes up, are the run's own
-        start and count, as does a pause the compressor comes up from again.
+        start and count, as does a pause the compressor comes up from again,
+        and a stop in a defrost (its changes in `defrost`).
         Without a frequency the state is all there is, and
         assuming the compressor ran keeps a real run protected. The pause is
         taken from the change that ended the last DHW run - from the first
@@ -616,15 +669,16 @@ class Optimization:
         if not heat_pump_state:
             return False, None, 0.0
 
-        def frequency_at(time: datetime) -> float:
-            value = 1.0
-
-            for point in compressor_frequency:
+        def at(points: Sequence[SeriesPoint], time: datetime, value):
+            for point in points:
                 if point.time > time:
                     break
                 value = point.value
 
             return value
+
+        def frequency_at(time: datetime) -> float:
+            return at(compressor_frequency, time, 1.0)
 
         if heat_pump_state[-1].value == dhw_state:
             # The change into DHW that began the stretch under way.
@@ -646,6 +700,14 @@ class Optimization:
             # minutes at 0 Hz, the booster off, mid-run; taken from the restart
             # the plan started 3-4 K cold, from the sensors that lag the heat).
             booster = any(running) and not running[-1]
+
+            if booster:
+                # Nor a stop in a defrost: the compressor stops there and
+                # comes up again after it (real data, 31 Oct 2026: 0 Hz from
+                # 12:58 to 13:00 in a defrost, the plan started from sensors
+                # stirred 5 K below the run's heat).
+                stop = max(i for i in range(1, len(changes)) if running[i - 1])
+                booster = not at(defrost, changes[stop], False)
 
             return True, None if booster else dhw_start, 0.0
 

@@ -53,6 +53,19 @@ def test_booster_sensor_counts_in_home_assistant_and_influxdb_form():
     assert booster_active(df, SWW).tolist() == [True, True, False]
 
 
+def test_a_defrost_is_not_the_booster():
+    """0 Hz mid-run in a defrost, the sensor even reporting the booster in it
+    (real data, 31 Oct 2026): the compressor comes up again after it. The
+    minute it ended in counts by the share it lasted."""
+
+    df = _run([52.0, 52.0, 0.0, 0.0, 48.0], [14.0, 14.5, 14.7, 16.0, 18.0]).assign(
+        booster=[0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        defrost=[0.7, 1.0, 1.0, 0.89, 0.0, 0.0],
+    )
+
+    assert not booster_active(df, SWW).any()
+
+
 MIXING_MODEL = BoilerThermalModel(
     volume_l=200.0,
     ua_top_w_per_k=1.0,

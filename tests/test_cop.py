@@ -579,7 +579,7 @@ def test_cooling_fit_reads_the_heat_taken_from_the_water(tmp_path, monkeypatch):
 
     identifier = HeatPumpCOPIdentifier(key="cooling", models_path=tmp_path)
     monkeypatch.setattr(
-        identifier, "_start_up", lambda _: (530.0, (0.0, 0.0), 700.0, 0.0)
+        identifier, "_start_up", lambda _: (530.0, (0.0, 0.0), 700.0, 0.0, None)
     )
     model = identifier.calibrate(df)
 
@@ -659,7 +659,7 @@ def test_the_start_up_is_read_from_the_readings_as_loaded(key, state, sign):
     (2 kW over 800 s at half, then full) 2000 * (1 - 400 / 900) = 1111 W.
     Cooling the same, with the heat taken from the water."""
 
-    ramp_s, _, power_w, _ = HeatPumpCOPIdentifier(key=key)._start_up(
+    ramp_s, _, power_w, _, _ = HeatPumpCOPIdentifier(key=key)._start_up(
         _start_up_rows(state, sign)
     )
 
@@ -722,7 +722,7 @@ def test_the_start_up_is_read_only_from_runs_the_compressor_starts_for():
         ignore_index=True,
     )
 
-    ramp_s, _, power_w, _ = HeatPumpCOPIdentifier(key="heating")._start_up(df)
+    ramp_s, _, power_w, _, _ = HeatPumpCOPIdentifier(key="heating")._start_up(df)
 
     assert ramp_s == pytest.approx(800.0, rel=0.02)
     assert power_w == pytest.approx(2000.0 * (1.0 - 400.0 / 900.0), rel=0.01)

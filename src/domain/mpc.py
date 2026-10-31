@@ -196,6 +196,10 @@ class MPCInput:
     # How long the compressor run under way has lasted (hours); 0 without one,
     # also while the booster finishes the tank with the compressor off.
     compressor_elapsed_hours: float = 0.0
+    # How long ago the last defrost in the DHW run under way ended (hours), 0
+    # while one lasts; None without one. The compressor rises again from it
+    # (see MPCOptimizer._tank_setting).
+    defrost_ended_hours: float | None = None
     # The tank's two sensors just before the DHW run under way began (deg C),
     # None without one: while it heats, the sensors lag the heat already in
     # the tank, and the plan starts from what the run has put in since instead

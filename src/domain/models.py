@@ -494,6 +494,14 @@ class HeatPumpCOPModel:
     # uses start_ramp_seconds.
     start_shortfall_at_zero_outdoor_j: float = 0.0
     start_shortfall_per_outdoor_j_per_k: float = 0.0
+    # The share of that shortfall a DHW run leaves short again after a
+    # defrost, from where the defrost ended (-): the compressor stops in it
+    # and rises again after, faster than from a start (real data, 5 defrosts
+    # Oct 2026: median 0.31 of the run's own steady heat). The quarter after a
+    # defrost came out 2.4 K too warm without it and 1.1 K with it - the rest
+    # the runs' steady heat, 5% below the heat line those days. None until
+    # runs have shown it: a whole start's then.
+    defrost_restart_share: float | None = None
     # The heat (J) a heating run handed over by hot water gets beyond the
     # compressor's own in its first planning step: the water in the heat
     # pump and the pipes it shares with the tank, at the tank's temperature as

@@ -561,6 +561,23 @@ def test_a_compressor_pause_mid_run_keeps_the_run():
     ) == (True, DAY + pd.Timedelta("11:45:45"), 0.0)
 
 
+def test_a_compressor_stop_in_a_defrost_keeps_the_run():
+    """0 Hz from inside a defrost, the defrost just over and the compressor
+    not up yet (real data, 31 Oct 2026): the run goes on, not the booster."""
+
+    state = _changes(("09:00:00", "Uit"), ("11:43:48", "SWW"))
+    frequency = _changes(("11:47:00", 36.0), ("11:58:00", 0.0))
+    defrost = _changes(("11:56:18", True), ("11:59:53", False))
+    now = DAY + pd.Timedelta("12:00:00")
+
+    assert Optimization.dhw_timing(state, frequency, "SWW", now, defrost) == (
+        True,
+        DAY + pd.Timedelta("11:43:48"),
+        0.0,
+    )
+    assert Optimization.dhw_timing(state, frequency, "SWW", now) == (True, None, 0.0)
+
+
 def test_the_pause_runs_from_the_change_that_ended_the_run():
     state = _changes(("13:15:38", "SWW"), ("13:53:30", "Uit"))
 
@@ -637,13 +654,16 @@ def test_a_runs_measured_heat_is_summed_to_each_trace_time(monkeypatch):
     optimization.loader = SimpleNamespace(load=lambda *_: frame)
     times = [start, start + pd.Timedelta("5min"), start + pd.Timedelta("10min")]
 
-    heat_j = optimization._run_heat_j(None, start, times)
+    def heat_j():
+        return optimization._run_heat_j(
+            optimization._run_minutes(None, start, times[-1]), start, times
+        )
 
     watts = 20.0 / 60.0 * 4186.0 * 5.0
-    assert heat_j == pytest.approx([0.0, 4 * 60 * watts, 9 * 60 * watts])
+    assert heat_j() == pytest.approx([0.0, 4 * 60 * watts, 9 * 60 * watts])
 
     frame["flow_lpm"] = float("nan")
-    assert optimization._run_heat_j(None, start, times) is None
+    assert heat_j() is None
 
 
 def test_a_settled_cooling_run_is_set_the_planned_heat_below_its_return():
