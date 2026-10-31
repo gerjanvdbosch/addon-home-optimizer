@@ -797,3 +797,21 @@ def test_the_rooms_habit_is_made_once_a_day():
     assert len(made) == 2
     assert first.loc[22 * 60, "rest"] == 2.0
     pd.testing.assert_frame_equal(first, again, check_dtype=False)
+
+
+def test_the_hot_water_is_the_tops_highest_since_the_last_run():
+    """Each quarter is labelled at its start: one that ended after the run's
+    end counts, the quarter under way too; the run itself before it not."""
+
+    start = datetime(2026, 10, 30, 13, 0, tzinfo=UTC)
+    top = [
+        SeriesPoint(time=start + timedelta(minutes=15 * i), value=value)
+        for i, value in enumerate([52.0, 48.4, 48.5, 47.0, 42.5])
+    ]
+
+    assert Optimization.hot_water_c(
+        top, start + timedelta(minutes=25), MPCConfig()
+    ) == pytest.approx(48.5)
+    assert (
+        Optimization.hot_water_c(top, start + timedelta(hours=2), MPCConfig()) is None
+    )

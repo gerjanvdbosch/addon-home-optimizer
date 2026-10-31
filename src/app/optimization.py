@@ -287,6 +287,13 @@ class Optimization:
 
         data = MPCInput(
             solar_forecast_w=solar_forecast,
+            hot_water_c=self.hot_water_c(
+                state.measurements.heat_pump.boiler.top_temperature,
+                now - timedelta(hours=idle_elapsed_hours),
+                mpc_config,
+            )
+            if not boiler_on_current
+            else None,
             mains_water_temperature=mains_water_temperature_c(
                 to_local_time(now).timetuple().tm_yday
             ),
@@ -419,7 +426,6 @@ class Optimization:
             power_w=result.electrical_power_w,
             times=forecast_times,
             heat_w=result.heat_w,
-            now=now,
             dhw_running=boiler_on_current,
             run_temperatures=[
                 SeriesPoint(time=t, value=c) for t, c in run_tank if c is not None
@@ -566,6 +572,20 @@ class Optimization:
             ]
 
         return changes("state"), changes("frequency")
+
+    @staticmethod
+    def hot_water_c(
+        top: list[SeriesPoint], since: datetime, mpc_config: MPCConfig
+    ) -> float | None:
+        """The top sensor's highest since the last DHW run ended at `since`
+        (deg C, see MPCInput.hot_water_c): in each quarter that ended after
+        it, labelled at its start - the quarter under way too. None without
+        one."""
+
+        step = timedelta(hours=mpc_config.step_hours)
+        readings = [p.value for p in top if p.time + step > since]
+
+        return max(readings) if readings else None
 
     @staticmethod
     def dhw_timing(

@@ -22,6 +22,8 @@ from domain.physics import (
     floor_loops_conductance_w_per_k,
     night_share,
     solar_gain_w,
+    zone_heat_capacities,
+    zone_heat_shortfall_j,
     zone_observation,
     zone_observations,
     zone_state_space,
@@ -1457,6 +1459,31 @@ def test_a_screed_in_halves_takes_the_waters_heat_as_one_when_closely_coupled():
         screed = balance + (screed - balance) * decay
 
     assert heat == pytest.approx(expected, rel=1e-3)
+
+
+def test_the_heat_short_at_the_end_is_the_living_rooms_through_its_loops():
+    """The heat the floor must deliver to bring the thermostat's room to its
+    target: its own parts' shortfall, over the share of the water under it -
+    twice that with every loop open, that alone with only its own - however
+    cold the rest; none where the room is warm enough, nor with its own
+    loops closed."""
+
+    model = replace(
+        TRUE_MODEL,
+        screed_capacity_j_per_k=6.0e6,
+        screed_to_slab_w_per_k=1900.0,
+        screed_layer_w_per_k=600.0,
+    )
+    capacities = zone_heat_capacities(model)
+    state = np.array([19.0, 16.0] * 4)
+    living_j = capacities[::2].sum() * 1.0
+
+    assert zone_heat_shortfall_j(model, state, 20.0, 1.0) == pytest.approx(living_j)
+    assert zone_heat_shortfall_j(model, state, 20.0, 0.5) == pytest.approx(
+        2.0 * living_j
+    )
+    assert zone_heat_shortfall_j(model, state, 18.0, 0.5) == 0.0
+    assert zone_heat_shortfall_j(model, state, 20.0, 0.0) == 0.0
 
 
 def test_the_screed_is_read_off_how_runs_fall_off():

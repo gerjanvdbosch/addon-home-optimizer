@@ -9,9 +9,10 @@ that estimates their states and to the planner that acts on them.
 """
 
 import numpy as np
-from scipy.special import expit, ndtr
+from scipy.special import expit, ndtr, ndtri
 
 from domain.models import (
+    TANK_SENSOR_RESOLUTION_K,
     BoilerThermalModel,
     BuildingThermalModel,
     DewPointModel,
@@ -128,7 +129,7 @@ def tank_stratification_k(top_c, bottom_c, mixing, held_before=None) -> np.ndarr
 
 
 def tank_sensor_temperatures(
-    model: BoilerThermalModel, hot_c, mixed_c, mains_c
+    model: BoilerThermalModel, hot_c, mixed_c, mains_c, width_l=None
 ) -> tuple[np.ndarray, np.ndarray]:
     """(top, bottom) the tank's sensors read (deg C) with its heat at mixed_c:
     water at hot_c above the mains water (mains_c) that draws let in at the
@@ -137,7 +138,9 @@ def tank_sensor_temperatures(
     model.thermocline_width_l thick, the water mixed there as it came in. A
     sensor reads the water at its height: the volume below it
     (model.top/bottom_sensor_volume_l). A run stirs the tank to one
-    temperature, which is hot_c = mixed_c here.
+    temperature, which is hot_c = mixed_c here. width_l is the front's
+    thickness where it is known otherwise (see tank_front), else the
+    model's.
 
     Between runs the sensors stay where the run left them until the front
     reaches them: over 116 rests after runs (Jun-Oct 2026) the bottom first
@@ -154,12 +157,55 @@ def tank_sensor_temperatures(
         1.0,
     )
 
+    width = model.thermocline_width_l if width_l is None else width_l
+
     def at(volume_below_l):
-        return mains_c + span * ndtr(
-            (volume_below_l - cold_l) / model.thermocline_width_l
-        )
+        return mains_c + span * ndtr((volume_below_l - cold_l) / width)
 
     return at(model.top_sensor_volume_l), at(model.bottom_sensor_volume_l)
+
+
+def tank_front(
+    model: BoilerThermalModel,
+    hot_c: float,
+    top_c: float,
+    bottom_c: float,
+    mains_c: float,
+) -> tuple[float, float] | None:
+    """(mixed_c, width_l): the tank's mean temperature (deg C) and its
+    front's thickness (L) that put both sensors where they read, its hot
+    water at hot_c above the mains water (see tank_sensor_temperatures) -
+    two readings, two unknowns. A draw thickens or sharpens the front, as
+    it mixes at the inlet, which one thickness for every rest cannot follow
+    (real data, 30 Oct 2026 after a shower: 42.5/27.0 degC read, the
+    thickness fitted over all rests put the top at 39.4). None where both
+    sensors are not inside the front - one in the hot water or the cold
+    reads where it lies no more than that it is past it - and without the
+    sensors' heights identified."""
+
+    span = hot_c - mains_c
+    top_l, bottom_l = model.top_sensor_volume_l, model.bottom_sensor_volume_l
+
+    if span <= 0.0 or top_l is None or bottom_l is None:
+        return None
+
+    shares = (np.array([top_c, bottom_c]) - mains_c) / span
+
+    # A share a sensor step from either end tells nothing of the front.
+    margin = TANK_SENSOR_RESOLUTION_K / span
+
+    if np.any(shares <= margin) or np.any(shares >= 1.0 - margin):
+        return None
+
+    top_z, bottom_z = ndtri(shares)
+
+    if top_z <= bottom_z:
+        return None
+
+    width_l = (top_l - bottom_l) / (top_z - bottom_z)
+    cold_l = top_l - top_z * width_l
+
+    return hot_c - span * float(np.clip(cold_l / model.volume_l, 0.0, 1.0)), width_l
 
 
 # A start dead time was tried for this planning model and rejected: no heat into
@@ -363,6 +409,29 @@ def zone_heat_capacities(model: BuildingThermalModel) -> np.ndarray:
         parts += [0.5 * c_screed, 0.5 * c_screed]
 
     return np.concatenate(parts)
+
+
+def zone_heat_shortfall_j(
+    model: BuildingThermalModel, state, target_c: float, living_fraction: float
+) -> float:
+    """The heat (J) the floor must deliver to bring the thermostat's room's
+    parts - its air, slab and screed - from `state` to target_c, through
+    loops with living_fraction of their water under it (see
+    floor_living_fraction): their shortfall over the share of the heat that
+    reaches them, the rest landing under the other rooms whose loops are
+    open. Zero where they are there already, and where its own loops are
+    closed: no run's floor heat reaches it then."""
+
+    if living_fraction <= 0.0:
+        return 0.0
+
+    capacities = zone_heat_capacities(model)
+    # The states alternate the living room's and the rest's (see
+    # zone_state_space).
+    living = np.arange(len(capacities)) % 2 == 0
+    short = float(capacities[living] @ (target_c - np.asarray(state)[living]))
+
+    return max(short, 0.0) / living_fraction
 
 
 def zone_size(model: BuildingThermalModel) -> int:

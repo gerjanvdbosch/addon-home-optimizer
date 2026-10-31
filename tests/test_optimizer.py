@@ -2791,6 +2791,46 @@ def test_the_planned_sensors_start_at_their_readings_and_a_run_stirs_them():
     assert top[3] == pytest.approx(bottom[3], abs=0.1)
 
 
+def test_after_a_draw_the_planned_sensors_start_at_both_readings():
+    """A draw can leave a front thinner or thicker than a rest's, which one
+    hot water fitted to both sensors cannot meet: with the hot water the
+    last run left (MPCInput.hot_water_c) the plan starts at both readings,
+    relaxes towards the rest's fit, and reads the tank once a run stirs it."""
+
+    top_c, bottom_c = (
+        float(c)
+        for c in tank_sensor_temperatures(
+            replace(THERMOCLINE_MODEL, thermocline_width_l=20.0), 48.0, 30.0, 15.0
+        )
+    )
+    data = _make_input(
+        current_temp_top=top_c,
+        current_temp_bottom=bottom_c,
+        mains_water_temperature=15.0,
+        hot_water_c=48.0,
+    )
+    result = MPCResult(
+        schedule=(0, 0, 0, 1, 0),
+        # The plan's tank mixed from the sensors otherwise: a degree apart.
+        temperatures=(29.0, 28.9, 28.8, 28.7, 45.0),
+        electrical_power_w=(0.0,) * 5,
+        heat_w=(0.0,) * 5,
+        objective_value=0.0,
+        solver_status="ok",
+        termination_condition="optimal",
+    )
+    optimizer = MPCOptimizer(THERMOCLINE_MODEL, MPCConfig())
+
+    top, bottom = optimizer.sensor_temperatures(data, result)
+    one = optimizer.sensor_temperatures(replace(data, hot_water_c=None), result)
+
+    assert (top[0], bottom[0]) == pytest.approx((top_c, bottom_c), abs=0.01)
+    assert abs(one[0][0] - top_c) + abs(one[1][0] - bottom_c) > 0.5
+    assert (top[4], bottom[4]) == pytest.approx(
+        (45.0, 45.0), abs=TANK_SENSOR_RESOLUTION_K
+    )
+
+
 def test_no_planned_sensors_without_a_thermocline():
     result = MPCResult((0,), (30.0,), (0.0,), (0.0,), 0.0, "ok", "optimal")
     data = _make_input(mains_water_temperature=15.0)

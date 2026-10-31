@@ -340,7 +340,6 @@ class StateManager:
         power_w: Sequence[float],
         times: list[datetime],
         heat_w: Sequence[float] = (),
-        now: datetime | None = None,
         dhw_running: bool = False,
         run_temperatures: Sequence[SeriesPoint] = (),
         top_temperatures: Sequence[float] = (),
@@ -357,26 +356,21 @@ class StateManager:
             for t, heat in zip(times, heat_w, strict=False)
         ]
 
-        # The first is the tank the plan starts from now, not at its quarter's
-        # start: drawn there, a heating tank's line ran up to 15 minutes ahead.
-        # Through a DHW run under way it is left out: the line shows only the
-        # quarters, from the tank before the run (see _tank_temperature)
-        # through the quarters the run has ended, by its heat balance, to the
-        # plan's.
-        tank_times = [now, *times[1:]] if now and times else times
+        # At whole quarters only, as the sensors are measured: each value is
+        # the tank at its step's start, the first the tank now, partway into
+        # its quarter - at the quarter's start a heating tank's line ran up to
+        # 15 minutes ahead, at now a point fell between the quarters. So from
+        # the first quarter's end on. Through a DHW run under way the quarters
+        # the run has ended come before it, by its heat balance (see
+        # _tank_temperature).
         boiler = state.schedule.heat_pump.boiler
-
-        def tank_line(values: Sequence[float]) -> list[SeriesPoint]:
-            tank = list(zip(tank_times, values, strict=False))
-
-            return [
+        boiler.temperatures, boiler.top_temperatures, boiler.bottom_temperatures = (
+            [
                 SeriesPoint(time=t, value=float(val))
-                for t, val in (tank[1:] if dhw_running else tank)
+                for t, val in zip(times[1:], values[1:], strict=False)
             ]
-
-        boiler.temperatures = tank_line(temperatures)
-        boiler.top_temperatures = tank_line(top_temperatures)
-        boiler.bottom_temperatures = tank_line(bottom_temperatures)
+            for values in (temperatures, top_temperatures, bottom_temperatures)
+        )
 
         if dhw_running:
             state.schedule.heat_pump.boiler.temperatures[:0] = run_temperatures

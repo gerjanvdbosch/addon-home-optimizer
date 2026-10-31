@@ -442,7 +442,7 @@ def test_a_run_under_way_leaves_the_tank_to_the_plan(tmp_path):
     assert tank[1:].isna().all()
 
 
-def test_the_plan_line_starts_at_the_tank_now(tmp_path):
+def test_the_tank_lines_show_only_whole_quarters(tmp_path):
     manager = _state_manager()
     manager.state_repository = StateRepository(JsonStorage(tmp_path / "state.json"))
     times = [NOW.replace(minute=30) + timedelta(minutes=15 * i) for i in range(3)]
@@ -452,12 +452,19 @@ def test_the_plan_line_starts_at_the_tank_now(tmp_path):
         temperatures=[40.0, 44.0, 47.0],
         power_w=[1500.0] * 3,
         times=times,
-        now=NOW,
+        top_temperatures=[45.0, 46.0, 48.0],
+        bottom_temperatures=[30.0, 38.0, 46.0],
     )
 
     boiler = manager.load().schedule.heat_pump.boiler
-    assert [p.time for p in boiler.temperatures] == [NOW, *times[1:]]
+    # From the first quarter's end on, as the sensors are measured.
+    assert [p.time for p in boiler.temperatures] == times[1:]
     assert [p.time for p in boiler.on] == times
+    assert [(p.time, p.value) for p in boiler.top_temperatures] == [
+        (times[1], 46.0),
+        (times[2], 48.0),
+    ]
+    assert [p.time for p in boiler.bottom_temperatures] == times[1:]
 
 
 def test_through_a_dhw_run_the_plan_line_shows_only_quarters(tmp_path):
@@ -470,7 +477,6 @@ def test_through_a_dhw_run_the_plan_line_shows_only_quarters(tmp_path):
         temperatures=[40.0, 44.0, 47.0],
         power_w=[1500.0] * 3,
         times=times,
-        now=NOW,
         dhw_running=True,
         run_temperatures=[SeriesPoint(time=times[0], value=42.0)],
     )

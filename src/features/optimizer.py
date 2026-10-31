@@ -31,9 +31,11 @@ from domain.physics import (
     floor_heat_moved_w,
     floor_living_fraction,
     lumped_tank_state_space,
+    tank_front,
     tank_sensor_temperatures,
     zone_floor,
     zone_heat_capacities,
+    zone_heat_shortfall_j,
     zone_observation,
     zone_state_space,
 )
@@ -137,6 +139,18 @@ SOLAR_SCENARIO_WEIGHTS = (0.3, 0.4, 0.3)
 GRID_K = 0.2
 
 INFEASIBLE = 1e12
+
+
+# How fast the front a draw left in the tank relaxes towards the tank at rest
+# the plan's sensors are otherwise read from (h, see
+# MPCOptimizer.sensor_temperatures): conduction and the inlet's plume even it
+# out. Over 253 rests begun with a front (Sep-Oct 2026, sensors 15-min, the
+# mixed tank as measured): held to the next run, the sensors came out 0.05 K
+# off at once, 0.4-0.6 K an hour on, but 0.9/1.4 K (top/bottom) six hours on
+# against 0.8 K for the rest's fit; relaxing over 4 h, 0.05, 0.42/0.58,
+# 0.61/0.76 and 0.71/0.83 K at 0, 1, 3 and 6 h - as good or better at every
+# horizon, 2 h about the same.
+FRONT_RELAXATION_HOURS = 4.0
 
 
 @dataclass
@@ -2723,38 +2737,81 @@ class MPCOptimizer:
                 + (bottom_c - data.current_temp_bottom) ** 2
             )
 
-        if data.boiler_on_current or lowest_c >= hottest_c:
-            hot_c = [float(tank_c[0]) if data.boiler_on_current else lowest_c]
-        else:
-            hot_c = [
-                float(
-                    minimize_scalar(
-                        misfit, bounds=(lowest_c, hottest_c), method="bounded"
-                    ).x
-                )
-            ]
-
         a, b = lumped_tank_state_space(
             model.volume_l, model.ua_top_w_per_k + model.ua_bottom_w_per_k
         )
 
-        for k in range(len(tank_c) - 1):
-            hours = (
-                data.first_step_hours
-                if k == 0 and data.first_step_hours is not None
-                else self.config.step_hours
-            )
+        def coasted(hot: float, hours: float) -> float:
             a_d, b_d = discretize_zoh(a, b, hours * 3600.0)
-            coast_c = float(
-                a_d[0, 0] * hot_c[-1] + b_d[0, 0] * data.ambient_temperature
+            return float(a_d[0, 0] * hot + b_d[0, 0] * data.ambient_temperature)
+
+        # Through a rest the hot water is what the last run stirred the tank
+        # to, cooled since on the standing loss (see MPCInput.hot_water_c):
+        # with it both sensors give the front's place and thickness, as a
+        # draw left it (see tank_front), and the plan's sensors start where
+        # they read. That front relaxes towards the tank at rest the hot
+        # water above is fitted to, over FRONT_RELAXATION_HOURS, and a run
+        # stirs it away.
+        front = None
+
+        if not data.boiler_on_current and data.hot_water_c is not None:
+            hot_now = max(
+                coasted(data.hot_water_c, data.idle_elapsed_hours),
+                float(data.current_temp_top),
             )
-            hot_c.append(
-                float(tank_c[k + 1])
-                if result.schedule[k]
-                else max(coast_c, float(tank_c[k + 1]))
+            front = tank_front(
+                model, hot_now, data.current_temp_top, data.current_temp_bottom, mains_c
             )
 
-        top_c, bottom_c = tank_sensor_temperatures(model, hot_c, tank_c, mains_c)
+        if data.boiler_on_current or lowest_c >= hottest_c:
+            start_c = float(tank_c[0]) if data.boiler_on_current else lowest_c
+        else:
+            start_c = float(
+                minimize_scalar(
+                    misfit, bounds=(lowest_c, hottest_c), method="bounded"
+                ).x
+            )
+
+        hours = [
+            data.first_step_hours
+            if k == 0 and data.first_step_hours is not None
+            else self.config.step_hours
+            for k in range(len(tank_c) - 1)
+        ]
+
+        def hot_from(hot: float) -> np.ndarray:
+            hot_c = [hot]
+
+            for k, step_hours in enumerate(hours):
+                hot_c.append(
+                    float(tank_c[k + 1])
+                    if result.schedule[k]
+                    else max(coasted(hot_c[-1], step_hours), float(tank_c[k + 1]))
+                )
+
+            return np.array(hot_c)
+
+        hot_c = hot_from(start_c)
+        mixed_c = tank_c
+        width_l = float(model.thermocline_width_l)
+
+        if front is not None:
+            weight = np.exp(
+                -np.concatenate([[0.0], np.cumsum(hours)]) / FRONT_RELAXATION_HOURS
+            )
+            # Until the first run, which stirs it.
+            stirred = next((k + 1 for k, on in enumerate(result.schedule) if on), None)
+
+            if stirred is not None:
+                weight[stirred:] = 0.0
+
+            hot_c = hot_c + (hot_from(hot_now) - hot_c) * weight
+            mixed_c = tank_c + (front[0] - tank_c[0]) * weight
+            width_l = width_l + (front[1] - width_l) * weight
+
+        top_c, bottom_c = tank_sensor_temperatures(
+            model, hot_c, mixed_c, mains_c, width_l
+        )
 
         return tuple(top_c.tolist()), tuple(bottom_c.tolist())
 
@@ -3340,17 +3397,25 @@ class MPCOptimizer:
         # The heat a plan leaves in the zone at its end beyond what the zone
         # left alone would hold (J): it makes up heat the next plan would
         # otherwise have to make, so it is worth what making it then costs
-        # (see _build_objective) - but only as much as the zone left alone
-        # falls short of its wanted temperature at the end, the heat the next
-        # plan needs to bring every part of it there. Beyond that no plan
-        # needs it, and none where the zone ends warm enough. Left at
-        # nothing, a plan let the floor run down towards its end whatever
-        # the day after needs. Heating only.
+        # (see _build_objective) - but only as much as the next plan would
+        # have to deliver to bring the thermostat's room, left alone, to its
+        # wanted temperature at the end, through the loops this plan's runs
+        # go through: a closed floor's shortfall is no heat any plan makes
+        # (see zone_heat_shortfall_j). Beyond that no plan needs it, and none
+        # where the room ends warm enough. Left at nothing, a plan let the
+        # floor run down towards its end whatever the day after needs.
+        # Heating only.
         if not cooling:
             last = num_steps - 1
             capacities = zone_heat_capacities(building)
-            short_j = float(capacities @ (float(target_c[last]) - unheated[last]))
-            model.zone_end_heat_j = pyo.Var(bounds=(0.0, max(short_j, 0.0)))
+            model.zone_end_heat_j = pyo.Var(
+                bounds=(
+                    0.0,
+                    zone_heat_shortfall_j(
+                        building, unheated[last], float(target_c[last]), living_fraction
+                    ),
+                )
+            )
             model.zone_constraints.add(
                 model.zone_end_heat_j
                 <= sum(

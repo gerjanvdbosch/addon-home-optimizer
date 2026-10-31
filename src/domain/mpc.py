@@ -231,6 +231,12 @@ class MPCInput:
     # physics.mains_water_temperature_c): what taps can cool the tank to at
     # most. None leaves the tap forecast as it is.
     mains_water_temperature: float | None = None
+    # The top sensor's highest since the last DHW run ended (deg C): the hot
+    # water that run stirred the tank to, before draws or the standing loss
+    # took the top below it - read off with the sensors where the front lies
+    # (see MPCOptimizer.sensor_temperatures). None without a rest to read it
+    # from.
+    hot_water_c: float | None = None
     # What a kWh costs from the grid and brings in exported per step (EUR/kWh):
     # a high and low tariff or dynamic prices. Empty uses MPCConfig's flat ones.
     import_price_eur_per_kwh: tuple[float, ...] = ()
