@@ -192,6 +192,10 @@ class TankSetting:
     # (weight, surplus W per step) per solar scenario.
     scenarios: list[tuple[float, np.ndarray]]
     weight_switching: float
+    # Short of a target: EUR per K^2 per hour within band_k of it, then
+    # weight_slack EUR per K (see MPCConfig.weight_tank_target_eur_per_k2h).
+    weight_target: float
+    band_k: float
     weight_slack: float
     min_runtime_hours: float
     min_off_steps: int
@@ -336,7 +340,11 @@ def shortfall_cost(tank: TankSetting, k: int, tank_c, next_c, ran):
     if k + 1 < tank.num_steps:
         short = np.maximum(short, required - next_c)
 
-    return tank.weight_slack * short
+    within = np.minimum(short, tank.band_k)
+
+    return tank.weight_target * tank.dt_hours[k] * within**2 + tank.weight_slack * (
+        short - within
+    )
 
 
 def _runs(plan: TankPlan) -> tuple[tuple[int, int], ...]:
@@ -1658,6 +1666,8 @@ class MPCOptimizer:
             export_price=tuple(export_price),
             scenarios=solar_scenarios,
             weight_switching=self.config.weight_switching,
+            weight_target=self.config.weight_tank_target_eur_per_k2h,
+            band_k=self.config.tank_target_band_k,
             weight_slack=self.config.weight_temperature_slack,
             min_runtime_hours=min_runtime_hours,
             min_off_steps=self.config.heat_pump_min_off_steps,
@@ -1811,6 +1821,26 @@ class MPCOptimizer:
             model.K,
             rule=end_temperature_rule,
         )
+
+        # The shortfall within the band (see
+        # MPCConfig.weight_tank_target_eur_per_k2h) and its square, bounded from
+        # below by tangents; beyond the band the slack costs per kelvin.
+        band_k = self.config.tank_target_band_k
+        model.slack_in = pyo.Var(model.K, bounds=(0.0, band_k))
+        model.slack_k2 = pyo.Var(model.K, domain=pyo.NonNegativeReals)
+        model.slack_tangents = pyo.ConstraintList()
+
+        for k in range(num_steps):
+            model.slack_tangents.add(model.slack_in[k] <= model.slack[k])
+
+            for point_k in np.arange(
+                COMFORT_TANGENT_SPACING_K,
+                band_k + COMFORT_TANGENT_SPACING_K / 2,
+                COMFORT_TANGENT_SPACING_K,
+            ):
+                model.slack_tangents.add(
+                    model.slack_k2[k] >= 2.0 * point_k * model.slack_in[k] - point_k**2
+                )
 
         # The compressor runs now if it serves either demand: a plan that goes
         # on heating the zone it is heating already makes no start.
@@ -3850,11 +3880,15 @@ class MPCOptimizer:
 
             objective += self.config.weight_switching * model.compressor_start[k]
 
-            objective += self.config.weight_temperature_slack * model.slack[k]
+            objective += self.config.weight_tank_target_eur_per_k2h * dt_hours[
+                k
+            ] * model.slack_k2[k] + self.config.weight_temperature_slack * (
+                model.slack[k] - model.slack_in[k]
+            )
 
-            # The zone's band is weighed the same as the tank's target: both
-            # are promises the plan made, and neither is worth trading for a
-            # few cents of electricity. Within it, comfort is traded.
+            # The zone's band is a promise the plan made, not worth trading
+            # for a few cents of electricity. Within it, comfort is traded, as
+            # for the tank's target.
             if hasattr(model, "zone_slack"):
                 objective += self.config.weight_temperature_slack * (
                     model.zone_slack[k] + model.zone_excess[k]

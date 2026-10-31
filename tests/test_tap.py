@@ -197,3 +197,20 @@ def test_what_was_drawn_today_is_not_forecast_again(tmp_path):
     np.testing.assert_allclose(
         forecaster._within_todays_budget(forecast, nothing_yet, heavy_day_w), forecast
     )
+
+
+def test_drawn_counts_from_the_quarter_of_since():
+    """From the quarter `since` falls in on, the local midnight without one."""
+
+    index = pd.date_range(
+        "2026-10-31 00:00", periods=4 * 18, freq="15min", tz=LOCAL_TIMEZONE
+    )
+    drawn = pd.Series(0.0, index=index)
+    drawn[pd.Timestamp("2026-10-31 07:00", tz=LOCAL_TIMEZONE)] = 4000.0
+    drawn[pd.Timestamp("2026-10-31 16:45", tz=LOCAL_TIMEZONE)] = 2000.0
+    prepared = pd.DataFrame({"excess_loss_w": drawn})
+
+    assert TapForecaster.drawn_j(prepared) == pytest.approx(6000.0 * 900.0)
+    assert TapForecaster.drawn_j(
+        prepared, datetime(2026, 10, 31, 15, 50, tzinfo=timezone.utc)
+    ) == pytest.approx(2000.0 * 900.0)

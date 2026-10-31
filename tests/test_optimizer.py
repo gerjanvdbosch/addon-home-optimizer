@@ -34,6 +34,12 @@ from features.optimizer import (
     surplus_scenarios,
 )
 
+# How far below its target the plan may leave the tank (K): within the
+# target's band a few hundredths to a tenth of a degree costs less than the
+# heat (see MPCConfig.weight_tank_target_eur_per_k2h), and the setpoint goes out
+# rounded to the heat pump's half degree anyway.
+TARGET_TOLERANCE_K = 0.25
+
 THERMAL_MODEL = BoilerThermalModel(
     volume_l=200.0,
     ua_top_w_per_k=0.15,
@@ -193,7 +199,7 @@ def test_tap_forecast_can_force_additional_heating_before_a_deadline():
         )
     )
 
-    assert with_draw.temperatures[18] >= 45.0 - 1e-6
+    assert with_draw.temperatures[18] >= 45.0 - TARGET_TOLERANCE_K
     assert sum(with_draw.schedule) > sum(baseline.schedule)
 
 
@@ -894,7 +900,7 @@ def test_a_long_horizon_meets_a_late_target():
 
     result = MPCOptimizer(THERMAL_MODEL, MPCConfig()).solve(data)
 
-    assert result.temperatures[168] >= 45.0 - 1e-6
+    assert result.temperatures[168] >= 45.0 - TARGET_TOLERANCE_K
     assert len(result.schedule) == horizon
     assert len(result.temperatures) == horizon
 
@@ -1162,7 +1168,7 @@ def test_the_tank_does_not_get_a_second_turn_within_one_run():
     assert _compressor_starts(result) == 1
 
     # Both demands still met, so the rule did not simply forbid one of them.
-    assert max(result.temperatures) >= 45.0 - 1e-6
+    assert max(result.temperatures) >= 45.0 - TARGET_TOLERANCE_K
     assert result.zone_temperatures[-1] >= 20.0 - 1e-6
 
 
@@ -2088,7 +2094,8 @@ def test_the_reported_energy_is_what_the_objective_priced(thermal_model, cop_mod
     objective, less its starts: a plan log built on them ranks plans the way the
     optimizer does. Also with a start step drawing its measured power."""
 
-    config = MPCConfig()
+    # The target held hard: a comfort cost within its band is no energy.
+    config = MPCConfig(tank_target_band_k=0.0)
     target = [10.0] * len(SOLAR_FORECAST_W)
     target[18] = 45.0
     result = MPCOptimizer(thermal_model, config, cop_model=cop_model).solve(
@@ -2845,7 +2852,16 @@ def test_heat_left_in_the_floor_at_the_end_is_worth_what_it_saves(monkeypatch):
     left alone would fall short of its wanted temperature, is worth what the
     next plan would pay to make it: a plan ends with a warmer floor than one
     that counts it as nothing - and leaves none where the zone ends warm
-    enough anyway (see test_heating_the_zone_is_not_free)."""
+    enough anyway (see test_heating_the_zone_is_not_free).
+
+    At a flat price that heat is worth what it costs, so it decides only where
+    comfort at the end nearly pays for a run already: a zone held at 18 degC
+    that wants 20 in the plan's last hour. A zone heated through the day ends
+    with its floor above the shortfall's cap, and both plans were the same."""
+
+    steps = 48
+    target = [18.0] * steps
+    target[-4:] = [20.0] * 4
 
     def plan():
         return MPCOptimizer(
@@ -2855,7 +2871,14 @@ def test_heat_left_in_the_floor_at_the_end_is_worth_what_it_saves(monkeypatch):
             building_model=TWO_NODE,
             floor_circuit_model=HEATING,
             space_cop_model=COP_MODEL,
-        ).solve(_cold_day(steps=48))
+        ).solve(
+            _cold_day(
+                steps=steps,
+                zone_state=_zone_state(18.3, 18.3),
+                zone_target_temperature=tuple(target),
+                zone_minimum_temperature=(18.0,) * steps,
+            )
+        )
 
     valued = plan()
     monkeypatch.setattr(
@@ -2926,3 +2949,24 @@ def test_a_run_under_way_is_planned_on_the_rest_of_its_ramp():
     assert halved._tank_setting(restarted).heat_w[0] == pytest.approx(
         full_w * delivered_h(0.25, 450.0) / 0.25
     )
+
+
+def test_a_tank_a_tenth_short_of_its_target_starts_no_run():
+    """Within its band a target is comfort traded against a run: a tenth of
+    a degree short is not worth a start, two degrees are (see
+    MPCConfig.weight_tank_target_eur_per_k2h)."""
+
+    optimizer = MPCOptimizer(THERMAL_MODEL, MPCConfig())
+    warm = dict(current_temp_top=45.0, current_temp_bottom=45.0)
+    unheated = optimizer.solve(_make_input(**warm)).temperatures
+
+    def schedule(short_k: float) -> tuple[int, ...]:
+        target = [10.0] * len(SOLAR_FORECAST_W)
+        target[8] = target[9] = unheated[10] + short_k
+
+        return optimizer.solve(
+            _make_input(**warm, target_temperature_top=tuple(target))
+        ).schedule
+
+    assert not any(schedule(0.1))
+    assert any(schedule(2.0))

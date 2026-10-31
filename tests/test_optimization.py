@@ -835,3 +835,63 @@ def test_the_hot_water_is_the_tops_highest_since_the_last_run():
     assert (
         Optimization.hot_water_c(top, start + timedelta(hours=2), MPCConfig()) is None
     )
+
+
+def _day_targets(now, windows):
+    """Today's targets per quarter from local midnight: 10 degC (none, below
+    the mains), and the (first quarter, last quarter, target) windows."""
+
+    start = local_day_start(now).astimezone(UTC)
+    values = [10.0] * 96
+
+    for first, last, target in windows:
+        values[first : last + 1] = [target] * (last + 1 - first)
+
+    return [
+        SeriesPoint(time=start + timedelta(minutes=15 * i), value=value)
+        for i, value in enumerate(values)
+    ]
+
+
+def test_a_target_heated_for_today_is_lowered_by_what_was_drawn_since():
+    """A run today to 48 degC and 3.7 K drawn since: today's 45 degC target
+    asks 41.3, tomorrow's still 45; nor without a run today, or for a target
+    the run did not reach."""
+
+    now = datetime(2026, 10, 31, 16, 20, tzinfo=UTC)
+    today = _day_targets(now, [(72, 73, 45.0)])
+    times = [today[72].time, today[72].time + timedelta(days=1)]
+    targets = (45.0, 45.0)
+    run_end = datetime(2026, 10, 31, 12, 52, tzinfo=UTC)
+
+    def served(run_end, hot_water_c):
+        return Optimization.served_targets(
+            targets, times, today, run_end, hot_water_c, 13.0, lambda _: 3.7, now
+        )
+
+    assert served(run_end, 48.0) == (pytest.approx(41.3), 45.0)
+    assert served(None, 48.0) == targets
+    assert served(run_end - timedelta(days=1), 48.0) == targets
+    assert served(run_end, 44.0) == targets
+
+
+def test_an_evening_target_is_not_lowered_by_draws_for_the_morning_one():
+    """One run at 06:30 for a 40 degC target at 07:00 and a 45 degC one at
+    18:00: 5 K drawn since the run, 3 K of it the morning's showers before
+    07:30. The evening target is lowered by the 2 K drawn after the morning
+    window only."""
+
+    now = datetime(2026, 10, 31, 16, 20, tzinfo=UTC)
+    today = _day_targets(now, [(28, 29, 40.0), (72, 73, 45.0)])
+    morning_end = today[30].time
+
+    assert Optimization.served_targets(
+        (45.0,),
+        [today[72].time],
+        today,
+        today[26].time,
+        48.0,
+        13.0,
+        lambda since: 5.0 if since < morning_end else 2.0,
+        now,
+    ) == (pytest.approx(43.0),)

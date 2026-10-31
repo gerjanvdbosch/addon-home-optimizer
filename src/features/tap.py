@@ -1,3 +1,4 @@
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -148,11 +149,11 @@ class TapForecaster:
         )
 
     @staticmethod
-    def drawn_today_j(prepared: pd.DataFrame) -> float:
-        """The heat drawn since the local midnight (J), from `prepared` (see
-        prepare()): signed per quarter hour, so sensor noise averages out, and
-        none while the tank heats - a draw then is not told from the heat put
-        in."""
+    def drawn_j(prepared: pd.DataFrame, since: datetime | None = None) -> float:
+        """The heat drawn since `since`, from its quarter hour on - the local
+        midnight without one (J), from `prepared` (see prepare()): signed per
+        quarter hour, so sensor noise averages out, and none while the tank
+        heats - a draw then is not told from the heat put in."""
 
         y = prepared["excess_loss_w"].dropna()
 
@@ -160,8 +161,13 @@ class TapForecaster:
             return 0.0
 
         quarter_s = 24 * 3600 / TapForecaster.QUARTERS_PER_DAY
+        start = (
+            y.index[-1].normalize()
+            if since is None
+            else pd.Timestamp(since).floor(f"{quarter_s:.0f}s")
+        )
 
-        return max(float(y[y.index >= y.index[-1].normalize()].sum()) * quarter_s, 0.0)
+        return max(float(y[y.index >= start].sum()) * quarter_s, 0.0)
 
     @staticmethod
     def _within_todays_budget(

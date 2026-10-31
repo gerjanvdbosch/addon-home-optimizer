@@ -1,7 +1,7 @@
 import dataclasses
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
@@ -317,6 +317,38 @@ class Optimization:
         tap_forecast = extended(
             [SeriesPoint(time=t, value=float(w)) for t, w in tap_w.items()], 0.0
         )
+        run_end = now - timedelta(hours=idle_elapsed_hours)
+        hot_water_c = (
+            self.hot_water_c(
+                state.measurements.heat_pump.boiler.top_temperature,
+                run_end,
+                mpc_config,
+            )
+            if not boiler_on_current
+            else None
+        )
+        mains_c = mains_water_temperature_c(to_local_time(now).timetuple().tm_yday)
+        day_start = local_day_start(now).astimezone(timezone.utc)
+        day_end = local_day_start(now, days=1).astimezone(timezone.utc)
+        # Without a DHW run in the changes loaded, run_end is only their first.
+        target_temps = self.served_targets(
+            target_temps,
+            forecast_times,
+            self.state_manager.resolve_schedule(
+                config.heat_pump.boiler.target_temperature,
+                [day_start + i * step for i in range((day_end - day_start) // step)],
+            ),
+            run_end
+            if any(p.value == dhw_state for p in heat_pump_changes[0])
+            else None,
+            hot_water_c,
+            mains_c,
+            lambda since: (
+                tap.drawn_j(draws, since)
+                / (thermal_model.volume_l * RHO_WATER_KG_PER_L * CP_WATER_J_PER_KG_K)
+            ),
+            now,
+        )
 
         # Empty without any Open-Meteo forecast (fresh install, fetch not yet
         # run), not 0 deg C: MPCOptimizer then falls back to the flat
@@ -329,16 +361,8 @@ class Optimization:
 
         data = MPCInput(
             solar_forecast_w=solar_forecast,
-            hot_water_c=self.hot_water_c(
-                state.measurements.heat_pump.boiler.top_temperature,
-                now - timedelta(hours=idle_elapsed_hours),
-                mpc_config,
-            )
-            if not boiler_on_current
-            else None,
-            mains_water_temperature=mains_water_temperature_c(
-                to_local_time(now).timetuple().tm_yday
-            ),
+            hot_water_c=hot_water_c,
+            mains_water_temperature=mains_c,
             ambient_temperature=state.measurements.heat_pump.boiler.ambient_temperature[
                 -1
             ].value,
@@ -486,7 +510,7 @@ class Optimization:
                 data.mains_water_temperature,
                 self._dhw_setpoint_c(config, now),
                 thermal_model.volume_l,
-                tap.drawn_today_j(draws),
+                tap.drawn_j(draws),
             ),
         )
         self.log_dhw_plan(result, forecast_times, optimizer, planned)
@@ -637,6 +661,65 @@ class Optimization:
         readings = [p.value for p in top if p.time + step > since]
 
         return max(readings) if readings else None
+
+    @staticmethod
+    def served_targets(
+        targets: tuple[float, ...],
+        times: Sequence[datetime],
+        today: Sequence[SeriesPoint],
+        run_end: datetime | None,
+        hot_water_c: float | None,
+        mains_c: float,
+        drawn_k: Callable[[datetime], float],
+        now: datetime,
+    ) -> tuple[float, ...]:
+        """The tank targets with today's lowered by what has been drawn
+        (drawn_k(since), K of the whole tank) since today's last DHW run ended
+        at run_end, where that run heated the tank to them (hot_water_c, see
+        hot_water_c). `today`: the day's targets per quarter hour from its
+        local midnight.
+
+        A target window - quarters with a target above the mains (mains_c,
+        deg C) - is only lowered by what was drawn since the previous window
+        today ended: draws before that were the previous target's water
+        (morning showers after a 07:00 target, then a run left for the 18:00
+        one). A target at or below the mains is none: draws cannot take the
+        tank below the mains (see MPCOptimizer).
+
+        A target is the hot water made ready for the day's draws: drawn before
+        its time, it was used early, not lost, and heating it again only
+        heats for draws the day has already had (real plan, 31 Oct 2026: a
+        run to 48 degC at noon, a shower at 16:45 local, then a run planned at
+        17:15 to have 45 degC again at 18:00). What the rest of the day still
+        draws stays covered: the tap forecast holds it to a heavy day less
+        what has been drawn (see TapForecaster.BUDGET_DAYS), 5.6 kWh, under
+        the 7.3 kWh a 200 l tank at 45 degC holds above the mains. Tomorrow's
+        targets are left as they are: their water is not made yet."""
+
+        if run_end is None or hot_water_c is None or run_end < local_day_start(now):
+            return targets
+
+        since: dict[datetime, datetime] = {}
+        window_since = ended = None
+
+        for i, point in enumerate(today):
+            previous = i > 0 and today[i - 1].value > mains_c
+
+            if point.value > mains_c and not previous:
+                window_since = ended
+            elif point.value <= mains_c and previous:
+                ended = point.time
+
+            since[point.time] = max(run_end, window_since or run_end)
+
+        drawn = {start: drawn_k(start) for start in set(since.values())}
+
+        return tuple(
+            target - drawn[since[time]]
+            if time in since and mains_c < target <= hot_water_c
+            else target
+            for time, target in zip(times, targets, strict=True)
+        )
 
     @staticmethod
     def dhw_timing(

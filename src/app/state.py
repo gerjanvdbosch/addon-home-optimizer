@@ -70,6 +70,41 @@ class StateManager:
         # The changes first: the tank's stratification is read with them.
         state = self.load()
         self._map_changes(state, config, now)
+        # From the sensors' minute means, as the boiler model was fitted on
+        # (see BoilerThermalIdentifier): each sensor flips a step every 16 s
+        # or so, and held from the quarters' last readings the difference
+        # caught the top's flip up with the bottom's flip down (real data, 31
+        # Oct 2026: 47.5/46.0 held, 1.5 K, where the minutes held 1.17 K - the
+        # tank read 2 K colder than the model reads its own sensors).
+        boiler = config.heat_pump.boiler
+        minutes = self.loader.load(
+            DatasetBuilder()
+            .timeseries(
+                "top",
+                boiler.top_temperature,
+                interval="1m",
+                aggregation="mean",
+                fill="previous",
+            )
+            .timeseries(
+                "bottom",
+                boiler.bottom_temperature,
+                interval="1m",
+                aggregation="mean",
+                fill="previous",
+            )
+            .build(),
+            local_day_start(now, days=-1).astimezone(timezone.utc),
+            now,
+        )
+        df = df.assign(
+            boiler_stratification=self.tank_stratification(
+                df["time"],
+                minutes,
+                state.measurements.heat_pump.state_changes,
+                config.heat_pump.states.dhw,
+            )
+        )
         state = self._map(df, state, config=config)
 
         recent_solar = self.loader.load(
@@ -522,55 +557,9 @@ class StateManager:
             df, "boiler_ambient_temperature"
         )
 
-        if config is not None and {
-            "heat_pump_state",
-            "boiler_top_temperature",
-            "boiler_bottom_temperature",
-        } <= set(df.columns):
-            # Mixed in a quarter hour that saw DHW at all, by the state's own
-            # changes: heat_pump_state is each quarter's first reading, and a
-            # state reports only its changes, so InfluxDB's fill repeats it
-            # into the quarters after (real data, 18 Oct 2026: a run from
-            # 16:20 to 17:10 read as off throughout, its tank's 8 K layer
-            # kept, and a plan started at 37.2 degC from both sensors at
-            # 47.5).
+        if config is not None and "boiler_stratification" in df:
             dhw = config.heat_pump.states.dhw
             changes = state.measurements.heat_pump.state_changes
-            quarter = pd.Timedelta(minutes=15)
-
-            def saw_dhw(start: pd.Timestamp) -> bool:
-                in_force = [c.value for c in changes if c.time <= start][-1:]
-
-                return in_force == [dhw] or any(
-                    c.value == dhw for c in changes if start < c.time < start + quarter
-                )
-
-            held_before = {
-                p.time: p.value
-                for p in (
-                    existing.measurements.heat_pump.boiler.stratification
-                    if existing is not None
-                    else []
-                )
-            }
-            top = pd.to_numeric(df["boiler_top_temperature"], errors="coerce")
-            bottom = pd.to_numeric(df["boiler_bottom_temperature"], errors="coerce")
-            # Kept only where the sensors read: held on into the forecast's
-            # quarters, it came back as held_before once they were measured,
-            # past the run that had mixed the tank meanwhile (real data, 30
-            # Oct 2026: 8 K from before a run at 14:45 held again from 15:00,
-            # the tank read 36 degC at 48/48).
-            df = df.assign(
-                boiler_stratification=pd.Series(
-                    tank_stratification_k(
-                        top,
-                        bottom,
-                        (df["heat_pump_state"] == dhw) | df["time"].map(saw_dhw),
-                        pd.to_numeric(df["time"].map(held_before), errors="coerce"),
-                    ),
-                    index=df.index,
-                ).where(top.notna() & bottom.notna())
-            )
             state.measurements.heat_pump.boiler.stratification = self._parse_series(
                 df, "boiler_stratification"
             )
@@ -630,6 +619,40 @@ class StateManager:
                     )
 
         return state
+
+    @staticmethod
+    def tank_stratification(
+        times: pd.Series,
+        minutes: pd.DataFrame,
+        changes: list[SeriesPoint],
+        dhw: str,
+    ) -> pd.Series:
+        """Per quarter in `times` (labelled at its start) the tank's
+        stratification held by its last minute read (see
+        physics.tank_stratification_k), from the sensors' minute means
+        (`minutes`: time, top, bottom), mixed where the operating state's
+        changes have DHW in force; NaN where no minute was read. Held over
+        the minutes since the previous local midnight that `minutes` covers:
+        a quarter's last reading alone loses a larger difference an earlier
+        minute showed."""
+
+        top = pd.to_numeric(minutes["top"], errors="coerce").to_numpy()
+        bottom = pd.to_numeric(minutes["bottom"], errors="coerce").to_numpy()
+        change_times = pd.to_datetime([c.time for c in changes], utc=True)
+        in_force = change_times.searchsorted(minutes["time"], side="right") - 1
+        mixing = [i >= 0 and changes[i].value == dhw for i in in_force]
+        held = pd.Series(
+            tank_stratification_k(
+                top,
+                bottom,
+                mixing,
+                (minutes["time"] - minutes["time"].iloc[0]).dt.total_seconds(),
+            ),
+            index=minutes["time"],
+        ).where(pd.notna(top) & pd.notna(bottom))
+        quarter = held.groupby(held.index.floor("15min")).last()
+
+        return times.map(quarter)
 
     def _tank_temperature(
         self,

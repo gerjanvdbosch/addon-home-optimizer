@@ -87,11 +87,24 @@ def tank_state_space(
     return a, b
 
 
-def tank_stratification_k(top_c, bottom_c, mixing, held_before=None) -> np.ndarray:
+# How long the tank sensors' difference is averaged before it is held (s): at
+# rest each sensor flips between neighbouring steps (TANK_SENSOR_RESOLUTION_K)
+# every 16 s or so, and held from minute means a single flip stayed in the
+# layer for good (real data, 31 Oct 2026: a 16 s flip of the bottom sensor to
+# 45.5 degC held 0.33 K more, read as 0.72 kWh drawn). Averaged over ten
+# minutes, the difference did not grow at rest without draws (90 days to 31
+# Oct 2026, 79 rests: median -0.03 K/h), so what it holds is the draws'; a
+# draw's layer shows in full ten minutes on.
+TANK_SPREAD_WINDOW_S = 600.0
+
+
+def tank_stratification_k(top_c, bottom_c, mixing, seconds=None) -> np.ndarray:
     """The stratification the cold layer below the tank's sensors is read from
     (K, see BoilerThermalModel.mixed_temperature): the top sensor less the
-    bottom one, held at its largest since the tank was last mixed. Arrays in
-    time order; mixing where the tank heats.
+    bottom one, averaged over TANK_SPREAD_WINDOW_S up to each reading where
+    their times are given (`seconds`, s, rising), held at its largest since
+    the tank was last mixed. Arrays in time order; mixing where the tank
+    heats.
 
     Tapping fills that layer from the bottom and only mixing empties it, so at
     rest it does not shrink - whereas the sensors' difference does, whenever
@@ -103,20 +116,29 @@ def tank_stratification_k(top_c, bottom_c, mixing, held_before=None) -> np.ndarr
     where the layer starts from after it. Before the first mixing the readings
     show, held from the first reading: the layer before them is not known.
     Missing readings hold what was held.
-
-    held_before is what an earlier update held at the same readings (NaN where
-    none): a quarter's reading is its last so far, so the larger difference an
-    earlier one showed is otherwise lost and the tank warms again when the
-    sensors step back (real data, 29 October 2026 at rest after a tap: 2.0 K,
-    then 1.5 K on the next update, the SoC 74 -> 80 %).
     """
 
     spread = np.asarray(top_c, dtype=float) - np.asarray(bottom_c, dtype=float)
     mixing = np.asarray(mixing, dtype=bool)
 
-    if held_before is not None:
-        spread = np.where(
-            mixing, spread, np.fmax(spread, np.asarray(held_before, dtype=float))
+    if seconds is not None:
+        seconds = np.asarray(seconds, dtype=float)
+        first = np.searchsorted(seconds, seconds - TANK_SPREAD_WINDOW_S, side="right")
+        # From the tank's last mixing on only: a run heats it from the bottom,
+        # and the difference it leaves behind is none of a layer's.
+        mixed = np.maximum.accumulate(np.where(mixing, np.arange(len(mixing)), -1))
+        first = np.maximum(first, mixed + 1)
+        first = np.where(mixing, np.arange(len(mixing)), first)
+        read = ~np.isnan(spread)
+        total = np.r_[0.0, np.cumsum(np.where(read, spread, 0.0))]
+        count = np.r_[0, np.cumsum(read)]
+        last = np.arange(1, len(spread) + 1)
+        n = count[last] - count[first]
+        spread = np.divide(
+            total[last] - total[first],
+            n,
+            out=np.full(len(spread), np.nan),
+            where=n > 0,
         )
 
     held = spread.copy()

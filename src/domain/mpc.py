@@ -44,6 +44,19 @@ class MPCConfig:
     # where it saves about 1 kWh or keeps a promise.
     weight_switching: float = 0.25
     weight_temperature_slack: float = 1000.0
+    # What the tank short of its target costs, within tank_target_band_k of
+    # it (EUR per K^2 per hour): a comfort choice, not physics, squared like
+    # the zone's. A kelvin of this 200 l tank is 0.23 kWh, some 7 l of 40 degC
+    # water: missed for a half-hour target, 0.5 EUR - about a run with its
+    # start, so a run is made for a degree, not for a tenth. Further below,
+    # weight_temperature_slack per kelvin, as the zone's band edges: the
+    # target is a promise. Priced that way all the way up, a plan a tenth of
+    # a degree short paid 100 EUR and started a run for it (real plan, 31 Oct
+    # 2026: 41.2 against 41.3 degC, 6 kWh above the mains in the tank). A
+    # degree is also within the tank's own estimate after a tap: one 0.5 K
+    # sensor step moved it 1.7 K that day.
+    weight_tank_target_eur_per_k2h: float = 1.0
+    tank_target_band_k: float = 1.0
     # What a zone away from its wanted temperature costs (EUR per K^2 per
     # hour): a comfort choice, not physics. Squared, so a small dip costs next
     # to nothing and a large one a lot: 0.1 K for an hour half a cent, 1 K for
@@ -93,7 +106,7 @@ class MPCInput:
     # the dynamics - empty means "no forecast available", treated as no draws
     # (the same assumption implicitly made before this field existed), not a
     # claim that none will occur. This forecast has known, real but modest
-    # accuracy (see TapForecaster) - weight_temperature_slack
+    # accuracy (see TapForecaster) - weight_tank_target_eur_per_k2h
     # absorbs the resulting forecast error, same as it already does for solar.
     # It also targets a quantity that is a mix of real tap draws and a known,
     # uncorrected temperature-dependent heat-transfer gap in the passive-loss

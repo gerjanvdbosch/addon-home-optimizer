@@ -82,6 +82,12 @@ def booster_active(df: pd.DataFrame, active_state: str) -> pd.Series:
     return active
 
 
+def _seconds(df: pd.DataFrame) -> np.ndarray:
+    """Each row's time since the first (s)."""
+
+    return (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
+
+
 def _model_from_parameters(
     parameters: np.ndarray,
     volume_l: float,
@@ -1476,7 +1482,10 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             >= self.DRAW_BOTTOM_DROP_K
         ).to_numpy()
         heat_c = model.mixed_temperature(
-            top, bottom, ambient, tank_stratification_k(top, bottom, boiler_on)
+            top,
+            bottom,
+            ambient,
+            tank_stratification_k(top, bottom, boiler_on, _seconds(df)),
         )
         rests = []
 
@@ -1548,7 +1557,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         ambient = df["T_ambient"].to_numpy(dtype=float)
         seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
         mixed_c = model.mixed_temperature(
-            top, bottom, ambient, tank_stratification_k(top, bottom, boiler_on)
+            top, bottom, ambient, tank_stratification_k(top, bottom, boiler_on, seconds)
         )
         (rate,) = lumped_tank_state_space(
             model.volume_l, model.ua_top_w_per_k + model.ua_bottom_w_per_k
@@ -1800,7 +1809,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         bottom = df["T_bottom"].to_numpy(dtype=float)
         ambient = df["T_ambient"].to_numpy(dtype=float)
         stratification = tank_stratification_k(
-            top, bottom, df["boiler_on"].to_numpy(dtype=bool)
+            top, bottom, df["boiler_on"].to_numpy(dtype=bool), seconds
         )
         loss_w = self.model.ua_top_w_per_k * (
             top - ambient
@@ -2112,7 +2121,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         T_ambient = df["T_ambient"].to_numpy(dtype=float)
         on = df["boiler_on"].to_numpy(dtype=bool)
         T_tank = model.mixed_temperature(
-            top, bottom, T_ambient, tank_stratification_k(top, bottom, on)
+            top, bottom, T_ambient, tank_stratification_k(top, bottom, on, seconds)
         )
         heat_w = pd.to_numeric(df["q_in_override_w"], errors="coerce").to_numpy()
         loss_w = model.ua_top_w_per_k * (top - T_ambient) + model.ua_bottom_w_per_k * (
@@ -2569,7 +2578,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         # more than the model predicts.
         # The prediction taps nothing, so it keeps the layer the tank had; both
         # at the same surroundings, which a draw does not change.
-        stratification = tank_stratification_k(T_top, T_bottom, boiler_on)
+        stratification = tank_stratification_k(T_top, T_bottom, boiler_on, _seconds(df))
         residual_k = self.model.mixed_temperature(
             predictions[:, 0], predictions[:, 1], T_ambient[1:], stratification[:-1]
         ) - self.model.mixed_temperature(

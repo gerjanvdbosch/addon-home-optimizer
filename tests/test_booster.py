@@ -11,6 +11,12 @@ from features.boiler import BoilerThermalIdentifier, booster_active
 from features.cop import HeatPumpCOPIdentifier
 from features.optimizer import MPCOptimizer
 
+# How far below its target the plan may leave the tank (K): within the
+# target's band a few hundredths to a tenth of a degree costs less than the
+# heat (see MPCConfig.weight_tank_target_eur_per_k2h), and the setpoint goes out
+# rounded to the heat pump's half degree anyway.
+TARGET_TOLERANCE_K = 0.25
+
 SWW = "SWW"
 
 
@@ -104,8 +110,9 @@ def test_a_stratified_tank_holds_the_cold_layer_below_its_sensors():
 
 @pytest.mark.parametrize("gain", [None, 1.3])
 def test_the_cold_layer_is_learned_from_each_runs_closed_heat_balance(gain):
-    """Twelve runs on the model above: a row before, three rows heating at
-    3 kW, then idle rows until the loop's heat has reached the tank. The tank
+    """Twelve runs on the model above: three rows before (longer than the
+    stratification is averaged over), three rows heating at 3 kW, then idle
+    rows until the loop's heat has reached the tank. The tank
     settles mixed at its mean before the run plus the heat put in - the
     measured heat times the calorimetric gain - so the fit recovers the
     layer's share and temperature. At 20 degC surroundings, with no standing
@@ -120,7 +127,7 @@ def test_the_cold_layer_is_learned_from_each_runs_closed_heat_balance(gain):
     for n in range(12):
         top, bottom = 30.0 + 1.5 * n, 22.0 + 1.5 * n - (n % 3)
         settled = MIXING_MODEL.mixed_temperature(top, bottom, 20.0) + added_k
-        run = [(top, bottom, False, float("nan"))]
+        run = [(top, bottom, False, float("nan"))] * 3
         run += [(top + 2.0, bottom + 4.0, True, heat_w)] * 3
         run += [(settled, settled, False, float("nan"))] * 5
 
@@ -412,7 +419,7 @@ def test_booster_heats_above_the_heat_pump_limit_and_only_there():
     above_the_limit = [t for t in temperatures if t > 55.0 + 1e-6]
     heated = [i for i, heat_w in enumerate(result.heat_w) if heat_w > 0.0]
 
-    assert temperatures[20] >= 59.0 - 1e-6
+    assert temperatures[20] >= 59.0 - TARGET_TOLERANCE_K
     assert above_the_limit
     # The thermostat cuts the booster out at the maximum, and it takes over in
     # the very step the heat pump reaches its limit: one run, no idle step
@@ -470,7 +477,7 @@ def test_a_tank_near_the_limit_still_starts_and_hands_over():
     result = MPCOptimizer(BOOSTER_MODEL, MPCConfig()).solve(data)
 
     assert any(result.schedule), "expected the tank to be heated at all"
-    assert result.temperatures[20] >= 60.0 - 1e-6
+    assert result.temperatures[20] >= 60.0 - TARGET_TOLERANCE_K
 
 
 @pytest.mark.parametrize("compressor_elapsed_hours", [0.0, 0.1])
@@ -498,7 +505,7 @@ def test_a_run_above_the_heat_pump_limit_is_not_held_to_the_minimum_runtime(
 
     result = MPCOptimizer(BOOSTER_MODEL, MPCConfig()).solve(data)
 
-    assert result.temperatures[1] >= 59.9 - 1e-6
+    assert result.temperatures[1] >= 59.9 - TARGET_TOLERANCE_K
     assert max(result.temperatures) <= BOOSTER_MODEL.max_tank_temperature_c + 1e-6
     assert result.heat_w[0] > 0.0
     assert result.electrical_power_w[0] == pytest.approx(1.2 * result.heat_w[0])
@@ -517,3 +524,19 @@ def test_a_tank_at_rest_keeps_its_cold_layer_when_its_top_steps_down():
 
     assert list(held) == [0.0, 1.0, 1.0, 1.0, 0.5, 0.5]
     assert np.all(np.diff(mixed[:4]) <= 0.0)
+
+
+def test_the_stratification_is_averaged_from_the_last_mixing_on():
+    """Averaged over ten minutes (see physics.TANK_SPREAD_WINDOW_S): a bottom
+    sensor flipping a step down for a minute at rest adds a tenth of it, not
+    the step; and a run, which heats the tank from the bottom and leaves the
+    bottom sensor above the top one, is no part of the rest after it."""
+
+    seconds = np.arange(0.0, 20 * 60.0, 60.0)
+    top = [47.0] * 20
+    bottom = [47.5] * 5 + [46.5] * 5 + [46.5] * 4 + [46.0] + [46.5] * 5
+    mixing = [True] * 5 + [False] * 15
+    held = tank_stratification_k(top, bottom, mixing, seconds)
+
+    assert held[5] == pytest.approx(0.5)
+    assert held[-1] == pytest.approx(0.55)

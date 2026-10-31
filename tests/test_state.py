@@ -1,14 +1,12 @@
 import math
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 
 import joblib
 import pandas as pd
 import pytest
 
 from app.state import StateManager
-from domain.config import HeatPumpStates
 from domain.models import BoilerThermalModel
 from domain.state import SeriesPoint, State
 from features.solar import nowcast_solar
@@ -255,129 +253,55 @@ def test_beyond_the_day_before_a_forecast_falls_back():
     assert all(math.isnan(v) for v in StateManager.extend_forecast({}, times))
 
 
-def test_a_run_the_quarters_miss_still_mixes_the_tank():
-    """The quarters read each one's first state, and a state reports only its
-    changes: a run that began inside a quarter reads as off throughout. By the
-    state's own changes the tank mixed, and its cold layer is gone."""
-
-    start = datetime(2026, 10, 18, 14, 0, tzinfo=UTC)
-    times = [start + timedelta(minutes=15 * i) for i in range(6)]
-    df = pd.DataFrame(
+def _minutes(start: datetime, top: list[float], bottom: list[float]) -> pd.DataFrame:
+    return pd.DataFrame(
         {
-            "time": times,
-            "heat_pump_state": ["Uit"] * 6,
-            "boiler_top_temperature": [37.0, 33.5, 33.5, 42.5, 47.5, 47.5],
-            "boiler_bottom_temperature": [29.0, 29.0, 32.5, 42.5, 47.5, 47.5],
+            "time": [start + timedelta(minutes=i) for i in range(len(top))],
+            "top": top,
+            "bottom": bottom,
         }
     )
-    existing = State()
-    existing.measurements.heat_pump.state_changes = [
+
+
+def test_a_run_inside_a_quarter_mixes_the_tank():
+    """18 Oct 2026: a run from 14:20 to 15:10 mixes the tank by the state's
+    own changes, and its cold layer is gone from then on; before it the
+    stratification is held at its largest."""
+
+    start = datetime(2026, 10, 18, 14, 0, tzinfo=UTC)
+    top = [37.0] * 10 + [33.5] * 10 + [40.0] * 50 + [47.5] * 20
+    bottom = [29.0] * 20 + [40.0] * 50 + [47.5] * 20
+    changes = [
         SeriesPoint(time=start + timedelta(minutes=20), value="SWW"),
         SeriesPoint(time=start + timedelta(minutes=70), value="Uit"),
     ]
-    config = SimpleNamespace(
-        heat_pump=SimpleNamespace(
-            states=HeatPumpStates(),
-            boiler=SimpleNamespace(target_temperature=45.0),
-            mode=None,
-        ),
-        building=SimpleNamespace(comfort=lambda cooling: None),
+    times = pd.Series([start + timedelta(minutes=15 * i) for i in range(7)])
+
+    held = StateManager.tank_stratification(
+        times, _minutes(start, top, bottom), changes, "SWW"
     )
 
-    state = _state_manager()._map(df, existing, config=config)  # type: ignore[arg-type]
-
-    assert [p.value for p in state.measurements.heat_pump.boiler.stratification] == [
-        8.0,
-        4.5,
-        1.0,
-        0.0,
-        0.0,
-        0.0,
-    ]
+    assert held.iloc[:6].tolist() == [8.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    assert math.isnan(held.iloc[6])
 
 
-def test_a_quarters_stratification_is_held_across_updates():
-    """29 October 2026 at rest after a tap: the quarter's last reading so far
-    showed 46.0/44.0 degC at 21:05, 45.5/44.0 at 21:10. The 2.0 K the first
-    update held stays: the layer did not shrink, only the top stepped down."""
+def test_the_stratification_is_held_from_the_minutes_not_the_flips():
+    """31 Oct 2026 at rest after a tap: the top sensor flips 47.0/47.5 degC
+    and the bottom 46.0/46.5 every 16 s or so. Averaged over ten minutes (see
+    physics.TANK_SPREAD_WINDOW_S) the 1.0 K between them is held, not the
+    1.17 K of a minute that caught the bottom's flip down, nor the 1.5 K of
+    the top's flip up over it."""
 
-    times = [
-        datetime(2026, 10, 29, 19, 45, tzinfo=UTC),
-        datetime(2026, 10, 29, 20, 0, tzinfo=UTC),
-    ]
-    config = SimpleNamespace(
-        heat_pump=SimpleNamespace(
-            states=HeatPumpStates(),
-            boiler=SimpleNamespace(target_temperature=45.0),
-            mode=None,
-        ),
-        building=SimpleNamespace(comfort=lambda cooling: None),
+    start = datetime(2026, 10, 31, 16, 0, tzinfo=UTC)
+    top = [47.25] * 5 + [47.17] + [47.25] * 9
+    bottom = [46.5] * 5 + [46.0] + [46.25] * 9
+    times = pd.Series([start])
+
+    held = StateManager.tank_stratification(
+        times, _minutes(start, top, bottom), [], "SWW"
     )
 
-    def update(top: float, bottom: float, existing: State) -> State:
-        df = pd.DataFrame(
-            {
-                "time": times,
-                "heat_pump_state": ["Uit"] * 2,
-                "boiler_top_temperature": [46.5, top],
-                "boiler_bottom_temperature": [45.5, bottom],
-            }
-        )
-
-        return _state_manager()._map(df, existing, config=config)  # type: ignore[arg-type]
-
-    state = update(45.5, 44.0, update(46.0, 44.0, State()))
-
-    assert [p.value for p in state.measurements.heat_pump.boiler.stratification] == [
-        1.0,
-        2.0,
-    ]
-
-
-def test_a_run_ends_the_stratification_held_before_it():
-    """30 October 2026: the 8 K before a run was held on into the forecast's
-    quarters and came back once they were measured, after the run had mixed
-    the tank - 36 degC read at 48/48. Only measured quarters are kept."""
-
-    times = [
-        datetime(2026, 10, 30, 12, 15, tzinfo=UTC) + timedelta(minutes=15 * i)
-        for i in range(3)
-    ]
-    config = SimpleNamespace(
-        heat_pump=SimpleNamespace(
-            states=HeatPumpStates(),
-            boiler=SimpleNamespace(target_temperature=45.0),
-            mode=None,
-        ),
-        building=SimpleNamespace(comfort=lambda cooling: None),
-    )
-
-    def update(state: list[str], top: list[float], bottom: list[float], existing):
-        df = pd.DataFrame(
-            {
-                "time": times,
-                "heat_pump_state": state,
-                "boiler_top_temperature": top,
-                "boiler_bottom_temperature": bottom,
-            }
-        )
-
-        return _state_manager()._map(df, existing, config=config)  # type: ignore[arg-type]
-
-    nan = float("nan")
-    before = update(["Uit"] * 3, [22.0, nan, nan], [14.0, nan, nan], State())
-    state = update(
-        ["Uit", "SWW", "Uit"], [22.0, 48.5, 48.0], [14.0, 48.5, 48.0], before
-    )
-
-    assert [p.value for p in before.measurements.heat_pump.boiler.stratification] == [
-        8.0
-    ]
-    assert [p.value for p in state.measurements.heat_pump.boiler.stratification] == [
-        8.0,
-        0.0,
-        0.0,
-    ]
+    assert held.iloc[0] == pytest.approx(1.017)
 
 
 RUN_START = datetime(2026, 10, 27, 10, 0, 49, tzinfo=UTC)
