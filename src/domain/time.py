@@ -35,9 +35,3 @@ def local_day_start(dt: datetime, days: int = 0) -> datetime:
     local_date = to_local_time(dt).date() + timedelta(days=days)
 
     return datetime.combine(local_date, time.min).astimezone()
-
-
-def to_local_series(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, utc=True).dt.tz_convert(
-        datetime.now().astimezone().tzinfo
-    )

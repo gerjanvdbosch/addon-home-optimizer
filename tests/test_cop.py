@@ -395,6 +395,26 @@ def test_validate_reports_low_error_on_matching_synthetic_data():
     assert metrics["mae"] < 0.3
 
 
+def test_validate_scores_the_newest_data_with_a_model_that_has_not_seen_it():
+    """calibrate() fits on all of the data; validate() scores its newest share
+    by a model calibrated on what came before it. A heat pump drawing 25% more
+    there is then off by all of it, not by what a fit through it absorbed."""
+
+    df = _simulate(np.random.default_rng(7), SWW_STATE, t_supply=50.0)
+    identifier = HeatPumpCOPIdentifier(key="dhw")
+    tail = df.index >= int(len(df) * identifier.TRAIN_RATIO)
+    df.loc[tail, "P_el"] *= 1.25
+    identifier.calibrate(df)
+
+    newest = identifier.prepare(df)
+    newest = newest.iloc[int(len(newest) * identifier.TRAIN_RATIO) :]
+    true_cop = TRUE_COP_MODEL.cop(newest["T_outdoor"], newest["T_supply"])
+
+    assert identifier.validate(df)["mae"] == pytest.approx(
+        float(np.mean(true_cop - newest["COP_measured"])), rel=0.05
+    )
+
+
 def test_validate_scores_the_planning_power_line_against_measured_power():
     """validate() must report how far the power line the optimizer plans with
     is from measured electrical power - the mismatch a COP-only validation
@@ -665,6 +685,50 @@ def test_the_start_up_is_read_from_the_readings_as_loaded(key, state, sign):
 
     assert ramp_s == pytest.approx(800.0, rel=0.02)
     assert power_w == pytest.approx(2000.0 * (1.0 - 400.0 / 900.0), rel=0.01)
+
+
+def test_the_power_rise_and_its_resumption_after_a_defrost_are_recovered():
+    """Runs whose power rises linearly to its line over 800 s with the
+    compressor's speed, a defrost after 25 minutes, and a restart that
+    resumes that rise 300 s into it: both read back."""
+
+    ramp_s, offset_s, line_w = 800.0, 300.0, 2000.0
+    rows = []
+    time = pd.Timestamp("2026-10-20 10:00", tz="UTC")
+
+    def rise(seconds: float) -> float:
+        """The minute's mean of the linear rise from `seconds` on."""
+
+        return float(np.minimum(1.0, (seconds + np.arange(60)) / ramp_s).mean())
+
+    for _ in range(6):
+        for minute in range(80):
+            on = minute < 50
+            thawing = 25 <= minute < 28
+            share = (
+                rise(60.0 * minute)
+                if minute < 25
+                else rise(60.0 * (minute - 28) + offset_s)
+            )
+            rows.append(
+                dict(
+                    time=time,
+                    state=SWW_STATE if on else "Uit",
+                    # The tank warming: the line rising 5 W a minute.
+                    P_el=(line_w + 5.0 * minute) * share if on and not thawing else 0.0,
+                    compressor_frequency=60.0 * share if on and not thawing else 0.0,
+                    defrost=1.0 if thawing else 0.0,
+                    flow_lpm=FLOW_LPM if on else 0.0,
+                )
+            )
+            time += pd.Timedelta(minutes=1)
+
+    found_ramp_s, found_offset_s = HeatPumpCOPIdentifier(key="dhw")._power_ramp(
+        pd.DataFrame(rows)
+    )
+
+    assert found_ramp_s == pytest.approx(ramp_s, rel=0.03)
+    assert found_offset_s == pytest.approx(offset_s, abs=20.0)
 
 
 def test_the_tanks_start_up_shortfall_is_a_line_in_the_outdoor_temperature():

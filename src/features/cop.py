@@ -4,14 +4,19 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, minimize_scalar
 
 from domain.config import Config, HeatPumpStates
 from domain.dataset import DatasetDefinition
 from domain.models import HeatPumpCOPModel
 from domain.mpc import MPCConfig
 from domain.physics import CP_WATER_J_PER_KG_K, RHO_WATER_KG_PER_L
-from features.boiler import BoilerThermalIdentifier, booster_active
+from features.boiler import (
+    BoilerThermalIdentifier,
+    booster_active,
+    defrost_active,
+    elapsed_seconds,
+)
 from features.dataset import DatasetBuilder
 from features.identifier import SystemIdentifier
 from features.metrics import mean_absolute_error, r2_score, root_mean_squared_error
@@ -422,30 +427,27 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             handover_heat_j,
             defrost_restart_share,
         ) = self._start_up(df)
+        power_ramp_s, power_offset_s = (
+            self._power_ramp(df) if self.key == "dhw" else (0.0, None)
+        )
         df = self.prepare(df)
 
         if len(df) < 10:
             raise ValueError("Not enough data points for calibration.")
 
-        split_index = int(len(df) * self.TRAIN_RATIO)
+        # On all of it, the newest runs too: a floor run is planned at the
+        # coming days' outdoor temperature, and the newest runs are the
+        # nearest to it. Fitted on the oldest 80%, the heating model read the
+        # floor's power (Q_th / COP) 8.8% high on the 14 days after it, 6.0%
+        # on all (real data, 18 Oct-1 Nov 2026); the DHW plan's power line and
+        # cooling about as before (14-day windows Jun-Oct: +4.1 / +3.9% and
+        # +3.6 / +3.9%). Fitted against the power drawn instead of the COP, no
+        # better: heating +6.5%, the same errors elsewhere.
+        logger.info("Heat pump COP calibration (%s): %d points", self.mode, len(df))
 
-        if split_index <= 0 or split_index >= len(df):
-            raise ValueError("Invalid train/test split.")
-
-        train_df = df.iloc[:split_index].copy()
-
-        logger.info(
-            "Heat pump COP calibration (%s): %d training points, %d validation points",
-            self.mode,
-            len(train_df),
-            len(df) - len(train_df),
-        )
-
-        T_outdoor = train_df["T_outdoor"].to_numpy(dtype=float)
-
-        T_supply = train_df["T_supply"].to_numpy(dtype=float)
-
-        COP_measured = train_df["COP_measured"].to_numpy(dtype=float)
+        T_outdoor = df["T_outdoor"].to_numpy(dtype=float)
+        T_supply = df["T_supply"].to_numpy(dtype=float)
+        COP_measured = df["COP_measured"].to_numpy(dtype=float)
 
         def residuals(
             parameters: np.ndarray,
@@ -568,6 +570,8 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             start_shortfall_per_outdoor_j_per_k=shortfall_per_k_j,
             handover_heat_j=handover_heat_j,
             defrost_restart_share=defrost_restart_share,
+            start_power_ramp_seconds=power_ramp_s,
+            defrost_power_offset_seconds=power_offset_s,
         )
 
         # Cooling is planned down to a lift of a kelvin or two - water just
@@ -591,7 +595,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             "%.2f kWh at 0 degC outdoor, %+.4f kWh per K) and %.0f W "
             "electrical over a run's first step, %.2f kWh from the loop "
             "handed over by hot water, %s of the start-up short again after a "
-            "defrost",
+            "defrost; power rising over %.0f s, resumed %s s into it after one",
             self.mode,
             self.model.start_ramp_seconds,
             self.model.start_shortfall_at_zero_outdoor_j / 3.6e6,
@@ -601,6 +605,10 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             "unknown"
             if self.model.defrost_restart_share is None
             else f"{self.model.defrost_restart_share:.2f}",
+            self.model.start_power_ramp_seconds,
+            "unknown"
+            if self.model.defrost_power_offset_seconds is None
+            else f"{self.model.defrost_power_offset_seconds:.0f}",
         )
 
         if self.key != "dhw":
@@ -608,14 +616,13 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
 
         self.model.reference_supply_temperature_c = float(df["T_supply"].quantile(0.95))
         # See the class docstring on POWER_FIT_T_LOW_C/HIGH_C and
-        # USUAL_SPEED_ROBUST_STD. Fitted on the training split only, like the
-        # COP parameters, so validate() scores it on data it never saw.
+        # USUAL_SPEED_ROBUST_STD. On all of it, like the COP parameters.
         (
             self.model.q_th_at_power_fit_low_w,
             self.model.q_th_at_power_fit_high_w,
             self.model.q_th_per_outdoor_w_per_k,
-        ) = self._fit_q_th_line(train_df, self.model)
-        # On all of it, not the training split: the line is planned with at
+        ) = self._fit_q_th_line(df, self.model)
+        # On all of it, not a training split: the line is planned with at
         # the coming days' outdoor temperature, which the season moves past
         # what older runs saw, and the newest runs are the nearest to it.
         # Fitted on the oldest 80% of 90 days, it read October's runs 8% too
@@ -792,36 +799,11 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         their first step brings beyond the second's median rate (see
         HeatPumpCOPModel.handover_heat_j). 0.0 for each without such runs."""
 
-        df = self._bridge_reporting_gaps(
-            df.sort_values("time")
-            .drop_duplicates(subset="time", keep="last")
-            .reset_index(drop=True)
-            .assign(
-                P_el=lambda d: pd.to_numeric(d["P_el"], errors="coerce"),
-                flow_lpm=lambda d: pd.to_numeric(d["flow_lpm"], errors="coerce"),
-            )
-        )
-        # Only runs that start the compressor from off. A run handed over by
-        # another mode starts with the compressor at speed and the loop warm:
-        # eight heating runs handed over from hot water gave 5.0 kW in their
-        # first quarter, against 2.7-3.9 kW from cold, and counted as starts
-        # they read the heating ramp below zero, so none (real data, Jul-Oct
-        # 2026). The state alone is not enough, as it can trail the
-        # compressor (25 Sep: 36 Hz while still off).
-        frequency = (
-            pd.to_numeric(df["compressor_frequency"], errors="coerce")
-            .ffill()
-            .fillna(0.0)
-            if "compressor_frequency" in df
-            else pd.Series(0.0, index=df.index)
-        )
-        compressor_off = (
-            (df["state"] == self.states.off) & (frequency <= 0.0)
-        ).to_numpy()
+        df = self._minute_readings(df)
         running = (df["state"] == self.mode).to_numpy(dtype=bool)
         starts = running & ~np.r_[False, running[:-1]]
         run_id = np.cumsum(starts)
-        cold = starts & np.r_[False, compressor_off[:-1]]
+        cold = self._cold_starts(df)
         previous = np.r_[None, df["state"].to_numpy()[:-1]]
         handed_over = starts & (previous == self.states.dhw)
         in_mode = running.copy()
@@ -846,9 +828,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
                 "boiler_on": running,
                 "booster_on": booster,
                 "q_in_override_w": heat_w.where(running),
-                "defrost": pd.to_numeric(
-                    df.get("defrost", pd.Series(0.0, index=df.index)), errors="coerce"
-                ),
+                "defrost": defrost_active(df),
             }
         )
         _, ramp_seconds = boiler._identify_heat_input_ramp(ramp_frame)
@@ -888,7 +868,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
                 restart_share = float(np.median(shares))
 
         power_w = df["P_el"].to_numpy(dtype=float)
-        seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
+        seconds = elapsed_seconds(df)
         step_s = MPCConfig().step_hours * 3600.0
         powers = []
 
@@ -901,11 +881,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             since = seconds[start : end + 1] - seconds[start]
             first = np.arange(start, end + 1)[since < step_s]
 
-            if (
-                since[-1] < step_s
-                or booster[start : end + 1].any()
-                or np.isnan(power_w[first]).any()
-            ):
+            if since[-1] < step_s or booster[start : end + 1].any():
                 continue
 
             powers.append(float(power_w[first].mean()))
@@ -950,6 +926,134 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             restart_share,
         )
 
+    def _minute_readings(self, df: pd.DataFrame) -> pd.DataFrame:
+        """The readings as loaded, in time order, one per time: the rates
+        bridged over reporting gaps (see _bridge_reporting_gaps), the
+        compressor's frequency held between its readings, 0 before the first
+        and without any."""
+
+        df = self._bridge_reporting_gaps(
+            df.sort_values("time")
+            .drop_duplicates(subset="time", keep="last")
+            .reset_index(drop=True)
+            .assign(
+                P_el=lambda d: pd.to_numeric(d["P_el"], errors="coerce"),
+                flow_lpm=lambda d: pd.to_numeric(d["flow_lpm"], errors="coerce"),
+            )
+        )
+        df["compressor_frequency"] = (
+            pd.to_numeric(df["compressor_frequency"], errors="coerce")
+            .ffill()
+            .fillna(0.0)
+            if "compressor_frequency" in df
+            else 0.0
+        )
+
+        return df
+
+    def _cold_starts(self, readings: pd.DataFrame) -> np.ndarray:
+        """Where a run in this mode starts the compressor from off, in
+        _minute_readings. A run handed over by another mode starts with the
+        compressor at speed and the loop warm: eight heating runs handed over
+        from hot water gave 5.0 kW in their first quarter, against 2.7-3.9 kW
+        from cold, and counted as starts they read the heating ramp below
+        zero (real data, Jul-Oct 2026). The state alone is not enough, as it
+        can trail the compressor (25 Sep: 36 Hz while still off)."""
+
+        running = (readings["state"] == self.mode).to_numpy(dtype=bool)
+        off = (
+            (readings["state"] == self.states.off)
+            & (readings["compressor_frequency"] <= 0.0)
+        ).to_numpy()
+
+        return running & ~np.r_[False, running[:-1]] & np.r_[False, off[:-1]]
+
+    def _power_ramp(self, df: pd.DataFrame) -> tuple[float, float | None]:
+        """(s the electrical power of a run the compressor starts for takes
+        to rise linearly to its power line, s into that rise a run resumes it
+        after a defrost - None without such restarts) by least squares over
+        the minutes of the first two planning steps, see HeatPumpCOPModel.
+        start_power_ramp_seconds. The power line of each: its power once the
+        compressor's speed has reached its highest, a straight line in time
+        as the tank warms, carried back to where it starts. 0.0 and None
+        without enough of either."""
+
+        if "compressor_frequency" not in df:
+            return 0.0, None
+
+        df = self._minute_readings(df)
+        frequency = df["compressor_frequency"].to_numpy()
+        power_w = df["P_el"].to_numpy(dtype=float)
+        running = (df["state"] == self.mode).to_numpy(dtype=bool)
+        defrost = defrost_active(df).to_numpy()
+        # Where the compressor runs on: no defrost, no booster.
+        steady = ~booster_active(df, self.mode).to_numpy(dtype=bool) & ~defrost
+
+        seconds = elapsed_seconds(df)
+        step_s = MPCConfig().step_hours * 3600.0
+        # Each stretch's (seconds since it began at the middle of each minute,
+        # power W, power line W) over its first two steps; from a start, and
+        # from where a defrost ended in a run.
+        starts, restarts = [], []
+        began = self._cold_starts(df)
+        resumed = running & steady & np.r_[False, running[:-1] & defrost[:-1]]
+
+        for first in np.flatnonzero(began | resumed):
+            end = first
+
+            while end + 1 < len(df) and running[end + 1] and steady[end + 1]:
+                end += 1
+
+            rows = np.arange(first, end + 1)
+            since = seconds[rows] - seconds[first] + 30.0
+            at_speed = rows >= rows[np.argmax(frequency[rows] >= frequency[rows].max())]
+
+            # Half a step of the line at least, to carry back.
+            if since[at_speed][-1] - since[at_speed][0] < step_s / 2.0:
+                continue
+
+            line = np.polyfit(since[at_speed], power_w[rows][at_speed], 1)
+            early = since < 2.0 * step_s
+            stretch = (
+                since[early],
+                power_w[rows][early],
+                np.polyval(line, since[early]),
+            )
+            (starts if began[first] else restarts).append(stretch)
+
+        def squared_w2(ramp_s: float, offset_s: float, stretches) -> float:
+            return sum(
+                float(
+                    np.sum((p - line * np.clip((t + offset_s) / ramp_s, 0.0, 1.0)) ** 2)
+                )
+                for t, p, line in stretches
+            )
+
+        if len(starts) < BoilerThermalIdentifier.MIN_RAMP_RUNS:
+            return 0.0, None
+
+        max_s = BoilerThermalIdentifier.MAX_RAMP_SECONDS
+        ramp_s = float(
+            minimize_scalar(
+                lambda r: squared_w2(r, 0.0, starts),
+                bounds=(60.0, max_s),
+                method="bounded",
+            ).x
+        )
+        offsets = [
+            minimize_scalar(
+                lambda o, stretch=stretch: squared_w2(ramp_s, o, [stretch]),
+                bounds=(0.0, ramp_s),
+                method="bounded",
+            ).x
+            for stretch in restarts
+        ]
+
+        if len(offsets) < BoilerThermalIdentifier.MIN_RAMP_RUNS:
+            return ramp_s, None
+
+        return ramp_s, float(np.median(offsets))
+
     @staticmethod
     def _fit_heat_input(df: pd.DataFrame) -> tuple[float, float]:
         """(heat at 0 degC outdoor W, its rise per K outdoor) from a line fitted
@@ -975,13 +1079,14 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
 
         return float(at_zero), float(per_k)
 
-    def _planned_power_w(self, df: pd.DataFrame) -> np.ndarray:
+    @staticmethod
+    def _planned_power_w(model: HeatPumpCOPModel, df: pd.DataFrame) -> np.ndarray:
         """The electrical power MPCOptimizer plans with at each row's real
         supply and outdoor temperature. Its line is expressed in tank
         temperature there, but shifting by the constant reference margin
         leaves it this same straight line in supply-temperature terms."""
 
-        power_low, power_high = self.model.planned_power_at_reference_points(
+        power_low, power_high = model.planned_power_at_reference_points(
             df["T_outdoor"].to_numpy(dtype=float)
         )
         fraction = (
@@ -991,7 +1096,8 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         return power_low + (power_high - power_low) * fraction
 
     def validate(self, df: pd.DataFrame) -> dict[str, float]:
-        df = self.prepare(df)
+        raw = df
+        df = self.prepare(raw)
 
         if self.model is None:
             raise RuntimeError("Model must be calibrated before validation.")
@@ -1006,6 +1112,16 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         if test_df.empty:
             raise ValueError("No validation data available.")
 
+        # Scored on the newest share by the model calibrated on what came
+        # before it, as one calibrated then would have been: calibrate() fits
+        # on all of the data, so the model itself has seen that share. The
+        # scores (r2, mae, rmse, power) are that model's; the parameter checks
+        # below (delta_t_evap at its bound, std errors) are the saved model's,
+        # the one planning uses.
+        held_out = HeatPumpCOPIdentifier(key=self.key, models_path=self.models_path)
+        held_out.states = self.states
+        model = held_out.calibrate(raw[raw["time"] < test_df["time"].iloc[0]])
+
         T_outdoor = test_df["T_outdoor"].to_numpy(dtype=float)
 
         T_supply = test_df["T_supply"].to_numpy(dtype=float)
@@ -1014,8 +1130,8 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
 
         parameters = np.array(
             [
-                self.model.eta_carnot,
-                self.model.delta_t_evap,
+                model.eta_carnot,
+                model.delta_t_evap,
             ]
         )
 
@@ -1023,8 +1139,8 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             parameters,
             T_outdoor,
             T_supply,
-            self.model.delta_t_cond,
-            self.model.cooling,
+            model.delta_t_cond,
+            model.cooling,
         )
 
         r2 = r2_score(COP_measured, COP_predicted)
@@ -1110,7 +1226,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         # STARTUP), as planning evaluates it. Only DHW planning has such a line
         # (see calibrate()).
         if self.key == "dhw":
-            planned_power_w = self._planned_power_w(test_df)
+            planned_power_w = self._planned_power_w(model, test_df)
             measured_power_w = test_df["P_el"].to_numpy(dtype=float)
             error_w = planned_power_w - measured_power_w
             power_bias_w = float(np.mean(error_w))

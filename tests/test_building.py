@@ -506,6 +506,43 @@ def test_asleep_the_occupants_heat_moves_to_the_bedrooms():
     np.testing.assert_array_equal(upstairs[:, 1], by_area[:, 1])
 
 
+def test_awake_the_household_and_what_it_switches_on_are_in_the_living_room():
+    identifier = _identifier()
+    prepared = identifier.prepare(_raw_frame())
+    standby_w = float(prepared["baseload_w"].quantile(0.2))
+    model = replace(TRUE_MODEL, asleep_baseload_w=standby_w)
+
+    by_area = identifier._inputs(model, prepared)
+    living = identifier._inputs(
+        replace(model, awake_in_living_fraction=1.0), prepared
+    )
+
+    local = pd.DatetimeIndex(prepared["time"]).tz_convert(LOCAL_TIMEZONE)
+    awake = 1.0 - night_share(
+        local.hour + local.minute / 60.0,
+        model.asleep_from_hour,
+        model.asleep_until_hour,
+        model.asleep_spread_h,
+    )
+    people_w = prepared["occupants"].to_numpy(dtype=float) * Q_PERSON_SENSIBLE_W
+    # The standby stays spread by floor area; only what runs above it moves.
+    switched_on_w = model.internal_gain_fraction * np.clip(
+        prepared["baseload_w"].to_numpy(dtype=float) - standby_w, 0.0, None
+    )
+    moved = living[:, 2] - by_area[:, 2]
+
+    assert moved.max() > 0.0
+    np.testing.assert_allclose(
+        moved,
+        (1.0 - model.living_area_fraction) * (switched_on_w + awake * people_w),
+        atol=1e-9,
+    )
+    np.testing.assert_allclose(
+        living[:, 2] + living[:, 3], by_area[:, 2] + by_area[:, 3], atol=1e-9
+    )
+    np.testing.assert_array_equal(living[:, 1], by_area[:, 1])
+
+
 def test_validate_flags_a_physically_impossible_aperture(caplog):
     """A converged fit is not the same as an identified window.
 
@@ -1139,11 +1176,13 @@ def test_forecast_takes_the_sky_ahead_from_the_pv_forecast():
 
     identifier, df, now = _calibrated()
     identifier.pv_power_per_irradiance_m2 = 2.0
-    # Asleep by floor area, as by day: the room's gain is its sun alone, also
+    # Asleep and awake by floor area: the room's gain is its sun alone, also
     # around waking on a sunny morning.
     model = identifier.get_model()
     identifier.model = replace(
-        model, asleep_in_rest_fraction=1.0 - model.living_area_fraction
+        model,
+        asleep_in_rest_fraction=1.0 - model.living_area_fraction,
+        awake_in_living_fraction=model.living_area_fraction,
     )
     df = df.copy()
     df["global_tilted_irradiance"] = df["direct_radiation"] + df["diffuse_radiation"]

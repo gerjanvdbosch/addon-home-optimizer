@@ -67,6 +67,17 @@ MIP_ABSOLUTE_GAP_EUR = 0.001
 # the same time; no setting of cuts, symmetry, restarts or probing did.
 OBJECTIVE_SCALE_EXPONENT = 10
 
+# How far (K) the zone's hard bounds taken from its unheated trajectory are
+# set past it - numerical, not physical. A zone left alone lies exactly on
+# them, and the solver's per-row tolerance (1e-7) does not hold that through
+# a chain of some 190 steps of eight states, nor against the end heat's row,
+# whose constants are the zone's capacity times its temperature (~3e9 J): a
+# plan without any floor run came out infeasible, and the plan forced a 3 kW
+# run into a warm house at the comfort band's slack price (backtest, Jun-Oct
+# 2026: objectives of 1700-15000 EUR on days that need no heat). A
+# millikelvin of the whole zone (~0.05 kWh) moves no plan.
+ZONE_BOUND_MARGIN_K = 1e-3
+
 # How far apart (K) the tangents lie that bound the square of the tank's excess
 # over its unheated trajectory from below (see MPCOptimizer._build_model). They
 # miss it by at most a quarter of the spacing squared, 1 K^2 at 2 K: on this
@@ -186,6 +197,10 @@ class TankSetting:
     # The share of a step's heat a run starting in it delivers.
     ramp: list[float]
     start_power_w: float
+    # The share of the power line a run under way draws at full use in each
+    # step, its power still rising (see MPCOptimizer._tank_setting); 1 where
+    # it does not.
+    power_share: list[float]
     booster_draw_per_heat: float
     import_price: tuple[float, ...]
     export_price: tuple[float, ...]
@@ -285,9 +300,10 @@ def draw_w(tank: TankSetting, k: int, tank_c, heat_pump_w, booster_w, start):
     """The electrical power step k draws (W) for this much heat from either
     source at tank_c: the power line for the heat pump's share of the step -
     a run's first quarter at its measured power in place of the ramp's share
-    (see HeatPumpCOPModel.start_step_power_w); a hand-over from the zone, the
-    compressor at speed, on the power line throughout - and the booster's own
-    draw."""
+    (see HeatPumpCOPModel.start_step_power_w), and a run under way for the
+    rest of its power's rise (TankSetting.power_share); a hand-over
+    from the zone, the compressor at speed, on the power line throughout -
+    and the booster's own draw."""
 
     alpha, beta = tank.power_lines[k]
     share = heat_pump_w / tank.heat_w[k]
@@ -295,7 +311,8 @@ def draw_w(tank: TankSetting, k: int, tank_c, heat_pump_w, booster_w, start):
     if tank.start_power_w:
         share = share - start * tank.ramp[k]
 
-    heat_pump = (alpha + beta * tank_c) * share + start * tank.start_power_w
+    heat_pump = (alpha + beta * tank_c) * tank.power_share[k] * share
+    heat_pump = heat_pump + start * tank.start_power_w
 
     return heat_pump + tank.booster_draw_per_heat * booster_w
 
@@ -948,13 +965,27 @@ class MPCOptimizer:
         # HiGHS lets go of the interpreter while it solves, so the relaxation
         # solves beside the plans that do not need it: on real data, as long as
         # either of them alone.
+        # Every tank plan leaves the steps a floor run under way still holds
+        # to the zone (see _zone_held): one that took them could not be chosen.
+        held = self._zone_held(data, tank)
+
+        def with_held(runs) -> tuple[int, ...]:
+            return tuple(
+                max(on, hold)
+                for on, hold in zip(
+                    (list(runs) + [0] * len(held))[: len(held)], held, strict=True
+                )
+            )
+
         def around(runs) -> TankPlan:
-            return plan_tank(tank, runs, data.zone_cooling, data.zone_local_day)
+            return plan_tank(
+                tank, with_held(runs), data.zone_cooling, data.zone_local_day
+            )
 
         with ThreadPoolExecutor(max_workers=1) as pool:
             relaxing = pool.submit(self._relaxed_zone, model, solver)
             previous = tuple(data.previous_space_on)
-            plans = [plan_tank(tank)] + ([around(previous)] if any(previous) else [])
+            plans = [around(())] + ([around(previous)] if any(previous) else [])
             on = relaxing.result()
 
         relaxed, partly = (tuple(int(x >= share) for x in on) for share in (0.75, 0.25))
@@ -968,13 +999,15 @@ class MPCOptimizer:
         # The tank is one of those: the previous plan starts the zone's only -
         # or without one, the relaxation's, so the search starts from a plan
         # rather than spending most of its time finding one (real data: 70%
-        # of its LP iterations in its own heuristics).
+        # of its LP iterations in its own heuristics). With the steps a floor
+        # run under way holds: one the previous plan did not have, started by
+        # hand, held none, and every replan in its minimum runtime solved cold.
         solver.config.warmstart = self._warm_start(
             model,
             replace(
                 data,
                 previous_tank_on=(),
-                previous_space_on=previous or relaxed,
+                previous_space_on=with_held(previous or relaxed),
             ),
             solver,
         )
@@ -1083,6 +1116,32 @@ class MPCOptimizer:
                         )
                     )
 
+    def _zone_held(self, data: MPCInput, tank: TankSetting) -> tuple[int, ...]:
+        """Per step, whether a floor run under way that the zone started still
+        holds the compressor: for the minimum runtime from its start, as a run
+        the plan starts does (see _build_model) - a rule, as there. Without it
+        the tank took over a run minutes into it, priced as a start saved: a
+        run started by hand at the thermostat, which no plan stops, was
+        planned over to hot water 9 minutes in, and every replan after it
+        planned hot water for the quarter under way while the floor ran on
+        (real data, 1 Nov 2026)."""
+
+        held = [0] * tank.num_steps
+
+        if (
+            self._zone_planned(data)
+            and data.space_on_current
+            and data.space_elapsed_hours > 0.0
+        ):
+            minimum_h = (
+                self.config.compressor_min_runtime_steps * self.config.step_hours
+            )
+
+            for k in tank.steps_within(minimum_h - data.space_elapsed_hours):
+                held[k] = 1
+
+        return tuple(held)
+
     def _zone_planned(self, data: MPCInput) -> bool:
         """Whether the zone is planned beside the tank: with a building model
         and a zone state and target to plan it from (see _add_space_heating)."""
@@ -1140,7 +1199,6 @@ class MPCOptimizer:
                 )
             ),
             objective_value=sum(plan.cost_eur),
-            solver_status=status,
             termination_condition=status,
             electricity_kwh=sum(electricity_kwh),
             grid_kwh=sum(grid_kwh),
@@ -1360,6 +1418,17 @@ class MPCOptimizer:
             self._heat_at(outdoor_c[k] if outdoor_c else None) for k in range(num_steps)
         ]
 
+        def rising(begin_h: float, dt_h: float, ramp_s: float) -> float:
+            """The mean over [begin_h, begin_h + dt_h] of a linear rise from 0
+            at 0 to 1 at ramp_s (see _ramp_share)."""
+
+            end_h = begin_h + dt_h
+
+            return (
+                end_h * self._ramp_share(end_h, ramp_s)
+                - begin_h * self._ramp_share(begin_h, ramp_s)
+            ) / dt_h
+
         # A run under way is still on its ramp (see _ramp_fraction): from its
         # start, or from a defrost in it, after which the compressor rises
         # again - by a share of a start's shortfall (see HeatPumpCOPModel.
@@ -1367,31 +1436,44 @@ class MPCOptimizer:
         # 1.3 K too warm from 5-10 minutes into a run, 0.15 K on the ramp
         # (136 runs, Aug-Oct 2026), and right after a defrost 2.4 K, 1.1 K on
         # the restart's (5 runs).
-        if data.boiler_on_current and data.compressor_elapsed_hours > 0.0:
-            restarted = data.defrost_ended_hours is not None
+        #
+        # Its power rises longer (see HeatPumpCOPModel.start_power_ramp_seconds),
+        # and the part of the power line it draws at full use is what is left
+        # of that rise in the step. On the line itself, a replan 3, 6 and 10
+        # minutes into a run costed its next quarter 685, 515 and 282 W too
+        # high, the quarter after a defrost some 500 W (real data, 97 cold
+        # starts and 5 defrosts Jul-Oct 2026).
+        # A run the zone handed over is at speed and on neither, until a
+        # defrost brings its compressor down.
+        power_share = [1.0] * num_steps
+        restarted = data.defrost_ended_hours is not None
+        running_c = data.boiler_on_current and data.compressor_elapsed_hours > 0.0
+        cop = self.cop_model
+
+        if running_c and (restarted or not data.compressor_handed_over):
             since_h = (
                 data.defrost_ended_hours if restarted else data.compressor_elapsed_hours
             )
-            share = (
-                (self.cop_model and self.cop_model.defrost_restart_share or 1.0)
+            share = (cop and cop.defrost_restart_share or 1.0) if restarted else 1.0
+            power_since_h = since_h + (
+                (cop and cop.defrost_power_offset_seconds or 0.0) / 3600.0
                 if restarted
-                else 1.0
+                else 0.0
             )
+            power_ramp_s = (cop and cop.start_power_ramp_seconds) or 0.0
 
             for k in range(num_steps):
                 ramp_s = share * (
                     self._ramp_seconds(outdoor_c[k] if outdoor_c else None) or 0.0
                 )
                 begin_h = since_h + step_start_h[k]
+                power_begin_h = power_since_h + step_start_h[k]
 
-                if begin_h * 3600.0 >= ramp_s:
-                    break
+                if begin_h * 3600.0 < ramp_s:
+                    heat_w[k] *= rising(begin_h, dt_hours[k], ramp_s)
 
-                end_h = begin_h + dt_hours[k]
-                heat_w[k] *= (
-                    end_h * self._ramp_share(end_h, ramp_s)
-                    - begin_h * self._ramp_share(begin_h, ramp_s)
-                ) / dt_hours[k]
+                if power_begin_h * 3600.0 < power_ramp_s:
+                    power_share[k] = rising(power_begin_h, dt_hours[k], power_ramp_s)
         target_c = data.target_temperature_top
         overall_target_max = max(data.target_temperature_top)
         heat_pump_max_c = self.thermal_model.heat_pump_max_tank_temperature_c
@@ -1662,6 +1744,7 @@ class MPCOptimizer:
             start_power_w=(
                 self.cop_model.start_step_power_w if self.cop_model else 0.0
             ),
+            power_share=power_share,
             booster_draw_per_heat=self._booster_draw_per_heat,
             import_price=tuple(import_price),
             export_price=tuple(export_price),
@@ -2066,6 +2149,11 @@ class MPCOptimizer:
         ):
             for k in remaining:
                 model.running_run.add(heating(model, k) >= 1)
+
+        # A floor run under way likewise, on the zone (see _zone_held).
+        for k, hold in enumerate(self._zone_held(data, tank)):
+            if hold:
+                model.running_run.add(model.space_on[k] >= 1)
 
         # The heat pump stays off for heat_pump_min_off_steps after a run ends,
         # and does not start at all until that long after the last real run
@@ -2572,6 +2660,8 @@ class MPCOptimizer:
             heat_pump_power_w = alpha * share + beta * (
                 t_floor[k] * share + model.heat_pump_excess_share[k]
             )
+            # A run under way, its power still rising, as draw_w.
+            heat_pump_power_w = tank.power_share[k] * heat_pump_power_w
 
             # A run's first step draws its measured power (see
             # HeatPumpCOPModel.start_step_power_w) in place of the power line
@@ -2663,7 +2753,7 @@ class MPCOptimizer:
 
         model.dt_hours = dt_hours
         model.t_floor = t_floor
-        model.ramp = tank.ramp
+        model.tank = tank
         model.mpc_scenario_weights = [weight for weight, _ in solar_scenarios]
 
         return model
@@ -3506,7 +3596,7 @@ class MPCOptimizer:
             capacities = zone_heat_capacities(building)
             model.zone_end_heat_j = pyo.Var(
                 bounds=(
-                    0.0,
+                    -ZONE_BOUND_MARGIN_K * float(np.sum(capacities)),
                     zone_heat_shortfall_j(
                         building, unheated[last], float(target_c[last]), living_fraction
                     ),
@@ -3619,7 +3709,10 @@ class MPCOptimizer:
                 for i in layers:
                     model.zone_constraints.add(
                         model.zone_state[k, i]
-                        >= min(mass_minimum_c[k], float(unheated[k][i]))
+                        >= min(
+                            mass_minimum_c[k],
+                            float(unheated[k][i]) - ZONE_BOUND_MARGIN_K,
+                        )
                     )
 
         # The temperature the floor's water delivers against: the screeds it
@@ -3687,8 +3780,10 @@ class MPCOptimizer:
         model.space_supply_c = []
 
         for k in range(num_steps):
-            low = sink_c(coolest[k])
-            high = sink_c(warmest[k])
+            # The product stays exact for a binary 'on' however wide the
+            # range: it only bounds the sink while off.
+            low = sink_c(coolest[k]) - ZONE_BOUND_MARGIN_K
+            high = sink_c(warmest[k]) + ZONE_BOUND_MARGIN_K
             on = model.space_on[k]
             sink_on = model.space_sink_on[k]
 
@@ -3950,34 +4045,21 @@ class MPCOptimizer:
         tank_start = [round(start) for start in values(model.tank_start)]
         handover = [round(on) for on in values(model.tank_handover)]
 
-        # Same formula the objective itself is built from (see
-        # _power_line_coefficients), evaluated at each step's own outdoor
-        # forecast and planned tank temperature - the reported curve reflects
-        # exactly what the optimizer costed with, not a separate display-only
-        # estimate.
-        overall_target_max = max(data.target_temperature_top)
-        start_power_w = self.cop_model.start_step_power_w if self.cop_model else 0.0
-        electrical_power_w = []
-
-        for k in range(num_steps):
-            T_outdoor = (
-                data.outdoor_temperature_forecast[k]
-                if data.outdoor_temperature_forecast
-                else None
+        # The formula the objective is built from (draw_w), at each step's
+        # planned tank: the reported curve is what the optimizer costed with.
+        electrical_power_w = [
+            float(
+                draw_w(
+                    model.tank,
+                    k,
+                    temperatures[k],
+                    heat_pump_w[k],
+                    booster_w[k],
+                    int(bool(tank_start[k] and not handover[k] and heat_pump_w[k])),
+                )
             )
-            alpha, beta = self._power_line_coefficients(T_outdoor, overall_target_max)
-            # For the part of the step the heat pump runs (see active_power_w).
-            used = heat_pump_w[k] / self._heat_at(T_outdoor)
-            heat_pump_power_w = (
-                start_power_w
-                + (alpha + beta * temperatures[k]) * (used - model.ramp[k])
-                if tank_start[k] and not handover[k] and used and start_power_w
-                else (alpha + beta * temperatures[k]) * used
-            )
-
-            electrical_power_w.append(
-                heat_pump_power_w + self._booster_draw_per_heat * booster_w[k]
-            )
+            for k in range(num_steps)
+        ]
 
         # Empty when no space heating was planned, so a caller can tell "the
         # zone was left alone" from "the zone was planned to coast".
@@ -4058,7 +4140,6 @@ class MPCOptimizer:
                 hp + bo for hp, bo in zip(heat_pump_w, booster_w, strict=True)
             ),
             objective_value=objective_value,
-            solver_status=str(termination_condition),
             termination_condition=str(termination_condition),
             space_schedule=space_schedule,
             space_heat_w=space_heat_w,

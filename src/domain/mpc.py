@@ -188,6 +188,11 @@ class MPCInput:
     # Whether the heat pump is serving the zone right now, the space-heating
     # counterpart of boiler_on_current.
     space_on_current: bool = False
+    # How long that run has served the zone since the compressor started it
+    # there (hours): it goes on for the minimum runtime, as one the plan starts
+    # does (see MPCOptimizer._zone_held). 0 without one, and for a run the
+    # tank handed over, which may run a single step.
+    space_elapsed_hours: float = 0.0
     # Whether the zone is cooled rather than heated: the heat pump serves the
     # floor in the one mode it is set to (see HeatPumpConfig.mode).
     zone_cooling: bool = False
@@ -213,6 +218,10 @@ class MPCInput:
     # while one lasts; None without one. The compressor rises again from it
     # (see MPCOptimizer._tank_setting).
     defrost_ended_hours: float | None = None
+    # Whether the zone handed that run over, the compressor running on from
+    # the floor into the tank: at speed already, it is on no ramp - as a
+    # hand-over the plan makes (see MPCOptimizer._tank_setting).
+    compressor_handed_over: bool = False
     # The tank's two sensors just before the DHW run under way began (deg C),
     # None without one: while it heats, the sensors lag the heat already in
     # the tank, and the plan starts from what the run has put in since instead
@@ -275,7 +284,6 @@ class MPCResult:
     # Planned heat into the tank per step (W), by either source.
     heat_w: tuple[float, ...]
     objective_value: float
-    solver_status: str
     termination_condition: str
     # Space heating, empty when none was planned: whether the heat pump serves
     # the zone in each step, the heat it delivers there (W), and the zone

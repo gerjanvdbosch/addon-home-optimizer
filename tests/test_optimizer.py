@@ -1809,6 +1809,47 @@ def test_a_run_the_zone_starts_serves_the_zone_its_minimum_runtime(
     assert solved == feasible
 
 
+def test_a_floor_run_under_way_keeps_the_zone_its_minimum_runtime(caplog):
+    """A floor run the zone started keeps the compressor for the minimum
+    runtime from its start, as one the plan starts does: hot water does not
+    take it over minutes into it (real data, 1 Nov 2026: a run started by hand
+    at the thermostat planned over to the tank 9 minutes in). The previous
+    plan, which did not have that run, still starts the solve."""
+
+    steps = 24
+    target = [10.0] * 4 + [45.0] * (steps - 4)
+    day = replace(
+        _cold_day(steps=steps, target_temperature_top=tuple(target)),
+        current_temp_top=35.0,
+        current_temp_bottom=35.0,
+        zone_state=_zone_state(20.8, 21.0),
+        idle_elapsed_hours=5.0,
+        space_on_current=True,
+    )
+    optimizer = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE,
+        floor_circuit_model=HEATING,
+        space_cop_model=COP_MODEL,
+    )
+    # Without a start on the zone - a run the tank handed over - it may hand
+    # back after a step; ten minutes into a run the zone started, not before
+    # the half hour is up.
+    free = optimizer.solve(day)
+
+    with caplog.at_level("INFO", logger="features.optimizer"):
+        held = optimizer.solve(
+            replace(day, space_elapsed_hours=10 / 60, previous_space_on=(0,) * steps)
+        )
+
+    assert "Previous plan does not hold" not in caplog.text
+    assert free.schedule[1] == 1
+    assert held.space_schedule[:2] == (1, 1)
+    assert held.schedule[:2] == (0, 0)
+
+
 def test_a_run_the_zone_opens_draws_the_starts_measured_power():
     """The compressor's start-up is the same in every mode, so a run the zone
     opens draws the start's measured power over its first step, as the tank's
@@ -1987,6 +2028,56 @@ def test_the_comfort_weight_holds_the_zone_near_its_target():
     # No more than the zone starts below its target.
     assert shortfall(priced).max() <= 0.4 + 1e-6
     assert shortfall(priced).mean() < 0.25 * shortfall(free).mean()
+
+
+def test_a_warm_house_is_not_heated():
+    """A zone that needs no heat over the whole horizon is left alone. On the
+    installation's own floor - two screed layers, eight states - a plan
+    without a floor run came out infeasible, its bounds lying exactly on the
+    unheated trajectory, and the plan forced a run into a warm house at the
+    band's slack price (see ZONE_BOUND_MARGIN_K)."""
+
+    building = BuildingThermalModel(
+        ua_envelope_w_per_k=84.8,
+        ua_air_mass_w_per_k=924.0,
+        c_air_j_per_k=18.8e6,
+        c_mass_j_per_k=40.7e6,
+        a_eff_m2=3.0,
+        sensor_mass_fraction=0.5,
+        internal_gain_fraction=0.6,
+        a_eff_rest_m2=1.6,
+        ua_rooms_w_per_k=1.0,
+        living_envelope_fraction=0.5,
+        living_area_fraction=0.5,
+        closed_shutter_gain_fraction=0.24,
+        screed_capacity_j_per_k=20.4e6,
+        screed_to_slab_w_per_k=886.0,
+        screed_layer_w_per_k=609.0,
+        ua_ceiling_w_per_k=158.0,
+    )
+    steps = 96
+    result = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=building,
+        floor_circuit_model=replace(HEATING, min_heat_w=3000.0, max_heat_w=4700.0),
+        space_cop_model=COP_MODEL,
+    ).solve(
+        _make_input(
+            solar_forecast_w=[0.0] * steps,
+            target_temperature_top=(10.0,) * steps,
+            outdoor_temperature_forecast=(18.0,) * steps,
+            zone_state=(21.5,) * zone_size(building),
+            zone_target_temperature=(19.5,) * steps,
+            zone_minimum_temperature=(19.0,) * steps,
+            zone_maximum_temperature=(21.0,) * steps,
+            zone_internal_gain_w=(300.0,) * steps,
+        )
+    )
+
+    assert not any(result.space_schedule)
+    assert result.objective_value < 0.01
 
 
 def test_cooling_is_free_below_its_target_and_priced_above():
@@ -2205,6 +2296,78 @@ def test_a_later_runs_first_step_draws_its_measured_power_too():
     assert len(starts) == 2, result.schedule
     assert result.heat_w[starts[1]] == pytest.approx(ramp * optimizer._heat_at(5.0))
     assert result.electrical_power_w[starts[1]] == pytest.approx(750.0)
+
+
+def test_a_run_the_zone_handed_over_is_on_no_ramp():
+    """Three minutes into a DHW run the floor handed over, the compressor at
+    speed already: its next quarter on the full heat and power line, as a
+    hand-over the plan makes. Started from off, it is on both ramps."""
+
+    cop = replace(STARTING_COP_MODEL, start_power_ramp_seconds=1200.0)
+    steps = len(SOLAR_FORECAST_W)
+    optimizer = MPCOptimizer(STARTING_MODEL, MPCConfig(), cop_model=cop)
+    data = _make_input(
+        outdoor_temperature_forecast=(5.0,) * steps,
+        boiler_on_current=True,
+        compressor_elapsed_hours=0.05,
+    )
+    cold = optimizer._tank_setting(data)
+    handed = optimizer._tank_setting(replace(data, compressor_handed_over=True))
+
+    assert cold.power_share[0] < 1.0
+    assert cold.heat_w[0] < optimizer._heat_at(5.0)
+    assert handed.power_share == [1.0] * steps
+    assert handed.heat_w[0] == pytest.approx(optimizer._heat_at(5.0))
+
+
+@pytest.mark.parametrize(
+    ("elapsed_h", "defrost_ended_h", "into_rise_h"),
+    [(0.05, None, 0.05), (1.0, 0.0, 0.1)],
+)
+def test_a_run_under_way_draws_what_is_left_of_its_powers_rise(
+    elapsed_h, defrost_ended_h, into_rise_h
+):
+    """Three minutes into a run its power is still rising (here over 20
+    minutes), and its next quarter draws that rise's mean share of the power
+    line; a defrost's restart resumes the rise 6 minutes into it. Past the
+    rise, the line."""
+
+    rise_s = 1200.0
+    cop = replace(
+        STARTING_COP_MODEL,
+        start_power_ramp_seconds=rise_s,
+        defrost_power_offset_seconds=360.0,
+    )
+    steps = len(SOLAR_FORECAST_W)
+    target = [10.0] * steps
+    target[3] = 50.0
+    optimizer = MPCOptimizer(STARTING_MODEL, MPCConfig(), cop_model=cop)
+    data = _make_input(
+        target_temperature_top=tuple(target),
+        outdoor_temperature_forecast=(5.0,) * steps,
+        boiler_on_current=True,
+        compressor_elapsed_hours=elapsed_h,
+        defrost_ended_hours=defrost_ended_h,
+    )
+    tank = optimizer._tank_setting(data)
+    result = optimizer.solve(data)
+
+    def share(hours: float) -> float:
+        return hours * MPCOptimizer._ramp_share(hours, rise_s)
+
+    end_h = into_rise_h + 0.25
+    rising = (share(end_h) - share(into_rise_h)) / 0.25
+    alpha, beta = tank.power_lines[0]
+
+    assert tank.power_share[0] == pytest.approx(rising)
+    assert tank.power_share[2:] == [1.0] * (steps - 2)
+    assert result.schedule[0]
+    assert result.electrical_power_w[0] == pytest.approx(
+        (alpha + beta * result.temperatures[0])
+        * rising
+        * result.heat_w[0]
+        / tank.heat_w[0]
+    )
 
 
 OVERSHOOT_MODEL = replace(THERMAL_MODEL, setpoint_overshoot_k=1.75)
@@ -2847,7 +3010,6 @@ def test_the_planned_sensors_start_at_their_readings_and_a_run_stirs_them():
         electrical_power_w=(0.0,) * 4,
         heat_w=(0.0,) * 4,
         objective_value=0.0,
-        solver_status="ok",
         termination_condition="optimal",
     )
 
@@ -2888,7 +3050,6 @@ def test_after_a_draw_the_planned_sensors_start_at_both_readings():
         electrical_power_w=(0.0,) * 5,
         heat_w=(0.0,) * 5,
         objective_value=0.0,
-        solver_status="ok",
         termination_condition="optimal",
     )
     optimizer = MPCOptimizer(THERMOCLINE_MODEL, MPCConfig())
@@ -2904,7 +3065,14 @@ def test_after_a_draw_the_planned_sensors_start_at_both_readings():
 
 
 def test_no_planned_sensors_without_a_thermocline():
-    result = MPCResult((0,), (30.0,), (0.0,), (0.0,), 0.0, "ok", "optimal")
+    result = MPCResult(
+        schedule=(0,),
+        temperatures=(30.0,),
+        electrical_power_w=(0.0,),
+        heat_w=(0.0,),
+        objective_value=0.0,
+        termination_condition="optimal",
+    )
     data = _make_input(mains_water_temperature=15.0)
 
     assert MPCOptimizer(THERMAL_MODEL, MPCConfig()).sensor_temperatures(

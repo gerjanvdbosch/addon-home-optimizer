@@ -76,13 +76,19 @@ def booster_active(df: pd.DataFrame, active_state: str) -> pd.Series:
             in_state.shift(-1, fill_value=False) | candidate.shift(fill_value=False)
         )
 
-    if "defrost" in df.columns:
-        active &= ~(pd.to_numeric(df["defrost"], errors="coerce").fillna(0.0) > 0.0)
-
-    return active
+    return active & ~defrost_active(df)
 
 
-def _seconds(df: pd.DataFrame) -> np.ndarray:
+def defrost_active(df: pd.DataFrame) -> pd.Series:
+    """Where the heat pump reports a defrost: nowhere without the sensor."""
+
+    if "defrost" not in df.columns:
+        return pd.Series(False, index=df.index)
+
+    return pd.to_numeric(df["defrost"], errors="coerce").fillna(0.0) > 0.0
+
+
+def elapsed_seconds(df: pd.DataFrame) -> np.ndarray:
     """Each row's time since the first (s)."""
 
     return (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
@@ -479,11 +485,8 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             T_return = pd.to_numeric(df["T_return"], errors="coerce")
             flow_lpm = pd.to_numeric(df["flow_lpm"], errors="coerce")
             delta_t_water = T_supply - T_return
-            defrost = pd.to_numeric(
-                df.get("defrost", pd.Series(0.0, index=df.index)), errors="coerce"
-            )
             delta_t_water = delta_t_water.where(
-                defrost > 0.0, delta_t_water.clip(lower=0.0)
+                defrost_active(df), delta_t_water.clip(lower=0.0)
             )
 
             # The interval a run stops in counts too (see _stop_interval): its
@@ -564,7 +567,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         """
 
         samples_per_window = max(
-            int(round(self.PASSIVE_DECAY_HORIZON_HOURS * 3600.0 / median_dt)), 2
+            round(self.PASSIVE_DECAY_HORIZON_HOURS * 3600.0 / median_dt), 2
         )
 
         clean_idle = (~boiler_on) & (~in_post_heating_tail)
@@ -1327,7 +1330,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             & (pd.to_numeric(df["flow_lpm"], errors="coerce") > 0)
         ).to_numpy(dtype=bool)
         onset = compressor & ~np.r_[False, compressor[:-1]]
-        seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
+        seconds = elapsed_seconds(df)
         step_s = np.r_[np.diff(seconds), 0.0]
         since_start_s = seconds - pd.Series(np.where(onset, seconds, np.nan)).ffill()
         heat_j = (
@@ -1485,7 +1488,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
             top,
             bottom,
             ambient,
-            tank_stratification_k(top, bottom, boiler_on, _seconds(df)),
+            tank_stratification_k(top, bottom, boiler_on, elapsed_seconds(df)),
         )
         rests = []
 
@@ -1555,7 +1558,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         top = df["T_top"].to_numpy(dtype=float)
         bottom = df["T_bottom"].to_numpy(dtype=float)
         ambient = df["T_ambient"].to_numpy(dtype=float)
-        seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
+        seconds = elapsed_seconds(df)
         mixed_c = model.mixed_temperature(
             top, bottom, ambient, tank_stratification_k(top, bottom, boiler_on, seconds)
         )
@@ -1635,7 +1638,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
 
         heating = (df["boiler_on"] & ~df["booster_on"]).to_numpy(dtype=bool)
         boiler_on = df["boiler_on"].to_numpy(dtype=bool)
-        seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
+        seconds = elapsed_seconds(df)
         spread = (df["T_top"] - df["T_bottom"]).abs().to_numpy(dtype=float)
         spans = []
 
@@ -1691,7 +1694,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         """
 
         on = df["boiler_on"].to_numpy(dtype=bool)
-        seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
+        seconds = elapsed_seconds(df)
         step_s = np.r_[np.diff(seconds), 0.0]
         top = df["T_top"].to_numpy(dtype=float)
         bottom = df["T_bottom"].to_numpy(dtype=float)
@@ -1802,7 +1805,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         on runs left out of the fit (0.99 against 1.02 K mean error).
         """
 
-        seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
+        seconds = elapsed_seconds(df)
         step_s = np.r_[np.diff(seconds), 0.0]
         heat_w = pd.to_numeric(df["q_in_override_w"], errors="coerce").fillna(0.0)
         top = df["T_top"].to_numpy(dtype=float)
@@ -1954,12 +1957,8 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         # some 1 kWh short (real data, Oct 2026: 5 runs, 4.5 K behind the
         # plan by 30 minutes); counted, they put the start-up line 25 Wh
         # higher at 15 degC.
-        defrost = (
-            pd.to_numeric(df["defrost"], errors="coerce").fillna(0.0).to_numpy() > 0.0
-            if "defrost" in df
-            else np.zeros(len(df), dtype=bool)
-        )
-        seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
+        defrost = defrost_active(df).to_numpy()
+        seconds = elapsed_seconds(df)
 
         steady_values: list[float] = []
         runs: list[tuple[int, float, float]] = []
@@ -2115,7 +2114,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         a, b = lumped_tank_state_space(
             model.volume_l, model.ua_top_w_per_k + model.ua_bottom_w_per_k
         )
-        seconds = (df["time"] - df["time"].iloc[0]).dt.total_seconds().to_numpy()
+        seconds = elapsed_seconds(df)
         top = df["T_top"].to_numpy(dtype=float)
         bottom = df["T_bottom"].to_numpy(dtype=float)
         T_ambient = df["T_ambient"].to_numpy(dtype=float)
@@ -2263,7 +2262,7 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         # mechanism between heating cycles), so an open-loop rollout spanning many
         # cycles inevitably accumulates that unmodeled energy and diverges regardless
         # of how correct the passive-loss/mixing dynamics are.
-        samples_per_window = max(int(round(horizon_hours * 3600.0 / median_dt)), 2)
+        samples_per_window = max(round(horizon_hours * 3600.0 / median_dt), 2)
 
         simulated_windows = []
         measured_windows = []
@@ -2578,7 +2577,9 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         # more than the model predicts.
         # The prediction taps nothing, so it keeps the layer the tank had; both
         # at the same surroundings, which a draw does not change.
-        stratification = tank_stratification_k(T_top, T_bottom, boiler_on, _seconds(df))
+        stratification = tank_stratification_k(
+            T_top, T_bottom, boiler_on, elapsed_seconds(df)
+        )
         residual_k = self.model.mixed_temperature(
             predictions[:, 0], predictions[:, 1], T_ambient[1:], stratification[:-1]
         ) - self.model.mixed_temperature(

@@ -196,6 +196,14 @@ class Optimization:
         compressor_elapsed_hours = (
             (now - run_start).total_seconds() / 3600.0 if run_start else 0.0
         )
+        # Handed over from the zone: the compressor running when the state
+        # changed into DHW.
+        frequency_before = [
+            p for p in heat_pump_changes[1] if run_start and p.time < run_start
+        ]
+        compressor_handed_over = bool(frequency_before) and (
+            frequency_before[-1].value > 0.0
+        )
         # The last defrost in the run under way: the compressor rises again
         # from its end (see MPCInput.defrost_ended_hours).
         defrosts = [
@@ -384,6 +392,7 @@ class Optimization:
             solar_p90_w=solar_p90,
             compressor_elapsed_hours=compressor_elapsed_hours,
             defrost_ended_hours=defrost_ended_hours,
+            compressor_handed_over=compressor_handed_over,
             run_start_temp_top=run_start_temp_top,
             run_start_ambient_c=run_start_ambient_c,
             run_heat_j=run_heat_j[-1] if run_heat_j else None,
@@ -434,12 +443,22 @@ class Optimization:
                 **models,
             )
             states = config.heat_pump.states
+            mode = states.cooling if inputs["zone_cooling"] else states.heating
+            running = self.zone_running(*heat_pump_changes, mode)
             planned = dataclasses.replace(
                 data,
                 **inputs,
-                space_on_current=self.zone_running(
-                    *heat_pump_changes,
-                    states.cooling if inputs["zone_cooling"] else states.heating,
+                space_on_current=running,
+                space_elapsed_hours=(
+                    self.zone_run_hours(
+                        *heat_pump_changes,
+                        mode,
+                        states.dhw,
+                        now,
+                        state.measurements.heat_pump.defrost,
+                    )
+                    if running
+                    else 0.0
                 ),
             )
 
@@ -722,6 +741,18 @@ class Optimization:
         )
 
     @staticmethod
+    def value_at(points: Sequence[SeriesPoint], time: datetime, value):
+        """The value a series of changes holds at `time`, each from its own
+        time until the next; `value` before the first."""
+
+        for point in points:
+            if point.time > time:
+                break
+            value = point.value
+
+        return value
+
+    @staticmethod
     def dhw_timing(
         heat_pump_state: list[SeriesPoint],
         compressor_frequency: list[SeriesPoint],
@@ -752,16 +783,8 @@ class Optimization:
         if not heat_pump_state:
             return False, None, 0.0
 
-        def at(points: Sequence[SeriesPoint], time: datetime, value):
-            for point in points:
-                if point.time > time:
-                    break
-                value = point.value
-
-            return value
-
         def frequency_at(time: datetime) -> float:
-            return at(compressor_frequency, time, 1.0)
+            return Optimization.value_at(compressor_frequency, time, 1.0)
 
         if heat_pump_state[-1].value == dhw_state:
             # The change into DHW that began the stretch under way.
@@ -790,7 +813,7 @@ class Optimization:
                 # 12:58 to 13:00 in a defrost, the plan started from sensors
                 # stirred 5 K below the run's heat).
                 stop = max(i for i in range(1, len(changes)) if running[i - 1])
-                booster = not at(defrost, changes[stop], False)
+                booster = not Optimization.value_at(defrost, changes[stop], False)
 
             return True, None if booster else dhw_start, 0.0
 
@@ -1568,6 +1591,58 @@ class Optimization:
             since = point.time
 
         return since
+
+    @staticmethod
+    def zone_run_hours(
+        heat_pump_state: list[SeriesPoint],
+        compressor_frequency: list[SeriesPoint],
+        mode_state: str,
+        dhw_state: str,
+        now: datetime,
+        defrost: Sequence[SeriesPoint] = (),
+    ) -> float:
+        """How long the floor run under way has run since the compressor
+        started it on the zone (hours, see MPCInput.space_elapsed_hours): from
+        the change into the zone's mode, or from the compressor's last start
+        within it - the state stays in that mode at 0 Hz between runs. 0 for a
+        run the tank handed over, the compressor running on from hot water.
+
+        A stop in a defrost (its changes in `defrost`) is no new start: the
+        compressor comes up again after it in the same run, as in dhw_timing.
+        Nor is a change from DHW at 0 Hz a hand-over - the booster finishing
+        the tank or a DHW run that had ended - but a start from off, counted
+        from the compressor's start."""
+
+        since = Optimization.running_since(heat_pump_state, mode_state)
+
+        if since is None:
+            return 0.0
+
+        before = [p for p in heat_pump_state if p.time < since]
+        handed_over = bool(before) and before[-1].value == dhw_state
+        frequency_before = [p for p in compressor_frequency if p.time < since]
+        stops = [since] if frequency_before and frequency_before[-1].value <= 0 else []
+        stops += [
+            p.time
+            for p in compressor_frequency
+            if p.time >= since
+            and p.value <= 0
+            and not Optimization.value_at(defrost, p.time, False)
+        ]
+
+        if stops:
+            starts = [
+                p.time
+                for p in compressor_frequency
+                if p.time >= stops[-1] and p.value > 0
+            ]
+
+            if not starts:
+                return 0.0
+
+            since, handed_over = starts[0], False
+
+        return 0.0 if handed_over else max((now - since).total_seconds() / 3600.0, 0.0)
 
     @staticmethod
     def zone_supply_c(

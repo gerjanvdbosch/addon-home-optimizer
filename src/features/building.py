@@ -150,6 +150,16 @@ def _asleep_in_rest(model: BuildingThermalModel) -> float:
     return model.asleep_in_rest_fraction
 
 
+def _awake_in_living(model: BuildingThermalModel) -> float:
+    """The share of the household's heat awake in the living room: by floor
+    area for a model saved without one."""
+
+    if model.awake_in_living_fraction is None:
+        return model.living_area_fraction
+
+    return model.awake_in_living_fraction
+
+
 def _rollout(
     a_steps: np.ndarray,
     b_steps: np.ndarray,
@@ -447,7 +457,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # and 0.161/0.201 against 0.179/0.212 (24 h), the rest to 0.096/0.143
     # against 0.089/0.137: what it moves into the bedrooms the rest's other
     # parameters take back. A share by day as well fitted 0.71 and 0.92, not
-    # identified.
+    # identified - the occupants' heat alone; with what they switch on it is
+    # (see BuildingThermalModel.awake_in_living_fraction).
     MIN_ASLEEP_FROM_HOUR = 19.0
     MAX_ASLEEP_FROM_HOUR = 28.0
     INITIAL_ASLEEP_FROM_HOUR = 23.0
@@ -536,12 +547,13 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # through it; none until a model to read it against has been saved.
         self.screed: tuple[float, float] = (0.0, 0.0)
         # The household's hours of sleep (to bed, up, spread - see
-        # _measured_sleep), read off its electricity before each fit; until
-        # then a model saved before them.
-        self.sleep: tuple[float, float, float] = (
+        # _measured_sleep) and its baseload asleep, read off its electricity
+        # before each fit; until then a model saved before them.
+        self.sleep: tuple[float, float, float, float] = (
             BuildingThermalModel.asleep_from_hour,
             BuildingThermalModel.asleep_until_hour,
             BuildingThermalModel.asleep_spread_h,
+            BuildingThermalModel.asleep_baseload_w,
         )
 
     @property
@@ -672,6 +684,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         "window_close_hour",
         "window_hour_spread_h",
         "screed_layer_w_per_k",
+        "awake_in_living_fraction",
     )
 
     @staticmethod
@@ -700,6 +713,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 model.window_close_hour,
                 model.window_hour_spread_h,
                 model.screed_layer_w_per_k,
+                _awake_in_living(model),
             ]
         )
 
@@ -742,9 +756,11 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             asleep_from_hour=self.sleep[0],
             asleep_until_hour=self.sleep[1],
             asleep_spread_h=self.sleep[2],
+            asleep_baseload_w=self.sleep[3],
             screed_capacity_j_per_k=self.screed[0],
             screed_to_slab_w_per_k=self.screed[1],
             screed_layer_w_per_k=float(x[21]),
+            awake_in_living_fraction=float(x[22]),
         )
 
     def load(self, path) -> None:
@@ -768,6 +784,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.model.asleep_from_hour,
                 self.model.asleep_until_hour,
                 self.model.asleep_spread_h,
+                self.model.asleep_baseload_w,
             )
 
     def _shutter_open_fraction(
@@ -1183,7 +1200,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         Rebuilt per fit iteration because three of the six depend on
         identified parameters (the effective apertures, the in-zone baseload
-        fraction and where the occupants sleep). Takes the model rather than
+        fraction and where the household sleeps and lives). Takes the model rather than
         the raw parameter vector.
         """
 
@@ -1221,7 +1238,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         # Q_internal lands by floor area; asleep, the occupants are in the
         # bedrooms instead, so what the thermostat's room has of them beyond
-        # its asleep share moves to the rest - the dwelling's total unchanged.
+        # its asleep share moves to the rest - the dwelling's total unchanged,
+        # and the same for what is awake below.
         asleep = night_share(
             df["hour"].to_numpy(dtype=float),
             model.asleep_from_hour,
@@ -1234,6 +1252,19 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             * occupants
             * Q_PERSON_SENSIBLE_W
         )
+        # Awake, they and what they switch on above the standby left on
+        # asleep are where the household lives, the kitchen with it: the
+        # thermostat's room takes its awake share of them instead.
+        awake_w = (
+            model.internal_gain_fraction
+            * np.clip(
+                df["baseload_w"].to_numpy(dtype=float) - model.asleep_baseload_w,
+                0.0,
+                None,
+            )
+            + (1.0 - asleep) * occupants * Q_PERSON_SENSIBLE_W
+        )
+        moved -= (_awake_in_living(model) - model.living_area_fraction) * awake_w
 
         return np.column_stack(
             [
@@ -1263,10 +1294,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # Zero is meaningful, not a degenerate case: a structure whose only
         # state is the measurement has nothing to settle, so every window
         # scores and a six-hour gap-free stretch is already usable.
-        warmup_samples = max(int(round(self.MASS_WARMUP_HOURS * 3600.0 / median_dt)), 0)
-        horizon_samples = max(
-            int(round(self.ROLLOUT_HORIZON_HOURS * 3600.0 / median_dt)), 2
-        )
+        warmup_samples = max(round(self.MASS_WARMUP_HOURS * 3600.0 / median_dt), 0)
+        horizon_samples = max(round(self.ROLLOUT_HORIZON_HOURS * 3600.0 / median_dt), 2)
 
         contiguous = (
             df["dt_seconds"].to_numpy(dtype=float)
@@ -1490,6 +1519,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.MIN_WINDOW_CLOSE_HOUR,
                 self.MIN_WINDOW_HOUR_SPREAD_H,
                 self.MIN_SCREED_LAYER_W_PER_M2_K * floor_m2,
+                0.0,
             ]
         )
 
@@ -1517,6 +1547,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.MAX_WINDOW_CLOSE_HOUR,
                 self.MAX_WINDOW_HOUR_SPREAD_H,
                 self.MAX_SCREED_LAYER_W_PER_M2_K * floor_m2,
+                1.0,
             ]
         )
 
@@ -1546,6 +1577,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.INITIAL_WINDOW_CLOSE_HOUR,
                 self.INITIAL_WINDOW_HOUR_SPREAD_H,
                 self.INITIAL_SCREED_LAYER_W_PER_M2_K * floor_m2,
+                # Awake by floor area to start, as asleep.
+                self.living_area_fraction,
             ]
         )
 
@@ -2174,9 +2207,11 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # The rooms' own channels; the floor's is the floor's error.
         return heat[:, :2]
 
-    def _measured_sleep(self, df: pd.DataFrame) -> tuple[float, float, float]:
+    def _measured_sleep(
+        self, df: pd.DataFrame
+    ) -> tuple[float, float, float, float]:
         """The household's hours of sleep (to bed, up, spread - see
-        physics.night_share) from its electricity: the median baseload at each
+        physics.night_share) and its baseload asleep (W) from its electricity: the median baseload at each
         local time of day, one level awake and a lower one asleep, stepping
         between them at those hours. Robustly - an evening's cooking, a
         morning's kettle stand above the awake level without being sleep."""
@@ -2220,7 +2255,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             loss="soft_l1",
             f_scale=max(float(np.median(np.abs(baseload - median))), self.MIN_F_SCALE),
         )
-        to_bed, up, spread = (float(value) for value in result.x[2:])
+        asleep_w, _, to_bed, up, spread = (float(value) for value in result.x)
         logger.info(
             "Building thermal calibration: asleep from %.2f h to %.2f h "
             "(spread %.2f h), %.0f W against %.0f W awake",
@@ -2231,7 +2266,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             result.x[1],
         )
 
-        return to_bed, up, spread
+        return to_bed, up, spread, asleep_w
 
     def _fit_screed(self, df: pd.DataFrame) -> tuple[float, float]:
         """(screed J/K, its conductance down to the slabs W/K) from the

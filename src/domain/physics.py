@@ -334,7 +334,7 @@ def zone_state_space(
     Q_internal and Q_floor are the dwelling's, divided by floor area; Q_living
     and Q_rest land in that room alone: its own glazing's sun, and the
     occupants' heat that is there beyond its floor area's share (asleep, in the
-    bedrooms). The floor's heat enters each floor's screed - its pipes'
+    bedrooms; awake, with what they switch on, in the living room). The floor's heat enters each floor's screed - its pipes'
     half where it has two, which passes it up to the half its room sees and
     down to the concrete - or without one its slab, the surface its room
     sees. Q_floor_moved is

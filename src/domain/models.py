@@ -310,6 +310,15 @@ class BuildingThermalModel:
     # sleep: the bedrooms are there. By day it lands by floor area. None is by
     # floor area at night too - a model saved before it.
     asleep_in_rest_fraction: float | None = None
+    # Share of the household's heat while awake that is in the living room:
+    # the occupants', and that of what they switch on above the standby left
+    # on asleep (asleep_baseload_w) - cooking, the television, the lights.
+    # The kitchen is in it, and by day the household lives there. Real data,
+    # Jun-Nov 2026, two folds: 0.78 and 0.87 (std error 0.02-0.04); the
+    # living room's rise after a dark floor run, 4/8 h on, came out -0.08/
+    # -0.13 K off against -0.14/-0.23 K by floor area. None is by floor area
+    # - a model saved before it.
+    awake_in_living_fraction: float | None = None
     # The household's own hours of sleep (local; past midnight counted on
     # past 24, see physics.night_share): gone to bed around asleep_from_hour,
     # up around asleep_until_hour, each night within asleep_spread_h (h) of
@@ -317,6 +326,9 @@ class BuildingThermalModel:
     asleep_from_hour: float = 23.0
     asleep_until_hour: float = 7.0
     asleep_spread_h: float = 0.25
+    # The baseload asleep (W): the standby that runs day and night - the
+    # fridge, the network - spread through the dwelling by floor area.
+    asleep_baseload_w: float = 0.0
     # Windows opened overnight to cool the house on warm days (see
     # physics.envelope_conductance_w_per_k): what the open windows add to the
     # envelope's conductance (W/K, the air's rho * c_p times the airflow
@@ -502,6 +514,19 @@ class HeatPumpCOPModel:
     # the runs' steady heat, 5% below the heat line those days. None until
     # runs have shown it: a whole start's then.
     defrost_restart_share: float | None = None
+    # How long a DHW run's electrical power takes to rise to the power line
+    # (s), taken as a linear rise from the start (see HeatPumpCOPIdentifier.
+    # _power_ramp): the compressor's speed rising, 36 Hz from 4 minutes to
+    # 60 Hz at 18 (real data, 97 cold starts Jul-Oct 2026: 19.6 min) - longer
+    # than its heat's ramp, which the loop warming makes up front. Costs what
+    # is left of it in a run under way; the start's own step draws
+    # start_step_power_w. 0.0 until calibrated: on the power line then.
+    start_power_ramp_seconds: float = 0.0
+    # Where a run resumes that rise after a defrost (s into it): the
+    # compressor comes back at its lowest speed and rises as from a start
+    # (real data, 5 defrosts Oct 2026: 6.6 min). None until runs have shown
+    # it: from the start of the rise.
+    defrost_power_offset_seconds: float | None = None
     # The heat (J) a heating run handed over by hot water gets beyond the
     # compressor's own in its first planning step: the water in the heat
     # pump and the pipes it shares with the tank, at the tank's temperature as

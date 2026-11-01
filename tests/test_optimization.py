@@ -48,7 +48,6 @@ def _published(
         electrical_power_w=(0.0,) * len(schedule),
         heat_w=(0.0,) * len(schedule),
         objective_value=0.0,
-        solver_status="optimal",
         termination_condition="optimal",
     )
 
@@ -77,7 +76,6 @@ def _published_zone(
         electrical_power_w=(0.0,) * len(tank),
         heat_w=(0.0,) * len(tank),
         objective_value=0.0,
-        solver_status="optimal",
         termination_condition="optimal",
         space_schedule=zone,
         space_heat_w=tuple(3000.0 * on for on in zone),
@@ -231,7 +229,6 @@ def test_the_tank_level_is_its_own_sensor():
         electrical_power_w=(0.0,) * 4,
         heat_w=(0.0,) * 4,
         objective_value=0.0,
-        solver_status="optimal",
         termination_condition="optimal",
     )
 
@@ -416,7 +413,6 @@ def test_the_plan_log_reports_the_objective_s_own_energy_per_day(caplog):
         electrical_power_w=(0.0, 2000.0, 2000.0, 0.0),
         heat_w=(0.0,) * 4,
         objective_value=0.0,
-        solver_status="optimal",
         termination_condition="optimal",
         electricity_kwh=1.0,
         grid_kwh=0.5,
@@ -441,7 +437,6 @@ def test_the_plan_log_splits_its_energy_by_day(caplog):
         electrical_power_w=(2000.0, 0.0, 2000.0, 0.0),
         heat_w=(0.0,) * 4,
         objective_value=0.0,
-        solver_status="optimal",
         termination_condition="optimal",
         electricity_kwh=1.5,
         grid_kwh=1.0,
@@ -467,7 +462,6 @@ def test_the_plan_log_counts_only_the_tank_s_electricity(caplog):
         electrical_power_w=(0.0, 2000.0, 0.0, 0.0),
         heat_w=(0.0,) * 4,
         objective_value=0.0,
-        solver_status="optimal",
         termination_condition="optimal",
         space_schedule=(0, 0, 1, 1),
         space_electrical_w=(0.0, 0.0, 1000.0, 1000.0),
@@ -726,6 +720,90 @@ def test_a_run_is_under_way_since_its_change_into_the_mode():
     )
     assert Optimization.running_since(changes, "Verwarmen") is None
     assert Optimization.running_since(changes[:1], "Koelen") is None
+
+
+def test_a_floor_run_counts_from_the_compressors_start_on_the_zone():
+    """From the change into heating, or the compressor's last start within it
+    (the state stays on heating at 0 Hz between runs); nothing for a run the
+    tank handed over."""
+
+    def at(minutes: float) -> datetime:
+        return START + timedelta(minutes=minutes)
+
+    now = at(70)
+    started = [
+        SeriesPoint(time=at(0), value="Uit"),
+        SeriesPoint(time=at(60), value="Verwarmen"),
+    ]
+    paused = [SeriesPoint(time=at(0), value="Verwarmen")]
+    pause = [
+        SeriesPoint(time=at(0), value=30.0),
+        SeriesPoint(time=at(20), value=0.0),
+        SeriesPoint(time=at(55), value=26.0),
+    ]
+    handed = [
+        SeriesPoint(time=at(0), value="SWW"),
+        SeriesPoint(time=at(60), value="Verwarmen"),
+    ]
+    running = [SeriesPoint(time=at(0), value=40.0)]
+
+    def hours(states, frequency) -> float:
+        return Optimization.zone_run_hours(states, frequency, "Verwarmen", "SWW", now)
+
+    assert hours(started, running) == pytest.approx(10 / 60)
+    assert hours(paused, pause) == pytest.approx(15 / 60)
+    assert hours(handed, running) == 0.0
+
+
+def test_a_floor_run_keeps_its_start_through_a_defrost():
+    """0 Hz in a defrost is no new start: the run counts from the compressor's
+    start before it, not from its restart after."""
+
+    def at(minutes: float) -> datetime:
+        return START + timedelta(minutes=minutes)
+
+    states = [SeriesPoint(time=at(0), value="Verwarmen")]
+    frequency = [
+        SeriesPoint(time=at(0), value=0.0),
+        SeriesPoint(time=at(10), value=35.0),
+        SeriesPoint(time=at(30), value=0.0),
+        SeriesPoint(time=at(33), value=30.0),
+    ]
+    defrost = [
+        SeriesPoint(time=at(29), value=True),
+        SeriesPoint(time=at(33), value=False),
+    ]
+
+    def hours(defrost) -> float:
+        return Optimization.zone_run_hours(
+            states, frequency, "Verwarmen", "SWW", at(40), defrost
+        )
+
+    assert hours(defrost) == pytest.approx(30 / 60)
+    assert hours(()) == pytest.approx(7 / 60)
+
+
+def test_a_floor_start_after_the_booster_is_no_hand_over():
+    """The state on DHW at 0 Hz while the booster finished the tank, then
+    heating and the compressor started from off: a cold start, counted from
+    the compressor's start, not a hand-over."""
+
+    def at(minutes: float) -> datetime:
+        return START + timedelta(minutes=minutes)
+
+    states = [
+        SeriesPoint(time=at(0), value="SWW"),
+        SeriesPoint(time=at(40), value="Verwarmen"),
+    ]
+    frequency = [
+        SeriesPoint(time=at(0), value=50.0),
+        SeriesPoint(time=at(30), value=0.0),
+        SeriesPoint(time=at(45), value=30.0),
+    ]
+
+    assert Optimization.zone_run_hours(
+        states, frequency, "Verwarmen", "SWW", at(60)
+    ) == pytest.approx(15 / 60)
 
 
 def test_a_floor_run_is_under_way_only_with_the_compressor_running():
