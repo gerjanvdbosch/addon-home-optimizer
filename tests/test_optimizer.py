@@ -1774,6 +1774,41 @@ def test_a_plan_through_the_living_rooms_loops_alone_heats_its_floor():
         assert living_floor[k + 1] == pytest.approx(state[2], abs=1e-4)
 
 
+@pytest.mark.parametrize(("zone_steps", "feasible"), [(1, False), (2, True)])
+def test_a_run_the_zone_starts_serves_the_zone_its_minimum_runtime(
+    zone_steps, feasible
+):
+    """A run the zone starts stays on the zone for the compressor's minimum
+    runtime: no lone quarter hour on the floor ahead of hot water."""
+
+    from pyomo.contrib.appsi.base import TerminationCondition
+
+    steps = 24
+    target = [10.0] * steps
+    target[-1] = 45.0
+    data = _cold_day(steps=steps, target_temperature_top=tuple(target))
+    optimizer = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE,
+        floor_circuit_model=HEATING,
+        space_cop_model=COP_MODEL,
+    )
+    model = optimizer._build_model(data, optimizer._tank_setting(data))
+    first = 4
+
+    for k in model.K:
+        zone = first <= k < first + zone_steps
+        model.space_on[k].fix(int(zone))
+        model.boiler_on[k].fix(int(first + zone_steps <= k < first + zone_steps + 4))
+
+    results = optimizer._solver().solve(model)
+    solved = results.termination_condition == TerminationCondition.optimal
+
+    assert solved == feasible
+
+
 def test_a_run_the_zone_opens_draws_the_starts_measured_power():
     """The compressor's start-up is the same in every mode, so a run the zone
     opens draws the start's measured power over its first step, as the tank's
@@ -2140,6 +2175,36 @@ def test_a_runs_first_step_draws_its_measured_power():
 
     assert result.electrical_power_w[first] == pytest.approx(750.0)
     assert result.electrical_power_w[first + 1] == pytest.approx(second_w)
+
+
+def test_a_later_runs_first_step_draws_its_measured_power_too():
+    """A run after another starts from a tank still warm from it, far above
+    the tank left unheated: its start step still draws the measured power,
+    which hardly follows the tank (real plan, 1 Nov 2026: +370 W)."""
+
+    steps = len(SOLAR_FORECAST_W)
+    target = [10.0] * steps
+    target[4] = target[-1] = 45.0
+    tap = [0.0] * steps
+    tap[6] = 12000.0
+    optimizer = MPCOptimizer(STARTING_MODEL, MPCConfig(), cop_model=STARTING_COP_MODEL)
+    result = optimizer.solve(
+        _make_input(
+            target_temperature_top=tuple(target),
+            tap_forecast_w=tuple(tap),
+            outdoor_temperature_forecast=(5.0,) * steps,
+        )
+    )
+    starts = [
+        k
+        for k, on in enumerate(result.schedule)
+        if on and (k == 0 or not result.schedule[k - 1])
+    ]
+    ramp = optimizer._ramp_fraction(0.25, 5.0)
+
+    assert len(starts) == 2, result.schedule
+    assert result.heat_w[starts[1]] == pytest.approx(ramp * optimizer._heat_at(5.0))
+    assert result.electrical_power_w[starts[1]] == pytest.approx(750.0)
 
 
 OVERSHOOT_MODEL = replace(THERMAL_MODEL, setpoint_overshoot_k=1.75)

@@ -284,17 +284,18 @@ class TankPlan:
 def draw_w(tank: TankSetting, k: int, tank_c, heat_pump_w, booster_w, start):
     """The electrical power step k draws (W) for this much heat from either
     source at tank_c: the power line for the heat pump's share of the step -
-    a run's first quarter at its measured power instead (see
-    MPCOptimizer._start_power_correction_w); a hand-over from the zone, the
+    a run's first quarter at its measured power in place of the ramp's share
+    (see HeatPumpCOPModel.start_step_power_w); a hand-over from the zone, the
     compressor at speed, on the power line throughout - and the booster's own
     draw."""
 
     alpha, beta = tank.power_lines[k]
-    heat_pump = (alpha + beta * tank_c) * heat_pump_w / tank.heat_w[k]
-    unheated_w = alpha + beta * tank.floor_c[k]
+    share = heat_pump_w / tank.heat_w[k]
 
     if tank.start_power_w:
-        heat_pump = heat_pump + start * (tank.start_power_w - tank.ramp[k] * unheated_w)
+        share = share - start * tank.ramp[k]
+
+    heat_pump = (alpha + beta * tank_c) * share + start * tank.start_power_w
 
     return heat_pump + tank.booster_draw_per_heat * booster_w
 
@@ -2024,6 +2025,21 @@ class MPCOptimizer:
                     heating(model, k) >= model.boiler_on[start] - previous_tank
                 )
 
+            # Likewise a run the zone starts serves the zone as long - a rule,
+            # not physics: priced alone, a quarter hour on the floor ahead of a
+            # hot water run came out level with starting on the tank (real
+            # plan, 1 Nov 2026: 0.07 ct, within the solver's gap), and the user
+            # wants no such quarter. A zone the tank hands over to may run one.
+            if hasattr(model, "space_on"):
+                zone_start = (
+                    model.compressor_start[start]
+                    - model.tank_start[start]
+                    + model.tank_handover[start]
+                )
+
+                for k in steps_within(min_runtime * self.config.step_hours, start):
+                    model.minimum_runtime.add(model.space_on[k] >= zone_start)
+
         # A run already heating keeps heating until its minimum runtime has
         # passed. Otherwise the next replan, minutes after the start, can plan it
         # off at step 0 while the heat pump finishes the run anyway - the plan,
@@ -2457,6 +2473,7 @@ class MPCOptimizer:
         model.draw_w = pyo.Var(model.K, domain=pyo.NonNegativeReals)
 
         start_power_w = self.cop_model.start_step_power_w if self.cop_model else 0.0
+        model.start_temperature = pyo.Var(model.K)
 
         for k in range(num_steps):
             share = model.q_heat_pump_w[k] / heat_w[k]
@@ -2558,17 +2575,21 @@ class MPCOptimizer:
 
             # A run's first step draws its measured power (see
             # HeatPumpCOPModel.start_step_power_w) in place of the power line
-            # over the heat it delivers, the ramp's share of the step: taken
-            # as the power at the tank unheated, so its excess over that is
-            # priced as in any step - exact for the horizon's first run, which
-            # has none. A hand-over from the zone runs on the power line.
-            ramp = tank.ramp[k]
-            unheated_w = alpha + beta * t_floor[k]
-
+            # over the ramp's share of the step, at the tank it starts from:
+            # T * start, exact for the binaries. That power hardly follows the
+            # tank (real data, 122 cold starts Jun-Oct 2026: 7 W/K, flat 699 W
+            # within 51 W). Taken at the tank unheated instead, a later run's
+            # start was charged the line's rise from there - the tank a day
+            # after a run 3 against 25 degC, +370 W - and the plan opened it
+            # with a quarter hour on the floor (real plan, 1 Nov 2026). A
+            # hand-over from the zone runs on the power line.
             if start_power_w:
-                heat_pump_power_w += (start_power_w - ramp * unheated_w) * (
-                    model.tank_start[k] - model.tank_handover[k]
-                )
+                ramp = tank.ramp[k]
+                cold_start = model.tank_start[k] - model.tank_handover[k]
+                add_product(model.start_temperature[k], cold_start, k)
+                heat_pump_power_w += (
+                    start_power_w - ramp * alpha
+                ) * cold_start - ramp * beta * model.start_temperature[k]
 
             # The booster draws more than it heats the tank (see
             # BoilerThermalModel.booster_electrical_w).
@@ -2642,6 +2663,7 @@ class MPCOptimizer:
 
         model.dt_hours = dt_hours
         model.t_floor = t_floor
+        model.ramp = tank.ramp
         model.mpc_scenario_weights = [weight for weight, _ in solar_scenarios]
 
         return model
@@ -3947,7 +3969,8 @@ class MPCOptimizer:
             # For the part of the step the heat pump runs (see active_power_w).
             used = heat_pump_w[k] / self._heat_at(T_outdoor)
             heat_pump_power_w = (
-                start_power_w + beta * (temperatures[k] - model.t_floor[k]) * used
+                start_power_w
+                + (alpha + beta * temperatures[k]) * (used - model.ramp[k])
                 if tank_start[k] and not handover[k] and used and start_power_w
                 else (alpha + beta * temperatures[k]) * used
             )
