@@ -430,7 +430,7 @@ class Optimization:
             thermal_model=thermal_model, config=mpc_config, cop_model=cop_model
         )
         optimizer, planned = dhw_only, data
-        zone = self._zone(
+        estimate, zone = self._zone(
             state, config, forecast_times, mpc_config, optimize_config.cooling
         )
 
@@ -548,6 +548,19 @@ class Optimization:
                 "at %s degC supply",
                 sum(result.space_heat_w) * mpc_config.step_hours / 1000.0,
                 "unknown" if supply_c is None else f"{supply_c:.1f}",
+            )
+
+        # Saved with the plan, not before the solve: a cold solve takes a
+        # minute, and in it the dashboard drew this estimate's mass, the zone
+        # left alone, beside the previous plan's floor runs.
+        if estimate is not None:
+            # The thermostat's room, which comfort is set in, and the slab and
+            # screed under it.
+            self.state_manager.update_zone(
+                temperature=estimate["measured"].dropna(),
+                thermal_mass=estimate["slab_living"],
+                # The pipes' half where the screed has two: what the water heats.
+                screed=estimate.get("pipes_living", estimate.get("screed_living")),
             )
 
         # Empty without a zone plan, so the dashboard shows none rather than
@@ -1313,10 +1326,11 @@ class Optimization:
         times: list[datetime],
         mpc_config: MPCConfig,
         cooling: bool | None = None,
-    ) -> tuple[dict, dict] | None:
-        """The zone as a second demand on the compressor: what the plan needs
-        of it (MPCInput fields) and the models it plans it with
-        (MPCOptimizer arguments), or None where it cannot be planned.
+    ) -> tuple[pd.DataFrame | None, tuple[dict, dict] | None]:
+        """The zone as a second demand on the compressor: the filter's
+        estimate of it (None without one), and what the plan needs of it
+        (MPCInput fields) with the models it plans it with (MPCOptimizer
+        arguments), or None where it cannot be planned.
 
         The zone is estimated here, where it is planned, rather than on every
         state update: one load and one filter pass give both the state a plan
@@ -1343,7 +1357,7 @@ class Optimization:
         identifier.load(self.models_path)
 
         if identifier.model is None:
-            return None
+            return None, None
 
         now = datetime.now(timezone.utc)
         # From the previous local midnight, so the dashboard has yesterday
@@ -1396,17 +1410,9 @@ class Optimization:
             # Normal right after a restart with no measurements yet, or before
             # the weather forecast reaches past now.
             logger.warning("No zone estimate: %s", error)
-            return None
+            return None, None
 
         zone.index = pd.to_datetime(zone.index, utc=True)
-        # The thermostat's room, which comfort is set in, and the slab and
-        # screed under it.
-        self.state_manager.update_zone(
-            temperature=zone["measured"].dropna(),
-            thermal_mass=zone["slab_living"],
-            # The pipes' half where the screed has two: what the water heats.
-            screed=zone.get("pipes_living", zone.get("screed_living")),
-        )
 
         # The heat pump's own mode unless this run asks for one (see
         # OptimizeConfig.cooling).
@@ -1416,7 +1422,7 @@ class Optimization:
         comfort = config.building.comfort(cooling)
 
         if comfort is None:
-            return None
+            return zone, None
 
         # The plan starts where the filter's estimate of the whole zone state
         # stands at its first step: both rooms and their slabs.
@@ -1425,7 +1431,7 @@ class Optimization:
 
         if planned[state_names].iloc[0].isna().any():
             logger.info("Zone not planned: no zone estimate at %s", times[0])
-            return None
+            return zone, None
 
         dew_point_c = self._dew_point_forecast(state, times, mpc_config)
 
@@ -1434,7 +1440,7 @@ class Optimization:
                 "Zone not planned: no dew point to keep the floor above while "
                 "cooling (see building.dew_points)"
             )
-            return None
+            return zone, None
 
         def gain(column: str) -> tuple[float, ...]:
             return tuple(
@@ -1509,10 +1515,13 @@ class Optimization:
         space_cop = HeatPumpCOPIdentifier(key=key)
         space_cop.load(path=self.models_path)
 
-        return inputs, dict(
-            building_model=identifier.model,
-            floor_circuit_model=floor_circuit.model,
-            space_cop_model=space_cop.model,
+        return zone, (
+            inputs,
+            dict(
+                building_model=identifier.model,
+                floor_circuit_model=floor_circuit.model,
+                space_cop_model=space_cop.model,
+            ),
         )
 
     def _dew_point_forecast(
