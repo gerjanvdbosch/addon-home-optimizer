@@ -2,6 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import plotly
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse
@@ -53,6 +54,13 @@ app.mount(
     "/static",
     StaticFiles(directory=BASE_DIR / "static"),
     name="static",
+)
+
+# plotly.js from the installed plotly package: no CDN needed, nothing vendored.
+app.mount(
+    "/plotly",
+    StaticFiles(directory=Path(plotly.__file__).parent / "package_data"),
+    name="plotly",
 )
 
 templates = Jinja2Templates(

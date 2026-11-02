@@ -1469,6 +1469,7 @@ class Optimization:
             zone_internal_gain_w=gain("internal_gain_w"),
             zone_living_gain_w=tuple(planned["living_gain_w"].fillna(0.0)),
             zone_rest_gain_w=tuple(planned["rest_gain_w"].fillna(0.0)),
+            zone_living_air_gain_w=gain("living_air_gain_w"),
             # Beyond the forecast the envelope a day earlier, else the nearest.
             zone_envelope_w_per_k=tuple(
                 self.state_manager.extend_forecast(

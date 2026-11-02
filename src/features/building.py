@@ -49,9 +49,10 @@ from domain.physics import (
     night_share,
     solar_gain_w,
     zone_floor,
+    zone_layers,
+    zone_living_air,
     zone_observation,
     zone_observations,
-    zone_size,
     zone_slab,
     zone_state_space,
 )
@@ -507,6 +508,16 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # Left at [0, 1] until that is modelled, rather than hide it elsewhere.
     INITIAL_INTERNAL_GAIN_FRACTION = 0.5
 
+    # The living room's air to its walls and furnishings (see
+    # BuildingThermalModel.ua_living_air_w_per_k), per m2 of its floor: a
+    # surface's convective coefficient, 1-5 W/m2K (EN ISO 6946's 2.5 for a
+    # wall), over its floor and ceiling at the least - 2 m2 per m2 - and at
+    # the most over those, its walls and both faces of its furnishings and
+    # internal walls, some 12 m2 per m2. Started at 3 W/m2K over 5 m2.
+    MIN_UA_LIVING_AIR_W_PER_M2_K = 2.0
+    MAX_UA_LIVING_AIR_W_PER_M2_K = 60.0
+    INITIAL_UA_LIVING_AIR_W_PER_M2_K = 15.0
+
     def __init__(self, latitude: float, longitude: float) -> None:
         super().__init__()
         self.latitude = latitude
@@ -685,6 +696,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         "window_hour_spread_h",
         "screed_layer_w_per_k",
         "awake_in_living_fraction",
+        "ua_living_air_w_per_k",
     )
 
     @staticmethod
@@ -714,6 +726,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 model.window_hour_spread_h,
                 model.screed_layer_w_per_k,
                 _awake_in_living(model),
+                model.ua_living_air_w_per_k,
             ]
         )
 
@@ -727,6 +740,18 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             return 1.0
 
         return self.room_areas_m2[self.thermostat_room_index] / total
+
+    @property
+    def living_air_capacity_j_per_k(self) -> float:
+        """The thermostat's room's air (rho c_p V): the zone's volume by its
+        floor area, one ceiling height throughout."""
+
+        return (
+            RHO_AIR_KG_PER_M3
+            * CP_AIR_J_PER_KG_K
+            * self.volume_m3
+            * self.living_area_fraction
+        )
 
     def _model_from_parameters(self, x: np.ndarray) -> BuildingThermalModel:
         return BuildingThermalModel(
@@ -761,6 +786,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             screed_to_slab_w_per_k=self.screed[1],
             screed_layer_w_per_k=float(x[21]),
             awake_in_living_fraction=float(x[22]),
+            ua_living_air_w_per_k=float(x[23]),
+            c_living_air_j_per_k=self.living_air_capacity_j_per_k,
         )
 
     def load(self, path) -> None:
@@ -1196,7 +1223,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
     def _inputs(self, model, df: pd.DataFrame) -> np.ndarray:
         """u = [T_outdoor, Q_internal, Q_living, Q_rest, Q_floor,
-        Q_floor_moved] per sample (see physics.zone_state_space).
+        Q_floor_moved, Q_living_air] per sample (see
+        physics.zone_state_space).
 
         Rebuilt per fit iteration because three of the six depend on
         identified parameters (the effective apertures, the in-zone baseload
@@ -1265,15 +1293,23 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             + (1.0 - asleep) * occupants * Q_PERSON_SENSIBLE_W
         )
         moved -= (_awake_in_living(model) - model.living_area_fraction) * awake_w
+        # Of that, the occupants' own heat warms the air around them - the
+        # thermostat's - before the room (see
+        # BuildingThermalModel.ua_living_air_w_per_k). What they switch on
+        # does not: the cooker's heat is in the kitchen and up the hood.
+        q_living_air = (
+            _awake_in_living(model) * (1.0 - asleep) * occupants * Q_PERSON_SENSIBLE_W
+        )
 
         return np.column_stack(
             [
                 df["T_out"].to_numpy(dtype=float),
                 q_internal,
-                q_solar[0] - moved,
+                q_solar[0] - moved - q_living_air,
                 q_solar[1] + moved,
                 df["Q_floor_w"].to_numpy(dtype=float),
                 df["Q_floor_moved_w"].to_numpy(dtype=float),
+                q_living_air,
             ]
         )
 
@@ -1520,6 +1556,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.MIN_WINDOW_HOUR_SPREAD_H,
                 self.MIN_SCREED_LAYER_W_PER_M2_K * floor_m2,
                 0.0,
+                self.MIN_UA_LIVING_AIR_W_PER_M2_K * ceiling_m2,
             ]
         )
 
@@ -1548,6 +1585,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.MAX_WINDOW_HOUR_SPREAD_H,
                 self.MAX_SCREED_LAYER_W_PER_M2_K * floor_m2,
                 1.0,
+                self.MAX_UA_LIVING_AIR_W_PER_M2_K * ceiling_m2,
             ]
         )
 
@@ -1579,6 +1617,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.INITIAL_SCREED_LAYER_W_PER_M2_K * floor_m2,
                 # Awake by floor area to start, as asleep.
                 self.living_area_fraction,
+                self.INITIAL_UA_LIVING_AIR_W_PER_M2_K * ceiling_m2,
             ]
         )
 
@@ -2488,6 +2527,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     STATE_NAMES = ("living", "rest", "slab_living", "slab_rest")
     SCREED_NAMES = ("screed_living", "screed_rest")
     PIPE_NAMES = ("pipes_living", "pipes_rest")
+    AIR_NAMES = ("air_living",)
 
     @classmethod
     def state_names(cls, model: BuildingThermalModel) -> tuple[str, ...]:
@@ -2495,7 +2535,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         names = (cls.STATE_NAMES, cls.SCREED_NAMES, cls.PIPE_NAMES)
 
-        return sum(names[: {4: 1, 6: 2, 8: 3}[zone_size(model)]], ())
+        layers = sum(names[: {4: 1, 6: 2, 8: 3}[zone_layers(model)]], ())
+
+        return layers + (cls.AIR_NAMES if zone_living_air(model) is not None else ())
 
     @classmethod
     def _states_frame(
@@ -2790,6 +2832,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         zone["internal_gain_w"] = inputs[:, 1]
         zone["living_gain_w"] = inputs[:, 2]
         zone["rest_gain_w"] = inputs[:, 3]
+        zone["living_air_gain_w"] = inputs[:, 6]
         # The envelope a plan's zone has each step (see _schedule).
         zone["envelope_w_per_k"] = self._envelope(model, prepared)
         # Which loops the floor's runs went through, and their flow, where

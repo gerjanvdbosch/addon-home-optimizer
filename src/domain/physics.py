@@ -328,8 +328,11 @@ def zone_state_space(
     has a screed, [T_screed_living, T_screed_rest] after them - the screed's
     upper halves, where it has two (see
     BuildingThermalModel.screed_layer_w_per_k), and its lower halves, the
-    pipes', [T_pipes_living, T_pipes_rest] last;
-    u = [T_outdoor, Q_internal, Q_living, Q_rest, Q_floor, Q_floor_moved].
+    pipes', [T_pipes_living, T_pipes_rest] after them; and the living room's
+    air, where it has a node of its own (see
+    BuildingThermalModel.ua_living_air_w_per_k), last;
+    u = [T_outdoor, Q_internal, Q_living, Q_rest, Q_floor, Q_floor_moved,
+    Q_living_air].
 
     Q_internal and Q_floor are the dwelling's, divided by floor area; Q_living
     and Q_rest land in that room alone: its own glazing's sun, and the
@@ -342,7 +345,9 @@ def zone_state_space(
     out of the rest's: where rooms have closed their loops, the water heats
     only the floors still open (see floor_heat_moved_w) - zero with every loop
     open. The rest's slab exchanges with the living room below it too,
-    through its ceiling.
+    through its ceiling. Q_living_air is the heat of the occupants awake in
+    the living room: it warms the air around them first, the thermostat's,
+    which passes it on to the room - or without an air node the room itself.
 
     The envelope at ua_envelope_w_per_k where given - its conductance that
     day (see envelope_conductance_w_per_k) - else at the model's own.
@@ -367,7 +372,7 @@ def zone_state_space(
     size = zone_size(model)
 
     a = np.zeros((size, size))
-    b = np.zeros((size, 6))
+    b = np.zeros((size, 7))
 
     for room, other in ((0, 1), (1, 0)):
         slab = room + 2
@@ -406,13 +411,26 @@ def zone_state_space(
     a[3, 3] -= ceiling / c[3]
     a[3, 0] += ceiling / c[3]
 
+    air = zone_living_air(model)
+
+    if air is None:
+        b[0, 6] = 1.0 / c[0]
+    else:
+        ua_air = model.ua_living_air_w_per_k
+        a[0, 0] -= ua_air / c[0]
+        a[0, air] = ua_air / c[0]
+        a[air, 0] = ua_air / c[air]
+        a[air, air] = -ua_air / c[air]
+        b[air, 6] = 1.0 / c[air]
+
     return a, b
 
 
 def zone_heat_capacities(model: BuildingThermalModel) -> np.ndarray:
     """Each of the zone's states' heat capacity (J/K, see zone_state_space):
-    the rooms, the slabs less their screeds, and the screeds - in halves
-    where they have two."""
+    the rooms, the slabs less their screeds, the screeds - in halves where
+    they have two - and the living room's air where it is a node of its
+    own."""
 
     share = model.living_area_fraction
     shares = np.array([share, 1.0 - share])
@@ -423,12 +441,15 @@ def zone_heat_capacities(model: BuildingThermalModel) -> np.ndarray:
         raise ValueError("The screed holds more heat than the slabs it lies on.")
 
     parts = [model.c_air_j_per_k * shares, c_slab]
-    size = zone_size(model)
+    layers = zone_layers(model)
 
-    if size == 6:
+    if layers == 6:
         parts.append(c_screed)
-    elif size == 8:
+    elif layers == 8:
         parts += [0.5 * c_screed, 0.5 * c_screed]
+
+    if zone_living_air(model) is not None:
+        parts.append([model.c_living_air_j_per_k])
 
     return np.concatenate(parts)
 
@@ -459,10 +480,24 @@ def zone_heat_shortfall_j(
 def zone_size(model: BuildingThermalModel) -> int:
     """How many states the zone has (see zone_state_space)."""
 
+    return zone_layers(model) + (zone_living_air(model) is not None)
+
+
+def zone_layers(model: BuildingThermalModel) -> int:
+    """How many of the zone's states are its rooms and floors' layers, the
+    living room's air left out (see zone_state_space)."""
+
     if not model.screed_capacity_j_per_k:
         return 4
 
     return 8 if model.screed_layer_w_per_k else 6
+
+
+def zone_living_air(model: BuildingThermalModel) -> int | None:
+    """The living room's air's state, the last, where it is a node of its
+    own (see BuildingThermalModel.ua_living_air_w_per_k)."""
+
+    return zone_layers(model) if model.ua_living_air_w_per_k else None
 
 
 def _surfaces(model: BuildingThermalModel) -> tuple[int, int]:
@@ -488,6 +523,12 @@ def zone_observations(model: BuildingThermalModel) -> np.ndarray:
     for room, surface in enumerate(_surfaces(model)):
         rows[room, room] = 1.0 - fraction
         rows[room, surface] = fraction
+
+    # The thermostat sits in the living room's air, not in its walls.
+    air = zone_living_air(model)
+
+    if air is not None:
+        rows[0, air], rows[0, 0] = rows[0, 0], 0.0
 
     return rows
 
@@ -521,7 +562,7 @@ def zone_floor(
 
     share = model.living_area_fraction if living_fraction is None else living_fraction
     row = np.zeros(zone_size(model))
-    pipes = ZONE_PIPE_STATES if zone_size(model) == 8 else _surfaces(model)
+    pipes = ZONE_PIPE_STATES if zone_layers(model) == 8 else _surfaces(model)
     row[list(pipes)] = [share, 1.0 - share]
 
     return row

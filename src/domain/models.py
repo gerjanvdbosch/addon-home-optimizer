@@ -319,6 +319,19 @@ class BuildingThermalModel:
     # -0.13 K off against -0.14/-0.23 K by floor area. None is by floor area
     # - a model saved before it.
     awake_in_living_fraction: float | None = None
+    # The living room's air as a node of its own (see
+    # physics.zone_state_space): what the occupants awake in it warm first,
+    # and what its thermostat reads. Its conductance to the room's walls and
+    # furnishings (W/K), fitted, and its heat capacity (J/K), the air's own
+    # (rho c_p V), configured: the air sits Q / UA above them. Real data,
+    # Jun-Nov 2026, three folds: 560-710 W/K (std error 60-110), the air
+    # ~0.2 K above the walls with two people in it, gone within minutes of
+    # their leaving - the room's fast 0.1-0.2 K drop at bedtime, -0.03 K with
+    # nobody home. Fed what they switch on as well (an oven's 1-2 kW) it ran
+    # to any bound: that heat is in the kitchen and up the hood, not at the
+    # thermostat. 0.0 is no node - and a model saved before it.
+    ua_living_air_w_per_k: float = 0.0
+    c_living_air_j_per_k: float = 0.0
     # The household's own hours of sleep (local; past midnight counted on
     # past 24, see physics.night_share): gone to bed around asleep_from_hour,
     # up around asleep_until_hour, each night within asleep_spread_h (h) of

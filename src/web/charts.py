@@ -601,5 +601,6 @@ def dashboard_chart(state: State, states: HeatPumpStates | None = None) -> str:
 
     return fig.to_html(
         full_html=False,
-        include_plotlyjs="cdn",
+        # Relative, like static/style.css, so it also resolves behind HA ingress.
+        include_plotlyjs="plotly/plotly.min.js",
     )

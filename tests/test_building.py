@@ -192,11 +192,16 @@ class _ShutWindows(BuildingThermalIdentifier):
     """The synthetic house never opens its windows, so its fits hold them
     shut at TRUE_MODEL's, as configured extensions are held: free, they are
     six parameters this data cannot see, and the fit wanders through them -
-    three times the evaluations for the same other parameters."""
+    three times the evaluations for the same other parameters. Its living
+    room has no air of its own either (see
+    test_the_occupants_warm_the_living_rooms_air_first), held likewise."""
 
     def _bounds(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         lower, initial, upper = super()._bounds()
-        shut = ["window" in name for name in self.PARAMETER_NAMES]
+        shut = [
+            "window" in name or name == "ua_living_air_w_per_k"
+            for name in self.PARAMETER_NAMES
+        ]
         lower[shut] = initial[shut] = upper[shut] = self._parameters(TRUE_MODEL)[shut]
 
         return lower, initial, upper
@@ -426,9 +431,10 @@ def test_a_shut_shutter_still_passes_part_of_the_sun():
 
     sunny = open_["I_facade_w_per_m2"].to_numpy() > 100.0
     model = replace(TRUE_MODEL, closed_shutter_gain_fraction=0.1)
-    ratio = (
-        identifier._inputs(model, shut)[sunny, 2]
-        / identifier._inputs(model, open_)[sunny, 2]
+    # The living room's own heat, its air's included.
+    shut_in, open_in = identifier._inputs(model, shut), identifier._inputs(model, open_)
+    ratio = (shut_in[sunny, 2] + shut_in[sunny, 6]) / (
+        open_in[sunny, 2] + open_in[sunny, 6]
     )
 
     assert ratio == pytest.approx(0.1)
@@ -513,9 +519,7 @@ def test_awake_the_household_and_what_it_switches_on_are_in_the_living_room():
     model = replace(TRUE_MODEL, asleep_baseload_w=standby_w)
 
     by_area = identifier._inputs(model, prepared)
-    living = identifier._inputs(
-        replace(model, awake_in_living_fraction=1.0), prepared
-    )
+    living = identifier._inputs(replace(model, awake_in_living_fraction=1.0), prepared)
 
     local = pd.DatetimeIndex(prepared["time"]).tz_convert(LOCAL_TIMEZONE)
     awake = 1.0 - night_share(
@@ -529,7 +533,9 @@ def test_awake_the_household_and_what_it_switches_on_are_in_the_living_room():
     switched_on_w = model.internal_gain_fraction * np.clip(
         prepared["baseload_w"].to_numpy(dtype=float) - standby_w, 0.0, None
     )
-    moved = living[:, 2] - by_area[:, 2]
+    # The room's and its air's together (see
+    # test_the_occupants_warm_the_living_rooms_air_first).
+    moved = living[:, 2] + living[:, 6] - by_area[:, 2] - by_area[:, 6]
 
     assert moved.max() > 0.0
     np.testing.assert_allclose(
@@ -538,7 +544,9 @@ def test_awake_the_household_and_what_it_switches_on_are_in_the_living_room():
         atol=1e-9,
     )
     np.testing.assert_allclose(
-        living[:, 2] + living[:, 3], by_area[:, 2] + by_area[:, 3], atol=1e-9
+        living[:, 2] + living[:, 3] + living[:, 6],
+        by_area[:, 2] + by_area[:, 3] + by_area[:, 6],
+        atol=1e-9,
     )
     np.testing.assert_array_equal(living[:, 1], by_area[:, 1])
 
@@ -1201,8 +1209,10 @@ def test_forecast_takes_the_sky_ahead_from_the_pv_forecast():
     ).to_numpy()
 
     assert lit.any()
+    # The sun with the occupants' heat in the room's air added back.
     np.testing.assert_allclose(
-        sunnier.loc[lit, "living_gain_w"], 2.0 * plain.loc[lit, "living_gain_w"]
+        sunnier.loc[lit, ["living_gain_w", "living_air_gain_w"]].sum(axis=1),
+        2.0 * plain.loc[lit, ["living_gain_w", "living_air_gain_w"]].sum(axis=1),
     )
 
 
@@ -1230,7 +1240,7 @@ def test_a_rooms_sun_warms_that_room_before_the_rest():
     runs ahead."""
 
     a_d, b_d = discretize_zoh(*zone_state_space(TRUE_MODEL), 3600.0)
-    sun_in_living = np.array([20.0, 0.0, 2000.0, 0.0, 0.0, 0.0])
+    sun_in_living = np.array([20.0, 0.0, 2000.0, 0.0, 0.0, 0.0, 0.0])
 
     state = a_d @ np.full(4, 20.0) + b_d @ sun_in_living
 
@@ -1340,7 +1350,7 @@ def test_the_floors_heat_lands_only_under_the_loops_that_are_open():
     )
     living = floor_living_fraction(share, 0.0, share)
     moved = floor_heat_moved_w(1000.0, living, share)
-    heated = capacity * (b @ np.array([0.0, 0.0, 0.0, 0.0, 1000.0, moved]))
+    heated = capacity * (b @ np.array([0.0, 0.0, 0.0, 0.0, 1000.0, moved, 0.0]))
 
     assert heated.sum() == pytest.approx(1000.0)
     assert heated[4] == pytest.approx(1000.0)
@@ -1423,7 +1433,9 @@ def test_a_screed_holds_part_of_the_slabs_heat_at_the_floors_surface():
     )
     uniform = np.full(6, 20.0)
 
-    stored = capacity @ (a @ uniform + b @ np.array([20.0, 0.0, 0.0, 0.0, 1000.0, 0.0]))
+    stored = capacity @ (
+        a @ uniform + b @ np.array([20.0, 0.0, 0.0, 0.0, 1000.0, 0.0, 0.0])
+    )
     assert stored == pytest.approx(1000.0)
     assert np.nonzero(b[:, 4])[0].tolist() == [4, 5]
     # Surface up to the room, conductance down to the concrete.
@@ -1431,6 +1443,41 @@ def test_a_screed_holds_part_of_the_slabs_heat_at_the_floors_surface():
     assert capacity[4] * a[4, 2] == pytest.approx(1900.0 * share)
     assert zone_observations(model)[0, 4] == model.sensor_mass_fraction
     assert zone_state_space(TRUE_MODEL)[0].shape == (4, 4)
+
+
+def test_the_occupants_warm_the_living_rooms_air_first():
+    """The occupants' heat lands in the living room's air, which its
+    thermostat reads: settled, the air sits their heat over its conductance
+    above the room's walls and furnishings - the same heat into the zone,
+    landing in the room itself without an air node."""
+
+    air_c = (
+        RHO_AIR_KG_PER_M3
+        * CP_AIR_J_PER_KG_K
+        * TRUE_VOLUME_M3
+        * (TRUE_MODEL.living_area_fraction)
+    )
+    model = replace(TRUE_MODEL, ua_living_air_w_per_k=600.0, c_living_air_j_per_k=air_c)
+    people = np.array([20.0, 0.0, 0.0, 0.0, 0.0, 0.0, 150.0])
+
+    a, b = zone_state_space(model)
+    plain_a, plain_b = zone_state_space(TRUE_MODEL)
+    uniform = np.full(5, 20.0)
+
+    assert a.shape == (5, 5)
+    assert zone_heat_capacities(model) @ (a @ uniform + b @ people) == pytest.approx(
+        150.0
+    )
+    assert zone_heat_capacities(TRUE_MODEL) @ (
+        plain_a @ uniform[:4] + plain_b @ people
+    ) == pytest.approx(150.0)
+    # Conduction both ways alike: C A symmetric.
+    capacity = zone_heat_capacities(model)
+    assert capacity[:, None] * a == pytest.approx((capacity[:, None] * a).T)
+
+    settled = np.linalg.solve(a, -b @ people)
+    assert settled[4] - settled[0] == pytest.approx(150.0 / 600.0)
+    assert zone_observation(model) @ settled == pytest.approx(settled[4])
 
 
 def test_a_screed_in_halves_holds_the_same_heat_and_shows_it_later():
@@ -1454,7 +1501,7 @@ def test_a_screed_in_halves_holds_the_same_heat_and_shows_it_later():
             3.0e6 * shares,
         ]
     )
-    heat = np.array([20.0, 0.0, 0.0, 0.0, 1000.0, 0.0])
+    heat = np.array([20.0, 0.0, 0.0, 0.0, 1000.0, 0.0, 0.0])
 
     assert a.shape == (8, 8)
     assert np.nonzero(b[:, 4])[0].tolist() == [6, 7]
@@ -1610,7 +1657,7 @@ def test_a_constant_schedule_filters_as_the_constant_system():
     a, b = zone_state_space(TRUE_MODEL)
     n = 50
     inputs = np.column_stack(
-        [rng.uniform(0, 15, n), rng.uniform(0, 500, n)] + [np.zeros(n)] * 4
+        [rng.uniform(0, 15, n), rng.uniform(0, 500, n)] + [np.zeros(n)] * 5
     )
     measured = 20.0 + rng.normal(0, 0.1, (n, 2))
     dt = np.full(n, DT_SECONDS)
