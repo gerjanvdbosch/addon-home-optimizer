@@ -3259,6 +3259,8 @@ class MPCOptimizer:
         living_gain_w = data.zone_living_gain_w or none_w
         rest_gain_w = data.zone_rest_gain_w or none_w
         living_air_gain_w = data.zone_living_air_gain_w or none_w
+        living_sun_w = data.zone_living_sun_w or none_w
+        rest_sun_w = data.zone_rest_sun_w or none_w
 
         # The same compressor serves both, so its output is the tank's nominal
         # heat - but the zone no more than its runs have moved (see
@@ -3513,7 +3515,8 @@ class MPCOptimizer:
             outdoor = zone_outdoor_c[k]
 
             # u = [T_outdoor, Q_internal, Q_living, Q_rest, Q_floor,
-            # Q_floor_moved, Q_living_air], the same input vector the zone is
+            # Q_floor_moved, Q_living_air, Q_sun_living, Q_sun_rest], the same
+            # input vector the zone is
             # identified with. Each state advances by its own row of the
             # discrete matrices, so where a gain lands - which room, or the
             # slabs - is the model's to decide, not this block's.
@@ -3529,6 +3532,8 @@ class MPCOptimizer:
                     + b_d[i, 3] * float(rest_gain_w[k])
                     + (b_d[i, 4] + moved_per_w * b_d[i, 5]) * floor_w(k)
                     + b_d[i, 6] * float(living_air_gain_w[k])
+                    + b_d[i, 7] * float(living_sun_w[k])
+                    + b_d[i, 8] * float(rest_sun_w[k])
                 )
 
         # What a thermostat reads of the plan: an operative temperature, part
@@ -3568,6 +3573,8 @@ class MPCOptimizer:
                         heat_w,
                         moved_per_w * heat_w,
                         float(living_air_gain_w[k]),
+                        float(living_sun_w[k]),
+                        float(rest_sun_w[k]),
                     ]
                 )
                 state = a_d @ state + b_d @ inputs
@@ -3707,9 +3714,7 @@ class MPCOptimizer:
             # The screeds too, where the floor has them: its surface - and
             # the pipes' halves, colder still while cooling.
             floor_states = zone_layers(building)
-            layers = ZONE_SLAB_STATES + (
-                ZONE_SCREED_STATES if floor_states > 4 else ()
-            )
+            layers = ZONE_SLAB_STATES + (ZONE_SCREED_STATES if floor_states > 4 else ())
             layers += ZONE_PIPE_STATES if floor_states > 6 else ()
 
             for k in range(num_steps):

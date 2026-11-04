@@ -14,12 +14,14 @@ from domain.physics import (
     CP_AIR_J_PER_KG_K,
     Q_PERSON_SENSIBLE_W,
     RHO_AIR_KG_PER_M3,
+    SUN_ON_FLOOR_SHARE,
     envelope_conductance_w_per_k,
     extension_shaded_fraction,
     floor_heat_moved_w,
     floor_heat_w,
     floor_living_fraction,
     floor_loops_conductance_w_per_k,
+    internal_gain_w,
     night_share,
     solar_gain_w,
     zone_heat_capacities,
@@ -53,6 +55,12 @@ TRUE_MODEL = BuildingThermalModel(
     living_envelope_fraction=0.6,
     living_area_fraction=TRUE_LIVING_AREA_M2 / TRUE_ZONE_AREA_M2,
     closed_shutter_gain_fraction=0.0,
+    # The synthetic night's baseload (see _raw_frame): the standby the fit
+    # measures, and keeps in whole (see physics.internal_gain_w).
+    asleep_baseload_w=200.0,
+    # Asleep in the bedrooms, all of them in the rest (see
+    # BuildingThermalIdentifier.ASLEEP_IN_REST_FRACTION).
+    asleep_in_rest_fraction=1.0,
 )
 
 
@@ -166,6 +174,16 @@ def _raw_frame() -> pd.DataFrame:
     # floor the two nodes drift together and their coupling is not excited.
     cooling = ((day % 2) == 1) & (hour >= 13.0) & (hour < 17.0)
 
+    # The household's electricity drops to its standby while it sleeps, at
+    # the hours the true model sleeps (local time).
+    local = target_time.tz_convert(LOCAL_TIMEZONE)
+    asleep = night_share(
+        local.hour + local.minute / 60.0,
+        TRUE_MODEL.asleep_from_hour,
+        TRUE_MODEL.asleep_until_hour,
+        TRUE_MODEL.asleep_spread_h,
+    )
+
     return pd.DataFrame(
         {
             "time": target_time - pd.Timedelta(minutes=30),
@@ -178,7 +196,7 @@ def _raw_frame() -> pd.DataFrame:
             "flow_lpm": np.where(cooling, COOLING_FLOW_LPM, 0.0),
             "T_supply": np.where(cooling, COOLING_SUPPLY_C, COOLING_RETURN_C),
             "T_return": COOLING_RETURN_C,
-            "baseload_w": 200.0 + 150.0 * daylight,
+            "baseload_w": 200.0 + 150.0 * (1.0 - asleep),
             "shutter_0": shutter,
             "presence_0": np.where((hour >= 17.0) | (hour < 8.0), "home", "not_home"),
             "T_air": 21.0,
@@ -430,11 +448,15 @@ def test_a_shut_shutter_still_passes_part_of_the_sun():
     assert (shut["open_living"] == 0.0).all()
 
     sunny = open_["I_facade_w_per_m2"].to_numpy() > 100.0
-    model = replace(TRUE_MODEL, closed_shutter_gain_fraction=0.1)
+    # Asleep by floor area: the room's gain is its sun alone, also around
+    # waking on a sunny morning.
+    model = replace(
+        TRUE_MODEL, closed_shutter_gain_fraction=0.1, asleep_in_rest_fraction=None
+    )
     # The living room's own heat, its air's included.
     shut_in, open_in = identifier._inputs(model, shut), identifier._inputs(model, open_)
-    ratio = (shut_in[sunny, 2] + shut_in[sunny, 6]) / (
-        open_in[sunny, 2] + open_in[sunny, 6]
+    ratio = shut_in[sunny][:, [2, 6, 7]].sum(axis=1) / (
+        open_in[sunny][:, [2, 6, 7]].sum(axis=1)
     )
 
     assert ratio == pytest.approx(0.1)
@@ -482,10 +504,10 @@ def test_asleep_the_occupants_heat_moves_to_the_bedrooms():
     identifier = _identifier()
     prepared = identifier.prepare(_raw_frame())
 
-    by_area = identifier._inputs(TRUE_MODEL, prepared)
-    upstairs = identifier._inputs(
-        replace(TRUE_MODEL, asleep_in_rest_fraction=1.0), prepared
+    by_area = identifier._inputs(
+        replace(TRUE_MODEL, asleep_in_rest_fraction=None), prepared
     )
+    upstairs = identifier._inputs(TRUE_MODEL, prepared)
 
     local = pd.DatetimeIndex(prepared["time"]).tz_convert(LOCAL_TIMEZONE)
     asleep = night_share(
@@ -932,8 +954,10 @@ def test_validate_flags_heat_lost_to_wind_the_model_lacks(caplog):
     with caplog.at_level("WARNING"):
         metrics = identifier.validate(windy)
 
-    assert metrics["wind_bias_slope_k_per_k_m_s"] < 0.0
+    # The loss reads as envelope here, the wind's own slope within its error:
+    # never as wind bringing heat.
     assert metrics["envelope_bias_slope_k_per_k"] < 0.0
+    assert metrics["wind_bias_slope_k_per_k_m_s"] < metrics["wind_bias_slope_std_error"]
     assert (
         "loses more heat with the wind" in caplog.text
         or "the envelope response is too weak" in caplog.text
@@ -1095,12 +1119,12 @@ def test_forecast_shutters_hold_for_the_day_then_follow_the_time_of_day():
     )
 
     assert (
-        forecast.loc[ahead & today, "living_gain_w"]
-        > shut.loc[ahead & today, "living_gain_w"]
+        forecast.loc[ahead & today, "living_sun_w"]
+        > shut.loc[ahead & today, "living_sun_w"]
     ).any()
     np.testing.assert_allclose(
-        forecast.loc[ahead & ~today, "living_gain_w"],
-        shut.loc[ahead & ~today, "living_gain_w"],
+        forecast.loc[ahead & ~today, "living_sun_w"],
+        shut.loc[ahead & ~today, "living_sun_w"],
     )
 
 
@@ -1130,12 +1154,12 @@ def test_forecast_shutters_follow_their_weekday_habit_while_shut():
     )
 
     assert (
-        habit.loc[ahead & today, "living_gain_w"]
-        > shut.loc[ahead & today, "living_gain_w"]
+        habit.loc[ahead & today, "living_sun_w"]
+        > shut.loc[ahead & today, "living_sun_w"]
     ).any()
     np.testing.assert_allclose(
-        habit.loc[ahead & ~today, "living_gain_w"],
-        shut.loc[ahead & ~today, "living_gain_w"],
+        habit.loc[ahead & ~today, "living_sun_w"],
+        shut.loc[ahead & ~today, "living_sun_w"],
     )
 
 
@@ -1211,8 +1235,14 @@ def test_forecast_takes_the_sky_ahead_from_the_pv_forecast():
     assert lit.any()
     # The sun with the occupants' heat in the room's air added back.
     np.testing.assert_allclose(
-        sunnier.loc[lit, ["living_gain_w", "living_air_gain_w"]].sum(axis=1),
-        2.0 * plain.loc[lit, ["living_gain_w", "living_air_gain_w"]].sum(axis=1),
+        sunnier.loc[lit, ["living_gain_w", "living_air_gain_w", "living_sun_w"]].sum(
+            axis=1
+        ),
+        2.0
+        * plain.loc[lit, ["living_gain_w", "living_air_gain_w", "living_sun_w"]].sum(
+            axis=1
+        ),
+        atol=1e-9,
     )
 
 
@@ -1240,11 +1270,30 @@ def test_a_rooms_sun_warms_that_room_before_the_rest():
     runs ahead."""
 
     a_d, b_d = discretize_zoh(*zone_state_space(TRUE_MODEL), 3600.0)
-    sun_in_living = np.array([20.0, 0.0, 2000.0, 0.0, 0.0, 0.0, 0.0])
+    sun_in_living = np.array([20.0, 0.0, 2000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
     state = a_d @ np.full(4, 20.0) + b_d @ sun_in_living
 
     assert state[0] - 20.0 > 2.0 * (state[1] - 20.0) > 0.0
+
+
+def test_the_sun_through_open_glass_falls_mostly_on_the_floor():
+    """Each floor's sun through its open glass lands whole in the zone: its
+    share on that floor's surface, the rest in the living room's air - or,
+    without an air node, the room - and upstairs in the room."""
+
+    air_c = RHO_AIR_KG_PER_M3 * CP_AIR_J_PER_KG_K * TRUE_VOLUME_M3 * 0.3
+    for model in (
+        TRUE_MODEL,
+        replace(TRUE_MODEL, ua_living_air_w_per_k=600.0, c_living_air_j_per_k=air_c),
+    ):
+        _, b = zone_state_space(model)
+        landed = zone_heat_capacities(model)[:, None] * b[:, 7:9]
+        air = 4 if model.ua_living_air_w_per_k else 0
+
+        np.testing.assert_allclose(landed.sum(axis=0), [1.0, 1.0])
+        np.testing.assert_allclose(landed[2:4], np.diag([SUN_ON_FLOOR_SHARE] * 2))
+        assert landed[air, 0] == landed[1, 1] == pytest.approx(1.0 - SUN_ON_FLOOR_SHARE)
 
 
 def test_glazing_takes_its_room_in_the_compact_form():
@@ -1350,7 +1399,9 @@ def test_the_floors_heat_lands_only_under_the_loops_that_are_open():
     )
     living = floor_living_fraction(share, 0.0, share)
     moved = floor_heat_moved_w(1000.0, living, share)
-    heated = capacity * (b @ np.array([0.0, 0.0, 0.0, 0.0, 1000.0, moved, 0.0]))
+    heated = capacity * (
+        b @ np.array([0.0, 0.0, 0.0, 0.0, 1000.0, moved, 0.0, 0.0, 0.0])
+    )
 
     assert heated.sum() == pytest.approx(1000.0)
     assert heated[4] == pytest.approx(1000.0)
@@ -1434,7 +1485,7 @@ def test_a_screed_holds_part_of_the_slabs_heat_at_the_floors_surface():
     uniform = np.full(6, 20.0)
 
     stored = capacity @ (
-        a @ uniform + b @ np.array([20.0, 0.0, 0.0, 0.0, 1000.0, 0.0, 0.0])
+        a @ uniform + b @ np.array([20.0, 0.0, 0.0, 0.0, 1000.0, 0.0, 0.0, 0.0, 0.0])
     )
     assert stored == pytest.approx(1000.0)
     assert np.nonzero(b[:, 4])[0].tolist() == [4, 5]
@@ -1458,7 +1509,7 @@ def test_the_occupants_warm_the_living_rooms_air_first():
         * (TRUE_MODEL.living_area_fraction)
     )
     model = replace(TRUE_MODEL, ua_living_air_w_per_k=600.0, c_living_air_j_per_k=air_c)
-    people = np.array([20.0, 0.0, 0.0, 0.0, 0.0, 0.0, 150.0])
+    people = np.array([20.0, 0.0, 0.0, 0.0, 0.0, 0.0, 150.0, 0.0, 0.0])
 
     a, b = zone_state_space(model)
     plain_a, plain_b = zone_state_space(TRUE_MODEL)
@@ -1501,7 +1552,7 @@ def test_a_screed_in_halves_holds_the_same_heat_and_shows_it_later():
             3.0e6 * shares,
         ]
     )
-    heat = np.array([20.0, 0.0, 0.0, 0.0, 1000.0, 0.0, 0.0])
+    heat = np.array([20.0, 0.0, 0.0, 0.0, 1000.0, 0.0, 0.0, 0.0, 0.0])
 
     assert a.shape == (8, 8)
     assert np.nonzero(b[:, 4])[0].tolist() == [6, 7]
@@ -1657,7 +1708,7 @@ def test_a_constant_schedule_filters_as_the_constant_system():
     a, b = zone_state_space(TRUE_MODEL)
     n = 50
     inputs = np.column_stack(
-        [rng.uniform(0, 15, n), rng.uniform(0, 500, n)] + [np.zeros(n)] * 5
+        [rng.uniform(0, 15, n), rng.uniform(0, 500, n)] + [np.zeros(n)] * 7
     )
     measured = 20.0 + rng.normal(0, 0.1, (n, 2))
     dt = np.full(n, DT_SECONDS)
@@ -1956,3 +2007,22 @@ def test_an_extension_shades_its_side_of_the_day_by_its_depth():
     )
 
     assert shaded == pytest.approx([0.0, 0.0, 0.5, 1.0, 1.0, 1.0])
+
+
+def test_internal_gain_keeps_the_standby_whole():
+    """The standby stays in the dwelling whole, what is switched on above it at
+    the share; without a standby the whole baseload at the share, as before."""
+
+    baseload = np.array([80.0, 130.0, 1130.0])
+    occupants = np.array([0.0, 1.0, 2.0])
+
+    gain = internal_gain_w(baseload, 0.4, occupants, standby_w=130.0)
+
+    np.testing.assert_allclose(
+        gain,
+        [80.0, 130.0 + Q_PERSON_SENSIBLE_W, 130.0 + 400.0 + 2 * Q_PERSON_SENSIBLE_W],
+    )
+    np.testing.assert_allclose(
+        internal_gain_w(baseload, 0.4, occupants),
+        0.4 * baseload + occupants * Q_PERSON_SENSIBLE_W,
+    )

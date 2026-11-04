@@ -1292,7 +1292,7 @@ def test_a_zone_run_handed_over_by_the_tank_takes_the_loops_heat():
     for k in range(len(result.schedule) - 1):
         floor_w = result.space_heat_w[k] + handover_j / 900.0 * (k in handed)
         state = a_d @ state + b_d @ np.array(
-            [data.ambient_temperature, 0.0, 0.0, 0.0, floor_w, 0.0, 0.0]
+            [data.ambient_temperature, 0.0, 0.0, 0.0, floor_w, 0.0, 0.0, 0.0, 0.0]
         )
 
         assert float(zone_observation(BUILDING_MODEL) @ state) == pytest.approx(
@@ -1769,7 +1769,7 @@ def test_a_plan_through_the_living_rooms_loops_alone_heats_its_floor():
 
     for k in range(len(heat) - 1):
         state = a_d @ state + b_d @ np.array(
-            [5.0, 150.0, 0.0, 0.0, heat[k], (1.0 - share) * heat[k], 0.0]
+            [5.0, 150.0, 0.0, 0.0, heat[k], (1.0 - share) * heat[k], 0.0, 0.0, 0.0]
         )
         assert living_floor[k + 1] == pytest.approx(state[2], abs=1e-4)
 
@@ -2673,7 +2673,7 @@ def test_a_cooling_run_takes_its_ramp_from_the_floor_in_the_step_it_starts():
 
     def zone_after(floor_w: float) -> float:
         state = a_d @ np.array(data.zone_state) + b_d @ np.array(
-            [30.0, 150.0, 0.0, 0.0, floor_w, 0.0, 0.0]
+            [30.0, 150.0, 0.0, 0.0, floor_w, 0.0, 0.0, 0.0, 0.0]
         )
 
         return float(zone_observation(TWO_NODE) @ state)

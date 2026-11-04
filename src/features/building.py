@@ -224,7 +224,19 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # A flow reading must be strictly positive to mean anything physically.
     MIN_FLOW_LPM = 0.0
 
-    TRAIN_RATIO = 0.80
+    # The fit weighs each rollout's error by how recent it is, halving every
+    # FIT_HALF_LIFE_DAYS before the newest: the household lives differently
+    # through the year - windows and doors open by day and night in summer,
+    # shut in the heating season - and the model has no term for that, so
+    # fitted over the whole year the envelope took summer's airing into the
+    # heating season (88 W/K, 53 fitted on October alone) and the rest of the
+    # house cooled too fast on cold nights while the living room cooled too
+    # slowly. Walk-forward on real data (fitted Jun up to 1 Aug, 1 Sep, 20 and
+    # 25 Oct 2026, scored on the weeks after): the living room and the rest
+    # together 1.7/2.2/5.8/6.7% better at 14 days, the living room 4 h into a
+    # run 4-7% better, its error with the floor circuit active 6% worse;
+    # 7 and 10 days did about as well, 30 and 60 days less (1.6 and 0.5%).
+    FIT_HALF_LIFE_DAYS = 14.0
 
     # Excludes transitions spanning a data gap far larger than the nominal
     # sampling interval, which would test steady-state convergence rather than
@@ -460,6 +472,17 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # parameters take back. A share by day as well fitted 0.71 and 0.92, not
     # identified - the occupants' heat alone; with what they switch on it is
     # (see BuildingThermalModel.awake_in_living_fraction).
+    # Held at all of it since 4 Nov 2026: the bedrooms are in the rest, and
+    # nobody sleeps in the thermostat's room. Fitted with the newest weeks
+    # weighed most (see FIT_HALF_LIFE_DAYS) it came out 0.59-0.69 (0.22-0.25
+    # with a phone tracker reporting one sleeper away for two weeks) - not
+    # identified in the heating season, where it took the living room's
+    # night. Held at 1, walk-forward from 20 and 25 Oct 2026 (tracker period
+    # filled with that person's usual week): the living room 4 h into a run
+    # 0.117/0.127 -> 0.106/0.123 K, with the floor active 0.082/0.103 ->
+    # 0.078/0.101, the rest at 07:00 -0.17/-0.17 -> -0.15/-0.14 K; the
+    # living room overall 1% worse.
+    ASLEEP_IN_REST_FRACTION = 1.0
     MIN_ASLEEP_FROM_HOUR = 19.0
     MAX_ASLEEP_FROM_HOUR = 28.0
     INITIAL_ASLEEP_FROM_HOUR = 23.0
@@ -498,14 +521,11 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # how fast that falls, where it settles: a few runs before they separate.
     MIN_SCREED_RUNS = 5
 
-    # Share of the baseload dissipated inside the zone. The zone is the whole
-    # dwelling and the baseload every appliance but the heat pump, so nearly
-    # all of it: only hot water down the drain and appliances outside leave.
-    # Yet it fits at 0.4 (Jul-Oct 2026), and bounded at 0.8 it sat on that
-    # bound while the envelope, the slab and the sensor fraction all moved:
-    # something the baseload goes with - plausibly the cooker hood and the
-    # bathroom's ventilation boost - carries heat out that the model lacks.
-    # Left at [0, 1] until that is modelled, rather than hide it elsewhere.
+    # Share of what is switched on above the standby that is dissipated inside
+    # the zone (see physics.internal_gain_w). Taken over the whole baseload it
+    # fitted 0.4 (Jul-Oct 2026), and bounded at 0.8 it sat on that bound: the
+    # standby stays in whole, but the cooker's heat partly goes up the hood and
+    # the washing's down the drain. Left at [0, 1].
     INITIAL_INTERNAL_GAIN_FRACTION = 0.5
 
     # The living room's air to its walls and furnishings (see
@@ -1223,7 +1243,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
     def _inputs(self, model, df: pd.DataFrame) -> np.ndarray:
         """u = [T_outdoor, Q_internal, Q_living, Q_rest, Q_floor,
-        Q_floor_moved, Q_living_air] per sample (see
+        Q_floor_moved, Q_living_air, Q_sun_living, Q_sun_rest] per sample (see
         physics.zone_state_space).
 
         Rebuilt per fit iteration because three of the six depend on
@@ -1243,18 +1263,21 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             model.extension_west_depth_ratio,
         )
         closed_gain = model.closed_shutter_gain_fraction
-        q_solar = [
-            solar_gain_w(
-                a_eff_m2=aperture,
-                # The open glass passes its full gain, the shut part a share.
-                shutter_open_fraction=closed_gain
-                + (1.0 - closed_gain) * df[column].to_numpy(dtype=float),
-                facade_irradiance=facade,
-            )
-            for aperture, column, facade in (
-                (model.a_eff_m2, "open_living", irradiance - shaded),
-                (model.a_eff_rest_m2, "open_rest", irradiance),
-            )
+        # The open glass passes its full gain, onto the floor and furnishings;
+        # the shut part a share, from the warm shutter and glass into the room
+        # (see physics.zone_state_space).
+        glazing = (
+            (
+                model.a_eff_m2,
+                df["open_living"].to_numpy(dtype=float),
+                irradiance - shaded,
+            ),
+            (model.a_eff_rest_m2, df["open_rest"].to_numpy(dtype=float), irradiance),
+        )
+        q_open = [solar_gain_w(a, open_, facade) for a, open_, facade in glazing]
+        q_shut = [
+            solar_gain_w(a, closed_gain * (1.0 - open_), facade)
+            for a, open_, facade in glazing
         ]
 
         occupants = df["occupants"].to_numpy(dtype=float)
@@ -1262,6 +1285,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             baseload_w=df["baseload_w"].to_numpy(dtype=float),
             internal_gain_fraction=model.internal_gain_fraction,
             occupants=occupants,
+            standby_w=model.asleep_baseload_w,
         )
 
         # Q_internal lands by floor area; asleep, the occupants are in the
@@ -1305,11 +1329,12 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             [
                 df["T_out"].to_numpy(dtype=float),
                 q_internal,
-                q_solar[0] - moved - q_living_air,
-                q_solar[1] + moved,
+                q_shut[0] - moved - q_living_air,
+                q_shut[1] + moved,
                 df["Q_floor_w"].to_numpy(dtype=float),
                 df["Q_floor_moved_w"].to_numpy(dtype=float),
                 q_living_air,
+                *q_open,
             ]
         )
 
@@ -1483,12 +1508,20 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         df: pd.DataFrame,
         plan: tuple[list[tuple[int, int]], int, int],
     ) -> np.ndarray:
-        predicted, measured, _, _ = self._simulate_windows(x, df, plan)
+        predicted, measured, _, rows = self._simulate_windows(x, df, plan)
+
+        # Weighed by how recent they are (see FIT_HALF_LIFE_DAYS): each
+        # residual by the square root, its square by the weight itself.
+        time_ns = pd.to_datetime(df["time"], utc=True).astype("int64").to_numpy()
+        age_days = (time_ns[-1] - time_ns[rows]) / 86400e9
+        weight = np.sqrt(0.5 ** (age_days / self.FIT_HALF_LIFE_DAYS))[:, None]
 
         # Both thermometers, each in its own right: the rest of the house is
         # what pins down how the rooms share the dwelling's heat. A reading
         # that is missing has nothing to say.
-        return np.nan_to_num((predicted - measured).reshape(*predicted.shape[:-2], -1))
+        return np.nan_to_num(
+            ((predicted - measured) * weight).reshape(*predicted.shape[:-2], -1)
+        )
 
     def _bounds(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """(lower, initial, upper) for the parameter vector.
@@ -1547,7 +1580,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 0.0,
                 0.0,
                 0.0,
-                0.0,
+                # Held: nobody sleeps in the living room (see
+                # ASLEEP_IN_REST_FRACTION).
+                self.ASLEEP_IN_REST_FRACTION,
                 0.0,
                 self.MIN_WINDOW_HALF_DAY_C,
                 self.MIN_WINDOW_SPREAD_K,
@@ -1576,7 +1611,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 max_extension,
                 max_extension,
                 max(self.MAX_UA_CEILING_W_PER_M2_K * ceiling_m2, self.MIN_F_SCALE),
-                1.0,
+                self.ASLEEP_IN_REST_FRACTION,
                 self.MAX_UA_WINDOW_W_PER_K,
                 self.MAX_WINDOW_HALF_DAY_C,
                 self.MAX_WINDOW_SPREAD_K,
@@ -1606,8 +1641,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.INITIAL_EXTENSION_DEPTH_RATIO,
                 self.INITIAL_EXTENSION_DEPTH_RATIO,
                 self.INITIAL_UA_CEILING_W_PER_M2_K * ceiling_m2,
-                # Asleep by floor area to start, as by day.
-                1.0 - self.living_area_fraction,
+                self.ASLEEP_IN_REST_FRACTION,
                 self.INITIAL_UA_WINDOW_W_PER_K,
                 self.INITIAL_WINDOW_HALF_DAY_C,
                 self.INITIAL_WINDOW_SPREAD_K,
@@ -1684,12 +1718,11 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         median_dt = float(df["dt_seconds"].median())
 
-        split_index = int(len(df) * self.TRAIN_RATIO)
-
-        if split_index <= 1 or split_index >= len(df):
-            raise ValueError("Invalid train/test split.")
-
-        train_df = df.iloc[:split_index].reset_index(drop=True)
+        # Fitted on all of it, the newest above all (see FIT_HALF_LIFE_DAYS):
+        # held out, the newest weeks were the season it would plan in (a fit
+        # made on 4 Nov 2026 ended on 4 Oct, before the heating season).
+        # validate() scores a model on data of its own choosing.
+        train_df = df
 
         plan = self._rollout_plan(train_df, median_dt)
         lower, initial, upper = self._bounds()
@@ -1756,11 +1789,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         predicted, _, active, _ = self._simulate_windows(x, train_df, plan)
 
         logger.info(
-            "Building thermal calibration: %d training points, %d validation "
-            "points, %d scored rollout samples (%.0f%% with the floor circuit "
-            "active), f_scale=%.4g K",
+            "Building thermal calibration: %d training points, %d scored rollout "
+            "samples (%.0f%% with the floor circuit active), f_scale=%.4g K",
             len(train_df),
-            len(df) - len(train_df),
             len(predicted),
             100.0 * float(np.mean(active)) if active.size else 0.0,
             f_scale,
@@ -2246,9 +2277,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # The rooms' own channels; the floor's is the floor's error.
         return heat[:, :2]
 
-    def _measured_sleep(
-        self, df: pd.DataFrame
-    ) -> tuple[float, float, float, float]:
+    def _measured_sleep(self, df: pd.DataFrame) -> tuple[float, float, float, float]:
         """The household's hours of sleep (to bed, up, spread - see
         physics.night_share) and its baseload asleep (W) from its electricity: the median baseload at each
         local time of day, one level awake and a lower one asleep, stepping
@@ -2833,6 +2862,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         zone["living_gain_w"] = inputs[:, 2]
         zone["rest_gain_w"] = inputs[:, 3]
         zone["living_air_gain_w"] = inputs[:, 6]
+        zone["living_sun_w"] = inputs[:, 7]
+        zone["rest_sun_w"] = inputs[:, 8]
         # The envelope a plan's zone has each step (see _schedule).
         zone["envelope_w_per_k"] = self._envelope(model, prepared)
         # Which loops the floor's runs went through, and their flow, where

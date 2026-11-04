@@ -48,6 +48,15 @@ CP_AIR_J_PER_KG_K = 1005.0
 # than silently dropped.
 Q_PERSON_SENSIBLE_W = 75.0
 
+# Share of the sun through open glazing that the floor absorbs (the PVC on the
+# screed); the rest is taken up by the furnishings and walls' light surfaces,
+# which pass it to the air within minutes. An assumption, not a fit: freed, the
+# share is not identified (0.36-0.91 over the folds, Jun-Nov 2026). Fixed,
+# 0.5 and 0.65 score alike and 0.8 worse in summer; at 0.65 the held-out error,
+# living room plus the rest, fell 2-5% against all the sun in the rooms' heavy
+# nodes, the living room's 4 h into a floor run 7-19%.
+SUN_ON_FLOOR_SHARE = 0.65
+
 
 def tank_state_space(
     volume_l: float,
@@ -332,12 +341,17 @@ def zone_state_space(
     air, where it has a node of its own (see
     BuildingThermalModel.ua_living_air_w_per_k), last;
     u = [T_outdoor, Q_internal, Q_living, Q_rest, Q_floor, Q_floor_moved,
-    Q_living_air].
+    Q_living_air, Q_sun_living, Q_sun_rest].
 
     Q_internal and Q_floor are the dwelling's, divided by floor area; Q_living
-    and Q_rest land in that room alone: its own glazing's sun, and the
+    and Q_rest land in that room alone: the sun its glazing lets through behind
+    lowered shutters, which warm and pass it on from the window, and the
     occupants' heat that is there beyond its floor area's share (asleep, in the
-    bedrooms; awake, with what they switch on, in the living room). The floor's heat enters each floor's screed - its pipes'
+    bedrooms; awake, with what they switch on, in the living room).
+    Q_sun_living and Q_sun_rest are the sun through each floor's open glazing:
+    SUN_ON_FLOOR_SHARE of it falls on its floor's surface, the rest on lighter
+    surfaces that pass it to the air - the living room's air node, where it
+    has one, else the room. The floor's heat enters each floor's screed - its pipes'
     half where it has two, which passes it up to the half its room sees and
     down to the concrete - or without one its slab, the surface its room
     sees. Q_floor_moved is
@@ -372,7 +386,7 @@ def zone_state_space(
     size = zone_size(model)
 
     a = np.zeros((size, size))
-    b = np.zeros((size, 7))
+    b = np.zeros((size, 9))
 
     for room, other in ((0, 1), (1, 0)):
         slab = room + 2
@@ -392,6 +406,7 @@ def zone_state_space(
         b[room, 2 + room] = 1.0 / c_room
         b[pipes, 4] = shares[room] / c_pipes
         b[pipes, 5] = (1.0 if room == 0 else -1.0) / c_pipes
+        b[top, 7 + room] = SUN_ON_FLOOR_SHARE / c_top
 
         if layered:
             a[top, top] -= layer[room] / c_top
@@ -412,9 +427,11 @@ def zone_state_space(
     a[3, 0] += ceiling / c[3]
 
     air = zone_living_air(model)
+    b[1, 8] = (1.0 - SUN_ON_FLOOR_SHARE) / c[1]
 
     if air is None:
         b[0, 6] = 1.0 / c[0]
+        b[0, 7] = (1.0 - SUN_ON_FLOOR_SHARE) / c[0]
     else:
         ua_air = model.ua_living_air_w_per_k
         a[0, 0] -= ua_air / c[0]
@@ -422,6 +439,7 @@ def zone_state_space(
         a[air, 0] = ua_air / c[air]
         a[air, air] = -ua_air / c[air]
         b[air, 6] = 1.0 / c[air]
+        b[air, 7] = (1.0 - SUN_ON_FLOOR_SHARE) / c[air]
 
     return a, b
 
@@ -738,16 +756,27 @@ def internal_gain_w(
     baseload_w: np.ndarray,
     internal_gain_fraction: float,
     occupants: np.ndarray,
+    standby_w: float = 0.0,
 ) -> np.ndarray:
-    """Q_int = f_indoor * P_baseload + n_occupants * Q_PERSON_SENSIBLE_W.
+    """Q_int = min(P, P_standby) + f_indoor * max(P - P_standby, 0)
+    + n_occupants * Q_PERSON_SENSIBLE_W.
 
-    Household electricity ends up as heat inside the building, so the measured
-    baseload power is a direct measurement of appliance and lighting gain rather
-    than something to fit. Only its in-zone fraction is identified, because the
-    sensor covers the whole house while the model covers one zone.
+    Household electricity ends up as heat, so the measured baseload power is a
+    direct measurement of appliance and lighting gain rather than something to
+    fit. The standby that runs day and night (the fridge, the network) stays in
+    the dwelling whole; of what is switched on above it only a share does -
+    the cooker's heat partly goes up the hood, the washing machine's and the
+    dishwasher's down the drain - and that share is identified. A standby of 0
+    takes the whole baseload at the share, as a model saved before it.
     """
 
-    return internal_gain_fraction * baseload_w + occupants * Q_PERSON_SENSIBLE_W
+    baseload_w = np.asarray(baseload_w, dtype=float)
+
+    return (
+        np.minimum(baseload_w, standby_w)
+        + internal_gain_fraction * np.clip(baseload_w - standby_w, 0.0, None)
+        + occupants * Q_PERSON_SENSIBLE_W
+    )
 
 
 # Magnus over water (Sonntag's coefficients), in both directions: the relation

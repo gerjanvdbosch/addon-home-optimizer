@@ -252,7 +252,13 @@ class BuildingThermalModel:
     # sensor, not to the balance: no heat flows because of it.
     sensor_mass_fraction: float
     # Fraction of the baseload electrical power - every appliance but the heat
-    # pump - released as heat in the zone, the whole dwelling.
+    # pump - released as heat in the zone, the whole dwelling: of what is
+    # switched on above the standby (asleep_baseload_w), which stays in whole
+    # (see physics.internal_gain_w). Real data, three folds Jun-Nov 2026:
+    # 0.32-0.45, the cooker's heat partly up the hood, the washing's down the
+    # drain; held out the living room 0.0825/0.116/0.094 K -> 0.082/0.111/
+    # 0.095, the rest 0.087/0.163/0.115 -> 0.085/0.152/0.115 against the
+    # whole baseload at one share.
     internal_gain_fraction: float
     # The same aperture for the rest of the house's south glazing (m2).
     a_eff_rest_m2: float

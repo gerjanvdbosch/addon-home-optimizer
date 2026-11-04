@@ -168,13 +168,18 @@ class MPCInput:
     # node (see physics.zone_state_space), but they are forecast apart.
     zone_internal_gain_w: tuple[float, ...] = ()
     # The heat landing in the thermostat's room alone, and in the rest alone:
-    # its glazing's sun, and the occupants' heat beyond the floor-area share
+    # its glazing's sun behind lowered shutters, and the occupants' heat beyond
+    # the floor-area share
     # (asleep, in the bedrooms - see physics.zone_state_space).
     zone_living_gain_w: tuple[float, ...] = ()
     zone_rest_gain_w: tuple[float, ...] = ()
     # The heat of the occupants awake in the living room, which warms its air
     # first (see physics.zone_state_space).
     zone_living_air_gain_w: tuple[float, ...] = ()
+    # The sun through each floor's open glazing, onto its floor and lighter
+    # surfaces (see physics.zone_state_space).
+    zone_living_sun_w: tuple[float, ...] = ()
+    zone_rest_sun_w: tuple[float, ...] = ()
     # The envelope's conductance per step (W/K): windows open more on warmer
     # days (see physics.envelope_conductance_w_per_k). Empty is the building
     # model's own, every step.
