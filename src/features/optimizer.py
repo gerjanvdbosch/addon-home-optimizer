@@ -164,6 +164,24 @@ INFEASIBLE = 1e12
 # horizon, 2 h about the same.
 FRONT_RELAXATION_HOURS = 4.0
 
+W_PER_KW = 1000.0
+
+
+def _watts(power_kw: pyo.Var) -> pyo.Expression:
+    """`power_kw` in W, as the program's equations use it.
+
+    Its powers are variables in kW: in W, the zone's heat entered its dynamics
+    with coefficients down to 1e-9 K/W beside unit ones on its temperatures,
+    and HiGHS's bound propagation at the root, to its feasibility tolerance,
+    proved feasible plans infeasible - 4 of 17 starting states within 0.1 mK
+    of a real one (5 Nov 2026), the zone then left out of the plan. In kW none
+    was, with the same plans.
+    """
+
+    return pyo.Expression(
+        power_kw.index_set(), rule=lambda m, *i: W_PER_KW * power_kw[i]
+    )
+
 
 @dataclass
 class TankSetting:
@@ -1808,7 +1826,10 @@ class MPCOptimizer:
         # the tank reaches its setpoint (published per run - see
         # app.optimization), or modulates down near its tank limit (real data:
         # ~7 kW at 36-47 degC, ~3 kW at 55 degC).
-        model.q_heat_pump_w = pyo.Var(model.K, bounds=lambda m, k: (0.0, heat_w[k]))
+        model.q_heat_pump_kw = pyo.Var(
+            model.K, bounds=lambda m, k: (0.0, heat_w[k] / W_PER_KW)
+        )
+        model.q_heat_pump_w = _watts(model.q_heat_pump_kw)
 
         # The booster heater is a resistive element: it cannot modulate, so while
         # it runs it heats at its identified rating. Its heat per step is still
@@ -1820,7 +1841,10 @@ class MPCOptimizer:
         # early in a step left the rest of that step empty before the booster
         # started - a gap the real run never has.
         model.booster_on = pyo.Var(model.K, domain=pyo.Binary)
-        model.q_booster_w = pyo.Var(model.K, bounds=(0.0, booster_heat_w or 0.0))
+        model.q_booster_kw = pyo.Var(
+            model.K, bounds=(0.0, (booster_heat_w or 0.0) / W_PER_KW)
+        )
+        model.q_booster_w = _watts(model.q_booster_kw)
 
         # Whether anything heats the tank in a step, 0 or 1 even in a step both
         # sources share: the bounds below leave no other value once boiler_on
@@ -2314,7 +2338,7 @@ class MPCOptimizer:
             last = k + 1 == num_steps
             if not tank.booster_allowed[k]:
                 model.booster_on[k].fix(0)
-                model.q_booster_w[k].fix(0.0)
+                model.q_booster_kw[k].fix(0.0)
                 continue
 
             booster = model.booster_on[k]
@@ -2549,7 +2573,8 @@ class MPCOptimizer:
         model.heat_pump_power_constraint = pyo.ConstraintList()
 
         model.S = pyo.RangeSet(0, len(solar_scenarios) - 1)
-        model.active_power_w = pyo.Var(model.K, model.S, domain=pyo.NonNegativeReals)
+        model.active_power_kw = pyo.Var(model.K, model.S, domain=pyo.NonNegativeReals)
+        model.active_power_w = _watts(model.active_power_kw)
 
         model.active_power_constraint = pyo.ConstraintList()
 
@@ -2559,7 +2584,8 @@ class MPCOptimizer:
         # Never below zero: the power line is a linear fit, and on inputs far
         # outside what it was fitted on it can dip below zero at a cold tank,
         # which no compressor does.
-        model.draw_w = pyo.Var(model.K, domain=pyo.NonNegativeReals)
+        model.draw_kw = pyo.Var(model.K, domain=pyo.NonNegativeReals)
+        model.draw_w = _watts(model.draw_kw)
 
         start_power_w = self.cop_model.start_step_power_w if self.cop_model else 0.0
         model.start_temperature = pyo.Var(model.K)
@@ -3305,9 +3331,11 @@ class MPCOptimizer:
         # floor's heat lands in (see BuildingThermalModel).
         model.ZONE_STATES = pyo.RangeSet(0, num_states - 1)
         model.zone_state = pyo.Var(model.K, model.ZONE_STATES)
-        model.q_space_w = pyo.Var(
-            model.K, bounds=(-max_heat_w, 0.0) if cooling else (0.0, max_heat_w)
+        max_heat_kw = max_heat_w / W_PER_KW
+        model.q_space_kw = pyo.Var(
+            model.K, bounds=(-max_heat_kw, 0.0) if cooling else (0.0, max_heat_kw)
         )
+        model.q_space_w = _watts(model.q_space_kw)
         model.zone_slack = pyo.Var(model.K, domain=pyo.NonNegativeReals)
         model.zone_excess = pyo.Var(model.K, domain=pyo.NonNegativeReals)
         model.zone_discomfort_k = pyo.Var(model.K, domain=pyo.NonNegativeReals)
@@ -3393,7 +3421,8 @@ class MPCOptimizer:
         if ramp_seconds:
             # |Q| * (the zone starts the compressor), exact: the start is 0 or 1
             # wherever the binaries are, and the heat bounded by the compressor.
-            model.space_ramp_w = pyo.Var(model.K, bounds=(0.0, max_heat_w))
+            model.space_ramp_kw = pyo.Var(model.K, bounds=(0.0, max_heat_kw))
+            model.space_ramp_w = _watts(model.space_ramp_kw)
 
             for k in range(num_steps):
                 zone_start = (
@@ -3778,7 +3807,8 @@ class MPCOptimizer:
         chosen = cooling or efficiency is not None
 
         if efficiency is not None:
-            model.space_power_w = pyo.Var(model.K, domain=pyo.NonNegativeReals)
+            model.space_power_kw = pyo.Var(model.K, domain=pyo.NonNegativeReals)
+            model.space_power_w = _watts(model.space_power_kw)
 
         def draw_w(moved_w: float, outdoor: float, sink_c: float) -> float:
             """The electricity (W) to move this heat into (or, cooling, out of)

@@ -29,6 +29,7 @@ from domain.physics import (
 from features import optimizer as optimizer_module
 from features.optimizer import (
     MIP_ABSOLUTE_GAP_EUR,
+    W_PER_KW,
     MPCOptimizer,
     plan_tank,
     surplus_scenarios,
@@ -226,7 +227,9 @@ def test_thermal_dynamics_matches_manual_discretization():
         model.boiler_on[k].fix(v)
         # Heat input is continuous (the compressor modulates), so fix it to the
         # nominal output this test re-derives by hand.
-        model.q_heat_pump_w[k].fix(THERMAL_MODEL.q_in_nominal_w if v else 0.0)
+        model.q_heat_pump_kw[k].fix(
+            THERMAL_MODEL.q_in_nominal_w / W_PER_KW if v else 0.0
+        )
 
     from pyomo.contrib.appsi.solvers.highs import Highs
 

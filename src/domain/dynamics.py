@@ -151,6 +151,8 @@ def kalman_states(
     observation: np.ndarray | None = None,
     disturbance_inputs: tuple[int, ...] = (1,),
     schedule: ScheduledSystem | None = None,
+    reading_drift_k: tuple[float, ...] = (),
+    reading_recovery_seconds: float | None = None,
 ) -> np.ndarray:
     """Filtered state estimate at every sample, from one scalar measurement.
 
@@ -183,6 +185,10 @@ def kalman_states(
     each; a reading that is missing (NaN) simply corrects nothing that step.
 
     With a `schedule` the system is its, step by step, in place of (a, b).
+
+    `reading_drift_k` is, per thermometer, the spread (K) of a departure of
+    its reading from the state it reads that moves no heat - a draught over
+    the sensor - and fades over `reading_recovery_seconds`; 0 for none.
     """
 
     n = a.shape[0]
@@ -199,6 +205,12 @@ def kalman_states(
         measurement_variance,
         h,
         disturbance_inputs,
+        reading_drift_k,
+        (
+            np.exp(-np.asarray(dt_seconds, float)[1:] / reading_recovery_seconds)
+            if any(reading_drift_k)
+            else None
+        ),
     )
 
 
@@ -211,14 +223,25 @@ def kalman_filter(
     measurement_variance: float,
     observation: np.ndarray,
     disturbance_inputs: tuple[int, ...],
+    reading_drift_k: tuple[float, ...] = (),
+    reading_decay: np.ndarray | None = None,
 ) -> np.ndarray:
     """kalman_states over steps discrete_steps() gives - or over many systems
     at once against the same readings, each along a leading axis of the steps,
-    the inputs and the observation (a fit's parameter sets, say)."""
+    the inputs and the observation (a fit's parameter sets, say).
+
+    A reading's drift (see kalman_states) is a state of the filter's own, one
+    per thermometer, decaying by `reading_decay` each step (exp(-dt/tau)) and
+    renewed so that its spread stays reading_drift_k: an AR(1) departure added
+    to what the thermometer reads. It is no part of the system, so it is left
+    out of the estimate returned.
+    """
 
     h = observation
     n = a_steps.shape[-1]
     readings = np.asarray(measured, float).reshape(len(measured), -1)
+    drift_k = np.asarray(reading_drift_k, float)
+    drifting = bool(drift_k.any())
 
     # Unmeasured parts start where the readings put them on average, and each
     # reading's departure from that is spread over the states it sees. States
@@ -229,6 +252,30 @@ def kalman_filter(
     covariance = np.broadcast_to(
         np.eye(n) * measurement_variance, state.shape[:-2] + (n, n)
     )
+
+    # The drift, after the system's states: driven by nothing, read in its
+    # thermometer's reading alone, starting at none at its own spread.
+    if drifting:
+        size = n + len(drift_k)
+        own = n + np.arange(len(drift_k))
+        augmented = np.zeros(a_steps.shape[:-2] + (size, size))
+        augmented[..., :n, :n] = a_steps
+        augmented[..., own, own] = reading_decay[:, None]
+        a_steps = augmented
+        augmented = np.zeros(b_steps.shape[:-2] + (size, b_steps.shape[-1]))
+        augmented[..., :n, :] = b_steps
+        b_steps = augmented
+        state = np.concatenate(
+            [state, np.zeros(state.shape[:-2] + (len(drift_k), 1))], axis=-2
+        )
+        grown = np.zeros(covariance.shape[:-2] + (size, size))
+        grown[..., :n, :n] = covariance
+        grown[..., own, own] = drift_k**2
+        covariance = grown
+        h = np.concatenate(
+            [h, np.broadcast_to(np.eye(len(drift_k)), h.shape[:-1] + (len(drift_k),))],
+            axis=-1,
+        )
 
     # The disturbances enter where unmodelled heat flows would, and their
     # effect on the state is what the DISCRETE input matrix says inputs of
@@ -242,6 +289,12 @@ def kalman_filter(
     process_covariances = np.moveaxis(
         (process_noise_w**2) * disturbances @ np.swapaxes(disturbances, -1, -2), -3, 0
     )
+
+    if drifting:
+        renewal = drift_k**2 * (1.0 - reading_decay[:, None] ** 2)
+        process_covariances[..., own, own] += renewal.reshape(
+            (len(renewal),) + (1,) * (process_covariances.ndim - 3) + (len(drift_k),)
+        )
     drives = np.moveaxis(b_steps @ inputs[..., : len(readings) - 1, :, None], -3, 0)
     a_steps = np.moveaxis(a_steps, -3, 0)
     a_transposed = np.swapaxes(a_steps, -1, -2)
@@ -275,9 +328,11 @@ def kalman_filter(
             gain = covariance_h @ np.linalg.inv(h_seen @ covariance_h + noise_seen)
 
             state = state + gain @ innovation
-            covariance = covariance - gain @ h_seen @ covariance
+            # G (H P), not (G H) P: the same product through the few readings
+            # rather than a full state-by-state one, ~10% of a fit's filter.
+            covariance = covariance - gain @ (h_seen @ covariance)
 
         estimates[i] = state
 
     # Back to the systems first, a row per reading.
-    return np.moveaxis(estimates[..., 0], 0, -2)
+    return np.moveaxis(estimates[..., :n, 0], 0, -2)

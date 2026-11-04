@@ -286,6 +286,14 @@ class BuildingThermalModel:
     # SouthGlazing.extensions).
     extension_east_depth_ratio: float = 0.0
     extension_west_depth_ratio: float = 0.0
+    # The horizon the houses or trees across the street make on either side
+    # of the facade's normal, east (the morning) and west (degrees of the
+    # sun's elevation): the direct sun reaches the thermostat's room's glazing
+    # only above it (see physics.horizon_visible_fraction). The rest,
+    # upstairs, looks over them. Zero is an open horizon - and a model saved
+    # before it.
+    horizon_east_deg: float = 0.0
+    horizon_west_deg: float = 0.0
     # The screed the floor's pipes lie in, each floor's top layer: its heat
     # capacity (J/K), part of the slabs' c_mass_j_per_k, and its conductance
     # down to the concrete below (W/K). The water heats it first and it

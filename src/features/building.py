@@ -45,6 +45,7 @@ from domain.physics import (
     floor_heat_w,
     floor_living_fraction,
     floor_loops_conductance_w_per_k,
+    horizon_visible_fraction,
     internal_gain_w,
     night_share,
     solar_gain_w,
@@ -76,12 +77,14 @@ def facade_irradiance_w_per_m2(
     latitude: float,
     longitude: float,
     azimuth_deg: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Plane-of-array irradiance on the vertical facade facing azimuth_deg
     (degrees clockwise from north), in W/m2: the total and its direct part,
     with the sun's horizontal angle from the facade's normal (degrees, positive
     towards the west) - what side walls shade the direct part by (see
-    physics.extension_shaded_fraction).
+    physics.extension_shaded_fraction) - and its elevation (degrees), what
+    the obstructions across the street hide it by (see
+    physics.horizon_visible_fraction).
 
     The Open-Meteo `global_tilted_irradiance` attribute already in the config is
     computed for the PV array's own tilt and azimuth, so it does not describe
@@ -138,6 +141,7 @@ def facade_irradiance_w_per_m2(
         np.nan_to_num(np.asarray(total["poa_global"], dtype=float), nan=0.0),
         np.nan_to_num(np.asarray(total["poa_direct"], dtype=float), nan=0.0),
         sun_from_normal_deg,
+        position["apparent_elevation"].to_numpy(dtype=float),
     )
 
 
@@ -300,6 +304,11 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # robust loss scale from the data's own residual spread (not physical).
     MAD_TO_STD = 1.4826
     MIN_F_SCALE = 1e-6
+    # The fit stops once a step improves its cost by less than this share
+    # (least_squares' ftol, 1e-8 by default). Real data, 365 d to 5 Nov 2026:
+    # 133 -> 99 Jacobians of ~1.4 s each, every parameter within 0.1 of its
+    # standard error of the tighter fit - the data cannot tell them apart.
+    FIT_COST_TOLERANCE = 1e-6
 
     # Envelope conductance of a whole dwelling of this size, from a very well
     # insulated new build to a poorly insulated older one. A sanity range, not
@@ -381,6 +390,23 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # carries a disturbance per room and one for the slabs instead of claiming
     # either is driven exactly as measured.
     DISTURBANCE_INPUTS = (2, 3, 4)
+
+    # A door opened near the thermostat drops its reading more than the room
+    # (4 Nov 2026, 17:24: the thermostat 0.53 K in a quarter, the living
+    # room's other sensor 0.2 K), and it is back within the hour - too slow
+    # for the air node (3 min), too fast for the room (2 h). Taken as heat
+    # lost from the room, the filter took some 1 kWh out of the zone (22 Oct:
+    # 1.3) and the plan brought its run forward to put it back. So each
+    # thermometer's reading may depart from the state by a draught that moves
+    # no heat and fades (see kalman_states): its spread (K) per thermometer,
+    # thermostat first, and its time constant. From a grid of both on Sep-Nov
+    # 2026: the forecast 1-2 h after a drop of 0.15 K or more 0.13-0.14 K off
+    # against 0.18-0.20 without, unbiased at 15 min (-0.07 K before), every
+    # other start unchanged (0.066 K at 1 h); 15-20 min equally good, 0.05 K
+    # too small to matter, 0.15 K worse at 15 min. None for the rest of the
+    # house, a mean of four rooms.
+    READING_DRIFT_K = (0.1, 0.0)
+    THERMOSTAT_RECOVERY_SECONDS = 20 * 60.0
 
     # Home Assistant's hvac mode of a room thermostat that has closed its
     # floor loops (see Room.climate).
@@ -577,6 +603,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # off the floor's runs before each fit (see _fit_screed) and held
         # through it; none until a model to read it against has been saved.
         self.screed: tuple[float, float] = (0.0, 0.0)
+        # Whether the data shows a horizon east and west of the facade's
+        # normal (see _horizon_scan), read off it during each fit; a horizon
+        # left open until then.
+        self.horizon_seen: tuple[bool, bool] = (True, True)
         # The household's hours of sleep (to bed, up, spread - see
         # _measured_sleep) and its baseload asleep, read off its electricity
         # before each fit; until then a model saved before them.
@@ -629,6 +659,42 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # the facade; zero, no extension there, is a result the fit can reach.
     MAX_EXTENSION_DEPTH_RATIO = 4.0
     INITIAL_EXTENSION_DEPTH_RATIO = 0.5
+
+    # The horizon the obstructions across the street make on either side (see
+    # BuildingThermalModel.horizon_east_deg): a 10 m ridge 15 m from
+    # ground-floor glass stands 30 degrees, which bounds it; zero, an open
+    # street, is a result the fit can reach. Real data, Nov 2026: on sunny
+    # October mornings with the shutters open the living room stayed flat in
+    # full sun (3 and 28 Oct, 520-690 W/m2 on the facade) until the sun stood
+    # 17-19 degrees, then rose 0.5-0.8 K within the hour; summer's morning sun
+    # reaches the facade above that. Fitted 18-21 degrees in the east (Jun up
+    # to 15/20/25 Oct 2026), 0.2-1.6 in the west. Held out on the weeks after,
+    # the living room 0.074/0.073/0.076 -> 0.071/0.068/0.071 K, with the floor
+    # active 0.077/0.078/0.101 -> 0.076/0.071/0.093; August and September the
+    # same (not identified there). The west fitted on its own came out 0-5
+    # degrees, the same accuracy: open here, the side wall west of the glass
+    # taking the low afternoon sun (see extension_west_depth_ratio); one
+    # horizon running smoothly from east to west did worse (a share of the
+    # midday sun lost), so each side has its own.
+    MAX_HORIZON_DEG = 30.0
+    INITIAL_HORIZON_DEG = 10.0
+    # A side's horizon is kept only where no single day sets it - an open
+    # door, a visitor, a floor run: with any one day left out its best angle
+    # must still stand above the open street (see _horizon_scan), and the fit
+    # starts from the lowest such angle; elsewhere it is held open - nothing
+    # there says otherwise. Counting the days the sun stood low was the wrong
+    # measure: the fit weighs the newest days most (see FIT_HALF_LIFE_DAYS),
+    # so a few days carry it. Real data, 365 d to 5 Nov 2026: east 24 days
+    # with low sun on the open glass, effectively 5 (17-28 Oct, 4-5 Nov), all
+    # pointing at 21 degrees, 21-22 with any one left out; west 16 days,
+    # effectively one - 4 Nov alone asked for 20 degrees, 5 Nov and 28 Oct
+    # for none, and without 4 Nov it is 0. Held out on the weeks before, west
+    # fitted 0-5. A side left free that the data does not show stalled the
+    # fit along its flat direction, twice the time.
+    #
+    # The angles looked at: the morning sun climbs 1.5-3 degrees a quarter
+    # hour, so a finer grid shows nothing more; the fit refines from it.
+    HORIZON_SCAN_STEP_DEG = 2.0
 
     # a_eff_m2 = glass area * g-value * frame factor * soiling. The geometric
     # angle of incidence is NOT in there - the transposition to the facade
@@ -717,6 +783,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         "screed_layer_w_per_k",
         "awake_in_living_fraction",
         "ua_living_air_w_per_k",
+        "horizon_east_deg",
+        "horizon_west_deg",
     )
 
     @staticmethod
@@ -747,6 +815,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 model.screed_layer_w_per_k,
                 _awake_in_living(model),
                 model.ua_living_air_w_per_k,
+                model.horizon_east_deg,
+                model.horizon_west_deg,
             ]
         )
 
@@ -808,6 +878,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             awake_in_living_fraction=float(x[22]),
             ua_living_air_w_per_k=float(x[23]),
             c_living_air_j_per_k=self.living_air_capacity_j_per_k,
+            horizon_east_deg=float(x[24]),
+            horizon_west_deg=float(x[25]),
         )
 
     def load(self, path) -> None:
@@ -832,6 +904,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.model.asleep_until_hour,
                 self.model.asleep_spread_h,
                 self.model.asleep_baseload_w,
+            )
+            self.horizon_seen = (
+                self.model.horizon_east_deg > 0.0,
+                self.model.horizon_west_deg > 0.0,
             )
 
     def _shutter_open_fraction(
@@ -1184,6 +1260,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             df["I_facade_w_per_m2"],
             df["I_facade_direct_w_per_m2"],
             df["sun_from_normal_deg"],
+            df["sun_elevation_deg"],
         ) = facade_irradiance_w_per_m2(
             df["time"] + pd.to_timedelta(forward_dt / 2.0, unit="s"),
             direct_horizontal=df["direct_radiation"].to_numpy(dtype=float),
@@ -1253,14 +1330,24 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         """
 
         irradiance = df["I_facade_w_per_m2"].to_numpy(dtype=float)
-        # The direct sun the extensions' side walls take off the thermostat's
-        # room's glazing; the rest's, upstairs, looks over them.
-        shaded = df["I_facade_direct_w_per_m2"].to_numpy(
-            dtype=float
-        ) * extension_shaded_fraction(
-            df["sun_from_normal_deg"].to_numpy(dtype=float),
-            model.extension_east_depth_ratio,
-            model.extension_west_depth_ratio,
+        direct = df["I_facade_direct_w_per_m2"].to_numpy(dtype=float)
+        sun_from_normal = df["sun_from_normal_deg"].to_numpy(dtype=float)
+        # The direct sun the extensions' side walls and the obstructions
+        # across the street take off the thermostat's room's glazing; the
+        # rest's, upstairs, looks over them.
+        beside = direct * (
+            1.0
+            - extension_shaded_fraction(
+                sun_from_normal,
+                model.extension_east_depth_ratio,
+                model.extension_west_depth_ratio,
+            )
+        )
+        shaded = direct - beside * horizon_visible_fraction(
+            df["sun_elevation_deg"].to_numpy(dtype=float),
+            sun_from_normal,
+            model.horizon_east_deg,
+            model.horizon_west_deg,
         )
         closed_gain = model.closed_shutter_gain_fraction
         # The open glass passes its full gain, onto the floor and furnishings;
@@ -1414,6 +1501,28 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         systems = [
             (*zone_state_space(model), self._schedule(model, df)) for model in models
         ]
+        # A parameter that only drives the inputs (an aperture, a horizon)
+        # leaves a set's system the base's: its steps are discretized once and
+        # shared. The envelope enters A and B linearly (see
+        # physics.zone_state_space), so a schedule's system at two
+        # conductances is its system at every one.
+        keys = [
+            b"".join(
+                matrix.tobytes()
+                for matrix in (
+                    (a, b)
+                    if schedule is None
+                    else (
+                        *schedule.system_at(0.0),
+                        *schedule.system_at(1.0),
+                        schedule.values,
+                    )
+                )
+            )
+            for a, b, schedule in systems
+        ]
+        first: dict[bytes, int] = {}
+        shared = [first.setdefault(key, index) for index, key in enumerate(keys)]
         observation = np.stack([zone_observations(model) for model in models])
 
         measured = df[["T_living", "T_rest"]].to_numpy(dtype=float)
@@ -1438,17 +1547,18 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             if not len(offsets):
                 continue
 
-            run_steps = [
-                discrete_steps(
+            run_steps = {
+                index: discrete_steps(
                     a,
                     b,
                     dt_seconds[run_start:run_end],
                     _window(schedule, run_start, run_end),
                 )
-                for a, b, schedule in systems
-            ]
-            a_steps = np.stack([a_d for a_d, _ in run_steps])
-            b_steps = np.stack([b_d for _, b_d in run_steps])
+                for index, (a, b, schedule) in enumerate(systems)
+                if shared[index] == index
+            }
+            a_steps = np.stack([run_steps[index][0] for index in shared])
+            b_steps = np.stack([run_steps[index][1] for index in shared])
 
             # Every window starts from the filter's estimate of the WHOLE state
             # at that moment, so its measured and unmeasured parts stay
@@ -1464,6 +1574,11 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 measurement_variance,
                 observation,
                 self.DISTURBANCE_INPUTS,
+                self.READING_DRIFT_K,
+                np.exp(
+                    -dt_seconds[run_start + 1 : run_end]
+                    / self.THERMOSTAT_RECOVERY_SECONDS
+                ),
             )
 
             steps = offsets[:, None] + np.arange(horizon_samples - 1)
@@ -1559,6 +1674,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         max_extension = (
             self.MAX_EXTENSION_DEPTH_RATIO if living_glass > 0.0 else self.MIN_F_SCALE
         )
+        max_horizon = self.MAX_HORIZON_DEG if living_glass > 0.0 else self.MIN_F_SCALE
         max_rest_aperture = max(
             self.MAX_APERTURE_FRACTION * rest_glass, self.MIN_F_SCALE
         )
@@ -1592,6 +1708,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.MIN_SCREED_LAYER_W_PER_M2_K * floor_m2,
                 0.0,
                 self.MIN_UA_LIVING_AIR_W_PER_M2_K * ceiling_m2,
+                0.0,
+                0.0,
             ]
         )
 
@@ -1621,6 +1739,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.MAX_SCREED_LAYER_W_PER_M2_K * floor_m2,
                 1.0,
                 self.MAX_UA_LIVING_AIR_W_PER_M2_K * ceiling_m2,
+                # No glazing in the thermostat's room, nothing to hide.
+                max_horizon,
+                max_horizon,
             ]
         )
 
@@ -1652,6 +1773,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 # Awake by floor area to start, as asleep.
                 self.living_area_fraction,
                 self.INITIAL_UA_LIVING_AIR_W_PER_M2_K * ceiling_m2,
+                self.INITIAL_HORIZON_DEG,
+                self.INITIAL_HORIZON_DEG,
             ]
         )
 
@@ -1659,6 +1782,11 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         for index, side in ((11, "east"), (12, "west")):
             if side in self.extensions:
                 lower[index] = upper[index] = self.extensions[side]
+
+        # A horizon the data does not show is held open (see _horizon_scan).
+        for index, seen in zip((24, 25), self.horizon_seen, strict=True):
+            if not seen:
+                lower[index] = upper[index] = 0.0
 
         # No screed, no halves to it.
         if not self.screed[0]:
@@ -1715,7 +1843,6 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         df["I_facade_direct_w_per_m2"] *= sky
         self.screed = self._fit_screed(df)
         self.sleep = self._measured_sleep(df)
-
         median_dt = float(df["dt_seconds"].median())
 
         # Fitted on all of it, the newest above all (see FIT_HALF_LIFE_DAYS):
@@ -1725,61 +1852,18 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         train_df = df
 
         plan = self._rollout_plan(train_df, median_dt)
-        lower, initial, upper = self._bounds()
 
-        # Only what is not held by the configuration (see _bounds).
-        free = lower < upper
+        # The rest first with the horizons open, then on from each side's angle
+        # the data shows (see _horizon_scan) - only those sides free.
+        self.horizon_seen = (False, False)
+        x, std_errors, f_scale = self._fit(train_df, plan)
+        angles = self._horizon_scan(x, train_df, plan, f_scale)
+        if any(angles):
+            self.horizon_seen = (angles[0] > 0.0, angles[1] > 0.0)
+            start = x.copy()
+            start[[24, 25]] = angles
+            x, std_errors, f_scale = self._fit(train_df, plan, (start, f_scale))
 
-        def full(x_free: np.ndarray) -> np.ndarray:
-            x = np.broadcast_to(initial, (*np.shape(x_free)[:-1], len(initial))).copy()
-            x[..., free] = x_free
-
-            return x
-
-        if sum(self.glazing_areas_m2) <= 0.0:
-            logger.warning(
-                "Building thermal calibration: building.south_glazing is not "
-                "configured, so solar gain is bounded to zero - any real solar "
-                "gain will be absorbed by the envelope and capacity parameters."
-            )
-
-        def residuals(x_free: np.ndarray) -> np.ndarray:
-            return self._window_residuals(full(x_free), train_df, plan)
-
-        def jacobian(x_free: np.ndarray) -> np.ndarray:
-            return self._forward_jacobian(residuals, x_free, lower[free], upper[free])
-
-        # x_scale="jac": the parameters span conductances (10^2 W/K) and heat
-        # capacities (10^7 J/K), so an unscaled trust region would step
-        # meaninglessly in one or the other.
-        ordinary = least_squares(
-            residuals,
-            initial[free],
-            jac=jacobian,
-            bounds=(lower[free], upper[free]),
-            x_scale="jac",
-        )
-
-        # Robust loss scaled by the data's own residual spread, so a window
-        # containing an unmodelled disturbance (an opened window, a visitor,
-        # a wood stove) is down-weighted instead of dragging the fit.
-        deviation = np.abs(ordinary.fun - np.median(ordinary.fun))
-        f_scale = max(self.MAD_TO_STD * float(np.median(deviation)), self.MIN_F_SCALE)
-
-        result = least_squares(
-            residuals,
-            ordinary.x,
-            jac=jacobian,
-            bounds=(lower[free], upper[free]),
-            loss="soft_l1",
-            f_scale=f_scale,
-            x_scale="jac",
-        )
-
-        x = full(result.x)
-        # A configured parameter carries no error from this fit.
-        std_errors = np.zeros_like(x)
-        std_errors[free] = self._parameter_std_errors(result)
         self.parameter_std_errors = dict(
             zip(self.PARAMETER_NAMES, std_errors, strict=True)
         )
@@ -1810,6 +1894,85 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         )
 
         return self.model
+
+    def _fit(
+        self,
+        train_df: pd.DataFrame,
+        plan,
+        start: tuple[np.ndarray, float] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        """(parameters, their standard errors, the robust loss's f_scale) fitted
+        within the current bounds (see _bounds). From a previous fit's
+        parameters and f_scale when given: a refit with a side's horizon held
+        open moves little, and starting over took the add-on minutes."""
+
+        lower, initial, upper = self._bounds()
+        if start is not None:
+            initial = np.clip(start[0], lower, upper)
+
+        # Only what is not held by the configuration (see _bounds).
+        free = lower < upper
+
+        def full(x_free: np.ndarray) -> np.ndarray:
+            x = np.broadcast_to(initial, (*np.shape(x_free)[:-1], len(initial))).copy()
+            x[..., free] = x_free
+
+            return x
+
+        if sum(self.glazing_areas_m2) <= 0.0:
+            logger.warning(
+                "Building thermal calibration: building.south_glazing is not "
+                "configured, so solar gain is bounded to zero - any real solar "
+                "gain will be absorbed by the envelope and capacity parameters."
+            )
+
+        def residuals(x_free: np.ndarray) -> np.ndarray:
+            return self._window_residuals(full(x_free), train_df, plan)
+
+        def jacobian(x_free: np.ndarray) -> np.ndarray:
+            return self._forward_jacobian(residuals, x_free, lower[free], upper[free])
+
+        # x_scale="jac": the parameters span conductances (10^2 W/K) and heat
+        # capacities (10^7 J/K), so an unscaled trust region would step
+        # meaninglessly in one or the other.
+        if start is None:
+            ordinary = least_squares(
+                residuals,
+                initial[free],
+                jac=jacobian,
+                bounds=(lower[free], upper[free]),
+                x_scale="jac",
+                ftol=self.FIT_COST_TOLERANCE,
+            )
+
+            # Robust loss scaled by the data's own residual spread, so a window
+            # containing an unmodelled disturbance (an opened window, a visitor,
+            # a wood stove) is down-weighted instead of dragging the fit.
+            deviation = np.abs(ordinary.fun - np.median(ordinary.fun))
+            f_scale = max(
+                self.MAD_TO_STD * float(np.median(deviation)), self.MIN_F_SCALE
+            )
+            initial[free] = ordinary.x
+        else:
+            f_scale = start[1]
+
+        result = least_squares(
+            residuals,
+            initial[free],
+            jac=jacobian,
+            bounds=(lower[free], upper[free]),
+            loss="soft_l1",
+            f_scale=f_scale,
+            x_scale="jac",
+            ftol=self.FIT_COST_TOLERANCE,
+        )
+
+        x = full(result.x)
+        # A configured parameter carries no error from this fit.
+        std_errors = np.zeros_like(x)
+        std_errors[free] = self._parameter_std_errors(result)
+
+        return x, std_errors, f_scale
 
     @staticmethod
     def _skill(
@@ -2186,6 +2349,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             zone_observations(model),
             self.DISTURBANCE_INPUTS,
             self._schedule(model, prepared),
+            reading_drift_k=self.READING_DRIFT_K,
+            reading_recovery_seconds=self.THERMOSTAT_RECOVERY_SECONDS,
         )
 
     def _schedule(
@@ -2276,6 +2441,53 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         # The rooms' own channels; the floor's is the floor's error.
         return heat[:, :2]
+
+    def _horizon_scan(
+        self,
+        x: np.ndarray,
+        train_df: pd.DataFrame,
+        plan,
+        f_scale: float,
+    ) -> tuple[float, float]:
+        """Each side's horizon (deg) that no single day sets: on a grid of
+        HORIZON_SCAN_STEP_DEG, the angle where a fit's robust cost is lowest
+        with everything else held at x and the other side open, taken with
+        each local day left out in turn, the lowest of those - 0, held open,
+        where one day alone asked for it. Every angle of a side in one pass,
+        like a Jacobian."""
+
+        grid = np.arange(
+            0.0,
+            self.MAX_HORIZON_DEG + self.HORIZON_SCAN_STEP_DEG / 2.0,
+            self.HORIZON_SCAN_STEP_DEG,
+        )
+        rows = self._simulate_windows(x, train_df, plan)[3]
+        _, day = np.unique(
+            pd.DatetimeIndex(train_df["time"]).tz_convert(LOCAL_TIMEZONE).date[rows],
+            return_inverse=True,
+        )
+        angles = [0.0, 0.0]
+
+        for side, index in enumerate((24, 25)):
+            points = np.repeat(x[None], len(grid), axis=0)
+            points[:, index] = grid
+            # least_squares' soft_l1 (see _fit) up to a constant factor, per
+            # scored row - each thermometer's residual a column of its own.
+            squared = (self._window_residuals(points, train_df, plan) / f_scale) ** 2
+            cost = (np.sqrt(1.0 + squared) - 1.0).reshape(len(grid), len(rows), -1)
+            per_day = np.stack(
+                [np.bincount(day, weights=angle.sum(axis=-1)) for angle in cost]
+            )
+            without_one = per_day.sum(axis=1, keepdims=True) - per_day
+            angles[side] = float(grid[np.argmin(without_one, axis=0)].min())
+
+        logger.info(
+            "Building thermal calibration: horizon %.0f deg east and %.0f west of "
+            "the facade's normal with any one day left out",
+            *angles,
+        )
+
+        return angles[0], angles[1]
 
     def _measured_sleep(self, df: pd.DataFrame) -> tuple[float, float, float, float]:
         """The household's hours of sleep (to bed, up, spread - see
@@ -2820,6 +3032,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             zone_observations(model),
             self.DISTURBANCE_INPUTS,
             _window(schedule, 0, last + 1),
+            reading_drift_k=self.READING_DRIFT_K,
+            reading_recovery_seconds=self.THERMOSTAT_RECOVERY_SECONDS,
         )
 
         # Nothing is delivered to the zone: this is what happens if the heat

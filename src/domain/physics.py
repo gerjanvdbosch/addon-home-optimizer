@@ -752,6 +752,36 @@ def extension_shaded_fraction(
     return np.clip(shadow, 0.0, 1.0)
 
 
+# How sharply the obstructions' edge takes the beam off the glass (deg of the
+# sun's elevation): sharper than the data resolves - the morning sun climbs
+# 1.5-3 degrees a quarter hour - and smooth for the fit's gradient.
+HORIZON_EDGE_DEG = 1.0
+
+
+def horizon_visible_fraction(
+    sun_elevation_deg: np.ndarray,
+    sun_from_normal_deg: np.ndarray,
+    horizon_east_deg: float,
+    horizon_west_deg: float,
+) -> np.ndarray:
+    """Share of the direct sun that clears the obstructions in front of a
+    ground-floor glazing - the houses or trees across the street - which hide
+    the sky up to horizon_east_deg above the horizon with the sun east of the
+    facade's normal, the morning, and up to horizon_west_deg west of it (see
+    BuildingThermalModel.horizon_east_deg). The diffuse sky they hide is a
+    fixed share, which the effective aperture already absorbs."""
+
+    horizon = np.where(
+        np.asarray(sun_from_normal_deg, dtype=float) < 0.0,
+        horizon_east_deg,
+        horizon_west_deg,
+    )
+
+    return expit(
+        (np.asarray(sun_elevation_deg, dtype=float) - horizon) / HORIZON_EDGE_DEG
+    )
+
+
 def internal_gain_w(
     baseload_w: np.ndarray,
     internal_gain_fraction: float,

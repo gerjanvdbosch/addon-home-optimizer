@@ -21,6 +21,7 @@ from domain.physics import (
     floor_heat_w,
     floor_living_fraction,
     floor_loops_conductance_w_per_k,
+    horizon_visible_fraction,
     internal_gain_w,
     night_share,
     solar_gain_w,
@@ -166,9 +167,10 @@ def _raw_frame() -> pd.DataFrame:
     diffuse = 120.0 * daylight
 
     # Shutters shut overnight, and kept shut all day every third day so the
-    # aperture and the shading are not confounded.
+    # aperture and the shading are not confounded. Opened at first light, so
+    # the low morning sun shows the open horizon in front of them.
     shut_all_day = (day % 3) == 0
-    shutter = np.where((hour >= 8.0) & (hour < 20.0) & ~shut_all_day, 100.0, 0.0)
+    shutter = np.where((hour >= 6.0) & (hour < 20.0) & ~shut_all_day, 100.0, 0.0)
 
     # Cooling in the afternoon on half the days: without heat injected into the
     # floor the two nodes drift together and their coupling is not excited.
@@ -251,6 +253,7 @@ def _simulate(
     rng: np.random.Generator,
     wind_kmh: np.ndarray | None = None,
     rest_loss_w: np.ndarray | None = None,
+    true_model: BuildingThermalModel = TRUE_MODEL,
 ) -> pd.DataFrame:
     """Generate a room-temperature trajectory from the known ODE parameters.
 
@@ -271,11 +274,11 @@ def _simulate(
 
     prepared = identifier.prepare(raw)
 
-    inputs = identifier._inputs(TRUE_MODEL, prepared)
+    inputs = identifier._inputs(true_model, prepared)
 
-    a_d, b_d = discretize_zoh(*zone_state_space(TRUE_MODEL), DT_SECONDS)
-    observations = zone_observations(TRUE_MODEL)
-    share = TRUE_MODEL.living_area_fraction
+    a_d, b_d = discretize_zoh(*zone_state_space(true_model), DT_SECONDS)
+    observations = zone_observations(true_model)
+    share = true_model.living_area_fraction
 
     state = np.full(4, 21.0)
     rooms = np.empty((len(prepared), 2))
@@ -1340,7 +1343,16 @@ def test_extensions_belong_to_the_thermostats_room():
 def test_configured_extensions_are_held_through_the_fit():
     identifier = _identifier()
     identifier.extensions = {"east": 0.4, "west": 0.7}
-    model = identifier.calibrate(_simulate(np.random.default_rng(14)))
+    model = identifier.calibrate(
+        _simulate(
+            np.random.default_rng(14),
+            true_model=replace(
+                TRUE_MODEL,
+                extension_east_depth_ratio=0.4,
+                extension_west_depth_ratio=0.7,
+            ),
+        )
+    )
 
     assert model.extension_east_depth_ratio == 0.4
     assert model.extension_west_depth_ratio == 0.7
@@ -1731,6 +1743,48 @@ def test_a_constant_schedule_filters_as_the_constant_system():
     )
 
 
+def test_a_draught_at_the_thermostat_takes_less_heat_out_of_the_zone():
+    """A dip in the thermostat's reading that fades within the hour is taken
+    in part as its draught, which moves no heat: the zone keeps more of its
+    heat than when the whole dip is room heat lost - and without a draught's
+    spread the filter is the one without it. Rooms as heavy as this
+    installation's fit (furnishings and inner walls, some 20 MJ/K): in a light
+    one a dip is room heat at little cost, and the filter takes it as that."""
+
+    model = replace(TRUE_MODEL, c_air_j_per_k=20e6)
+    a, b = zone_state_space(model)
+    n = 24
+    inputs = np.zeros((n, b.shape[1]))
+    inputs[:, 0] = 20.0
+    calm = np.full((n, 2), 20.0)
+    dipped = calm.copy()
+    dipped[8:, 0] -= 0.5 * np.exp(-np.arange(n - 8) * DT_SECONDS / 1200.0)
+    capacities = zone_heat_capacities(model)
+
+    def heat_j(measured, drift_k):
+        estimates = kalman_states(
+            a,
+            b,
+            measured,
+            inputs,
+            np.full(n, DT_SECONDS),
+            3000.0,
+            1e-5,
+            zone_observations(model),
+            (2, 3, 4),
+            reading_drift_k=drift_k,
+            reading_recovery_seconds=1200.0,
+        )
+        return estimates @ capacities
+
+    lost_j = heat_j(calm, (0.0, 0.0)) - heat_j(dipped, (0.0, 0.0))
+
+    assert heat_j(dipped, (0.0, 0.0)) == pytest.approx(
+        heat_j(dipped, ()), rel=0, abs=1e-6
+    )
+    assert (heat_j(calm, (0.1, 0.0)) - heat_j(dipped, (0.1, 0.0)))[8] < 0.95 * lost_j[8]
+
+
 def test_a_single_reading_is_filtered_without_a_step():
     """One reading so far - a frame whose only known sample is its first -
     is the filter's start, whether or not the envelope is scheduled."""
@@ -1958,7 +2012,7 @@ def test_facade_irradiance_follows_from_the_horizontal_components():
         model="isotropic",
     )["poa_global"]
 
-    facade, _, _ = facade_irradiance_w_per_m2(
+    facade, _, _, _ = facade_irradiance_w_per_m2(
         noon,
         direct_horizontal=np.array([500.0]),
         diffuse_horizontal=np.array([200.0]),
@@ -2007,6 +2061,54 @@ def test_an_extension_shades_its_side_of_the_day_by_its_depth():
     )
 
     assert shaded == pytest.approx([0.0, 0.0, 0.5, 1.0, 1.0, 1.0])
+
+
+def test_the_obstructions_across_hide_the_low_sun_on_their_side():
+    """Below the horizon they make on the sun's side of the facade's normal no
+    direct sun reaches the glass, well above it all of it."""
+
+    visible = horizon_visible_fraction(
+        np.array([10.0, 20.0, 30.0, 10.0, 10.0]),
+        np.array([-30.0, -30.0, -30.0, 30.0, 60.0]),
+        horizon_east_deg=20.0,
+        horizon_west_deg=5.0,
+    )
+
+    assert visible == pytest.approx([0.0, 0.5, 1.0, 0.993, 0.993], abs=1e-3)
+
+
+def test_a_horizon_is_found_where_no_single_day_sets_it():
+    """A row of houses east across the street, on every low morning of the
+    synthetic house, is found; the open west, and the east too once all but
+    one morning's sun is kept off the glass, stay open."""
+
+    true_model = replace(TRUE_MODEL, horizon_east_deg=16.0)
+    identifier = _identifier()
+    # The household's sleep as the true model's, as calibrate() reads it off
+    # the electricity before the scan.
+    identifier.sleep = (
+        true_model.asleep_from_hour,
+        true_model.asleep_until_hour,
+        true_model.asleep_spread_h,
+        true_model.asleep_baseload_w,
+    )
+    raw = _simulate(np.random.default_rng(14), true_model=true_model)
+    x = identifier._parameters(replace(true_model, horizon_east_deg=0.0))
+    step = identifier.HORIZON_SCAN_STEP_DEG
+
+    def scan(frame: pd.DataFrame) -> tuple[float, float]:
+        prepared = identifier.prepare(frame)
+        plan = identifier._rollout_plan(prepared, DT_SECONDS)
+        return identifier._horizon_scan(x, prepared, plan, MEASUREMENT_NOISE_STD_C)
+
+    east, west = scan(raw)
+    assert abs(east - 16.0) <= step
+    assert west == 0.0
+
+    # One morning's low sun left on the open glass: that day alone shows it.
+    morning = (raw["target_time"].dt.hour < 9) & (raw["target_time"].dt.day != 3)
+    raw.loc[morning, identifier.shutter_columns] = 0.0
+    assert scan(raw) == (0.0, 0.0)
 
 
 def test_internal_gain_keeps_the_standby_whole():
