@@ -2128,3 +2128,71 @@ def test_internal_gain_keeps_the_standby_whole():
         internal_gain_w(baseload, 0.4, occupants),
         0.4 * baseload + occupants * Q_PERSON_SENSIBLE_W,
     )
+
+
+def test_sets_sharing_a_system_share_its_filter_covariance_exactly():
+    """kalman_filter's `same`: the covariance and gain carried once for sets
+    with the same steps and observation, the estimates bit for bit those of
+    carrying them for every set - with a drifting reading and a missing one."""
+
+    from domain.dynamics import discrete_steps, kalman_filter
+
+    rng = np.random.default_rng(3)
+    a = np.array([[-2e-4, 1e-4], [5e-5, -1e-4]])
+    b = np.array([[1e-6, 0.0, 2e-4], [0.0, 1e-6, 0.0]])
+    dt = np.full(60, 900.0)
+    a_steps, b_steps = discrete_steps(a, b, dt)
+    other_a, other_b = discrete_steps(a * 1.01, b, dt)
+    systems = np.stack([a_steps, a_steps, other_a, a_steps])
+    inputs_b = np.stack([b_steps, b_steps, other_b, b_steps])
+    inputs = rng.normal(size=(4, 60, 3)) * [100.0, 100.0, 1.0]
+    measured = 20.0 + rng.normal(size=(60, 2)) * 0.1
+    measured[17, 1] = np.nan
+    observation = np.stack([np.eye(2)] * 3 + [np.eye(2) * 0.9])
+    arguments = (
+        systems,
+        inputs_b,
+        measured,
+        inputs,
+        300.0,
+        0.01,
+        observation,
+        (0, 1),
+        (0.1, 0.0),
+        np.full(59, 0.5),
+    )
+
+    np.testing.assert_array_equal(
+        kalman_filter(*arguments, [0, 0, 2, 3]), kalman_filter(*arguments)
+    )
+
+
+def test_a_settled_filter_ends_where_the_step_by_step_one_does():
+    """kalman_filter's `stationary`: on a system whose step does not change,
+    the gain carried step by step settles to the Riccati equation's - so past
+    its start the estimates are the same."""
+
+    from domain.dynamics import discrete_steps, kalman_filter
+
+    rng = np.random.default_rng(5)
+    a = np.array([[-2e-4, 1e-4], [5e-5, -1e-4]])
+    b = np.array([[1e-6, 0.0, 2e-4], [0.0, 1e-6, 0.0]])
+    a_steps, b_steps = discrete_steps(a, b, np.full(400, 900.0))
+    arguments = (
+        a_steps,
+        b_steps,
+        20.0 + rng.normal(size=(400, 2)) * 0.1,
+        rng.normal(size=(400, 3)) * [100.0, 100.0, 1.0],
+        300.0,
+        0.01,
+        np.eye(2),
+        (0, 1),
+        (0.1, 0.0),
+        np.full(399, 0.5),
+    )
+
+    np.testing.assert_allclose(
+        kalman_filter(*arguments, stationary=True)[200:],
+        kalman_filter(*arguments)[200:],
+        atol=1e-9,
+    )

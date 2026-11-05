@@ -31,6 +31,7 @@ from features.optimizer import (
     MIP_ABSOLUTE_GAP_EUR,
     W_PER_KW,
     MPCOptimizer,
+    TankPlan,
     plan_tank,
     surplus_scenarios,
 )
@@ -2928,6 +2929,41 @@ def test_the_tanks_own_plan_is_the_programs_optimum(thermal_model, target_c):
     assert _program_cost(optimizer, data, plan) == pytest.approx(
         _program_cost(optimizer, data), abs=MIP_ABSOLUTE_GAP_EUR
     )
+
+
+def test_a_tank_plan_holds_its_blocks_but_may_end_each_a_step_sooner():
+    """The program takes a tank plan's runs as they are but for each heat pump
+    block's last step, which it may leave off: a plan made around a zone run
+    that starts a quarter after the block could end held the block on into
+    that quarter, which the zone could have taken over instead."""
+
+    import pyomo.environ as pyo
+
+    steps = 8
+    plan = TankPlan(
+        heat_pump_w=(0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0),
+        booster_w=(0.0,) * steps,
+        temperatures=(40.0,) * steps,
+        starts=(0,) * steps,
+        cost_eur=(0.0,) * steps,
+    )
+    model = pyo.ConcreteModel()
+    model.K = pyo.RangeSet(0, steps - 1)
+    model.boiler_on = pyo.Var(model.K, domain=pyo.Binary)
+    model.booster_on = pyo.Var(model.K, domain=pyo.Binary)
+    MPCOptimizer._choose_tank(model, [plan])
+
+    for sense, expected in (
+        (pyo.minimize, [0, 1, 1, 0, 0, 1, 0, 0]),
+        (pyo.maximize, [0, 1, 1, 1, 0, 1, 1, 0]),
+    ):
+        model.objective = pyo.Objective(
+            expr=sum(model.boiler_on[k] for k in model.K), sense=sense
+        )
+        Highs().solve(model)
+        model.del_component(model.objective)
+
+        assert [round(pyo.value(model.boiler_on[k])) for k in model.K] == expected
 
 
 def test_taps_cannot_cool_the_tank_below_the_mains():

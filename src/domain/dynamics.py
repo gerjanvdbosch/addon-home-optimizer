@@ -7,10 +7,10 @@ identical in meaning to the continuous formulation rather than a second,
 slightly different model.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import numpy as np
-from scipy.linalg import expm
+from scipy.linalg import expm, solve_discrete_are
 
 
 def discretize_zoh(
@@ -214,6 +214,25 @@ def kalman_states(
     )
 
 
+def _settled_covariance(
+    a: np.ndarray, q: np.ndarray, h: np.ndarray, noise: np.ndarray
+) -> np.ndarray:
+    """The predicted covariance a filter on step (a, q), read by h with
+    `noise`, settles to - per system along any leading axes."""
+
+    h = np.broadcast_to(h, a.shape[:-2] + h.shape[-2:])
+    systems = zip(
+        a.reshape(-1, *a.shape[-2:]),
+        q.reshape(-1, *q.shape[-2:]),
+        h.reshape(-1, *h.shape[-2:]),
+        strict=True,
+    )
+
+    return np.stack(
+        [solve_discrete_are(a_s.T, h_s.T, q_s, noise) for a_s, q_s, h_s in systems]
+    ).reshape(a.shape)
+
+
 def kalman_filter(
     a_steps: np.ndarray,
     b_steps: np.ndarray,
@@ -225,10 +244,25 @@ def kalman_filter(
     disturbance_inputs: tuple[int, ...],
     reading_drift_k: tuple[float, ...] = (),
     reading_decay: np.ndarray | None = None,
+    same: Sequence[int] | None = None,
+    stationary: bool = False,
 ) -> np.ndarray:
     """kalman_states over steps discrete_steps() gives - or over many systems
     at once against the same readings, each along a leading axis of the steps,
     the inputs and the observation (a fit's parameter sets, say).
+
+    `same` gives, for each of those, the first with the very same steps and
+    observation: the covariance and the gain depend on nothing else, so they
+    are carried for the first alone - a Jacobian's sets mostly move only the
+    inputs (an aperture, a horizon), and the covariance's products were most
+    of a fit's time.
+
+    `stationary` holds each system's covariance where its mean step settles it
+    (the discrete Riccati equation) instead of carrying it step by step: only
+    the states are left to the loop. The building's gain moves hardly at all
+    once settled - within 0.6% of its median over 150 days of steps with every
+    step's system its own (real data, 5 Nov 2026), settled within 50 steps -
+    and carrying it was most of a fit's time.
 
     A reading's drift (see kalman_states) is a state of the filter's own, one
     per thermometer, decaying by `reading_decay` each step (exp(-dt/tau)) and
@@ -298,39 +332,77 @@ def kalman_filter(
     drives = np.moveaxis(b_steps @ inputs[..., : len(readings) - 1, :, None], -3, 0)
     a_steps = np.moveaxis(a_steps, -3, 0)
     a_transposed = np.swapaxes(a_steps, -1, -2)
-    h_transposed = np.swapaxes(h, -1, -2)
 
     estimates = np.empty((len(readings), *state.shape))
     estimates[0] = state
 
+    # The covariance and the gain over the distinct systems alone, the gain
+    # handed back to every set by `spread`.
+    if same is not None:
+        same = np.asarray(same)
+        distinct = np.flatnonzero(same == np.arange(len(same)))
+        spread = np.searchsorted(distinct, same)
+    else:
+        distinct = spread = slice(None)
+    h_distinct = h[distinct]
+    h_distinct_t = np.swapaxes(h_distinct, -1, -2)
+    noise = np.eye(h.shape[-2]) * measurement_variance
+
+    if stationary:
+        # The covariance a step's prediction settles to, and its gain.
+        covariance = _settled_covariance(
+            a_steps.mean(axis=0)[distinct],
+            process_covariances.mean(axis=0)[distinct],
+            h_distinct,
+            noise,
+        )
+        covariance_h = covariance @ h_distinct_t
+        settled_gain = covariance_h @ np.linalg.inv(h_distinct @ covariance_h + noise)
+    else:
+        covariance = covariance[distinct]
+        a_distinct = a_steps[:, distinct]
+        a_transposed = a_transposed[:, distinct]
+        process_covariances = process_covariances[:, distinct]
+
     seen_rows = ~np.isnan(readings)
     all_seen = seen_rows.all(axis=1).tolist()
     any_seen = seen_rows.any(axis=1).tolist()
-    noise = np.eye(h.shape[-2]) * measurement_variance
 
     for i in range(1, len(readings)):
-        a_d = a_steps[i - 1]
-        state = a_d @ state + drives[i - 1]
-        covariance = a_d @ covariance @ a_transposed[i - 1] + process_covariances[i - 1]
+        state = a_steps[i - 1] @ state + drives[i - 1]
+
+        if not stationary:
+            covariance = (
+                a_distinct[i - 1] @ covariance @ a_transposed[i - 1]
+                + process_covariances[i - 1]
+            )
 
         if any_seen[i]:
             if all_seen[i]:
-                h_seen, h_seen_t, noise_seen = h, h_transposed, noise
+                h_seen, noise_seen = h, noise
+                own_h, own_h_t = h_distinct, h_distinct_t
                 reading = readings[i][:, None]
             else:
                 seen = seen_rows[i]
-                h_seen, h_seen_t = h[..., seen, :], h_transposed[..., seen]
+                h_seen = h[..., seen, :]
+                own_h, own_h_t = h_distinct[..., seen, :], h_distinct_t[..., seen]
                 noise_seen = noise[np.ix_(seen, seen)]
                 reading = readings[i][seen][:, None]
 
             innovation = reading - h_seen @ state
-            covariance_h = covariance @ h_seen_t
-            gain = covariance_h @ np.linalg.inv(h_seen @ covariance_h + noise_seen)
 
-            state = state + gain @ innovation
+            if stationary and all_seen[i]:
+                gain = settled_gain
+            else:
+                covariance_h = covariance @ own_h_t
+                gain = covariance_h @ np.linalg.inv(own_h @ covariance_h + noise_seen)
+
+            state = state + gain[spread] @ innovation
+
             # G (H P), not (G H) P: the same product through the few readings
             # rather than a full state-by-state one, ~10% of a fit's filter.
-            covariance = covariance - gain @ (h_seen @ covariance)
+            if not stationary:
+                covariance = covariance - gain @ (own_h @ covariance)
 
         estimates[i] = state
 

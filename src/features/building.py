@@ -293,16 +293,13 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     #
     # Stating it as a heat flow rather than an abstract covariance is what makes
     # that argument possible at all. It also has to be large relative to the
-    # 0.03 K sensor noise, because the model is demonstrably the less reliable
-    # of the two: below roughly 1 kW the filter starts trusting the model over
-    # the thermometer and the result gets worse. Above it the result is flat
-    # across two orders of magnitude, so nothing here hinges on the exact
-    # number - the tests check that.
+    # readings' own noise (0.003 K, see SENSOR_RESOLUTION_K), because the
+    # model is demonstrably the less reliable of the two: below roughly 1 kW
+    # the filter starts trusting the model over the thermometer and the result
+    # gets worse. Above it the result is flat across two orders of magnitude,
+    # so nothing here hinges on the exact number - the tests check that.
     PROCESS_NOISE_W = 3000.0
 
-    # Standard MAD-to-std conversion for a normal distribution, used to set the
-    # robust loss scale from the data's own residual spread (not physical).
-    MAD_TO_STD = 1.4826
     MIN_F_SCALE = 1e-6
     # The fit stops once a step improves its cost by less than this share
     # (least_squares' ftol, 1e-8 by default). Real data, 365 d to 5 Nov 2026:
@@ -1524,6 +1521,13 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         first: dict[bytes, int] = {}
         shared = [first.setdefault(key, index) for index, key in enumerate(keys)]
         observation = np.stack([zone_observations(model) for model in models])
+        # The same system and thermometers: the same filter covariance (see
+        # kalman_filter).
+        seen: dict[tuple[int, bytes], int] = {}
+        same = [
+            seen.setdefault((shared[index], observation[index].tobytes()), index)
+            for index in range(len(models))
+        ]
 
         measured = df[["T_living", "T_rest"]].to_numpy(dtype=float)
         dt_seconds = df["dt_seconds"].to_numpy(dtype=float)
@@ -1564,7 +1568,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             # at that moment, so its measured and unmeasured parts stay
             # consistent with each other. For a single-state model that is the
             # measurement, lightly smoothed; for a two-state one it is the only
-            # principled way to know where the mass node is.
+            # principled way to know where the mass node is. Its gain held
+            # where it settles (see kalman_filter): the fit 2.3x faster, every
+            # parameter within 0.1 of its standard error of carrying it step
+            # by step (real data, 365 d to 5 Nov 2026).
             estimates = kalman_filter(
                 a_steps,
                 b_steps,
@@ -1579,6 +1586,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                     -dt_seconds[run_start + 1 : run_end]
                     / self.THERMOSTAT_RECOVERY_SECONDS
                 ),
+                same,
+                stationary=True,
             )
 
             steps = offsets[:, None] + np.arange(horizon_samples - 1)
@@ -1853,16 +1862,34 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         plan = self._rollout_plan(train_df, median_dt)
 
-        # The rest first with the horizons open, then on from each side's angle
-        # the data shows (see _horizon_scan) - only those sides free.
+        # Least absolute deviations, quadratic only within the readings' own
+        # noise - the filter's (see SENSOR_RESOLUTION_K), below which a reading
+        # cannot tell two predictions apart: the rollouts' errors are far from
+        # normal, an unmodelled disturbance (an opened window, a visitor, a
+        # wood stove) now and then and the rest small - std 1.5-1.7 times the
+        # MAD's sigma and kurtosis 7-9 over the last 4-8 weeks (normal 1.0 and
+        # 3, Laplace 1.4 and 6; real data, 5 Nov 2026). Scaled by the
+        # residuals' spread instead it shrank as the history grew, the old
+        # rows' weighted residuals near zero: 0.03 K on 90 days, 0.013 on 152,
+        # the fit then near this already. Walk-forward (fitted up to
+        # 15/22/29 Oct, scored on the week after): the living room the same,
+        # the rest 1% better, runs with the floor active 2% worse; scaled by
+        # the spread as weighed, 0.074 K, the living room 0-3% worse.
+        f_scale = self.SENSOR_RESOLUTION_K / np.sqrt(12.0)
+
+        # By least squares first with the horizons open, each side's angle the
+        # data shows from there (see _horizon_scan), and the robust fit last
+        # with only those sides free. One robust fit rather than one before
+        # the scan and another after it, which crept along the loss's kink for
+        # most of its steps (365 d to 5 Nov 2026: 31 -> 22 s, every parameter
+        # within 0.04 of its standard error; walk-forward as above the same,
+        # its 15 Oct fit no longer finding a west horizon of 24 deg).
         self.horizon_seen = (False, False)
-        x, std_errors, f_scale = self._fit(train_df, plan)
+        x, _ = self._fit(train_df, plan)
         angles = self._horizon_scan(x, train_df, plan, f_scale)
-        if any(angles):
-            self.horizon_seen = (angles[0] > 0.0, angles[1] > 0.0)
-            start = x.copy()
-            start[[24, 25]] = angles
-            x, std_errors, f_scale = self._fit(train_df, plan, (start, f_scale))
+        self.horizon_seen = (angles[0] > 0.0, angles[1] > 0.0)
+        x[[24, 25]] = angles
+        x, std_errors = self._fit(train_df, plan, (x, f_scale))
 
         self.parameter_std_errors = dict(
             zip(self.PARAMETER_NAMES, std_errors, strict=True)
@@ -1899,16 +1926,18 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         self,
         train_df: pd.DataFrame,
         plan,
-        start: tuple[np.ndarray, float] | None = None,
-    ) -> tuple[np.ndarray, np.ndarray, float]:
-        """(parameters, their standard errors, the robust loss's f_scale) fitted
-        within the current bounds (see _bounds). From a previous fit's
-        parameters and f_scale when given: a refit with a side's horizon held
-        open moves little, and starting over took the add-on minutes."""
+        robust: tuple[np.ndarray, float] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """(parameters, their standard errors) fitted within the current bounds
+        (see _bounds): by least squares from the initial values, or with
+        soft_l1 at f_scale from the (parameters, f_scale) given - a previous
+        fit's, starting over took the add-on minutes."""
 
         lower, initial, upper = self._bounds()
-        if start is not None:
-            initial = np.clip(start[0], lower, upper)
+        loss, f_scale = "linear", 1.0
+        if robust is not None:
+            initial = np.clip(robust[0], lower, upper)
+            loss, f_scale = "soft_l1", robust[1]
 
         # Only what is not held by the configuration (see _bounds).
         free = lower < upper
@@ -1935,33 +1964,12 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # x_scale="jac": the parameters span conductances (10^2 W/K) and heat
         # capacities (10^7 J/K), so an unscaled trust region would step
         # meaninglessly in one or the other.
-        if start is None:
-            ordinary = least_squares(
-                residuals,
-                initial[free],
-                jac=jacobian,
-                bounds=(lower[free], upper[free]),
-                x_scale="jac",
-                ftol=self.FIT_COST_TOLERANCE,
-            )
-
-            # Robust loss scaled by the data's own residual spread, so a window
-            # containing an unmodelled disturbance (an opened window, a visitor,
-            # a wood stove) is down-weighted instead of dragging the fit.
-            deviation = np.abs(ordinary.fun - np.median(ordinary.fun))
-            f_scale = max(
-                self.MAD_TO_STD * float(np.median(deviation)), self.MIN_F_SCALE
-            )
-            initial[free] = ordinary.x
-        else:
-            f_scale = start[1]
-
         result = least_squares(
             residuals,
             initial[free],
             jac=jacobian,
             bounds=(lower[free], upper[free]),
-            loss="soft_l1",
+            loss=loss,
             f_scale=f_scale,
             x_scale="jac",
             ftol=self.FIT_COST_TOLERANCE,
@@ -1972,7 +1980,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         std_errors = np.zeros_like(x)
         std_errors[free] = self._parameter_std_errors(result)
 
-        return x, std_errors, f_scale
+        return x, std_errors
 
     @staticmethod
     def _skill(
@@ -2491,10 +2499,11 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
     def _measured_sleep(self, df: pd.DataFrame) -> tuple[float, float, float, float]:
         """The household's hours of sleep (to bed, up, spread - see
-        physics.night_share) and its baseload asleep (W) from its electricity: the median baseload at each
-        local time of day, one level awake and a lower one asleep, stepping
-        between them at those hours. Robustly - an evening's cooking, a
-        morning's kettle stand above the awake level without being sleep."""
+        physics.night_share) and its baseload asleep (W) from its electricity:
+        the median baseload at each local time of day, one level awake and a
+        lower one asleep, stepping between them at those hours. Robustly - an
+        evening's cooking, a morning's kettle stand above the awake level
+        without being sleep."""
 
         profile = df.groupby("hour")["baseload_w"].median().dropna()
         hour = profile.index.to_numpy(dtype=float)

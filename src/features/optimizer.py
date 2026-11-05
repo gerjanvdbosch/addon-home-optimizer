@@ -75,8 +75,11 @@ OBJECTIVE_SCALE_EXPONENT = 10
 # whose constants are the zone's capacity times its temperature (~3e9 J): a
 # plan without any floor run came out infeasible, and the plan forced a 3 kW
 # run into a warm house at the comfort band's slack price (backtest, Jun-Oct
-# 2026: objectives of 1700-15000 EUR on days that need no heat). A
-# millikelvin of the whole zone (~0.05 kWh) moves no plan.
+# 2026: objectives of 1700-15000 EUR on days that need no heat). Since the
+# plan states the zone as its rise above that trajectory (see zone_rise), a
+# zone left alone sits on them exactly; a plan heating flat out still lies on
+# the flat-out rollout's through the chain. A millikelvin of the whole zone
+# (~0.05 kWh) moves no plan.
 ZONE_BOUND_MARGIN_K = 1e-3
 
 # How far apart (K) the tangents lie that bound the square of the tank's excess
@@ -94,18 +97,6 @@ EXCESS_TANGENT_SPACING_K = 2.0
 # data (13 Oct, a zone started 1-1.5 K under its target) in three times the
 # time: 8 s against 2.6.
 COMFORT_TANGENT_SPACING_K = 0.2
-
-# HiGHS's presolve, off. On this model it cut off the optimal plan and proved
-# a dearer one optimal, three times on real data with the zone: 2.076 EUR
-# against 1.802 on a 46-hour plan, 1.7095 against 1.7085 on another, and a
-# cooling day's plan held to 8757 EUR of comfort it did not have to miss
-# (1.049 without presolve). Leaving out single rules (parallel rows, doubleton
-# equations) mended the one day and not the next; without presolve each of
-# them was proven right, in about the time it took with it. Not the same cause
-# as OBJECTIVE_SCALE_EXPONENT's: with the objective scaled, presolve still
-# proved a plan optimal 0.003 EUR above the optimum (real data, 16 Oct, a cold
-# tank: 0.7170 against 0.7141), though up to a third sooner.
-PRESOLVE = "off"
 
 # HiGHS's primal heuristics, off once the previous plan has given the solve its
 # start: they look for good plans, and that one is all but optimal already, so
@@ -165,6 +156,7 @@ INFEASIBLE = 1e12
 FRONT_RELAXATION_HOURS = 4.0
 
 W_PER_KW = 1000.0
+J_PER_KWH = 3.6e6
 
 
 def _watts(power_kw: pyo.Var) -> pyo.Expression:
@@ -1115,7 +1107,18 @@ class MPCOptimizer:
     @staticmethod
     def _choose_tank(model: pyo.ConcreteModel, plans: list[TankPlan]) -> None:
         """The tank's heat pump and booster on or off as in exactly one of
-        `plans`, the program to choose which."""
+        `plans`, the program to choose which - but for the last step of each
+        of the heat pump's blocks there, which the program may also leave off.
+
+        A plan made around a zone run that starts a quarter after the block
+        could end holds the block on into that quarter: ending before it left
+        the compressor off for a quarter, and handing over saves the zone its
+        start. The heat pump then heats the steps before in full and the tank
+        ends past its target - though the zone could have started a quarter
+        earlier and taken over (real data, 5 Nov 2026 21:30: 50.1 degC
+        against 48.7 for the 18:00 target, 2.6 ct dearer). Its rules - a run's
+        last step the only one partly used, its minimum runtime - hold either
+        way (see _build_model)."""
 
         patterns = list(dict.fromkeys(_runs(plan) for plan in plans))
         model.tank_plan = pyo.Var(range(len(patterns)), domain=pyo.Binary)
@@ -1123,17 +1126,28 @@ class MPCOptimizer:
         model.tank_plan_constraint.add(
             sum(model.tank_plan[i] for i in range(len(patterns))) == 1
         )
+        num_steps = len(model.K)
+
+        def held(pattern, k, source):
+            """Whether the pattern holds this source on at step k: not the
+            heat pump's last step of a block that nothing follows."""
+
+            ends = k + 1 == num_steps or not any(pattern[k + 1])
+            return int(pattern[k][source] and not (source == 0 and ends))
 
         for k in model.K:
             for variable, source in ((model.boiler_on, 0), (model.booster_on, 1)):
                 if not variable[k].fixed:
-                    model.tank_plan_constraint.add(
-                        variable[k]
-                        == sum(
-                            model.tank_plan[i] * pattern[k][source]
-                            for i, pattern in enumerate(patterns)
-                        )
+                    on = sum(
+                        model.tank_plan[i] * pattern[k][source]
+                        for i, pattern in enumerate(patterns)
                     )
+                    kept = sum(
+                        model.tank_plan[i] * held(pattern, k, source)
+                        for i, pattern in enumerate(patterns)
+                    )
+                    model.tank_plan_constraint.add(variable[k] <= on)
+                    model.tank_plan_constraint.add(variable[k] >= kept)
 
     def _zone_held(self, data: MPCInput, tank: TankSetting) -> tuple[int, ...]:
         """Per step, whether a floor run under way that the zone started still
@@ -1228,11 +1242,16 @@ class MPCOptimizer:
     @staticmethod
     def _solver() -> Highs:
         solver = Highs()
+        # HiGHS's presolve at its default, on. It was off while the zone was
+        # stated on its states themselves (see zone_rise): it then proved
+        # dearer plans optimal (real data: 2.076 EUR against 1.802, a cooling
+        # day held to 8757 EUR of comfort it did not have to miss). On the
+        # rise, 72 solves of three real days and variants found the same plans
+        # in 30% less time (1428 -> 997 s, the longest 59 -> 34 s).
         solver.highs_options = {
             "user_objective_scale": OBJECTIVE_SCALE_EXPONENT,
             "mip_abs_gap": MIP_ABSOLUTE_GAP_EUR * 2.0**OBJECTIVE_SCALE_EXPONENT,
             "mip_rel_gap": 0.0,
-            "presolve": PRESOLVE,
         }
         solver.config.load_solution = False
         # HiGHS's own progress log, at INFO by default, buried the plan's own
@@ -1269,7 +1288,6 @@ class MPCOptimizer:
         highs = highspy.Highs()
         highs.setOptionValue("output_flag", False)
         highs.setOptionValue("time_limit", self.config.warm_start_time_limit_s)
-        highs.setOptionValue("presolve", PRESOLVE)
         highs.passModel(solver._solver_model.getModel())
         columns = solver._pyomo_var_to_solver_var_map
 
@@ -3330,7 +3348,15 @@ class MPCOptimizer:
         # The rooms - air, furnishings, internal walls - and the slabs the
         # floor's heat lands in (see BuildingThermalModel).
         model.ZONE_STATES = pyo.RangeSet(0, num_states - 1)
-        model.zone_state = pyo.Var(model.K, model.ZONE_STATES)
+        # The zone's rise above its unheated trajectory (K, see unheated
+        # below), the floor's heat's own response: the zone is linear, so its
+        # states are that trajectory - every other input rolled out beforehand
+        # - plus the rise, exactly. Stated on the states themselves, the rows
+        # carried the outdoor, gain and sun terms and the end heat a difference
+        # of two sums of some 1e9 J: coefficients from 7e-9 to 2e7 and right-
+        # hand sides from 4e-9 to 1e9, on which HiGHS proved dearer plans
+        # optimal (real data, 5 Nov 2026).
+        model.zone_rise = pyo.Var(model.K, model.ZONE_STATES)
         max_heat_kw = max_heat_w / W_PER_KW
         model.q_space_kw = pyo.Var(
             model.K, bounds=(-max_heat_kw, 0.0) if cooling else (0.0, max_heat_kw)
@@ -3344,7 +3370,7 @@ class MPCOptimizer:
         model.zone_constraints = pyo.ConstraintList()
 
         for i in model.ZONE_STATES:
-            model.zone_constraints.add(model.zone_state[0, i] == float(initial[i]))
+            model.zone_rise[0, i].fix(0.0)
 
         # Evaluated at a representative floor-circuit supply temperature and
         # the outdoor temperature of each step, so a cold day costs what a cold
@@ -3523,61 +3549,6 @@ class MPCOptimizer:
                 model.zone_constraints.add(model.dhw_today[k] >= earlier)
                 model.zone_constraints.add(model.space_on[k] <= 1 - earlier)
 
-        for k in range(num_steps):
-            # Heat only flows to the zone while the valve points at it.
-            model.zone_constraints.add(
-                sign * model.q_space_w[k] <= max_heat_w * model.space_on[k]
-            )
-
-            # One compressor, one demand at a time. Sequential within a run is
-            # what the hardware does; simultaneous is not. The booster counts
-            # too: it finishes the tank with the heat pump in its hot water
-            # mode (see app.state), which serves nothing else meanwhile -
-            # counted apart, a plan heated the floor beside it (0.9 kW on top
-            # of the booster's 2.2).
-            model.zone_constraints.add(model.tank_heating[k] + model.space_on[k] <= 1)
-
-            if k + 1 >= num_steps:
-                continue
-
-            a_d, b_d = zone_step(k)
-            outdoor = zone_outdoor_c[k]
-
-            # u = [T_outdoor, Q_internal, Q_living, Q_rest, Q_floor,
-            # Q_floor_moved, Q_living_air, Q_sun_living, Q_sun_rest], the same
-            # input vector the zone is
-            # identified with. Each state advances by its own row of the
-            # discrete matrices, so where a gain lands - which room, or the
-            # slabs - is the model's to decide, not this block's.
-            for i in model.ZONE_STATES:
-                model.zone_constraints.add(
-                    model.zone_state[k + 1, i]
-                    == sum(
-                        a_d[i, j] * model.zone_state[k, j] for j in model.ZONE_STATES
-                    )
-                    + b_d[i, 0] * outdoor
-                    + b_d[i, 1] * float(internal_gain_w[k])
-                    + b_d[i, 2] * float(living_gain_w[k])
-                    + b_d[i, 3] * float(rest_gain_w[k])
-                    + (b_d[i, 4] + moved_per_w * b_d[i, 5]) * floor_w(k)
-                    + b_d[i, 6] * float(living_air_gain_w[k])
-                    + b_d[i, 7] * float(living_sun_w[k])
-                    + b_d[i, 8] * float(rest_sun_w[k])
-                )
-
-        # What a thermostat reads of the plan: an operative temperature, part
-        # air and part mass (see zone_observation). Comfort is
-        # judged on it because that is the quantity the setpoint is set in and
-        # the occupant feels, and because it is what the model was identified
-        # against.
-        def measured(k):
-            return sum(
-                float(observation[i]) * model.zone_state[k, i]
-                for i in model.ZONE_STATES
-            )
-
-        model.zone_measured = measured
-
         # What a thermostat would read with the zone heated (or cooled) flat out
         # every step, and with it left alone. A target above the warmer of the
         # two cannot be met by any plan, and sun alone may carry the zone past
@@ -3619,9 +3590,57 @@ class MPCOptimizer:
         coolest = [np.minimum(a, b) for a, b in zip(flat_out, unheated, strict=True)]
         reachable_c = [float(observation @ state) for state in warmest]
         unheated_c = [float(observation @ state) for state in coolest]
+        model.zone_state = pyo.Expression(
+            model.K,
+            model.ZONE_STATES,
+            rule=lambda m, k, i: float(unheated[k][i]) + m.zone_rise[k, i],
+        )
+
+        for k in range(num_steps):
+            # Heat only flows to the zone while the valve points at it.
+            model.zone_constraints.add(
+                sign * model.q_space_w[k] <= max_heat_w * model.space_on[k]
+            )
+
+            # One compressor, one demand at a time. Sequential within a run is
+            # what the hardware does; simultaneous is not. The booster counts
+            # too: it finishes the tank with the heat pump in its hot water
+            # mode (see app.state), which serves nothing else meanwhile -
+            # counted apart, a plan heated the floor beside it (0.9 kW on top
+            # of the booster's 2.2).
+            model.zone_constraints.add(model.tank_heating[k] + model.space_on[k] <= 1)
+
+            if k + 1 >= num_steps:
+                continue
+
+            a_d, b_d = zone_step(k)
+
+            # The rise advances by the zone's own discrete matrices with the
+            # floor's heat its only input (Q_floor and Q_floor_moved of u, see
+            # states_with): each state by its own row, so where that heat lands
+            # is the model's to decide, not this block's.
+            for i in model.ZONE_STATES:
+                model.zone_constraints.add(
+                    model.zone_rise[k + 1, i]
+                    == sum(a_d[i, j] * model.zone_rise[k, j] for j in model.ZONE_STATES)
+                    + (b_d[i, 4] + moved_per_w * b_d[i, 5]) * floor_w(k)
+                )
+
+        # What a thermostat reads of the plan: an operative temperature, part
+        # air and part mass (see zone_observation). Comfort is
+        # judged on it because that is the quantity the setpoint is set in and
+        # the occupant feels, and because it is what the model was identified
+        # against.
+        def measured(k):
+            return sum(
+                float(observation[i]) * model.zone_state[k, i]
+                for i in model.ZONE_STATES
+            )
+
+        model.zone_measured = measured
 
         # The heat a plan leaves in the zone at its end beyond what the zone
-        # left alone would hold (J): it makes up heat the next plan would
+        # left alone would hold (kWh): it makes up heat the next plan would
         # otherwise have to make, so it is worth what making it then costs
         # (see _build_objective) - but only as much as the next plan would
         # have to deliver to bring the thermostat's room, left alone, to its
@@ -3634,19 +3653,19 @@ class MPCOptimizer:
         if not cooling:
             last = num_steps - 1
             capacities = zone_heat_capacities(building)
-            model.zone_end_heat_j = pyo.Var(
+            model.zone_end_heat_kwh = pyo.Var(
                 bounds=(
-                    -ZONE_BOUND_MARGIN_K * float(np.sum(capacities)),
+                    -ZONE_BOUND_MARGIN_K * float(np.sum(capacities)) / J_PER_KWH,
                     zone_heat_shortfall_j(
                         building, unheated[last], float(target_c[last]), living_fraction
-                    ),
+                    )
+                    / J_PER_KWH,
                 )
             )
             model.zone_constraints.add(
-                model.zone_end_heat_j
+                model.zone_end_heat_kwh
                 <= sum(
-                    float(capacities[i])
-                    * (model.zone_state[last, i] - float(unheated[last][i]))
+                    float(capacities[i]) / J_PER_KWH * model.zone_rise[last, i]
                     for i in model.ZONE_STATES
                 )
             )
@@ -4064,9 +4083,9 @@ class MPCOptimizer:
 
         # The heat left in the zone at the plan's end, at what heat costs the
         # zone then: the grid's price over the horizon by its COP at the end.
-        if hasattr(model, "zone_end_heat_j"):
+        if hasattr(model, "zone_end_heat_kwh"):
             price = sum(import_price_eur_per_kwh) / len(import_price_eur_per_kwh)
-            objective -= price / model.space_cop[-1] * model.zone_end_heat_j / 3.6e6
+            objective -= price / model.space_cop[-1] * model.zone_end_heat_kwh
 
         return objective
 
