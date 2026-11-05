@@ -218,11 +218,13 @@ actions:
           "solar": "sensor.pv_output",
           "baseload": "sensor.stroomverbruik_base_load",
           "heat_pump": {
+            "auto_adaptive": true,
             "mode": "select.ecodan_heatpump_ca09ec_gekozen_werking_mode",
             "state": "sensor.ecodan_heatpump_ca09ec_status_bedrijf",
             "power": "sensor.warmtepomp_geschat_vermogen",
             "supply_temperature": "sensor.ecodan_heatpump_ca09ec_aanvoer_temp",
             "return_temperature": "sensor.ecodan_heatpump_ca09ec_retour_temp",
+            "outdoor_temperature": "sensor.ecodan_heatpump_ca09ec_buiten_temp",
             "flow": "sensor.ecodan_heatpump_ca09ec_flow_waarde",
             "compressor_frequency": "sensor.ecodan_heatpump_compressor_frequentie",
             "booster": "binary_sensor.ecodan_heatpump_ca09ec_status_booster_heater", 

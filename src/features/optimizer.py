@@ -3987,11 +3987,15 @@ class MPCOptimizer:
                 # solver's own tolerance; on eight days this held runs steady
                 # for at most 0.23 cent, every solve as quick. Exact in the
                 # binaries' four cases: no bound beyond the most heat unless
-                # both steps run.
-                model.zone_constraints.add(
-                    sign * model.q_space_w[k + 1]
-                    <= sign * model.q_space_w[k] + max_heat_w * (2 - on_k - on_next)
-                )
+                # both steps run. Not where the bias steers the heat: the
+                # controller's setpoint is the return plus the rise asked for,
+                # which the heat pump follows (5 Nov 2026: supply within
+                # 0.1-0.5 K of it), so a run follows a rising sun.
+                if not data.zone_heat_may_rise:
+                    model.zone_constraints.add(
+                        sign * model.q_space_w[k + 1]
+                        <= sign * model.q_space_w[k] + max_heat_w * (2 - on_k - on_next)
+                    )
 
                 # Where the ranges do not overlap the order holds by itself.
                 if cooling and hi_next >= lo_k:

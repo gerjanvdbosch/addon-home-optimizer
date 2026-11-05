@@ -116,15 +116,15 @@ class HeatPumpConfig(BaseModel):
     # operating state does not show it (it stays on the demand being served).
     # Only drawn on the dashboard.
     defrost: SensorReference | None = Field(default=None)
-    # The unit's own outdoor air temperature sensor, if it really measures
-    # outdoor air. Optional, and deliberately unset on this installation: the
-    # heat pump stands in a shed, so its sensor reads shed air, which runs on
-    # average 1.8 K warmer than the 2 m air temperature and carries a strongly
-    # diurnal bias (+2.8 K at night against +0.9 K at midday) because the shed
-    # retains heat and damps the real outdoor swing. Driving an envelope loss
-    # with that would fold a sensor artifact into the building's own dynamics.
-    # Without it, Open-Meteo's temperature attribute is used instead - which
-    # planning has to use for the future in any case.
+    # The unit's own outdoor sensor, which its auto-adaptive controller's cold
+    # factor reads (see auto_adaptive). Not the building's outdoor air: the
+    # heat pump stands in a shed,
+    # so its sensor reads shed air, on average 1.8 K warmer than the 2 m air
+    # temperature with a strongly diurnal bias (+2.8 K at night against +0.9 K
+    # at midday) as the shed retains heat and damps the real outdoor swing -
+    # an envelope loss driven by it would fold a sensor artifact into the
+    # building's own dynamics. The building takes Open-Meteo's temperature,
+    # which planning has to use for the future in any case.
     outdoor_temperature: SensorReference | None = Field(default=None)
     # The operating mode the heat pump is set to (on the Ecodan a select whose
     # options read "Verwarmen ..." or "Koelen ..."): a mode starting with
@@ -132,8 +132,26 @@ class HeatPumpConfig(BaseModel):
     # since the heat pump can only serve the floor in the mode it is in. None
     # plans heating.
     mode: SensorReference | None = Field(default=None)
+    # Steer the esphome-ecodan-hp auto-adaptive controller (underfloor S-curve,
+    # Smart Boost off) through its setpoint bias: the plan's heat during a run
+    # is published as the bias that makes the controller ask for it (see
+    # features.ecodan), on the thermostat's setpoint, which the controller
+    # follows - and so a run's planned heat may rise. On only where something
+    # writes that bias to the controller (the blueprint's bias input), or the
+    # plan counts on heat no one asks for. Needs outdoor_temperature.
+    auto_adaptive: bool = Field(default=False)
     boiler: BoilerConfig = Field()
     states: HeatPumpStates = Field(default_factory=HeatPumpStates)
+
+    @model_validator(mode="after")
+    def auto_adaptive_needs_its_outdoor_sensor(self) -> "HeatPumpConfig":
+        if self.auto_adaptive and self.outdoor_temperature is None:
+            raise ValueError(
+                "heat_pump.auto_adaptive needs heat_pump.outdoor_temperature: "
+                "the unit's own outdoor sensor, which the controller reads."
+            )
+
+        return self
 
 
 class SouthGlazing(BaseModel):

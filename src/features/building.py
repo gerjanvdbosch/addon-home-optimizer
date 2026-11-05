@@ -1085,11 +1085,11 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 .mean(axis=1)
             )
 
-        # Without a configured outdoor sensor, Open-Meteo's own temperature is
-        # the only outdoor air temperature available (see
-        # HeatPumpConfig.outdoor_temperature for why the measurement is
-        # preferred when there is one).
-        if "T_out" not in df.columns and "temperature" in df.columns:
+        # Open-Meteo's temperature is the outdoor air: the heat pump's own
+        # sensor reads the shed it stands in (see
+        # HeatPumpConfig.outdoor_temperature), and planning has to use the
+        # forecast for the future in any case.
+        if "temperature" in df.columns:
             df["T_out"] = df["temperature"]
 
         # Every one of these is requested unconditionally by dataset(), so a
@@ -3266,11 +3266,6 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             # no measurement, and leaves the forecast's sun as it is.
             ("pv_w", config.solar, "mean", "none"),
         ]
-
-        if config.heat_pump.outdoor_temperature is not None:
-            numeric.append(
-                ("T_out", config.heat_pump.outdoor_temperature, "mean", "previous")
-            )
 
         # Cover position is an event-driven state - it only changes when a
         # shutter actually moves - so it is carried forward, not averaged.

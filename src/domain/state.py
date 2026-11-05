@@ -209,6 +209,9 @@ class BuildingSchedule(BaseModel):
     # The supply setpoint last published during a cooling run, which a later
     # one in the same run may not exceed (see Optimization.zone_supply_c).
     supply_setpoint: SeriesPoint[float] | None = None
+    # The setpoint bias last published and when it last changed, which a
+    # later one holds to (see Optimization._zone_bias).
+    bias: SeriesPoint[float] | None = None
 
 
 class Schedule(BaseModel):

@@ -23,6 +23,7 @@ from domain.physics import (
 from domain.sensors import SensorReference
 from domain.state import BaseloadHabit, SeriesPoint, State, TapHabit, ZoneHabit
 from domain.time import local_day_start, to_local_time
+from features import ecodan
 from features.baseload import BaseloadForecaster
 from features.boiler import BoilerThermalIdentifier
 from features.building import BuildingThermalIdentifier
@@ -60,6 +61,9 @@ class Optimization:
     ZONE_STATUS_ENTITY = "binary_sensor.home_optimizer_zone_status"
     ZONE_START_ENTITY = "sensor.home_optimizer_zone_start"
     ZONE_SUPPLY_ENTITY = "sensor.home_optimizer_zone_supply"
+    # The auto-adaptive setpoint bias for the run (see features.ecodan), only with
+    # HeatPumpConfig.auto_adaptive on.
+    ZONE_BIAS_ENTITY = "sensor.home_optimizer_zone_bias"
     ZONE_SETPOINT_ENTITY = "sensor.home_optimizer_zone_setpoint"
 
     def __init__(
@@ -1480,6 +1484,7 @@ class Optimization:
             ),
             zone_floor_open=loops[:2] if loops else (),
             zone_floor_flow_lpm=loops[2] if loops else None,
+            zone_heat_may_rise=config.heat_pump.auto_adaptive,
             zone_cooling=cooling,
             zone_mass_minimum_c=(
                 tuple(c + config.building.dew_point_margin for c in dew_point_c)
@@ -1747,6 +1752,90 @@ class Optimization:
 
         return f"{setpoint_c:.1f}"
 
+    # A new bias only past this from the held one, and not within ZONE_BIAS_HOLD
+    # of its last change: near the plan's heats the controller moves ~3-4 kW
+    # of heat per K of error (5 Nov 2026, 17.5 L/min, 8 degC), so a 0.1 K step
+    # is ~0.4 kW - the deadband keeps the plan's quarter-hour heats and the
+    # sun of the quarter now from stepping it to and fro. The hold is the
+    # least run (two quarter hours): the floor answers a change over that long.
+    ZONE_BIAS_DEADBAND_K = 0.2
+    ZONE_BIAS_HOLD = timedelta(minutes=30)
+
+    def _zone_bias(
+        self,
+        config: Config,
+        data: MPCInput,
+        result: MPCResult,
+        state: State,
+        k: int,
+        on: bool,
+        since: datetime | None,
+        now: datetime,
+    ) -> float:
+        """The bias to publish now: for a heating run under way or handed over
+        (step k its first), the plan's mean heat over its next hour; 0 -
+        the controller left to its setpoint - outside one, while cooling, or
+        without the readings. Within a run under way since `since`, held to
+        its last one within the deadband and the hold; a run's first and the
+        0 after it are not held."""
+
+        outdoor = config.heat_pump.outdoor_temperature
+        assert outdoor is not None
+        building = state.measurements.building
+        measured = state.measurements.heat_pump
+        bias_k = 0.0
+
+        if on and not data.zone_cooling and result.space_heat_w:
+            schedule = result.space_schedule
+            steps_per_hour = round(1.0 / MPCConfig().step_hours)
+            run = [
+                result.space_heat_w[j]
+                for j in range(k, min(k + steps_per_hour, len(schedule)))
+                if schedule[j] == 1
+            ] or [result.space_heat_w[k]]
+            flow_lpm = (
+                measured.flow[-1].value
+                if measured.flow and measured.flow[-1].value > 0
+                else data.zone_floor_flow_lpm
+            )
+            outdoor_c = self._latest(outdoor, now)
+
+            if (
+                flow_lpm
+                and outdoor_c is not None
+                and building.setpoint
+                and building.zone_temperature
+                and data.zone_maximum_temperature
+            ):
+                bias_k = ecodan.setpoint_bias_k(
+                    heat_w=float(np.mean(run)),
+                    flow_lpm=flow_lpm,
+                    outdoor_c=outdoor_c,
+                    room_c=building.zone_temperature[-1].value,
+                    setpoint_c=building.setpoint[-1].value,
+                    maximum_c=data.zone_maximum_temperature[k],
+                )
+
+        previous = state.schedule.building.bias
+
+        if (
+            on
+            and previous is not None
+            and since is not None
+            and previous.time >= since
+            and (
+                abs(bias_k - previous.value) < self.ZONE_BIAS_DEADBAND_K - 1e-9
+                or now - previous.time < self.ZONE_BIAS_HOLD
+            )
+        ):
+            return previous.value
+
+        # Stored on a change only: its time is when the bias last moved.
+        if previous is None or previous.value != bias_k:
+            self.state_manager.update_zone_bias(SeriesPoint(time=now, value=bias_k))
+
+        return bias_k
+
     def publish_zone(
         self,
         result: MPCResult,
@@ -1770,6 +1859,7 @@ class Optimization:
 
         status = start = setpoint = room = "unknown"
         published = None
+        bias: float | None = None
 
         if data is not None and result.space_schedule:
             schedule = result.space_schedule
@@ -1803,6 +1893,18 @@ class Optimization:
                 start = (
                     since if running and since is not None else times[first]
                 ).isoformat()
+
+            if config.heat_pump.auto_adaptive:
+                bias = self._zone_bias(
+                    config,
+                    data,
+                    result,
+                    state,
+                    k,
+                    running or hand_over,
+                    since if running else None,
+                    now,
+                )
 
             # The room setpoint the thermostat is given for that run, which
             # asks the heat pump for heat while the room is below it: what the
@@ -1897,23 +1999,34 @@ class Optimization:
             },
         )
 
+        if config.heat_pump.auto_adaptive:
+            self.home_assistant.set_state(
+                self.ZONE_BIAS_ENTITY,
+                f"{bias:.1f}" if bias is not None else "unknown",
+                {
+                    "friendly_name": "Home Optimizer zone bias",
+                    "unit_of_measurement": "°C",
+                },
+            )
+
     def _dhw_setpoint_c(self, config: Config, now: datetime) -> float | None:
         """The heat pump's DHW setpoint now (deg C), None without a reading."""
+
+        return self._latest(config.heat_pump.boiler.setpoint, now)
+
+    def _latest(self, reference: SensorReference, now: datetime) -> float | None:
+        """A sensor's last reading in the quarter hour before now, None without."""
 
         frame = self.loader.load(
             DatasetBuilder()
             .timeseries(
-                "setpoint",
-                config.heat_pump.boiler.setpoint,
-                aggregation="last",
-                interval="15m",
-                fill="previous",
+                "value", reference, aggregation="last", interval="15m", fill="previous"
             )
             .build(),
             now - timedelta(minutes=15),
             now,
         )
-        readings = pd.to_numeric(frame.get("setpoint"), errors="coerce").dropna()
+        readings = pd.to_numeric(frame.get("value"), errors="coerce").dropna()
 
         return float(readings.iloc[-1]) if not readings.empty else None
 

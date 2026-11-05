@@ -421,6 +421,11 @@ class StateManager:
         state.schedule.building.supply_setpoint = point
         self.state_repository.save(state)
 
+    def update_zone_bias(self, point: SeriesPoint | None) -> None:
+        state = self.load()
+        state.schedule.building.bias = point
+        self.state_repository.save(state)
+
     def update_zone(
         self,
         temperature: pd.Series,

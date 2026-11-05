@@ -1919,6 +1919,33 @@ def test_a_runs_heat_never_rises():
             assert heat[k + 1] <= heat[k] + 1e-6
 
 
+def test_with_the_bias_steering_a_runs_heat_follows_the_rising_sun():
+    """Where the bias steers the heat (MPCInput.zone_heat_may_rise) a run may
+    raise it as the sun comes up - never at a higher cost than holding it."""
+
+    hour = np.arange(48) * 0.25 + 6.0
+    sun_w = tuple(np.clip((hour - 8.0) / 4.0, 0.0, 1.0) * 1500.0)
+    optimizer = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE,
+        floor_circuit_model=HEATING,
+        space_cop_model=COP_MODEL,
+    )
+    held = optimizer.solve(_cold_day(steps=48, solar_forecast_w=list(sun_w)))
+    free = optimizer.solve(
+        _cold_day(steps=48, solar_forecast_w=list(sun_w), zone_heat_may_rise=True)
+    )
+    on, heat = free.space_schedule, free.space_heat_w
+
+    assert free.objective_value <= held.objective_value + 1e-3
+    assert any(
+        on[k] and on[k + 1] and heat[k + 1] > heat[k] + 100.0
+        for k in range(len(on) - 1)
+    )
+
+
 def test_the_floor_is_planned_no_further_than_its_runs_have_gone():
     """The zone's heat stays within the most the floor's runs have moved, the
     range its COP model was fitted in, though the compressor gives more."""

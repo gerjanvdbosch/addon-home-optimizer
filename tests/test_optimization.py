@@ -90,7 +90,9 @@ def _published_zone(
         boiler_on_current=bool(tank[0]),
         zone_cooling=cooling,
     )
-    config = SimpleNamespace(heat_pump=SimpleNamespace(states=HeatPumpStates()))
+    config = SimpleNamespace(
+        heat_pump=SimpleNamespace(states=HeatPumpStates(), auto_adaptive=False)
+    )
 
     optimization.publish_zone(result, TIMES, State(), config, data, [], START)  # type: ignore[arg-type]
 
@@ -973,3 +975,112 @@ def test_an_evening_target_is_not_lowered_by_draws_for_the_morning_one():
         lambda since: 5.0 if since < morning_end else 2.0,
         now,
     ) == (pytest.approx(43.0),)
+
+
+def _zone_bias(
+    previous: SeriesPoint | None, on: bool, heat_w: float = 4500.0
+) -> tuple[float, list[SeriesPoint]]:
+    stored: list[SeriesPoint] = []
+    optimization = Optimization(
+        loader=None,  # type: ignore[arg-type]
+        state_manager=SimpleNamespace(update_zone_bias=stored.append),  # type: ignore[arg-type]
+        config_repository=None,  # type: ignore[arg-type]
+        models_path=Path("."),
+        home_assistant=None,  # type: ignore[arg-type]
+    )
+    optimization._latest = lambda reference, now: 8.0  # type: ignore[method-assign]
+    config = SimpleNamespace(
+        heat_pump=SimpleNamespace(
+            outdoor_temperature=SensorReference(entity_id="outdoor")
+        )
+    )
+    state = State()
+    state.measurements.building.setpoint = [SeriesPoint(time=START, value=20.0)]
+    state.measurements.building.zone_temperature = [SeriesPoint(time=START, value=19.5)]
+    state.measurements.heat_pump.flow = [SeriesPoint(time=START, value=18.0)]
+    state.schedule.building.bias = previous
+    result = MPCResult(
+        schedule=(0,) * 4,
+        temperatures=TEMPERATURES,
+        electrical_power_w=(0.0,) * 4,
+        heat_w=(0.0,) * 4,
+        objective_value=0.0,
+        termination_condition="optimal",
+        space_schedule=(1, 1, 1, 1),
+        space_heat_w=(heat_w,) * 4,
+    )
+    data = MPCInput(
+        solar_forecast_w=[0.0] * 4,
+        ambient_temperature=20.0,
+        current_temp_top=45.0,
+        current_temp_bottom=45.0,
+        boiler_on_current=False,
+        zone_maximum_temperature=(21.0,) * 4,
+    )
+    since = START - timedelta(hours=1)
+    bias = optimization._zone_bias(config, data, result, state, 0, on, since, START)  # type: ignore[arg-type]
+
+    return bias, stored
+
+
+def test_the_zone_bias_holds_within_a_run_and_drops_after_it():
+    free, _ = _zone_bias(None, on=True)
+    assert free == 0.2
+
+    # Changed 10 minutes ago in this run: held, though 0.4 K off.
+    held, stored = _zone_bias(
+        SeriesPoint(time=START - timedelta(minutes=10), value=-0.2), on=True
+    )
+    assert (held, stored) == (-0.2, [])
+
+    # Within the deadband: held however long ago.
+    held, _ = _zone_bias(
+        SeriesPoint(time=START - timedelta(minutes=50), value=0.1), on=True
+    )
+    assert held == 0.1
+
+    # Past both: moves, and the change is stored.
+    moved, stored = _zone_bias(
+        SeriesPoint(time=START - timedelta(minutes=50), value=-0.2), on=True
+    )
+    assert moved == 0.2 and stored == [SeriesPoint(time=START, value=0.2)]
+
+    # The run over: back to 0 at once.
+    off, _ = _zone_bias(
+        SeriesPoint(time=START - timedelta(minutes=10), value=0.2), on=False
+    )
+    assert off == 0.0
+
+
+def test_auto_adaptive_needs_the_units_outdoor_sensor():
+    from domain.config import HeatPumpConfig
+
+    sensor = {"entity_id": "sensor.x"}
+    heat_pump = {
+        name: sensor
+        for name in (
+            "state",
+            "power",
+            "supply_temperature",
+            "return_temperature",
+            "compressor_frequency",
+            "flow",
+        )
+    } | {
+        "boiler": {
+            "setpoint": sensor,
+            "top_temperature": sensor,
+            "bottom_temperature": sensor,
+            "ambient_temperature": sensor,
+            "volume": 200,
+            "target_temperature": 45.0,
+        },
+        "auto_adaptive": True,
+    }
+
+    with pytest.raises(ValueError, match="outdoor_temperature"):
+        HeatPumpConfig.model_validate(heat_pump)
+
+    assert HeatPumpConfig.model_validate(
+        heat_pump | {"outdoor_temperature": sensor}
+    ).auto_adaptive

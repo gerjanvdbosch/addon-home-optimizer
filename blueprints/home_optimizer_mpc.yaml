@@ -86,6 +86,16 @@ blueprint:
       default: 20
       selector:
         number: { min: 15, max: 22, step: 0.5, unit_of_measurement: °C }
+    bias_number:
+      name: Auto-adaptive setpoint bias (optional)
+      description: >-
+        The esphome-ecodan-hp bias number, set to sensor.home_optimizer_zone_bias
+        (needs heat_pump.auto_adaptive on in the optimizer config). Empty leaves
+        the bias alone.
+      default: ""
+      selector:
+        entity:
+          domain: number
 
 variables:
   zone_window: !input zone_window
@@ -95,6 +105,7 @@ variables:
   outdoor_cold: !input outdoor_cold
   upstairs_setpoint: !input upstairs_setpoint
   upstairs_setpoint_cold: !input upstairs_setpoint_cold
+  bias_number: !input bias_number
 
 triggers:
   - trigger: state
@@ -113,6 +124,10 @@ triggers:
     to: "off"
     for: { minutes: 10 }
     id: zone_stop
+  - trigger: state
+    entity_id: sensor.home_optimizer_zone_bias
+    not_to: [ unknown, unavailable ]
+    id: zone_bias
 
 conditions:
   - condition: state
@@ -210,5 +225,18 @@ actions:
           - action: notify.notify
             data:
               message: Optimizer zone stop
+      - alias: Zone bias
+        conditions:
+          - condition: trigger
+            id: zone_bias
+          - condition: template
+            value_template: "{{ bias_number != '' }}"
+        sequence:
+          - action: number.set_value
+            target:
+              entity_id: "{{ bias_number }}"
+            data:
+              value: "{{ states('sensor.home_optimizer_zone_bias') | float(0) }}"
 
-mode: single
+# Queued: a bias change may come with a start.
+mode: queued

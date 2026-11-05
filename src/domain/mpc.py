@@ -193,6 +193,10 @@ class MPCInput:
     # physics.floor_circuit_conductance_w_per_k): fewer loops open, more
     # through each. None is the flow its runs ran at.
     zone_floor_flow_lpm: float | None = None
+    # Whether a run's heat may rise: with the controller steered through its
+    # setpoint bias (see features.ecodan) the heat is the water's rise over the
+    # return it is asked for. Left to itself the heat only falls within a run.
+    zone_heat_may_rise: bool = False
     # Whether the heat pump is serving the zone right now, the space-heating
     # counterpart of boiler_on_current.
     space_on_current: bool = False
