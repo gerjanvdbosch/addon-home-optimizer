@@ -24,6 +24,7 @@ from domain.dataset import (
     AttributeTimeSeriesDefinition,
     DataDefinition,
     DataLoader,
+    SumSeriesDefinition,
     TimeSeriesDefinition,
 )
 from domain.sensors import InfluxSensor, SensorReference
@@ -373,6 +374,48 @@ class TimeSeriesLoader(InfluxLoader):
             shift=definition.target_shift,
             sample_interval=definition.interval,
         )
+
+
+class SumSeriesLoader(TimeSeriesLoader):
+    """A signed sum of sensors' series (see SumSeriesDefinition): each part
+    loaded as a time series of its own, the sum where all of them have a
+    value."""
+
+    def supports(self, definition) -> bool:
+        return type(definition) is SumSeriesDefinition
+
+    def _sensors(self, definition: Any) -> list[SensorReference]:
+        if isinstance(definition, SumSeriesDefinition):
+            return [sensor for _, sensor in definition.terms]
+
+        return super()._sensors(definition)
+
+    def _queries(self, definition: Any, start: datetime, end: datetime) -> list[str]:
+        return [
+            query
+            for part in definition.parts()
+            for query in super(SumSeriesLoader, self)._queries(part, start, end)
+        ]
+
+    def load(
+        self, definition: SumSeriesDefinition, start: datetime, end: datetime
+    ) -> pd.DataFrame:
+        parts = [
+            sign
+            * pd.to_numeric(
+                super(SumSeriesLoader, self)
+                .load(part, start, end)
+                .set_index("time")[part.name],
+                errors="coerce",
+            )
+            for (sign, _), part in zip(
+                definition.terms, definition.parts(), strict=True
+            )
+        ]
+        total = pd.concat(parts, axis=1, join="inner").dropna().sum(axis=1)
+        total.index.name = "time"
+
+        return total.rename(definition.name).reset_index()
 
 
 class AttributeSeriesLoader(InfluxLoader):

@@ -413,6 +413,12 @@ class FloorCircuitModel:
     pipe_ua_w_per_k: float = 0.0
     # The flow its runs ran at (L/min, the median of their settled readings).
     flow_lpm: float = 0.0
+    # Heating only: the coolest supply a settled run holds (deg C), the
+    # controller's own floor on its flow setpoint (the Ecodan's auto-adaptive
+    # minimum supply, set to 24 degC). Asked for less heat than that brings
+    # into a cool floor, it brings that anyway. 0.0 for cooling and for a
+    # model from before it was identified: nothing bounds the supply then.
+    min_supply_c: float = 0.0
 
     def supply_c(self, outdoor_c):
         return self.supply_at_zero_outdoor_c + self.supply_per_outdoor_k * outdoor_c

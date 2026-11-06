@@ -11,6 +11,10 @@ body {
     }
 }
 
+h1 {
+    margin-top: 0;
+}
+
 .plotly-notifier {
     display: none;
 }
@@ -20,4 +24,13 @@ body {
     border: 1px solid #6f7378;
     overflow: hidden;
     margin-bottom: 16px;
+}
+
+/* No drag on the time axis' labels: there it slid the whole chart off its
+   two days. Zoom and pan inside the panels stay (plotly's own inline
+   pointer-events, hence !important). */
+.js-plotly-plot .ewdrag,
+.js-plotly-plot .wdrag,
+.js-plotly-plot .edrag {
+    pointer-events: none !important;
 }

@@ -3270,7 +3270,6 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                     strict=True,
                 )
             ],
-            ("baseload_w", config.baseload, "mean", "previous"),
             # Rate-like and unfilled: a gap - and every row ahead of now - is
             # no measurement, and leaves the forecast's sun as it is.
             ("pv_w", config.solar, "mean", "none"),
@@ -3341,6 +3340,11 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 target_interval="15min",
             )
 
+        # The house's own draw, from the meters' balance: over time too.
+        builder = builder.sum_series(
+            "baseload_w", config.baseload_terms, interval="5m", target_interval="15min"
+        )
+
         for name, sensor in textual:
             builder = builder.timeseries(
                 name,
@@ -3350,7 +3354,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 fill="previous",
             )
 
-        for name in [entry[0] for entry in hydronic + numeric + textual]:
+        for name in [
+            *(entry[0] for entry in hydronic + numeric + textual),
+            "baseload_w",
+        ]:
             builder = builder.join(
                 left="weather",
                 right=name,

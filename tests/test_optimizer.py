@@ -1920,12 +1920,13 @@ def test_a_runs_heat_never_rises():
             assert heat[k + 1] <= heat[k] + 1e-6
 
 
-def test_with_the_bias_steering_a_runs_heat_follows_the_rising_sun():
+def test_with_the_bias_steering_a_runs_heat_rises_only_into_export():
     """Where the bias steers the heat (MPCInput.zone_heat_may_rise) a run may
-    raise it as the sun comes up - never at a higher cost than holding it."""
+    raise it into solar the house would otherwise export - never at a higher
+    cost than holding it, and never where the raised step imports: a weaker
+    sun, which the floor's draw takes all of, holds the run steady."""
 
     hour = np.arange(48) * 0.25 + 6.0
-    sun_w = tuple(np.clip((hour - 8.0) / 4.0, 0.0, 1.0) * 1500.0)
     optimizer = MPCOptimizer(
         THERMAL_MODEL,
         MPCConfig(),
@@ -1934,17 +1935,27 @@ def test_with_the_bias_steering_a_runs_heat_follows_the_rising_sun():
         floor_circuit_model=HEATING,
         space_cop_model=COP_MODEL,
     )
-    held = optimizer.solve(_cold_day(steps=48, solar_forecast_w=list(sun_w)))
-    free = optimizer.solve(
-        _cold_day(steps=48, solar_forecast_w=list(sun_w), zone_heat_may_rise=True)
-    )
-    on, heat = free.space_schedule, free.space_heat_w
 
-    assert free.objective_value <= held.objective_value + 1e-3
-    assert any(
-        on[k] and on[k + 1] and heat[k + 1] > heat[k] + 100.0
-        for k in range(len(on) - 1)
-    )
+    def rises(peak_w: float):
+        sun_w = np.clip((hour - 8.0) / 4.0, 0.0, 1.0) * peak_w
+        held = optimizer.solve(_cold_day(steps=48, solar_forecast_w=list(sun_w)))
+        free = optimizer.solve(
+            _cold_day(steps=48, solar_forecast_w=list(sun_w), zone_heat_may_rise=True)
+        )
+        on, heat = free.space_schedule, free.space_heat_w
+        steps = [
+            k + 1
+            for k in range(len(on) - 1)
+            if on[k] and on[k + 1] and heat[k + 1] > heat[k] + 1.0
+        ]
+
+        assert free.objective_value <= held.objective_value + 1e-3
+        assert all(free.space_electrical_w[k] <= sun_w[k] + 1e-3 for k in steps)
+
+        return [heat[k] - heat[k - 1] for k in steps]
+
+    assert max(rises(3000.0)) > 100.0
+    assert not rises(1500.0)
 
 
 def test_the_floor_is_planned_no_further_than_its_runs_have_gone():
@@ -1992,6 +2003,34 @@ def test_the_plan_chooses_the_heating_supply():
     for k in range(len(on) - 1):
         if on[k] and on[k + 1]:
             assert supply[k + 1] >= supply[k] - 1e-6
+
+
+def test_the_controllers_floor_bounds_a_runs_supply_from_below():
+    """No supply below the controller's own floor (its least flow
+    temperature), though the zone wants less heat than that brings."""
+
+    floored = replace(HEATING, min_supply_c=28.5)
+    result = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE,
+        floor_circuit_model=floored,
+        space_cop_model=COP_MODEL,
+    ).solve(
+        # Gains that leave the zone wanting less than that.
+        _cold_day(
+            steps=48,
+            outdoor_temperature_forecast=(0.0,) * 48,
+            zone_internal_gain_w=(800.0,) * 48,
+            zone_heat_may_rise=True,
+        )
+    )
+    on = np.asarray(result.space_schedule, dtype=bool)
+
+    assert on.any(), "expected the zone to be heated"
+    assert (np.asarray(result.space_heat_w)[on] >= floored.min_heat_w - 1e-3).all()
+    assert (np.asarray(result.space_supply_c)[on] >= 28.5 - 1e-3).all()
 
 
 def test_without_a_heating_cop_model_the_plan_keeps_to_the_curve():

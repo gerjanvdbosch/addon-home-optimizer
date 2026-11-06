@@ -3,7 +3,9 @@
 Smart Boost off. The room's error below setpoint + bias, as a share x of an
 error range, sets the water's rise over the return:
 rise = min_rise + (3x^2 - 2x^3)(max_rise - min_rise), both widened towards
-the cold by a cold factor of the unit's outdoor sensor.
+the cold by a cold factor of the unit's outdoor sensor. With the room past
+its target (error < 0) the rise is the base MIN_RISE_K, not the cold-widened
+least: aiming just below the room asks for the heat pump's least heat.
 """
 
 import math
@@ -23,6 +25,28 @@ BIAS_LIMIT_K = 2.5
 BIAS_STEP_K = 0.1
 
 
+def _cold_factor(outdoor_c: float) -> float:
+    return (
+        COLD_FACTOR_MAX
+        * ((MILD_C - min(max(outdoor_c, COLD_C), MILD_C)) / (MILD_C - COLD_C)) ** 2
+    )
+
+
+def water_w_per_k(flow_lpm: float) -> float:
+    """The heat the water carries per K of rise (W/K) at this flow."""
+
+    return flow_lpm / 60.0 * RHO_WATER_KG_PER_L * CP_WATER_J_PER_KG_K
+
+
+def min_rise_k(outdoor_c: float) -> float:
+    """The least rise over the return (K) the controller asks for with the
+    room at or below its target: 2 K when mild, widening towards the cold
+    (3.4 K at 1.5 degC, ~4.2 kW at 18 L/min). Past the target it asks for
+    MIN_RISE_K."""
+
+    return MIN_RISE_K + _cold_factor(outdoor_c) * (COLD_MIN_RISE_K - MIN_RISE_K)
+
+
 def setpoint_bias_k(
     heat_w: float,
     flow_lpm: float,
@@ -36,18 +60,24 @@ def setpoint_bias_k(
     never past the comfort band's maximum. Rounded up to the bias step, so at
     least that heat.
 
-    The controller's least rise is a floor no bias goes under (2.4 K, ~3 kW at
-    8 degC); in the cold it can exceed the heat pump's least heat.
+    Less than the least rise at or below the target - which in the cold is
+    more than the heat pump's least heat (4.1 kW at 2 degC, 18 L/min) - is
+    asked for with the target one step below the room: the base rise, which
+    the compressor at its lowest speed gives at least.
     """
 
-    water_w_per_k = flow_lpm / 60.0 * RHO_WATER_KG_PER_L * CP_WATER_J_PER_KG_K
-    cold_factor = (
-        COLD_FACTOR_MAX
-        * ((MILD_C - min(max(outdoor_c, COLD_C), MILD_C)) / (MILD_C - COLD_C)) ** 2
-    )
-    min_rise_k = MIN_RISE_K + cold_factor * (COLD_MIN_RISE_K - MIN_RISE_K)
-    error_range_k = ERROR_RANGE_K * (1.0 - 0.5 * min(cold_factor, 1.0))
-    share = (heat_w / water_w_per_k - min_rise_k) / (MAX_RISE_K - min_rise_k)
+    least_k = min_rise_k(outdoor_c)
+
+    if heat_w < least_k * water_w_per_k(flow_lpm):
+        # Strictly below the room, within a step of it.
+        bias_k = (math.ceil(round((room_c - setpoint_c) / BIAS_STEP_K, 6)) - 1) * (
+            BIAS_STEP_K
+        )
+
+        return round(min(max(bias_k, -BIAS_LIMIT_K), BIAS_LIMIT_K), 1)
+
+    error_range_k = ERROR_RANGE_K * (1.0 - 0.5 * min(_cold_factor(outdoor_c), 1.0))
+    share = (heat_w / water_w_per_k(flow_lpm) - least_k) / (MAX_RISE_K - least_k)
     share = min(max(share, 0.0), 1.0)
     # The inverse of 3x^2 - 2x^3 on [0, 1].
     x = 0.5 - math.sin(math.asin(1.0 - 2.0 * share) / 3.0)

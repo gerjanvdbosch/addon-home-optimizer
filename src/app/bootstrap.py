@@ -12,6 +12,7 @@ from infrastructure.influx import InfluxDatabase, InfluxSensorResolver
 from infrastructure.loaders import (
     AttributeSeriesLoader,
     AttributeTimeSeriesLoader,
+    SumSeriesLoader,
     TimeSeriesLoader,
 )
 from infrastructure.repositories import ConfigRepository
@@ -116,6 +117,7 @@ def create_container() -> Container:
     dataset_loader = DatasetLoader(
         loaders=[
             TimeSeriesLoader(influx, resolver),
+            SumSeriesLoader(influx, resolver),
             AttributeSeriesLoader(influx, resolver),
             AttributeTimeSeriesLoader(influx, resolver),
         ],

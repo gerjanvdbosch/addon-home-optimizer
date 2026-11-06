@@ -68,6 +68,12 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
     # The most it moves, the same way: a high quantile, so one reading caught
     # in a transient does not set it.
     MAX_HEAT_QUANTILE = 0.90
+    # The coolest supply it holds, the same way but lower: the supply sits on
+    # the controller's floor only on a run's coldest quarters, so in fewer
+    # readings than the compressor sits at its lowest speed (real data,
+    # Sep-Nov 2026, floor set at 24 degC: 24.4 at 0.05, 24.7 at 0.10, 23.9 at
+    # 0.02).
+    MIN_SUPPLY_QUANTILE = 0.05
 
     # How long the screed between the pipes takes to settle against the water:
     # lateral conduction over half a pipe spacing, (7.5 cm)^2 / 6e-7 m2/s, some
@@ -213,6 +219,11 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
             min_heat_w=float(np.quantile(np.abs(heat), self.MIN_HEAT_QUANTILE)),
             max_heat_w=float(np.quantile(np.abs(heat), self.MAX_HEAT_QUANTILE)),
             flow_lpm=float(np.median(flow)),
+            min_supply_c=(
+                float(np.quantile(settled["T_supply"], self.MIN_SUPPLY_QUANTILE))
+                if self.sign > 0.0
+                else 0.0
+            ),
         )
 
         def residuals(ua: np.ndarray) -> np.ndarray:
@@ -248,7 +259,8 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
 
         logger.info(
             "%s calibrated: supply = %.1f %+.2f * T_out degC, "
-            "G = %.0f W/K (UA %.0f W/K at %.1f L/min), %.0f-%.0f W",
+            "G = %.0f W/K (UA %.0f W/K at %.1f L/min), %.0f-%.0f W, "
+            "supply >= %.1f degC",
             self.label,
             self.model.supply_at_zero_outdoor_c,
             self.model.supply_per_outdoor_k,
@@ -257,6 +269,7 @@ class FloorCircuitIdentifier(SystemIdentifier[FloorCircuitModel]):
             self.model.flow_lpm,
             self.model.min_heat_w,
             self.model.max_heat_w,
+            self.model.min_supply_c,
         )
 
         return self.model

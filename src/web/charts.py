@@ -170,14 +170,23 @@ def ended(points: list[SeriesPoint], updated: datetime) -> list[SeriesPoint]:
     return [p for p in points if p.time + quarter <= updated]
 
 
+# Under the panels: the time axis' labels, then the legend.
+LEGEND_OFFSET_PX = 56
+LEGEND_MARGIN_PX = 126
+
+
 def dashboard_chart(state: State, states: HeatPumpStates | None = None) -> str:
+    # Each panel's height in pixels, and the gap between them.
+    panels_px = [139, 116, 116]
+    gap_px = 34
+    plot_px = sum(panels_px) + gap_px * (len(panels_px) - 1)
     fig = make_subplots(
-        rows=3,
+        rows=len(panels_px),
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.06,
+        vertical_spacing=gap_px / plot_px,
         subplot_titles=("Power", "Zone", "Boiler"),
-        row_heights=[0.4, 0.3, 0.3],
+        row_heights=panels_px,
     )
 
     # Exactly today and tomorrow in local time. Points outside are dropped, not
@@ -516,10 +525,15 @@ def dashboard_chart(state: State, states: HeatPumpStates | None = None) -> str:
                 shade([(start, end)], "Defrost", "#FFFFFF", row=row, opacity=0.25)
 
     fig.update_layout(
+        # From the top left corner in pixels, not a share of the width: on a
+        # phone 1% put it against the edge.
         title=dict(
             text="Dashboard",
-            x=0.01,
-            y=0.97,
+            x=0.0,
+            xanchor="left",
+            y=1.0,
+            yanchor="top",
+            pad=dict(l=14, t=20),
             font=dict(
                 size=22,
                 color="#eeeeee",
@@ -528,13 +542,15 @@ def dashboard_chart(state: State, states: HeatPumpStates | None = None) -> str:
         template="plotly_dark",
         paper_bgcolor="#2b2b2b",
         plot_bgcolor="#2b2b2b",
+        # Room below for the time axis and two rows of legend, so the
+        # panels keep their pixels (see panels_px).
         margin=dict(
             l=70,
             r=20,
             t=60,
-            b=10,
+            b=LEGEND_MARGIN_PX,
         ),
-        height=700,
+        height=60 + plot_px + LEGEND_MARGIN_PX,
         font=dict(
             color="#cccccc",
         ),
@@ -576,7 +592,8 @@ def dashboard_chart(state: State, states: HeatPumpStates | None = None) -> str:
         ),
         legend=dict(
             orientation="h",
-            y=-0.10,
+            # A fixed distance under the panels, not a share of their height.
+            y=-LEGEND_OFFSET_PX / plot_px,
             x=0.5,
             xanchor="center",
             font=dict(size=12),

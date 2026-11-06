@@ -1,4 +1,6 @@
+import json
 import math
+import re
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -94,6 +96,24 @@ def test_the_tanks_last_quarter_runs_on_into_the_zone():
 
 def test_the_dashboard_renders_without_any_data():
     assert "plotly" in dashboard_chart(State())
+
+
+def test_a_defrost_stays_on_the_run_it_interrupts():
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    state = State(updated=now)
+    state.measurements.heat_pump.state_changes = [
+        SeriesPoint(time=now - timedelta(hours=1), value="SWW")
+    ]
+    state.measurements.heat_pump.defrost = [
+        SeriesPoint(time=now - timedelta(minutes=30), value=True),
+        SeriesPoint(time=now - timedelta(minutes=27), value=False),
+    ]
+
+    def defrost_axes(html: str) -> list[str]:
+        shapes = json.loads(re.search(r'"shapes":(\[.*?\]),"', html).group(1))
+        return [s["yref"] for s in shapes if s.get("name") == "Defrost"]
+
+    assert defrost_axes(dashboard_chart(state)) == ["y3 domain"]
 
 
 def test_the_dashboard_draws_a_cooling_plan():

@@ -36,13 +36,7 @@ class BaseloadForecaster:
     def dataset(self, config: Config) -> DatasetDefinition:
         return (
             DatasetBuilder()
-            .timeseries(
-                "P_baseload",
-                config.baseload,
-                interval="15m",
-                aggregation="mean",
-                fill="previous",
-            )
+            .sum_series("P_baseload", config.baseload_terms, interval="15m")
             .build()
         )
 

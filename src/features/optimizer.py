@@ -3863,10 +3863,26 @@ class MPCOptimizer:
                 model.space_supply_c.append(sink(k) + model.q_space_w[k] / conductance)
 
                 # No less than the compressor at its lowest speed: asked for
-                # less it overshoots the setpoint rather than turn down.
+                # less it overshoots the setpoint rather than turn down. The
+                # bias asks for that much in the cold too, with the target just
+                # below the room (see features.ecodan).
                 model.zone_constraints.add(
                     sign * model.q_space_w[k] >= operating.min_heat_w * on
                 )
+
+                # Nor a supply below the controller's own floor: into a cool
+                # floor that takes more than the least heat. Never past what
+                # the most heat brings into the coolest floor, so a run stays
+                # possible - the floor left unheated, which a day ahead is
+                # colder than any plan leaves it: there the bound is looser
+                # until a replan starts from the floor heated (7 Nov 2026:
+                # 24.1 for 24.3 degC a day ahead).
+                if not cooling and operating.min_supply_c:
+                    model.zone_constraints.add(
+                        sink_on + model.q_space_w[k] / conductance
+                        >= min(operating.min_supply_c, low + max_heat_w / conductance)
+                        * on
+                    )
 
                 # What that heat draws: the heat over the COP (EER) at the
                 # supply it takes, T_sink +- Q / G - so more heat moved means a
@@ -3992,6 +4008,25 @@ class MPCOptimizer:
             def supply_on(k: int):
                 return model.space_sink_on[k] + model.q_space_w[k] / conductance
 
+            # The steps a run's heat may rise in (see below): where the bias
+            # steers the heat, those whose expected surplus - the grid meter's
+            # export ahead, solar less the baseload as forecast - exceeds the
+            # floor's least draw.
+            surplus_w = np.asarray(data.solar_forecast_w, dtype=float) - np.asarray(
+                data.baseload_forecast_w or np.zeros(len(data.solar_forecast_w)),
+                dtype=float,
+            )
+            exporting = [
+                k
+                for k in range(1, num_steps)
+                if not cooling
+                and data.zone_heat_may_rise
+                and efficiency is not None
+                and surplus_w[k]
+                > draw_w(operating.min_heat_w, zone_outdoor_c[k], sink_c(coolest[k]))
+            ]
+            model.space_rises = pyo.Var(exporting, domain=pyo.Binary)
+
             for k in range(num_steps - 1):
                 lo_k, hi_k = supply_range(k)
                 lo_next, hi_next = supply_range(k + 1)
@@ -4006,15 +4041,32 @@ class MPCOptimizer:
                 # solver's own tolerance; on eight days this held runs steady
                 # for at most 0.23 cent, every solve as quick. Exact in the
                 # binaries' four cases: no bound beyond the most heat unless
-                # both steps run. Not where the bias steers the heat: the
-                # controller's setpoint is the return plus the rise asked for,
-                # which the heat pump follows (5 Nov 2026: supply within
-                # 0.1-0.5 K of it), so a run follows a rising sun.
-                if not data.zone_heat_may_rise:
+                # both steps run. The bias can raise it (5 Nov 2026: supply
+                # within 0.1-0.5 K of its setpoint), but only into solar the
+                # house would otherwise export: the raised step draws no more
+                # than the expected surplus. Any other rise is a near tie the
+                # solver turned either way between replans (7 Nov 2026: a
+                # 1.4 K step at noon on 0.1-0.3 kW of surplus, 3 cent from a
+                # steady run) - a steady run preferred (user's rule). Live the
+                # bias holds the heat to the meter's measured surplus (see
+                # Optimization._zone_bias). The power bound's big M is the most
+                # heat: a draw never exceeds its heat.
+                rise_w = 0.0
+
+                if k + 1 in exporting:
+                    rises = model.space_rises[k + 1]
+                    rise_w = max_heat_w * rises
                     model.zone_constraints.add(
-                        sign * model.q_space_w[k + 1]
-                        <= sign * model.q_space_w[k] + max_heat_w * (2 - on_k - on_next)
+                        model.space_power_w[k + 1]
+                        <= surplus_w[k + 1] + max_heat_w * (1 - rises)
                     )
+
+                model.zone_constraints.add(
+                    sign * model.q_space_w[k + 1]
+                    <= sign * model.q_space_w[k]
+                    + rise_w
+                    + max_heat_w * (2 - on_k - on_next)
+                )
 
                 # Where the ranges do not overlap the order holds by itself.
                 if cooling and hi_next >= lo_k:

@@ -58,11 +58,15 @@ def _identifier() -> FloorCircuitIdentifier:
 def test_fit_recovers_the_curve_and_the_floor():
     # The first and the last run are cut off by the edges of the data.
     lengths = [8, 12, 16, 10, 20, 6, 14, 18]
-    model = _identifier().fit(_runs(lengths, np.random.default_rng(3)))
+    rows = _runs(lengths, np.random.default_rng(3))
+    model = _identifier().fit(rows)
+    supply = rows.loc[rows["settled"], "T_supply"]
 
     assert model.supply_per_outdoor_k == pytest.approx(SUPPLY_PER_OUTDOOR_K, abs=0.05)
     assert model.supply_at_zero_outdoor_c == pytest.approx(SUPPLY_AT_ZERO_C, abs=0.5)
     assert model.conductance_w_per_k == pytest.approx(CONDUCTANCE_W_PER_K, rel=0.05)
+    # The coolest supply its runs held, near their coolest but not one outlier.
+    assert supply.min() < model.min_supply_c < supply.median()
 
 
 def test_one_run_gives_a_flat_curve_at_its_supply():
@@ -131,6 +135,8 @@ def test_cooling_fit_reads_runs_that_take_heat_from_the_floor():
     assert model.supply_per_outdoor_k == pytest.approx(SUPPLY_PER_OUTDOOR_K, abs=0.05)
     assert model.conductance_w_per_k == pytest.approx(CONDUCTANCE_W_PER_K, rel=0.05)
     assert model.heat_w(30.0, 20.0) < 0.0
+    # Nothing bounds a cooling supply from below but the dew point.
+    assert model.min_supply_c == 0.0
 
 
 def test_the_water_implies_the_conductance_it_was_given_either_way():

@@ -423,7 +423,7 @@ class StateManager:
 
     def update_zone_bias(self, point: SeriesPoint | None) -> None:
         state = self.load()
-        state.schedule.building.bias = point
+        state.schedule.building.bias_target = point
         self.state_repository.save(state)
 
     def update_zone(
@@ -858,12 +858,7 @@ class StateManager:
                 aggregation="time_mean",
                 interval="15m",
             )
-            .timeseries(
-                "baseload",
-                config.baseload,
-                aggregation="time_mean",
-                interval="15m",
-            )
+            .sum_series("baseload", config.baseload_terms, interval="15m")
             .timeseries(
                 "heat_pump_state",
                 config.heat_pump.state,

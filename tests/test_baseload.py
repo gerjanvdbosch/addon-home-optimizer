@@ -110,7 +110,9 @@ def test_the_habit_is_made_once_a_day_and_forecast_every_plan():
         home_assistant=None,  # type: ignore[arg-type]
     )
     state = State()
-    config = SimpleNamespace(baseload=SensorReference(entity_id="sensor.baseload"))
+    config = SimpleNamespace(
+        baseload_terms=[(1.0, SensorReference(entity_id="sensor.grid"))]
+    )
     now = NOW.to_pydatetime()
     later = datetime(2026, 10, 28, 11, tzinfo=timezone.utc)
 

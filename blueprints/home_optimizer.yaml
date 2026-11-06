@@ -1,0 +1,301 @@
+blueprint:
+  name: Home Optimizer
+  description: >-
+    Runs the Home Optimizer plan: starts DHW on schedule, blocks it again once
+    the heat pump has left DHW, and sets the living room thermostat to
+    sensor.home_optimizer_zone_setpoint - a run's setpoint
+    while the zone is on (from the tank's last quarter hour when heating
+    follows, so the heat pump goes straight on to the floor), the comfort
+    band's edge between runs. Upstairs is raised for a run where cold and set
+    down between runs.
+  domain: automation
+  source_url: https://github.com/gerjanvdbosch/addon-home-optimizer/blob/main/blueprints/home_optimizer.yaml
+  input:
+    optimizer:
+      name: Optimizer enabled
+      selector:
+        entity:
+          domain: input_boolean
+    dhw_switch:
+      name: DHW block switch (off at DHW start, on again after)
+      selector:
+        entity:
+          domain: switch
+    heat_pump_state:
+      name: Heat pump operating state
+      selector:
+        entity:
+          domain: sensor
+    dhw_state:
+      name: Operating state while in DHW
+      default: SWW
+      selector:
+        text: { }
+    zone_after:
+      name: Zone not before
+      default: "08:00:00"
+      selector: { time: { } }
+    zone_before:
+      name: Zone not after
+      default: "20:00:00"
+      selector: { time: { } }
+    living_climate:
+      name: Living room thermostat
+      selector:
+        entity:
+          domain: climate
+    upstairs_climates:
+      name: Upstairs thermostats
+      default: [ ]
+      selector:
+        entity:
+          domain: climate
+          multiple: true
+    upstairs_below:
+      name: Raise an upstairs room below (°C)
+      default: 19
+      selector:
+        number: { min: 15, max: 22, step: 0.5, unit_of_measurement: °C }
+    upstairs_setpoint:
+      name: Upstairs setpoint (°C)
+      default: 19.5
+      selector:
+        number: { min: 15, max: 22, step: 0.5, unit_of_measurement: °C }
+    upstairs_idle:
+      name: Upstairs setpoint between runs (°C)
+      description: >-
+        An upstairs thermostat below its setpoint asks for heat too, so between
+        runs they go down to this: the least an upstairs room may cool to before
+        it starts the heat pump itself.
+      default: 16
+      selector:
+        number: { min: 5, max: 22, step: 0.5, unit_of_measurement: °C }
+    outdoor_temperature:
+      name: Outdoor temperature
+      selector:
+        entity:
+          domain: sensor
+          device_class: temperature
+    outdoor_cold:
+      name: Cold outside below (°C)
+      default: 10
+      selector:
+        number: { min: -10, max: 20, step: 0.5, unit_of_measurement: °C }
+    upstairs_setpoint_cold:
+      name: Upstairs setpoint when cold outside (°C)
+      default: 20
+      selector:
+        number: { min: 15, max: 22, step: 0.5, unit_of_measurement: °C }
+    bias_number:
+      name: Auto-adaptive setpoint bias (optional)
+      description: >-
+        The esphome-ecodan-hp bias number, set to sensor.home_optimizer_zone_bias
+        (needs heat_pump.auto_adaptive on in the optimizer config). Empty leaves
+        the bias alone.
+      default: ""
+      selector:
+        entity:
+          domain: number
+
+variables:
+  living: !input living_climate
+  upstairs: !input upstairs_climates
+  upstairs_below: !input upstairs_below
+  outdoor: !input outdoor_temperature
+  outdoor_cold: !input outdoor_cold
+  upstairs_setpoint: !input upstairs_setpoint
+  upstairs_setpoint_cold: !input upstairs_setpoint_cold
+  upstairs_idle: !input upstairs_idle
+  bias_number: !input bias_number
+
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.home_optimizer_dhw_status
+    from: "off"
+    to: "on"
+    id: dhw_start
+  # The heat pump out of DHW for 10 minutes, so a started run is never cut off:
+  # a defrost keeps the state on DHW, the 10 minutes ride out a flicker, and a
+  # sensor gone unavailable is no end.
+  - trigger: state
+    entity_id: !input heat_pump_state
+    from: !input dhw_state
+    not_to: [ !input dhw_state, unknown, unavailable ]
+    for: { minutes: 10 }
+    id: dhw_end
+  - trigger: state
+    entity_id: binary_sensor.home_optimizer_zone_status
+    from: "off"
+    to: "on"
+    id: zone_start
+  - trigger: state
+    entity_id: binary_sensor.home_optimizer_zone_status
+    from: "on"
+    to: "off"
+    for: { minutes: 10 }
+    id: zone_stop
+  - trigger: state
+    entity_id: sensor.home_optimizer_zone_setpoint
+    not_to: [ unknown, unavailable ]
+    id: zone_setpoint
+  - trigger: state
+    entity_id: sensor.home_optimizer_zone_bias
+    not_to: [ unknown, unavailable ]
+    id: zone_bias
+
+conditions:
+  - condition: state
+    entity_id: !input optimizer
+    state: "on"
+
+actions:
+  - choose:
+      - alias: DHW start
+        conditions:
+          - condition: trigger
+            id: dhw_start
+          - condition: state
+            entity_id: binary_sensor.home_optimizer_dhw_status
+            state: "on"
+          - condition: state
+            entity_id: !input dhw_switch
+            state: "on"
+        sequence:
+          - action: notify.notify
+            data:
+              message: Optimizer DHW start
+          - action: switch.turn_off
+            target:
+              entity_id: !input dhw_switch
+      - alias: DHW end
+        conditions:
+          - condition: trigger
+            id: dhw_end
+          - condition: state
+            entity_id: !input dhw_switch
+            state: "off"
+        sequence:
+          - action: notify.notify
+            data:
+              message: Optimizer DHW end
+          - action: switch.turn_on
+            target:
+              entity_id: !input dhw_switch
+      - alias: Zone start
+        conditions:
+          - condition: trigger
+            id: zone_start
+          - condition: state
+            entity_id: binary_sensor.home_optimizer_zone_status
+            state: "on"
+          - condition: time
+            after: !input zone_after
+            before: !input zone_before
+          - condition: template
+            value_template: "{{ has_value('sensor.home_optimizer_zone_setpoint') }}"
+        sequence:
+          - action: notify.notify
+            data:
+              message: >-
+                Optimizer zone start, living room
+                {{ states('sensor.home_optimizer_zone_setpoint') }} °C
+          # The thermostat calls for heat only above the room: left at a lower
+          # setpoint the run never starts (6 Nov 2026: 15 degC, 40 min late).
+          # Handed over from hot water the zone is on in the tank's last
+          # quarter hour already, so the heat pump goes on to the floor.
+          - action: climate.set_temperature
+            target:
+              entity_id: !input living_climate
+            data:
+              temperature: "{{ states('sensor.home_optimizer_zone_setpoint') | float }}"
+          - variables:
+              upstairs_target: >-
+                {{ upstairs_setpoint_cold
+                   if states(outdoor) | float(99) < outdoor_cold
+                   else upstairs_setpoint }}
+          - repeat:
+              for_each: "{{ upstairs }}"
+              sequence:
+                # Only raise, never lower a higher setpoint.
+                - if:
+                    - condition: template
+                      value_template: >-
+                        {{ state_attr(repeat.item, 'current_temperature') | float(99) < upstairs_below
+                           and state_attr(repeat.item, 'temperature') | float(0) < upstairs_target }}
+                  then:
+                    - action: climate.set_temperature
+                      target:
+                        entity_id: "{{ repeat.item }}"
+                      data:
+                        temperature: "{{ upstairs_target }}"
+      - alias: Zone stop
+        conditions:
+          - condition: trigger
+            id: zone_stop
+          - condition: state
+            entity_id: binary_sensor.home_optimizer_zone_status
+            state: "off"
+        sequence:
+          - action: notify.notify
+            data:
+              message: Optimizer zone stop
+          # A room upstairs below its setpoint starts the heat pump too.
+          - repeat:
+              for_each: "{{ upstairs }}"
+              sequence:
+                - action: climate.set_temperature
+                  target:
+                    entity_id: "{{ repeat.item }}"
+                  data:
+                    temperature: "{{ upstairs_idle }}"
+      - alias: Zone setpoint
+        conditions:
+          - condition: trigger
+            id: zone_setpoint
+        sequence:
+          - choose:
+              # Within a run only up, and only in the hours a run may start:
+              # the plan raises it as the run goes on, and a thermostat left
+              # at the start's setpoint ends the run once the room reaches it
+              # (6 Nov 2026: 19.1 at the start, 20.3 later).
+              - conditions:
+                  - condition: state
+                    entity_id: binary_sensor.home_optimizer_zone_status
+                    state: "on"
+                  - condition: time
+                    after: !input zone_after
+                    before: !input zone_before
+                  - condition: template
+                    value_template: >-
+                      {{ states('sensor.home_optimizer_zone_setpoint') | float(0)
+                         > state_attr(living, 'temperature') | float(99) }}
+                sequence: &living
+                  - action: climate.set_temperature
+                    target:
+                      entity_id: !input living_climate
+                    data:
+                      temperature: "{{ states('sensor.home_optimizer_zone_setpoint') | float }}"
+              # Between runs the comfort band's edge: the thermostat asks for
+              # heat only where the room passed what the plan allows - left at
+              # the run's setpoint the heat pump ran on 20-75 minutes past the
+              # plan's end (3-5 Nov 2026).
+              - conditions:
+                  - condition: state
+                    entity_id: binary_sensor.home_optimizer_zone_status
+                    state: "off"
+                sequence: *living
+      - alias: Zone bias
+        conditions:
+          - condition: trigger
+            id: zone_bias
+          - condition: template
+            value_template: "{{ bias_number != '' }}"
+        sequence:
+          - action: number.set_value
+            target:
+              entity_id: "{{ bias_number }}"
+            data:
+              value: "{{ states('sensor.home_optimizer_zone_bias') | float(0) }}"
+
+# Queued: a bias change may come with a start.
+mode: queued

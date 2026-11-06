@@ -448,7 +448,9 @@ class Optimization:
             )
             states = config.heat_pump.states
             mode = states.cooling if inputs["zone_cooling"] else states.heating
-            running = self.zone_running(*heat_pump_changes, mode)
+            running = self.zone_running(
+                *heat_pump_changes, mode, state.measurements.heat_pump.defrost
+            )
             planned = dataclasses.replace(
                 data,
                 **inputs,
@@ -536,23 +538,9 @@ class Optimization:
                 tap.drawn_j(draws),
             ),
         )
-        self.log_dhw_plan(result, forecast_times, optimizer, planned)
 
         if optimize_config.explain:
             self.explain_dhw_plan(optimizer, planned, result, forecast_times)
-
-        if zone is not None:
-            # The supply of the first planned run: the setpoint the plan would
-            # give the heat pump.
-            supply_c = next(
-                (c for c in result.space_supply_c if not math.isnan(c)), None
-            )
-            logger.info(
-                "Zone plan: %.1f kWh into the zone over the horizon, first run "
-                "at %s degC supply",
-                sum(result.space_heat_w) * mpc_config.step_hours / 1000.0,
-                "unknown" if supply_c is None else f"{supply_c:.1f}",
-            )
 
         # Saved with the plan, not before the solve: a cold solve takes a
         # minute, and in it the dashboard drew this estimate's mass, the zone
@@ -587,6 +575,10 @@ class Optimization:
             planned if zone is not None else None,
             heat_pump_changes[0],
             now,
+        )
+        # Last, so it reads after what was published.
+        self.log_day_costs(
+            config, state, planned, result, optimizer, forecast_times, now
         )
 
     def _run_minutes(
@@ -1040,15 +1032,254 @@ class Optimization:
             f"EUR {sum(cost_step_eur):.3f}"
         )
 
-    @classmethod
-    def log_dhw_plan(
-        cls,
+    # What a day's line adds up, per row (kWh, the cost EUR).
+    DAY_COLUMNS = (
+        "import",
+        "export",
+        "solar",
+        "dhw",
+        "heating",
+        "cooling",
+        "standby",
+        "house",
+        "cost",
+    )
+
+    def log_day_costs(
+        self,
+        config: Config,
+        state: State,
+        data: MPCInput,
         result: MPCResult,
+        optimizer: MPCOptimizer,
+        times: list[datetime],
+        now: datetime,
+    ) -> None:
+        """Logs per local day the grid's import and export, the solar, the heat
+        pump's electricity per mode, the rest of the house and their cost:
+        today measured up to now and planned on from it, tomorrow planned."""
+
+        measured = self.measured_energy(config, state, now)
+        planned = self.planned_energy(result, data, times, optimizer)
+        step = timedelta(hours=optimizer.config.step_hours)
+        logger.info(
+            "Planned runs (kWh):\n%s",
+            "\n".join(self.planned_runs(result, data, planned, times, step)),
+        )
+
+        # The table's columns: header, and what each day's cell sums.
+        columns = (
+            ("eur", "cost", None),
+            ("meas", "cost", "measured"),
+            ("plan", "cost", "planned"),
+            ("in", "import", None),
+            ("out", "export", None),
+            ("solar", "solar", None),
+            ("hp", ("dhw", "heating", "cooling", "standby"), None),
+            ("dhw", "dhw", None),
+            ("heat", "heating", None),
+            ("cool", "cooling", None),
+            ("stby", "standby", None),
+            ("house", "house", None),
+        )
+        lines = [f"{'day':<10}" + "".join(f"{h:>7}" for h, _, _ in columns)]
+
+        for date in dict.fromkeys(to_local_time(t).date() for t in times):
+            parts = {
+                name: frame[[to_local_time(t).date() == date for t in frame["time"]]]
+                for name, frame in (("measured", measured), ("planned", planned))
+            }
+            cells = []
+
+            for _, column, part in columns:
+                rows = parts[part] if part else pd.concat(parts.values())
+                value = float(rows[list(np.atleast_1d(column))].to_numpy().sum())
+                cells.append(f"{value:>7.2f}" if abs(value) >= 0.005 else f"{'-':>7}")
+
+            lines.append(f"{date:%a %d %b}" + "".join(cells))
+
+        logger.info("Day costs (EUR, kWh):\n%s", "\n".join(lines))
+
+    @staticmethod
+    def planned_runs(
+        result: MPCResult,
+        data: MPCInput,
+        planned: pd.DataFrame,
+        times: list[datetime],
+        step: timedelta,
+    ) -> list[str]:
+        """The plan's runs as table lines, in order of their start: which, its
+        day, start and end and the electricity it draws (see
+        planned_energy)."""
+
+        modes = [("dhw", "dhw", result.schedule)]
+
+        if result.space_schedule:
+            zone = "cool" if data.zone_cooling else "heat"
+            modes.append(
+                (
+                    zone,
+                    "cooling" if data.zone_cooling else "heating",
+                    result.space_schedule,
+                )
+            )
+
+        runs = []
+
+        for label, column, schedule in modes:
+            k = 0
+
+            while k < len(schedule):
+                if not schedule[k]:
+                    k += 1
+                    continue
+
+                end = k
+
+                while end + 1 < len(schedule) and schedule[end + 1]:
+                    end += 1
+
+                runs.append(
+                    (
+                        times[k],
+                        label,
+                        times[end] + step,
+                        float(planned[column].iloc[k : end + 1].sum()),
+                    )
+                )
+                k = end + 1
+
+        lines = [f"{'day':<12}{'start':<7}{'end':<7}{'run':<6}{'kwh':>5}"]
+
+        for start, label, end, kwh in sorted(runs):
+            lines.append(
+                f"{to_local_time(start):%a %d %b}  {to_local_time(start):%H:%M}  "
+                f"{to_local_time(end):%H:%M}  {label:<6}{kwh:>5.2f}"
+            )
+
+        return lines if runs else [*lines, "none"]
+
+    def measured_energy(
+        self, config: Config, state: State, now: datetime
+    ) -> pd.DataFrame:
+        """Today so far per quarter hour (see DAY_COLUMNS), from the meters'
+        minutes over time: import and export apart per minute, as the grid
+        meter counts them - over a quarter hour's mean they would net."""
+
+        frame = self.loader.load(
+            DatasetBuilder()
+            .timeseries("grid", config.grid, aggregation="time_mean", interval="1m")
+            .timeseries("solar", config.solar, aggregation="time_mean", interval="1m")
+            .timeseries(
+                "power", config.heat_pump.power, aggregation="time_mean", interval="1m"
+            )
+            .timeseries(
+                "state",
+                config.heat_pump.state,
+                aggregation="last",
+                interval="1m",
+                fill="previous",
+            )
+            .build(),
+            local_day_start(now).astimezone(timezone.utc),
+            now,
+        )
+        frame = frame.dropna(subset=["grid", "solar", "power"])
+
+        if frame.empty:
+            return pd.DataFrame(columns=["time", *self.DAY_COLUMNS])
+
+        kwh = 1.0 / 60.0 / 1000.0
+        grid = frame["grid"].astype(float)
+        power = frame["power"].astype(float)
+        states = config.heat_pump.states
+        mode = frame["state"]
+        minutes = pd.DataFrame(
+            {
+                "import": grid.clip(lower=0.0) * kwh,
+                "export": (-grid).clip(lower=0.0) * kwh,
+                "solar": frame["solar"].astype(float).clip(lower=0.0) * kwh,
+                "dhw": power.where(mode == states.dhw, 0.0) * kwh,
+                "heating": power.where(mode == states.heating, 0.0) * kwh,
+                "cooling": power.where(mode == states.cooling, 0.0) * kwh,
+                "standby": power.where(
+                    ~mode.isin([states.dhw, states.heating, states.cooling]), 0.0
+                )
+                * kwh,
+                "house": (grid + frame["solar"].astype(float) - power) * kwh,
+                "time": pd.to_datetime(frame["time"]).dt.floor("15min"),
+            }
+        )
+        quarters = minutes.groupby("time").sum().reset_index()
+        quarter_times = [t.to_pydatetime() for t in quarters["time"]]
+        prices = config.prices
+        quarters["cost"] = quarters["import"] * np.array(
+            self._price("import", prices.import_, state, quarter_times)
+        ) - quarters["export"] * np.array(
+            self._price("export", prices.export, state, quarter_times)
+        )
+
+        return quarters
+
+    @staticmethod
+    def planned_energy(
+        result: MPCResult,
+        data: MPCInput,
         times: list[datetime],
         optimizer: MPCOptimizer,
-        data: MPCInput,
-    ) -> None:
-        logger.info("DHW plan: %s", cls.dhw_summary(result, times, optimizer, data))
+    ) -> pd.DataFrame:
+        """The plan per step from now (see DAY_COLUMNS): the heat pump's draw
+        split between the tank and the zone, and the house's import and export
+        at the median forecasts."""
+
+        step_hours = optimizer.config.step_hours
+        hours = np.array(
+            [
+                data.first_step_hours
+                if j == 0 and data.first_step_hours
+                else step_hours
+                for j in range(len(result.electricity_step_kwh))
+            ]
+        )
+        drawn = np.array(result.electricity_step_kwh, dtype=float)
+        tank_w = np.abs(np.array(result.electrical_power_w, dtype=float))
+        zone_w = np.abs(
+            np.array(result.space_electrical_w or (0.0,) * len(drawn), dtype=float)
+        )
+        # A step serves the tank or the zone (see dhw_summary).
+        tank_share = np.divide(
+            tank_w, tank_w + zone_w, out=np.zeros_like(drawn), where=tank_w + zone_w > 0
+        )
+        # The house's import and export at the median sun and baseload, the
+        # day a forecast expects: the plan's own scenarios weight each
+        # quarter's p90 baseload - its peaks - as if a third of the day drew
+        # it (7.1 kWh for 7 Nov 2026 against 5.55 at p50; 6 Nov drew 5.2).
+        baseload_w = np.array(
+            data.baseload_forecast_w or (0.0,) * len(drawn), dtype=float
+        )[: len(drawn)]
+        solar_w = np.array(data.solar_forecast_w[: len(drawn)], dtype=float)
+        grid_w = drawn / hours * 1000.0 + baseload_w - solar_w
+
+        import_price, export_price = optimizer.prices(data)
+        zone = drawn * (1.0 - tank_share)
+        frame = pd.DataFrame(
+            {
+                "time": times[: len(drawn)],
+                "import": np.clip(grid_w, 0.0, None) * hours / 1000.0,
+                "export": np.clip(-grid_w, 0.0, None) * hours / 1000.0,
+                "solar": solar_w * hours / 1000.0,
+                "dhw": drawn * tank_share,
+                "heating": 0.0 if data.zone_cooling else zone,
+                "cooling": zone if data.zone_cooling else 0.0,
+                "standby": 0.0,
+                "house": baseload_w * hours / 1000.0,
+            }
+        )
+        frame["cost"] = frame["import"] * np.array(import_price[: len(drawn)]) - frame[
+            "export"
+        ] * np.array(export_price[: len(drawn)])
+
+        return frame
 
     # How much earlier explain_dhw_plan has the first run finish (hours): the
     # question a plan usually raises is why it does not run earlier, in more sun.
@@ -1579,17 +1810,25 @@ class Optimization:
         heat_pump_state: list[SeriesPoint],
         compressor_frequency: list[SeriesPoint],
         mode_state: str,
+        defrost: Sequence[SeriesPoint] = (),
     ) -> bool:
         """Whether a floor run is under way: the compressor running in the
         zone's mode now, so a plan that goes on with it makes no start. The
         state alone does not say so - it stays on heating at 0 Hz between
         runs. Without a frequency the state is all there is, as in
-        dhw_timing."""
+        dhw_timing. A stop in a defrost (its changes in `defrost`) is no end:
+        the compressor comes up again after it in the same run, as in
+        zone_run_hours (7 Nov 2026: 0 Hz in a defrost 16 minutes into a run,
+        and the plan went over to hot water)."""
 
-        return (
-            bool(heat_pump_state)
-            and heat_pump_state[-1].value == mode_state
-            and (not compressor_frequency or compressor_frequency[-1].value > 0.0)
+        if not heat_pump_state or heat_pump_state[-1].value != mode_state:
+            return False
+
+        if not compressor_frequency or compressor_frequency[-1].value > 0.0:
+            return True
+
+        return bool(
+            Optimization.value_at(defrost, compressor_frequency[-1].time, False)
         )
 
     @staticmethod
@@ -1707,8 +1946,11 @@ class Optimization:
 
         return rounded_c
 
-    # The resolution the zone's room setpoint is published at (K).
-    ZONE_SETPOINT_STEP_C = 0.1
+    # The resolution the zone's room setpoints are published at (K): half a
+    # degree, the step thermostats take (Danfoss Icon: target_temp_step 0.5,
+    # never another value in 60 days). Between steps the thermostat rounds,
+    # and rounded down a run's setpoint could fall under the room.
+    ZONE_SETPOINT_STEP_C = 0.5
 
     @classmethod
     def zone_setpoint_c(
@@ -1719,35 +1961,55 @@ class Optimization:
         measured_c: float | None,
         limit_c: tuple[float, ...] | None,
         cooling: bool,
+        tank: tuple[int, ...] = (),
     ) -> str:
         """The room setpoint (deg C) for the zone run starting at step first:
         the least step of ZONE_SETPOINT_STEP_C past the warmest (coolest)
         temperature the plan has the room at from that run's start to the next
-        run's, and past measured_c, the room now; no further than the comfort
-        band's edge where the run starts. temperatures are at each step's
-        start."""
+        run's, and a whole step past measured_c, the room now; no further than
+        limit_c where the run starts (the comfort band's edge, None for no
+        limit). temperatures are at each step's start. The run is the
+        compressor's: a tank block it hands over to and back (tank) does not
+        end it, the floor goes on after it.
+
+        A whole step past the room, so a room the sun warms faster than the
+        plan has it stays below the setpoint until the next replan raises it:
+        the thermostat reads the air, which the sun warms within minutes and
+        which cools as fast once it is gone, while the plan sees the floor and
+        the mass too (7 Nov 2026: +0.4 K in 25 minutes; three runs in Oct-Nov
+        2026 ended at the thermostat, the room 0.03-0.05 K under its setpoint,
+        five minutes before the plan's end)."""
 
         end = first
 
-        while end + 1 < len(schedule) and schedule[end + 1]:
+        while end + 1 < len(schedule) and (
+            schedule[end + 1] or (end + 1 < len(tank) and tank[end + 1])
+        ):
             end += 1
 
         following = next(
             (k for k in range(end + 1, len(schedule)) if schedule[k]), len(schedule)
         )
-        window = list(temperatures[first : following + 1])
-
-        if measured_c is not None:
-            window.append(measured_c)
-
+        window = temperatures[first : following + 1]
         step = cls.ZONE_SETPOINT_STEP_C
-        # Strictly past it: at the room's own temperature a thermostat asks for
-        # nothing.
+
+        # Strictly past the plan's: at the room's own temperature a thermostat
+        # asks for nothing.
         if cooling:
-            setpoint_c = (math.ceil(round(min(window) / step, 6)) - 1) * step
+            steps = math.ceil(round(min(window) / step, 6)) - 1
+
+            if measured_c is not None:
+                steps = min(steps, math.floor(round(measured_c / step, 6)) - 1)
+
+            setpoint_c = steps * step
             setpoint_c = max(setpoint_c, limit_c[first]) if limit_c else setpoint_c
         else:
-            setpoint_c = (math.floor(round(max(window) / step, 6)) + 1) * step
+            steps = math.floor(round(max(window) / step, 6)) + 1
+
+            if measured_c is not None:
+                steps = max(steps, math.ceil(round(measured_c / step, 6)) + 1)
+
+            setpoint_c = steps * step
             setpoint_c = min(setpoint_c, limit_c[first]) if limit_c else setpoint_c
 
         return f"{setpoint_c:.1f}"
@@ -1760,6 +2022,11 @@ class Optimization:
     # least run (two quarter hours): the floor answers a change over that long.
     ZONE_BIAS_DEADBAND_K = 0.2
     ZONE_BIAS_HOLD = timedelta(minutes=30)
+    # The span the measured surplus is read over: one decision interval (the
+    # plan runs every 5 minutes). Its best minute is taken, so only a shortfall
+    # that lasted all of it lowers the heat - a kettle or a passing cloud does
+    # not, the floor could not follow them anyway.
+    ZONE_BIAS_SURPLUS_WINDOW = timedelta(minutes=5)
 
     def _zone_bias(
         self,
@@ -1771,68 +2038,136 @@ class Optimization:
         on: bool,
         since: datetime | None,
         now: datetime,
+        run_setpoint_c: float | None = None,
     ) -> float:
         """The bias to publish now: for a heating run under way or handed over
         (step k its first), the plan's mean heat over its next hour; 0 -
         the controller left to its setpoint - outside one, while cooling, or
-        without the readings. Within a run under way since `since`, held to
-        its last one within the deadband and the hold; a run's first and the
-        0 after it are not held."""
+        without the readings. Within a run under way since `since`, the
+        controller's target (setpoint + bias) is held to its last one within
+        the deadband and the hold - the target, so a setpoint the blueprint
+        raises within the run lowers the bias as much instead of adding to
+        the heat; a run's first and the 0 after it are not held.
+
+        Against the thermostat's setpoint, which the controller follows -
+        before the heat pump heats, run_setpoint_c, the room setpoint the
+        blueprint gives the run as it starts: the one measured is still the
+        one before (6 Nov 2026: 15 degC, the bias clamped at 2.5 K).
+
+        The heat is at most what the measured solar surplus
+        plus the plan's own expected import buys at the plan's COP: the plan
+        chose that import, more is the forecast's error (sun or load). Lowered
+        for that at once, past the deadband and the hold."""
 
         outdoor = config.heat_pump.outdoor_temperature
         assert outdoor is not None
         building = state.measurements.building
         measured = state.measurements.heat_pump
         bias_k = 0.0
+        setpoint_c = None
+        trimmed = False
 
         if on and not data.zone_cooling and result.space_heat_w:
             schedule = result.space_schedule
-            steps_per_hour = round(1.0 / MPCConfig().step_hours)
-            run = [
-                result.space_heat_w[j]
+            step_hours = MPCConfig().step_hours
+            steps_per_hour = round(1.0 / step_hours)
+            steps = [
+                j
                 for j in range(k, min(k + steps_per_hour, len(schedule)))
                 if schedule[j] == 1
-            ] or [result.space_heat_w[k]]
+            ] or [k]
+            heat_w = float(np.mean([result.space_heat_w[j] for j in steps]))
+            surplus_w = self._surplus_w(config, now)
+
+            if (
+                surplus_w is not None
+                and result.grid_step_kwh
+                and result.space_electrical_w
+                and result.space_electrical_w[k] > 0
+            ):
+                planned_import_w = float(
+                    np.mean(
+                        [
+                            result.grid_step_kwh[j]
+                            * 1000.0
+                            / (
+                                data.first_step_hours
+                                if j == 0 and data.first_step_hours
+                                else step_hours
+                            )
+                            for j in steps
+                        ]
+                    )
+                )
+                cop = result.space_heat_w[k] / result.space_electrical_w[k]
+                allowed_w = (surplus_w + planned_import_w) * cop
+                trimmed = allowed_w < heat_w
+                heat_w = min(heat_w, allowed_w)
+
+            # The flow measured once the heat pump has heated this run for a
+            # quarter hour, as zone_supply_c takes it: before, the quarter's
+            # mean holds the hot water's circuit or the pump still off. Till
+            # then the plan's, the floor's last (or this) run's.
+            settled = since is not None and now - since >= timedelta(hours=step_hours)
             flow_lpm = (
                 measured.flow[-1].value
-                if measured.flow and measured.flow[-1].value > 0
+                if settled and measured.flow and measured.flow[-1].value > 0
                 else data.zone_floor_flow_lpm
             )
             outdoor_c = self._latest(outdoor, now)
+            setpoint_c = run_setpoint_c if since is None else None
+
+            if setpoint_c is None and building.setpoint:
+                setpoint_c = building.setpoint[-1].value
 
             if (
                 flow_lpm
                 and outdoor_c is not None
-                and building.setpoint
+                and setpoint_c is not None
                 and building.zone_temperature
                 and data.zone_maximum_temperature
             ):
                 bias_k = ecodan.setpoint_bias_k(
-                    heat_w=float(np.mean(run)),
+                    heat_w=heat_w,
                     flow_lpm=flow_lpm,
                     outdoor_c=outdoor_c,
                     room_c=building.zone_temperature[-1].value,
-                    setpoint_c=building.setpoint[-1].value,
-                    maximum_c=data.zone_maximum_temperature[k],
+                    setpoint_c=setpoint_c,
+                    # Within a run under way the plan's heat, wherever the sun
+                    # has taken the air (see zone_setpoint_c).
+                    maximum_c=(
+                        data.zone_maximum_temperature[k] if since is None else math.inf
+                    ),
                 )
 
-        previous = state.schedule.building.bias
+        if setpoint_c is None:
+            return bias_k
 
+        target_c = setpoint_c + bias_k
+        previous = state.schedule.building.bias_target
+
+        # Held only from a target set once the run has settled - its first
+        # quarter hour, as the flow above: before it the compressor is not yet
+        # up and the plan may not count the run as under way, and a target
+        # stored then was held for half an hour (7 Nov 2026: 20.1 degC from 2
+        # minutes into a run, the plan's own 19.6).
         if (
             on
             and previous is not None
             and since is not None
-            and previous.time >= since
+            and previous.time >= since + timedelta(hours=MPCConfig().step_hours)
+            and not (trimmed and target_c < previous.value)
             and (
-                abs(bias_k - previous.value) < self.ZONE_BIAS_DEADBAND_K - 1e-9
+                abs(target_c - previous.value) < self.ZONE_BIAS_DEADBAND_K - 1e-9
                 or now - previous.time < self.ZONE_BIAS_HOLD
             )
         ):
-            return previous.value
+            limit = ecodan.BIAS_LIMIT_K
+            return round(min(max(previous.value - setpoint_c, -limit), limit), 1)
 
-        # Stored on a change only: its time is when the bias last moved.
-        if previous is None or previous.value != bias_k:
-            self.state_manager.update_zone_bias(SeriesPoint(time=now, value=bias_k))
+        # Stored on a change only: its time is when the target last moved.
+        if previous is None or previous.value != target_c:
+            self.state_manager.update_zone_bias(SeriesPoint(time=now, value=target_c))
 
         return bias_k
 
@@ -1849,8 +2184,9 @@ class Optimization:
         """Writes the plan's floor decision to Home Assistant, as publish_dhw
         does the hot water's: on/off for the quarter hour running now, the
         start of the run under way or the next one planned, the room setpoint
-        for that run (see zone_setpoint_c), and the supply setpoint while a run
-        is under way (see zone_supply_c).
+        the thermostat is to have now - the run's while one is under way (see
+        zone_setpoint_c), the comfort band's edge between runs - and the
+        supply setpoint while a run is under way (see zone_supply_c).
 
         All four 'unknown' where the zone cannot be planned at all: nothing
         then for an automation to act on.
@@ -1870,41 +2206,38 @@ class Optimization:
                 states.cooling if data.zone_cooling else states.heating,
             )
             first = next((k for k, on in enumerate(schedule) if on), None)
-            # The tank's block ending in this quarter and the zone's run
-            # planned from the next: on already, so the heat pump goes from the
-            # hot water straight on to the floor - it finishes the tank first.
-            # Off, it stops once the hot water is done and starts again for the
-            # zone a few minutes later, a start the plan does not make: it
-            # counts the hand-over as one run. Heating only: the heat pump
-            # stops to reverse between cooling and the tank anyway.
+            # The tank's block under way and the zone's run planned straight
+            # after it: on from the tank's start, so the heat pump goes from
+            # the hot water straight on to the floor - the hot water comes
+            # first, it is not cut short for heat (19 hand-overs 18 Oct-6 Nov
+            # 2026 with the thermostat asking throughout, runs to 74 minutes).
+            # Off until the tank's last quarter hour, a tank done sooner than
+            # planned stopped the heat pump and started it again for the zone,
+            # a start the plan does not make: it counts the hand-over as one
+            # run. Heating only: the heat pump stops to reverse between cooling
+            # and the tank anyway.
+            tank = result.schedule
+            tank_end = next((j for j, on in enumerate(tank) if not on), len(tank))
             hand_over = (
                 not running
                 and not data.zone_cooling
-                and len(schedule) > 1
-                and schedule[1] == 1
-                and result.schedule[:2] == (1, 0)
+                and bool(tank)
+                and tank[0] == 1
+                and tank_end < len(schedule)
+                and schedule[tank_end] == 1
             )
-            # The step whose supply the run is given: the next one's when
-            # handed over, the step now being the tank's.
-            k = 1 if hand_over else 0
-            status = "on" if running or hand_over else "off"
+            # The step whose supply the run is given: its first, after the
+            # tank's when handed over. Handed over the run is set up - its
+            # setpoints and bias - but on only from its own start, which the
+            # status and start say.
+            k = tank_end if hand_over else 0
+            serving = running or hand_over
+            status = "on" if running else "off"
 
             if first is not None:
                 start = (
                     since if running and since is not None else times[first]
                 ).isoformat()
-
-            if config.heat_pump.auto_adaptive:
-                bias = self._zone_bias(
-                    config,
-                    data,
-                    result,
-                    state,
-                    k,
-                    running or hand_over,
-                    since if running else None,
-                    now,
-                )
 
             # The room setpoint the thermostat is given for that run, which
             # asks the heat pump for heat while the room is below it: what the
@@ -1915,26 +2248,69 @@ class Optimization:
             # the plan has it, asked for nothing (real plan, 25 Oct 2026: 19.8
             # degC against a room at 19.82). The least published step past
             # either, never past the comfort band: status says when it ends.
-            if first is not None and result.zone_temperatures:
+            # Between runs the comfort band's edge now, so the thermostat asks
+            # for heat (cold) only where the room passed what the plan allows:
+            # left at a run's setpoint the heat pump ran on 20-75 minutes past
+            # the plan's end (3-5 Nov 2026). Inside the band, on its step.
+            band = (
+                data.zone_maximum_temperature
+                if data.zone_cooling
+                else data.zone_minimum_temperature
+            )
+
+            if serving and first is not None and result.zone_temperatures:
                 room = self.zone_setpoint_c(
                     schedule,
                     first,
                     result.zone_temperatures,
                     (
                         state.measurements.building.zone_temperature[-1].value
-                        if status == "on"
-                        and state.measurements.building.zone_temperature
+                        if state.measurements.building.zone_temperature
                         else None
                     ),
+                    # Within a run under way the plan ends it (status), not
+                    # the comfort band at the thermostat: the sun takes the air
+                    # past the band's edge, not the floor the plan charges.
                     (
-                        data.zone_minimum_temperature
+                        None
+                        if running and since is not None
+                        else data.zone_minimum_temperature
                         if data.zone_cooling
                         else data.zone_maximum_temperature
                     ),
                     data.zone_cooling,
+                    tank,
+                )
+                # Held within a run under way: never short of the thermostat's
+                # setpoint, which the blueprint only raises within a run - a
+                # replan lowering it changes nothing there (7 Nov 2026: 20.0
+                # and 20.5 in turn, the thermostat at 21).
+                measured = state.measurements.building.setpoint
+
+                if running and since is not None and measured:
+                    held = (min if data.zone_cooling else max)(
+                        float(room), measured[-1].value
+                    )
+                    room = f"{held:.1f}"
+            elif not serving and band:
+                step = self.ZONE_SETPOINT_STEP_C
+                within = math.ceil if data.zone_cooling else math.floor
+                room = f"{within(round(band[0] / step, 6)) * step:.1f}"
+
+            if config.heat_pump.auto_adaptive:
+                bias = self._zone_bias(
+                    config,
+                    data,
+                    result,
+                    state,
+                    k,
+                    serving,
+                    since if running else None,
+                    now,
+                    float(room) if room != "unknown" else None,
                 )
 
-            if (running or hand_over) and result.space_supply_c:
+            if serving and result.space_supply_c:
                 measured = state.measurements.heat_pump
                 step = timedelta(hours=MPCConfig().step_hours)
                 settled = since is not None and now - since >= step
@@ -2029,6 +2405,34 @@ class Optimization:
         readings = pd.to_numeric(frame.get("value"), errors="coerce").dropna()
 
         return float(readings.iloc[-1]) if not readings.empty else None
+
+    def _surplus_w(self, config: Config, now: datetime) -> float | None:
+        """The solar surplus the heat pump had (W): its own draw less the grid
+        meter's, per minute - solar less the rest of the house - at its best
+        minute of ZONE_BIAS_SURPLUS_WINDOW. None without readings."""
+
+        frame = self.loader.load(
+            DatasetBuilder()
+            .timeseries(
+                "grid", config.grid, aggregation="mean", interval="1m", fill="previous"
+            )
+            .timeseries(
+                "heat_pump",
+                config.heat_pump.power,
+                aggregation="mean",
+                interval="1m",
+                fill="previous",
+            )
+            .build(),
+            now - self.ZONE_BIAS_SURPLUS_WINDOW,
+            now,
+        )
+        surplus = (
+            pd.to_numeric(frame.get("heat_pump"), errors="coerce")
+            - pd.to_numeric(frame.get("grid"), errors="coerce")
+        ).dropna()
+
+        return float(surplus.max()) if not surplus.empty else None
 
     @staticmethod
     def tank_level(

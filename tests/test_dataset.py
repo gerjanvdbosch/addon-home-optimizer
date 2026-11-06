@@ -5,11 +5,16 @@ import pandas as pd
 import pytest
 from influxdb.resultset import ResultSet
 
-from domain.dataset import AttributeSeriesDefinition, TimeSeriesDefinition
+from domain.dataset import (
+    AttributeSeriesDefinition,
+    SumSeriesDefinition,
+    TimeSeriesDefinition,
+)
 from domain.sensors import InfluxSensor, SensorAttributesReference, SensorReference
 from infrastructure.influx import InfluxDatabase
 from infrastructure.loaders import (
     AttributeSeriesLoader,
+    SumSeriesLoader,
     TimeSeriesLoader,
     resample_dataframe,
     time_weighted_means,
@@ -310,3 +315,51 @@ def test_samples_stand_side_by_side_by_their_place_in_the_interval():
     assert wide.iloc[0, 1:].tolist()[0::2] == ["SWW", "Verwarmen"]
     assert pd.isna(wide.loc[0, "state_1"])
     assert wide.iloc[1, 1:].tolist() == ["Verwarmen", "Verwarmen", "Uit"]
+
+
+def test_a_power_balance_adds_its_meters_over_time():
+    """The baseload as grid + solar - heat pump over a quarter hour of 200 W:
+    the heat pump reports 2 kW and, 5 minutes on, once 0; the grid every
+    minute. Over readings the heat pump would count 1 kW, over time 667 W."""
+
+    start = datetime(2026, 11, 6, 12, tzinfo=UTC)
+    minute = timedelta(minutes=1)
+    readings = {
+        "grid": [(i, 1900.0 if i < 5 else -100.0) for i in range(15)],
+        "solar": [(0, 300.0)],
+        "heat_pump": [(0, 2000.0), (5, 0.0)],
+    }
+
+    class _Meters:
+        def find(self, measurement, entity_id, field, before=None):
+            return None
+
+        def find_series(self, measurement, entity_id, field, start, end, **kwargs):
+            assert kwargs["aggregation"] is None
+            return [
+                {"time": (start + i * minute).isoformat(), "value": value}
+                for i, value in readings[entity_id]
+            ]
+
+    class _Sensors:
+        def resolve(self, sensor):
+            return InfluxSensor(
+                measurement="W", entity_id=sensor.entity_id, field="value"
+            )
+
+    frame = SumSeriesLoader(_Meters(), _Sensors()).load(
+        SumSeriesDefinition(
+            name="baseload",
+            terms=[
+                (1.0, SensorReference(entity_id="grid")),
+                (1.0, SensorReference(entity_id="solar")),
+                (-1.0, SensorReference(entity_id="heat_pump")),
+            ],
+            interval="15m",
+        ),
+        start,
+        start + 15 * minute,
+    )
+
+    assert list(frame["time"]) == [start]
+    assert frame["baseload"].iloc[0] == pytest.approx(200.0)
