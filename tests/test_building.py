@@ -78,7 +78,7 @@ def _config() -> Config:
 
     return Config(
         solar="sensor.pv_output",
-        baseload="sensor.baseload",
+        grid="sensor.grid",
         heat_pump={
             "state": "sensor.heat_pump_state",
             "power": "sensor.heat_pump_power",
@@ -811,6 +811,21 @@ def test_a_room_may_name_the_thermostat_that_opens_its_loops():
     assert identifier.room_climate_columns == [None, "room_climate_1"]
     assert loaded["room_climate_1"].sensor.entity_id == "climate.bedroom"
     assert loaded["room_climate_1"].sensor.attribute == "state"
+
+
+def test_every_series_the_building_loads_is_joined_onto_its_grid():
+    """A definition left out of the joins is loaded and then dropped: the
+    baseload was, once taken from the meters' balance."""
+
+    definition = BuildingThermalIdentifier(latitude=52.39, longitude=5.79).dataset(
+        _config()
+    )
+    joined = {join.right for join in definition.joins} | {
+        join.left for join in definition.joins
+    }
+
+    assert {d.name for d in definition.definitions} <= joined
+    assert "baseload_w" in joined
 
 
 def test_filter_infers_the_unmeasured_mass_node():

@@ -20,6 +20,7 @@ from domain.dataset import (
     DataLoader,
     DatasetDefinition,
     JoinDefinition,
+    SumSeriesDefinition,
     TimeSeriesDefinition,
 )
 from domain.sensors import (
@@ -184,6 +185,27 @@ class DatasetBuilder:
                 target_label=target_label,
                 target_resample=target_resample,
                 target_shift=target_shift,
+            )
+        )
+
+        return self
+
+    def sum_series(
+        self,
+        name: str,
+        terms: list[tuple[float, SensorReference]],
+        interval: str = "1m",
+        target_interval: str | None = None,
+    ) -> "DatasetBuilder":
+        """Load the signed sum of sensors' series, each averaged over time
+        (see SumSeriesDefinition)."""
+
+        self._definitions.append(
+            SumSeriesDefinition(
+                name=name,
+                terms=terms,
+                interval=interval,
+                target_interval=target_interval,
             )
         )
 

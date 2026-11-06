@@ -39,6 +39,32 @@ class TimeSeriesDefinition(DataDefinition):
     fill: FillMethod | int | float = "none"
 
 
+class SumSeriesDefinition(DataDefinition):
+    """The sum of sensors' series, each with its sign (a power balance, as the
+    house's baseload: grid + solar - heat pump). Each is averaged over time:
+    the meters report at different rates and some seldom at 0, so means over
+    readings would not add up."""
+
+    terms: list[tuple[float, SensorReference]]
+    interval: str = "1min"
+
+    def parts(self) -> list[TimeSeriesDefinition]:
+        target = self.model_dump(
+            include={"target_interval", "target_closed", "target_label", "target_shift"}
+        )
+
+        return [
+            TimeSeriesDefinition(
+                name=f"{self.name}_{i}",
+                sensor=sensor,
+                aggregation="time_mean",
+                interval=self.interval,
+                **target,
+            )
+            for i, (_, sensor) in enumerate(self.terms)
+        ]
+
+
 class AttributeSeriesDefinition(DataDefinition):
     sensor: SensorAttributesReference
     attributes: list[str]

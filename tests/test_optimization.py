@@ -14,7 +14,7 @@ from domain.models import BoilerThermalModel
 from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.sensors import SensorReference
 from domain.state import SeriesPoint, State, ZoneHabit
-from domain.time import local_day_start
+from domain.time import local_day_start, to_local_time
 from features.boiler import BoilerThermalIdentifier
 from features.optimizer import MPCOptimizer
 
@@ -62,6 +62,18 @@ def _published_zone(
     cooling: bool = False,
     room_c: tuple[float, ...] = (),
 ) -> dict[str, str]:
+    states = _zone_states(tank, zone, cooling, room_c)
+
+    return {entity: state for entity, (state, _) in states.items()}
+
+
+def _zone_states(
+    tank: tuple[int, ...],
+    zone: tuple[int, ...],
+    cooling: bool = False,
+    room_c: tuple[float, ...] = (),
+    band_c: tuple[float, ...] = (),
+) -> dict[str, tuple[str, dict]]:
     home_assistant = _RecordingHomeAssistant()
     optimization = Optimization(
         loader=None,  # type: ignore[arg-type]
@@ -89,6 +101,8 @@ def _published_zone(
         current_temp_bottom=45.0,
         boiler_on_current=bool(tank[0]),
         zone_cooling=cooling,
+        zone_maximum_temperature=band_c if cooling else (),
+        zone_minimum_temperature=() if cooling else band_c,
     )
     config = SimpleNamespace(
         heat_pump=SimpleNamespace(states=HeatPumpStates(), auto_adaptive=False)
@@ -96,29 +110,50 @@ def _published_zone(
 
     optimization.publish_zone(result, TIMES, State(), config, data, [], START)  # type: ignore[arg-type]
 
-    return {entity: state for entity, (state, _) in home_assistant.states.items()}
+    return home_assistant.states
+
+
+def test_between_runs_the_thermostat_is_given_the_comfort_bands_edge():
+    """Off, the setpoint is the band's edge now, on the thermostat's step and
+    inside the band - heat only below its minimum, cold only above its
+    maximum."""
+
+    def idle(band_c: float, cooling: bool = False) -> str:
+        states = _zone_states(
+            (0, 0, 0, 0), (0, 0, 1, 0), cooling, band_c=(band_c, 21.0, 21.0, 21.0)
+        )
+        return states[Optimization.ZONE_SETPOINT_ENTITY][0]
+
+    assert idle(18.5) == "18.5"
+    assert idle(18.7) == "18.5"
+    assert idle(25.2, cooling=True) == "25.5"
 
 
 def test_the_zone_is_on_in_the_quarter_the_tank_hands_over_in():
     """The heat pump finishes the hot water first; with heating already on it
     goes straight on to the floor rather than stopping and starting again."""
 
-    published = _published_zone(tank=(1, 0, 0, 0), zone=(0, 1, 1, 0))
+    published = _published_zone(
+        tank=(1, 0, 0, 0), zone=(0, 1, 1, 0), room_c=(19.2, 19.24, 19.6, 19.83)
+    )
 
-    assert published[Optimization.ZONE_STATUS_ENTITY] == "on"
+    # Set up, but on only from its own start.
+    assert published[Optimization.ZONE_STATUS_ENTITY] == "off"
+    assert published[Optimization.ZONE_START_ENTITY] == TIMES[1].isoformat()
+    assert published[Optimization.ZONE_SETPOINT_ENTITY] == "20.0"
     assert published[Optimization.ZONE_SUPPLY_ENTITY] == "26.0"
 
 
 def test_the_zone_setpoint_is_past_the_room_the_next_run_heats_to():
-    """The least step past the warmest the plan has the room from the run's
-    start to the next run's - after the run too, as the screed warms the room
-    later - and unknown without a run."""
+    """During a run the least step past the warmest the plan has the room from
+    the run's start to the next run's - after the run too, as the screed warms
+    the room later - and unknown without a run or a band."""
 
     published = _published_zone(
-        tank=(0, 0, 0, 0), zone=(0, 1, 1, 0), room_c=(19.2, 19.24, 19.6, 19.83)
+        tank=(0, 0, 0, 0), zone=(1, 1, 0, 0), room_c=(19.2, 19.24, 19.6, 19.83)
     )
 
-    assert published[Optimization.ZONE_SETPOINT_ENTITY] == "19.9"
+    assert published[Optimization.ZONE_SETPOINT_ENTITY] == "20.0"
     assert (
         _published_zone(tank=(0, 0, 0, 0), zone=(0, 0, 0, 0), room_c=(19.2,) * 4)[
             Optimization.ZONE_SETPOINT_ENTITY
@@ -135,13 +170,14 @@ FALLING = (19.75, 19.7, 19.65, 19.6)
     [
         # A run under way past a room warmer than the plan has it, which it
         # heats for later: past the room, or the thermostat asks for nothing.
-        ((1, 1, 0, 0), FALLING, 19.82, None, False, "19.9"),
+        # In half degrees, the thermostat's step.
+        ((1, 1, 0, 0), FALLING, 19.82, None, False, "20.0"),
         # At a step of its own: still strictly past it.
-        ((1, 1, 0, 0), FALLING, 19.8, None, False, "19.9"),
+        ((1, 1, 0, 0), FALLING, 20.0, None, False, "20.5"),
         # The next run's temperatures are not this run's.
-        ((1, 0, 1, 1), (19.75, 19.7, 19.65, 20.4), None, None, False, "19.8"),
+        ((1, 0, 1, 1), (19.75, 19.7, 19.65, 20.4), None, None, False, "20.0"),
         # Never past the comfort band.
-        ((1, 1, 0, 0), FALLING, 19.82, (19.85,) * 4, False, "19.9"),
+        ((1, 1, 0, 0), FALLING, 20.1, (20.0,) * 4, False, "20.0"),
         ((1, 1, 0, 0), FALLING, 19.82, (19.5,) * 4, False, "19.5"),
         # Cooling the other way.
         ((1, 1, 0, 0), FALLING, None, None, True, "19.5"),
@@ -158,25 +194,33 @@ def test_the_zone_setpoint(
     )
 
 
+def test_the_zone_is_set_up_from_the_tanks_start_when_its_run_follows():
+    """Its setpoints from the hot water's start, so a tank done sooner than
+    planned goes straight on to the floor too; the run's supply its own first
+    step's, its status and start its own."""
+
+    published = _published_zone(
+        tank=(1, 1, 0, 0), zone=(0, 0, 1, 1), room_c=(19.2, 19.24, 19.6, 19.83)
+    )
+
+    assert published[Optimization.ZONE_STATUS_ENTITY] == "off"
+    assert published[Optimization.ZONE_START_ENTITY] == TIMES[2].isoformat()
+    assert published[Optimization.ZONE_SETPOINT_ENTITY] == "20.0"
+    assert published[Optimization.ZONE_SUPPLY_ENTITY] == "26.0"
+
+
 def test_no_hand_over_without_a_zone_run_straight_after_or_while_cooling():
-    assert (
-        _published_zone(tank=(1, 0, 0, 0), zone=(0, 0, 1, 0))[
-            Optimization.ZONE_STATUS_ENTITY
-        ]
-        == "off"
-    )
-    assert (
-        _published_zone(tank=(1, 1, 0, 0), zone=(0, 0, 1, 0))[
-            Optimization.ZONE_STATUS_ENTITY
-        ]
-        == "off"
-    )
-    assert (
-        _published_zone(tank=(1, 0, 0, 0), zone=(0, 1, 1, 0), cooling=True)[
-            Optimization.ZONE_STATUS_ENTITY
-        ]
-        == "off"
-    )
+    """Nothing set up for a run that does not follow the tank straight away."""
+
+    for tank, zone, cooling in (
+        ((1, 0, 0, 0), (0, 0, 1, 0), False),
+        ((1, 1, 0, 0), (0, 0, 0, 1), False),
+        ((1, 0, 0, 0), (0, 1, 1, 0), True),
+    ):
+        published = _published_zone(tank=tank, zone=zone, cooling=cooling)
+
+        assert published[Optimization.ZONE_STATUS_ENTITY] == "off"
+        assert published[Optimization.ZONE_SUPPLY_ENTITY] == "unknown"
 
 
 def test_a_run_planned_later_is_off_now_with_its_start_time():
@@ -404,7 +448,7 @@ LOG_PLANNER = (
 )
 
 
-def test_the_plan_log_reports_the_objective_s_own_energy_per_day(caplog):
+def test_the_plan_log_reports_the_objective_s_own_energy_per_day():
     """1.00 kWh of which 0.50 from the grid, as the optimizer counted them:
     the import at the price, the sun at the export it forgoes - per day, and
     in total."""
@@ -422,14 +466,13 @@ def test_the_plan_log_reports_the_objective_s_own_energy_per_day(caplog):
         grid_step_kwh=(0.0, 0.25, 0.25, 0.0),
     )
 
-    with caplog.at_level("INFO", logger="app.optimization"):
-        Optimization.log_dhw_plan(result, TIMES, *LOG_PLANNER)
+    summary = Optimization.dhw_summary(result, TIMES, *LOG_PLANNER)
 
-    assert "to 48.2 degC: 1.00 kWh, of which sun 0.50 and grid 0.50" in caplog.text
-    assert "(expected), EUR 0.150 | total 1.00 kWh, EUR 0.150" in caplog.text
+    assert "to 48.2 degC: 1.00 kWh, of which sun 0.50 and grid 0.50" in summary
+    assert "(expected), EUR 0.150 | total 1.00 kWh, EUR 0.150" in summary
 
 
-def test_the_plan_log_splits_its_energy_by_day(caplog):
+def test_the_plan_log_splits_its_energy_by_day():
     """A run today and one tomorrow: each day's own electricity and cost."""
 
     times = [START + timedelta(hours=12 * i) for i in range(4)]
@@ -446,15 +489,14 @@ def test_the_plan_log_splits_its_energy_by_day(caplog):
         grid_step_kwh=(0.0, 0.0, 1.0, 0.0),
     )
 
-    with caplog.at_level("INFO", logger="app.optimization"):
-        Optimization.log_dhw_plan(result, times, *LOG_PLANNER)
+    summary = Optimization.dhw_summary(result, times, *LOG_PLANNER)
 
-    assert ": 0.50 kWh, of which sun 0.50 and grid 0.00" in caplog.text
-    assert ": 1.00 kWh, of which sun 0.00 and grid 1.00" in caplog.text
-    assert "| total 1.50 kWh" in caplog.text
+    assert ": 0.50 kWh, of which sun 0.50 and grid 0.00" in summary
+    assert ": 1.00 kWh, of which sun 0.00 and grid 1.00" in summary
+    assert "| total 1.50 kWh" in summary
 
 
-def test_the_plan_log_counts_only_the_tank_s_electricity(caplog):
+def test_the_plan_log_counts_only_the_tank_s_electricity():
     """The plan's electricity is the whole heat pump's: a floor run after the
     tank's must not be reported as hot water."""
 
@@ -473,11 +515,10 @@ def test_the_plan_log_counts_only_the_tank_s_electricity(caplog):
         grid_step_kwh=(0.0, 0.25, 0.25, 0.0),
     )
 
-    with caplog.at_level("INFO", logger="app.optimization"):
-        Optimization.log_dhw_plan(result, TIMES, *LOG_PLANNER)
+    summary = Optimization.dhw_summary(result, TIMES, *LOG_PLANNER)
 
-    assert ": 0.50 kWh, of which sun 0.25 and grid 0.25" in caplog.text
-    assert "| total 0.50 kWh" in caplog.text
+    assert ": 0.50 kWh, of which sun 0.25 and grid 0.25" in summary
+    assert "| total 0.50 kWh" in summary
 
 
 def test_explain_logs_the_plan_beside_earlier_finishes(caplog):
@@ -978,7 +1019,14 @@ def test_an_evening_target_is_not_lowered_by_draws_for_the_morning_one():
 
 
 def _zone_bias(
-    previous: SeriesPoint | None, on: bool, heat_w: float = 4500.0
+    previous: SeriesPoint | None,
+    on: bool,
+    heat_w: float = 4500.0,
+    surplus_w: float | None = None,
+    setpoint_c: float = 20.0,
+    run_setpoint_c: float | None = None,
+    heating: bool = True,
+    flow_lpm: float = 18.0,
 ) -> tuple[float, list[SeriesPoint]]:
     stored: list[SeriesPoint] = []
     optimization = Optimization(
@@ -989,16 +1037,17 @@ def _zone_bias(
         home_assistant=None,  # type: ignore[arg-type]
     )
     optimization._latest = lambda reference, now: 8.0  # type: ignore[method-assign]
+    optimization._surplus_w = lambda config, now: surplus_w  # type: ignore[method-assign]
     config = SimpleNamespace(
         heat_pump=SimpleNamespace(
             outdoor_temperature=SensorReference(entity_id="outdoor")
         )
     )
     state = State()
-    state.measurements.building.setpoint = [SeriesPoint(time=START, value=20.0)]
+    state.measurements.building.setpoint = [SeriesPoint(time=START, value=setpoint_c)]
     state.measurements.building.zone_temperature = [SeriesPoint(time=START, value=19.5)]
-    state.measurements.heat_pump.flow = [SeriesPoint(time=START, value=18.0)]
-    state.schedule.building.bias = previous
+    state.measurements.heat_pump.flow = [SeriesPoint(time=START, value=flow_lpm)]
+    state.schedule.building.bias_target = previous
     result = MPCResult(
         schedule=(0,) * 4,
         temperatures=TEMPERATURES,
@@ -1008,6 +1057,9 @@ def _zone_bias(
         termination_condition="optimal",
         space_schedule=(1, 1, 1, 1),
         space_heat_w=(heat_w,) * 4,
+        # COP 5, the plan expecting 50 W from the grid in each step.
+        space_electrical_w=(heat_w / 5.0,) * 4,
+        grid_step_kwh=(0.0125,) * 4,
     )
     data = MPCInput(
         solar_forecast_w=[0.0] * 4,
@@ -1016,40 +1068,117 @@ def _zone_bias(
         current_temp_bottom=45.0,
         boiler_on_current=False,
         zone_maximum_temperature=(21.0,) * 4,
+        zone_floor_flow_lpm=18.0,
     )
-    since = START - timedelta(hours=1)
-    bias = optimization._zone_bias(config, data, result, state, 0, on, since, START)  # type: ignore[arg-type]
+    since = START - timedelta(hours=1) if heating else None
+    bias = optimization._zone_bias(  # type: ignore[arg-type]
+        config, data, result, state, 0, on, since, START, run_setpoint_c
+    )
 
     return bias, stored
 
 
 def test_the_zone_bias_holds_within_a_run_and_drops_after_it():
+    """What is held is the controller's target, the setpoint (20 degC here)
+    plus the bias."""
+
     free, _ = _zone_bias(None, on=True)
     assert free == 0.2
 
     # Changed 10 minutes ago in this run: held, though 0.4 K off.
     held, stored = _zone_bias(
-        SeriesPoint(time=START - timedelta(minutes=10), value=-0.2), on=True
+        SeriesPoint(time=START - timedelta(minutes=10), value=19.8), on=True
     )
     assert (held, stored) == (-0.2, [])
 
     # Within the deadband: held however long ago.
     held, _ = _zone_bias(
-        SeriesPoint(time=START - timedelta(minutes=50), value=0.1), on=True
+        SeriesPoint(time=START - timedelta(minutes=50), value=20.1), on=True
     )
     assert held == 0.1
 
     # Past both: moves, and the change is stored.
     moved, stored = _zone_bias(
-        SeriesPoint(time=START - timedelta(minutes=50), value=-0.2), on=True
+        SeriesPoint(time=START - timedelta(minutes=50), value=19.8), on=True
     )
-    assert moved == 0.2 and stored == [SeriesPoint(time=START, value=0.2)]
+    assert moved == 0.2 and stored == [SeriesPoint(time=START, value=20.2)]
 
     # The run over: back to 0 at once.
     off, _ = _zone_bias(
-        SeriesPoint(time=START - timedelta(minutes=10), value=0.2), on=False
+        SeriesPoint(time=START - timedelta(minutes=10), value=20.2), on=False
     )
     assert off == 0.0
+
+
+def test_a_raised_setpoint_lowers_the_held_bias_as_much():
+    # Held at 20.2 degC; the blueprint raises the thermostat to 20.5 within
+    # the run: the target stays, the bias drops by the 0.5 K.
+    held, stored = _zone_bias(
+        SeriesPoint(time=START - timedelta(minutes=10), value=20.2),
+        on=True,
+        setpoint_c=20.5,
+    )
+    assert (held, stored) == (-0.3, [])
+
+
+def test_the_zone_bias_takes_the_runs_setpoint_until_the_heat_pump_heats():
+    # The thermostat still at its night 15 degC as the run starts: against
+    # the 20 degC the blueprint gives it, not clamped at the bias limit.
+    starting, _ = _zone_bias(
+        None, on=True, setpoint_c=15.0, run_setpoint_c=20.0, heating=False
+    )
+    assert starting == 0.2
+
+    # Heating: the thermostat's own setpoint, whoever set it.
+    heating, _ = _zone_bias(None, on=True, setpoint_c=15.0, run_setpoint_c=20.0)
+    assert heating == 2.5
+
+
+def test_the_zone_bias_takes_the_floors_flow_until_the_run_has_settled():
+    # Handed over, the flow measured is the hot water's (30 L/min here): the
+    # floor's last run's 18 L/min instead, the same bias as heating at 18.
+    handed_over, _ = _zone_bias(
+        None, on=True, run_setpoint_c=20.0, heating=False, flow_lpm=30.0
+    )
+    assert handed_over == 0.2
+
+    # A quarter hour into the run: the flow measured.
+    heating, _ = _zone_bias(None, on=True, flow_lpm=30.0)
+    assert heating < 0.2
+
+
+def test_the_zone_bias_keeps_to_the_measured_surplus():
+    # The plan's 4.5 kW (900 W at COP 5) with 850 W surplus measured and 50 W
+    # import planned: within what the plan expected, so its bias.
+    planned, _ = _zone_bias(None, on=True, surplus_w=850.0)
+    assert planned == 0.2
+
+    # 250 W less sun than that: lowered at once, though changed 10 minutes
+    # ago and less than the deadband away.
+    lowered, stored = _zone_bias(
+        SeriesPoint(time=START - timedelta(minutes=10), value=20.2),
+        on=True,
+        surplus_w=600.0,
+    )
+    assert lowered < 0.2 and stored == [
+        SeriesPoint(time=START, value=pytest.approx(20.0 + lowered))
+    ]
+
+    # The same surplus again: the same bias, not lowered further.
+    again, stored = _zone_bias(
+        SeriesPoint(time=START - timedelta(minutes=5), value=20.0 + lowered),
+        on=True,
+        surplus_w=600.0,
+    )
+    assert (again, stored) == (lowered, [])
+
+    # The sun back: raised only after the hold.
+    held, _ = _zone_bias(
+        SeriesPoint(time=START - timedelta(minutes=10), value=20.0 + lowered),
+        on=True,
+        surplus_w=850.0,
+    )
+    assert held == lowered
 
 
 def test_auto_adaptive_needs_the_units_outdoor_sensor():
@@ -1084,3 +1213,167 @@ def test_auto_adaptive_needs_the_units_outdoor_sensor():
     assert HeatPumpConfig.model_validate(
         heat_pump | {"outdoor_temperature": sensor}
     ).auto_adaptive
+
+
+def test_the_plans_day_energy_splits_the_heat_pump_and_prices_the_grid():
+    """Two quarter hours: the tank at 2 kW in 1 kW surplus, then the floor at
+    1 kW in 1.5 kW surplus - 0.25 kWh in, then 0.125 kWh out; and a night
+    quarter hour, the house's 300 W alone, 0.075 kWh in."""
+
+    result = MPCResult(
+        schedule=(1, 0, 0),
+        temperatures=(45.0, 50.0, 50.0, 50.0),
+        electrical_power_w=(2000.0, 0.0, 0.0),
+        heat_w=(6000.0, 0.0, 0.0),
+        objective_value=0.0,
+        termination_condition="optimal",
+        space_schedule=(0, 1, 0),
+        space_heat_w=(0.0, 4000.0, 0.0),
+        space_electrical_w=(0.0, 1000.0, 0.0),
+        electricity_step_kwh=(0.5, 0.25, 0.0),
+    )
+    data = MPCInput(
+        solar_forecast_w=[1300.0, 1800.0, 0.0],
+        baseload_forecast_w=(300.0, 300.0, 300.0),
+        ambient_temperature=20.0,
+        current_temp_top=45.0,
+        current_temp_bottom=45.0,
+        boiler_on_current=False,
+        import_price_eur_per_kwh=(0.2, 0.2, 0.2),
+        export_price_eur_per_kwh=(0.08, 0.08, 0.08),
+    )
+    optimizer = SimpleNamespace(
+        config=MPCConfig(),
+        prices=lambda data: (
+            data.import_price_eur_per_kwh,
+            data.export_price_eur_per_kwh,
+        ),
+    )
+
+    frame = Optimization.planned_energy(result, data, TIMES[:3], optimizer)  # type: ignore[arg-type]
+
+    assert list(frame["import"]) == pytest.approx([0.25, 0.0, 0.075])
+    assert list(frame["export"]) == pytest.approx([0.0, 0.125, 0.0])
+    assert list(frame["dhw"]) == pytest.approx([0.5, 0.0, 0.0])
+    assert list(frame["heating"]) == pytest.approx([0.0, 0.25, 0.0])
+    assert list(frame["house"]) == pytest.approx([0.075, 0.075, 0.075])
+    assert frame["cost"].sum() == pytest.approx(0.325 * 0.2 - 0.125 * 0.08)
+    # The balance: in - out = heat pump + house - sun.
+    assert (frame["import"] - frame["export"]).sum() == pytest.approx(
+        (frame[["dhw", "heating", "house"]].sum(axis=1) - frame["solar"]).sum()
+    )
+
+
+def test_the_measured_day_counts_import_and_export_per_minute():
+    """A quarter hour's grid that nets to 0 over it: 500 W in for half of it
+    and out for the other half still bought and sold 0.058 kWh each."""
+
+    now = datetime(2026, 11, 6, 11, 15, tzinfo=UTC)
+    start = datetime(2026, 11, 6, 11, 0, tzinfo=UTC)
+    minutes = [start + timedelta(minutes=i) for i in range(15)]
+    frame = pd.DataFrame(
+        {
+            "time": minutes,
+            "grid": [500.0 if i < 7.5 else -500.0 for i in range(15)],
+            "solar": [1000.0] * 15,
+            "power": [800.0] * 15,
+            "state": ["Verwarmen"] * 15,
+        }
+    )
+    frame.loc[7, "grid"] = 0.0
+    optimization = Optimization(
+        loader=SimpleNamespace(load=lambda *args: frame),  # type: ignore[arg-type]
+        state_manager=None,  # type: ignore[arg-type]
+        config_repository=None,  # type: ignore[arg-type]
+        models_path=Path("."),
+        home_assistant=None,  # type: ignore[arg-type]
+    )
+    optimization._price = lambda key, price, state, times: (
+        (  # type: ignore[method-assign]
+            (0.2,) if key == "import" else (0.08,)
+        )
+        * len(times)
+    )
+    config = SimpleNamespace(
+        grid=SensorReference(entity_id="grid"),
+        solar=SensorReference(entity_id="solar"),
+        heat_pump=SimpleNamespace(
+            power=SensorReference(entity_id="power"),
+            state=SensorReference(entity_id="state"),
+            states=HeatPumpStates(),
+        ),
+        prices=SimpleNamespace(import_=None, export=None),
+    )
+
+    quarters = optimization.measured_energy(config, State(), now)  # type: ignore[arg-type]
+
+    assert len(quarters) == 1
+    assert quarters["import"].iloc[0] == pytest.approx(7 * 500.0 / 60000.0)
+    assert quarters["export"].iloc[0] == pytest.approx(7 * 500.0 / 60000.0)
+    assert quarters["heating"].iloc[0] == pytest.approx(15 * 800.0 / 60000.0)
+    assert quarters["cost"].iloc[0] == pytest.approx(7 * 500.0 / 60000.0 * (0.2 - 0.08))
+
+
+def test_the_day_costs_are_one_table_with_today_measured_and_planned(caplog):
+    """Today's measured and planned add up in its row, tomorrow is planned
+    only; nothing is a dash."""
+
+    today, tomorrow = START, START + timedelta(days=1)
+
+    def frame(time, cost, heating):
+        row = dict.fromkeys(Optimization.DAY_COLUMNS, 0.0)
+        return pd.DataFrame([{**row, "time": time, "cost": cost, "heating": heating}])
+
+    optimization = Optimization(
+        loader=None,  # type: ignore[arg-type]
+        state_manager=None,  # type: ignore[arg-type]
+        config_repository=None,  # type: ignore[arg-type]
+        models_path=Path("."),
+        home_assistant=None,  # type: ignore[arg-type]
+    )
+    optimization.measured_energy = lambda config, state, now: frame(today, 0.5, 1.0)  # type: ignore[method-assign]
+    optimization.planned_energy = lambda *args: pd.concat(  # type: ignore[method-assign]
+        [frame(today, 0.25, 0.0), frame(tomorrow, 1.0, 2.0)]
+    )
+
+    with caplog.at_level("INFO", logger="app.optimization"):
+        optimization.log_day_costs(  # type: ignore[arg-type]
+            None,
+            None,
+            None,
+            SimpleNamespace(schedule=(), space_schedule=()),
+            SimpleNamespace(config=MPCConfig()),
+            [today, tomorrow],
+            today,
+        )
+
+    lines = caplog.messages[-1].splitlines()
+    assert lines[1].split()[:3] == ["day", "eur", "meas"]
+    today_cells = lines[2].split()[3:]
+    tomorrow_cells = lines[3].split()[3:]
+    # EUR, meas, plan, in, out, solar, hp, dhw, heat
+    assert today_cells[:3] == ["0.75", "0.50", "0.25"]
+    assert today_cells[6] == "1.00" and today_cells[8] == "1.00"
+    assert tomorrow_cells[:3] == ["1.00", "-", "1.00"]
+
+
+def test_the_planned_runs_are_listed_by_their_start():
+    """The tank's run and the floor's after it, each with its own steps'
+    electricity."""
+
+    result = SimpleNamespace(schedule=(1, 1, 0, 0), space_schedule=(0, 0, 1, 1))
+    planned = pd.DataFrame(
+        {"dhw": [0.5, 0.5, 0.0, 0.0], "heating": [0.0, 0.0, 0.25, 0.25]}
+    )
+    data = SimpleNamespace(zone_cooling=False)
+
+    lines = Optimization.planned_runs(  # type: ignore[arg-type]
+        result, data, planned, TIMES, timedelta(minutes=15)
+    )
+
+    assert [line.split()[-2] for line in lines] == ["run", "dhw", "heat"]
+    assert lines[1].split()[-1] == "1.00" and lines[2].split()[-1] == "0.50"
+    assert lines[2].split()[3:5] == [
+        f"{to_local_time(TIMES[2]):%H:%M}",
+        f"{to_local_time(TIMES[3] + timedelta(minutes=15)):%H:%M}",
+    ]

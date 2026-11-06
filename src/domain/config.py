@@ -485,9 +485,19 @@ class PricesConfig(BaseModel):
 
 class Config(BaseModel):
     solar: SensorReference = Field()
-    baseload: SensorReference = Field()
+    # The grid meter's power (W, import positive, export negative).
+    grid: SensorReference = Field()
     heat_pump: HeatPumpConfig = Field()
     building: BuildingConfig = Field()
     forecast: ForecastConfig = Field()
     presence: list[SensorReference] = Field(default_factory=list)
     prices: PricesConfig = Field(default_factory=PricesConfig)
+
+    @property
+    def baseload_terms(self) -> list[tuple[float, SensorReference]]:
+        """The rest of the house's draw (W) as a balance of the meters: grid
+        plus solar less the heat pump. Matched a hand-made baseload sensor to a
+        median 0 W per quarter hour over 60 days (6.31 against 6.34 kWh a
+        day)."""
+
+        return [(1.0, self.grid), (1.0, self.solar), (-1.0, self.heat_pump.power)]

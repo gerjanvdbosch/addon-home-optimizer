@@ -216,7 +216,7 @@ actions:
       payload: |
         {{ {
           "solar": "sensor.pv_output",
-          "baseload": "sensor.stroomverbruik_base_load",
+          "grid": "sensor.p1_meter_power",
           "heat_pump": {
             "auto_adaptive": true,
             "mode": "select.ecodan_heatpump_ca09ec_gekozen_werking_mode",
@@ -385,7 +385,7 @@ Home Optimizer writes the following entities to Home Assistant:
 
 ## Blueprints
 
-The [Home Optimizer MPC](blueprints/home_optimizer_mpc.yaml) blueprint acts
+The [Home Optimizer MPC](blueprints/home_optimizer.yaml) blueprint acts
 on these sensors: it handles the DHW and zone schedule.
 
 1. In Home Assistant go to **Settings → Automations & scenes → Blueprints → Import
