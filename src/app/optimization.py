@@ -435,7 +435,12 @@ class Optimization:
         )
         optimizer, planned = dhw_only, data
         estimate, zone = self._zone(
-            state, config, forecast_times, mpc_config, optimize_config.cooling
+            state,
+            config,
+            forecast_times,
+            mpc_config,
+            optimize_config.cooling,
+            now,
         )
 
         if zone is not None:
@@ -575,6 +580,11 @@ class Optimization:
             planned if zone is not None else None,
             heat_pump_changes[0],
             now,
+            # The compressor's least heat into the floor (see
+            # features.ecodan.setpoint_bias_k).
+            optimizer.floor_circuit_model.min_heat_w
+            if optimizer.floor_circuit_model is not None
+            else 0.0,
         )
         # Last, so it reads after what was published.
         self.log_day_costs(
@@ -1561,6 +1571,7 @@ class Optimization:
         times: list[datetime],
         mpc_config: MPCConfig,
         cooling: bool | None = None,
+        now: datetime | None = None,
     ) -> tuple[pd.DataFrame | None, tuple[dict, dict] | None]:
         """The zone as a second demand on the compressor: the filter's
         estimate of it (None without one), and what the plan needs of it
@@ -1693,6 +1704,29 @@ class Optimization:
         )
         # Every loop, at the flow its runs ran at, without a run in the frame.
         loops = identifier.last_run_loops(zone)
+        rest_minimum_c = config.building.rest_temperature
+
+        # Set to the rest's minimum while a heating run is served (see
+        # publish_zone), each room's own thermostat opens its loops while the
+        # room is below it: the plan takes the rooms below it now to open, in
+        # every run - a replan corrects it as they warm or cool.
+        if rest_minimum_c is not None and not cooling:
+            rooms = config.building.rooms
+            total_m2 = sum(room.area_m2 for room in rooms)
+            rest = 0.0
+
+            for room in rooms:
+                if room.temperature == config.building.thermostat.temperature:
+                    continue
+
+                room_c = self._latest(room.temperature, now or times[0])
+
+                if room_c is not None and room_c < rest_minimum_c:
+                    rest += room.area_m2 / total_m2
+
+            living = identifier.model.living_area_fraction
+            flow = identifier.run_flow_lpm(zone, (living, rest))
+            loops = (living, rest, flow or (loops[2] if loops else None))
         inputs = dict(
             zone_state=tuple(float(c) for c in planned[state_names].iloc[0]),
             zone_target_temperature=target_c,
@@ -2039,6 +2073,7 @@ class Optimization:
         since: datetime | None,
         now: datetime,
         run_setpoint_c: float | None = None,
+        least_heat_w: float = 0.0,
     ) -> float:
         """The bias to publish now: for a heating run under way or handed over
         (step k its first), the plan's mean heat over its next hour; 0 -
@@ -2138,6 +2173,7 @@ class Optimization:
                     maximum_c=(
                         data.zone_maximum_temperature[k] if since is None else math.inf
                     ),
+                    least_heat_w=least_heat_w,
                 )
 
         if setpoint_c is None:
@@ -2180,6 +2216,7 @@ class Optimization:
         data: MPCInput | None,
         heat_pump_state: list[SeriesPoint],
         now: datetime,
+        least_heat_w: float = 0.0,
     ) -> None:
         """Writes the plan's floor decision to Home Assistant, as publish_dhw
         does the hot water's: on/off for the quarter hour running now, the
@@ -2194,6 +2231,16 @@ class Optimization:
         """
 
         status = start = setpoint = room = "unknown"
+        # The rest's thermostats' setpoint (see
+        # BuildingConfig.rest_temperature): the setpoint's attribute
+        # "rest", only with that minimum set - the minimum while a heating
+        # run is served, the idle setpoint otherwise.
+        minimum_c = config.building.rest_temperature
+        rest = (
+            {"rest": config.building.rest_idle_temperature}
+            if minimum_c is not None
+            else {}
+        )
         published = None
         bias: float | None = None
 
@@ -2233,6 +2280,9 @@ class Optimization:
             k = tank_end if hand_over else 0
             serving = running or hand_over
             status = "on" if running else "off"
+
+            if minimum_c is not None and serving and not data.zone_cooling:
+                rest["rest"] = minimum_c
 
             if first is not None:
                 start = (
@@ -2308,6 +2358,7 @@ class Optimization:
                     since if running else None,
                     now,
                     float(room) if room != "unknown" else None,
+                    least_heat_w,
                 )
 
             if serving and result.space_supply_c:
@@ -2363,6 +2414,7 @@ class Optimization:
                 "friendly_name": "Home Optimizer zone setpoint",
                 "device_class": "temperature",
                 "unit_of_measurement": "°C",
+                **rest,
             },
         )
         self.home_assistant.set_state(

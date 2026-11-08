@@ -54,21 +54,30 @@ def setpoint_bias_k(
     room_c: float,
     setpoint_c: float,
     maximum_c: float,
+    least_heat_w: float = 0.0,
 ) -> float:
     """The setpoint bias (K) at which the controller asks for heat_w into the
     floor: the law inverted for the room's error, the room target it needs
     never past the comfort band's maximum. Rounded up to the bias step, so at
     least that heat.
 
-    Less than the least rise at or below the target - which in the cold is
-    more than the heat pump's least heat (4.1 kW at 2 degC, 18 L/min) - is
+    No more than the heat pump's least heat (least_heat_w, its compressor at
+    the lowest speed) or less than the least rise at or below the target -
+    which in the cold is more than that (4.1 kW at 2 degC, 18 L/min) - is
     asked for with the target one step below the room: the base rise, which
-    the compressor at its lowest speed gives at least.
+    the compressor at its lowest speed gives at least. Asked for through the
+    curve instead, the least heat sets a supply the lowest speed only just
+    reaches over a cool return, and the controller speeds the compressor up to
+    reach it (8 Nov 2026: 26 -> 39 Hz for 20 minutes at -0.7/-0.8 K) - at a
+    lower COP than its lowest speed (steady heating 10 Oct-8 Nov: 7% above
+    the fitted COP at 26 Hz, 4-6% below it from 38 Hz).
     """
 
     least_k = min_rise_k(outdoor_c)
 
-    if heat_w < least_k * water_w_per_k(flow_lpm):
+    # In whole watts: at its least the plan's heat comes back from the solver
+    # a fraction of a watt either side of it.
+    if round(heat_w) <= max(least_k * water_w_per_k(flow_lpm), least_heat_w):
         # Strictly below the room, within a step of it.
         bias_k = (math.ceil(round((room_c - setpoint_c) / BIAS_STEP_K, 6)) - 1) * (
             BIAS_STEP_K

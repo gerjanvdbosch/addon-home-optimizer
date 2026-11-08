@@ -266,6 +266,8 @@ actions:
               ]
             },
             "comfort_weight": 0.5,
+            "rest_temperature": 18.5,
+            "rest_idle_temperature": 15.0,
             "rooms": [
               [6.0, "sensor.danfoss_0_temperature", "climate.danfoss_icon_badkamer"],
               [10.0, "sensor.danfoss_1_temperature", "climate.danfoss_icon_slaapkamer_voor"],

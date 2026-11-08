@@ -29,3 +29,18 @@ def test_less_than_the_cold_least_rise_aims_just_below_the_room():
 
     assert bias == -1.9
     assert 19.18 - 0.1 <= 21.0 + bias < 19.18
+
+
+def test_the_heat_pumps_least_heat_aims_just_below_the_room():
+    """8 Nov 2026, 14:20 (room 19.35, setpoint 20.5, 9 degC, 16 L/min): the
+    plan at the compressor's least heat - a fraction of a watt from the solver
+    either side of it - is asked for below the room, the base rise; more heat
+    through the curve."""
+
+    for heat_w in (2976.0 - 1e-4, 2976.0 + 1e-4):
+        bias = setpoint_bias_k(heat_w, 16.0, 9.0, 19.35, 20.5, 21.5, 2976.0)
+        assert bias == -1.2
+        assert 19.35 - 0.1 <= 20.5 + bias < 19.35
+
+    assert setpoint_bias_k(2976.0, 16.0, 9.0, 19.35, 20.5, 21.5) == -0.7
+    assert setpoint_bias_k(3500.0, 16.0, 9.0, 19.35, 20.5, 21.5, 2976.0) == -0.6

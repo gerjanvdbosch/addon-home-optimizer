@@ -6,8 +6,10 @@ blueprint:
     sensor.home_optimizer_zone_setpoint - a run's setpoint
     while the zone is on (from the tank's last quarter hour when heating
     follows, so the heat pump goes straight on to the floor), the comfort
-    band's edge between runs. Upstairs is raised for a run where cold and set
-    down between runs.
+    band's edge between runs. The rest (bathroom and bedrooms) gets that
+    setpoint's attribute "rest" - the rest's minimum while a run is served,
+    so a room below it heats along and one above it does not, the idle
+    setpoint from the optimizer config otherwise.
   domain: automation
   source_url: https://github.com/gerjanvdbosch/addon-home-optimizer/blob/main/blueprints/home_optimizer.yaml
   input:
@@ -44,48 +46,13 @@ blueprint:
       selector:
         entity:
           domain: climate
-    upstairs_climates:
-      name: Upstairs thermostats
+    rest_climates:
+      name: Rest thermostats (bathroom and bedrooms)
       default: [ ]
       selector:
         entity:
           domain: climate
           multiple: true
-    upstairs_below:
-      name: Raise an upstairs room below (°C)
-      default: 19
-      selector:
-        number: { min: 15, max: 22, step: 0.5, unit_of_measurement: °C }
-    upstairs_setpoint:
-      name: Upstairs setpoint (°C)
-      default: 19.5
-      selector:
-        number: { min: 15, max: 22, step: 0.5, unit_of_measurement: °C }
-    upstairs_idle:
-      name: Upstairs setpoint between runs (°C)
-      description: >-
-        An upstairs thermostat below its setpoint asks for heat too, so between
-        runs they go down to this: the least an upstairs room may cool to before
-        it starts the heat pump itself.
-      default: 16
-      selector:
-        number: { min: 5, max: 22, step: 0.5, unit_of_measurement: °C }
-    outdoor_temperature:
-      name: Outdoor temperature
-      selector:
-        entity:
-          domain: sensor
-          device_class: temperature
-    outdoor_cold:
-      name: Cold outside below (°C)
-      default: 10
-      selector:
-        number: { min: -10, max: 20, step: 0.5, unit_of_measurement: °C }
-    upstairs_setpoint_cold:
-      name: Upstairs setpoint when cold outside (°C)
-      default: 20
-      selector:
-        number: { min: 15, max: 22, step: 0.5, unit_of_measurement: °C }
     bias_number:
       name: Auto-adaptive setpoint bias (optional)
       description: >-
@@ -99,13 +66,7 @@ blueprint:
 
 variables:
   living: !input living_climate
-  upstairs: !input upstairs_climates
-  upstairs_below: !input upstairs_below
-  outdoor: !input outdoor_temperature
-  outdoor_cold: !input outdoor_cold
-  upstairs_setpoint: !input upstairs_setpoint
-  upstairs_setpoint_cold: !input upstairs_setpoint_cold
-  upstairs_idle: !input upstairs_idle
+  rest: !input rest_climates
   bias_number: !input bias_number
 
 triggers:
@@ -138,6 +99,10 @@ triggers:
     entity_id: sensor.home_optimizer_zone_setpoint
     not_to: [ unknown, unavailable ]
     id: zone_setpoint
+  - trigger: state
+    entity_id: sensor.home_optimizer_zone_setpoint
+    attribute: rest
+    id: rest
   - trigger: state
     entity_id: sensor.home_optimizer_zone_bias
     not_to: [ unknown, unavailable ]
@@ -208,26 +173,31 @@ actions:
               entity_id: !input living_climate
             data:
               temperature: "{{ states('sensor.home_optimizer_zone_setpoint') | float }}"
-          - variables:
-              upstairs_target: >-
-                {{ upstairs_setpoint_cold
-                   if states(outdoor) | float(99) < outdoor_cold
-                   else upstairs_setpoint }}
-          - repeat:
-              for_each: "{{ upstairs }}"
-              sequence:
-                # Only raise, never lower a higher setpoint.
-                - if:
-                    - condition: template
-                      value_template: >-
-                        {{ state_attr(repeat.item, 'current_temperature') | float(99) < upstairs_below
-                           and state_attr(repeat.item, 'temperature') | float(0) < upstairs_target }}
-                  then:
-                    - action: climate.set_temperature
-                      target:
-                        entity_id: "{{ repeat.item }}"
-                      data:
-                        temperature: "{{ upstairs_target }}"
+      - alias: Rest
+        conditions:
+          - condition: trigger
+            id: rest
+          - condition: template
+            value_template: >-
+              {{ rest | count > 0
+                 and state_attr('sensor.home_optimizer_zone_setpoint', 'rest') is number }}
+          # Up only in the hours a run may start, as the living room: a rest
+          # room below its setpoint starts the heat pump too. Down always.
+          - or:
+              - condition: time
+                after: !input zone_after
+                before: !input zone_before
+              - condition: template
+                value_template: >-
+                  {{ state_attr('sensor.home_optimizer_zone_setpoint', 'rest')
+                     < state_attr(rest[0], 'temperature') | float(99) }}
+        sequence:
+          - &rest
+            action: climate.set_temperature
+            target:
+              entity_id: !input rest_climates
+            data:
+              temperature: "{{ state_attr('sensor.home_optimizer_zone_setpoint', 'rest') }}"
       - alias: Zone stop
         conditions:
           - condition: trigger
@@ -239,15 +209,13 @@ actions:
           - action: notify.notify
             data:
               message: Optimizer zone stop
-          # A room upstairs below its setpoint starts the heat pump too.
-          - repeat:
-              for_each: "{{ upstairs }}"
-              sequence:
-                - action: climate.set_temperature
-                  target:
-                    entity_id: "{{ repeat.item }}"
-                  data:
-                    temperature: "{{ upstairs_idle }}"
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ rest | count > 0
+                     and state_attr('sensor.home_optimizer_zone_setpoint', 'rest') is number }}
+            then:
+              - *rest
       - alias: Zone setpoint
         conditions:
           - condition: trigger

@@ -318,6 +318,19 @@ class BuildingConfig(BaseModel):
     # at least one more: the zone is modelled as that room and the rest of the
     # house (see BuildingThermalModel).
     rooms: list[Room] = Field(default_factory=list)
+    # The least the rest of the house - every room but the thermostat's,
+    # upstairs and the bathroom - is kept at (deg C): its rooms' thermostats
+    # are set to it while a heating run is served, so a room below it opens
+    # its loops with the run and one above it does not, and the plan plans
+    # the run with those (see Optimization._zone). The rest never starts a run
+    # itself. None leaves the rooms' thermostats to it, the plan taking the
+    # loops the last run went through.
+    rest_temperature: float | None = Field(default=None)
+    # The rest's thermostats' setpoint between runs (deg C): a rest room below
+    # its setpoint starts the heat pump itself, so outside a run they go down
+    # to this - the least a rest room may cool to before it does. Below
+    # rest_temperature, so the plan decides the rest's heat.
+    rest_idle_temperature: float = Field(default=15.0)
     # Net floor-to-ceiling height of the conditioned zone. The air volume is
     # derived from it and the room areas, rather than configured separately:
     # those areas are already required for the weighting, so a hand-computed

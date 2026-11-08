@@ -177,7 +177,7 @@ LEGEND_MARGIN_PX = 126
 
 def dashboard_chart(state: State, states: HeatPumpStates | None = None) -> str:
     # Each panel's height in pixels, and the gap between them.
-    panels_px = [139, 116, 116]
+    panels_px = [160, 120, 120]
     gap_px = 34
     plot_px = sum(panels_px) + gap_px * (len(panels_px) - 1)
     fig = make_subplots(

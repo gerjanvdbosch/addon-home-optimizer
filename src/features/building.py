@@ -3271,6 +3271,27 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         return float(held[0]), float(held[1]), float(flow)
 
+    @staticmethod
+    def run_flow_lpm(zone: pd.DataFrame, loops: tuple[float, float]) -> float | None:
+        """The flow (L/min) of the latest floor run in a trajectory() that held
+        these loops open (open_living, open_rest), None without one: fewer
+        loops open, less flow from the pump (real data: 16 L/min through the
+        living room and bathroom, 18 through all)."""
+
+        columns = ["floor_open_living", "floor_open_rest"]
+        ran = zone[columns[0]].notna().to_numpy()
+        run = np.cumsum(ran & ~np.concatenate([[False], ran[:-1]]))
+        held = ran & np.all(
+            np.isclose(zone[columns].to_numpy(dtype=float), loops, atol=1e-3), axis=1
+        )
+
+        if not held.any():
+            return None
+
+        latest = held & (run == run[held].max())
+
+        return float(zone["floor_flow_lpm"].to_numpy(dtype=float)[latest].mean())
+
     def habit_dataset(self) -> DatasetDefinition:
         """The shutters and who is home alone, over the weeks forecast() takes
         their habit from (see HABIT_HISTORY_DAYS) - a few series, where the

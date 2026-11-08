@@ -76,6 +76,7 @@ def _zone_states(
     state: State | None = None,
     heat_pump_state: list[SeriesPoint] | None = None,
     maximum_c: tuple[float, ...] = (),
+    rest_minimum_c: float | None = None,
 ) -> dict[str, tuple[str, dict]]:
     home_assistant = _RecordingHomeAssistant()
     optimization = Optimization(
@@ -108,7 +109,10 @@ def _zone_states(
         zone_minimum_temperature=() if cooling else band_c,
     )
     config = SimpleNamespace(
-        heat_pump=SimpleNamespace(states=HeatPumpStates(), auto_adaptive=False)
+        heat_pump=SimpleNamespace(states=HeatPumpStates(), auto_adaptive=False),
+        building=SimpleNamespace(
+            rest_temperature=rest_minimum_c, rest_idle_temperature=15.0
+        ),
     )
 
     optimization.publish_zone(
@@ -122,6 +126,22 @@ def _zone_states(
     )
 
     return home_assistant.states
+
+
+def test_the_rest_is_given_its_minimum_while_a_run_is_served():
+    """The setpoint's attribute "rest": the rest's minimum while a run is
+    served - handed over from the tank too - so its rooms below it open their
+    loops; the idle setpoint otherwise, cooling too; absent without a minimum,
+    the rooms' thermostats then left to themselves."""
+
+    def upstairs(tank, zone, minimum_c=18.5) -> float | None:
+        states = _zone_states(tank, zone, rest_minimum_c=minimum_c)
+        return states[Optimization.ZONE_SETPOINT_ENTITY][1].get("rest", "absent")
+
+    assert upstairs((0, 0, 0, 0), (1, 1, 0, 0)) == 18.5
+    assert upstairs((1, 0, 0, 0), (0, 1, 1, 0)) == 18.5
+    assert upstairs((0, 0, 0, 0), (0, 0, 1, 0)) == 15.0
+    assert upstairs((0, 0, 0, 0), (1, 1, 0, 0), None) == "absent"
 
 
 def test_between_runs_the_thermostat_is_given_the_comfort_bands_edge():

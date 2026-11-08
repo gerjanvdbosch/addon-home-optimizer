@@ -1535,6 +1535,22 @@ def test_a_plan_takes_the_loops_the_last_run_held_longest():
     assert BuildingThermalIdentifier.last_run_loops(zone.iloc[[3, 10]]) is None
 
 
+def test_a_loop_set_is_planned_at_the_flow_its_latest_run_had():
+    """The latest run that held the set, at its flow then: the pump gives
+    less through fewer loops. None where no run held it."""
+
+    columns = ["floor_open_living", "floor_open_rest", "floor_flow_lpm"]
+    nan = (np.nan, np.nan, np.nan)
+    zone = pd.DataFrame(
+        [(0.5, 0.5, 17.0), nan, (0.5, 0.5, 18.0), (0.5, 0.07, 16.0), nan],
+        columns=columns,
+    )
+
+    assert BuildingThermalIdentifier.run_flow_lpm(zone, (0.5, 0.5)) == 18.0
+    assert BuildingThermalIdentifier.run_flow_lpm(zone, (0.5, 0.07)) == 16.0
+    assert BuildingThermalIdentifier.run_flow_lpm(zone, (0.5, 0.0)) is None
+
+
 def test_a_room_that_closes_its_loops_takes_none_of_the_floors_heat():
     """Per sample, as the heat: a step whose last two samples ran with the
     rest's loops closed moves those samples' rest share of the heat under the
