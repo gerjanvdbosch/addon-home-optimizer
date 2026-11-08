@@ -353,6 +353,17 @@ class BuildingThermalModel:
     asleep_from_hour: float = 23.0
     asleep_until_hour: float = 7.0
     asleep_spread_h: float = 0.25
+    # The same on the nights before a day off - Friday's and Saturday's (see
+    # BuildingThermalIdentifier.prepare): a household that works sleeps in
+    # at the weekend. Real data, 365 d to 8 Nov 2026: up at 06:22 on the
+    # other nights, 08:08 on these, against 06:52 for all of them, which put
+    # the occupants awake in the living room early on a day off. Walk-forward
+    # (fitted up to 18 and 25 Oct and 1 Nov 2026, scored on the week after):
+    # the living room 11 h ahead 0.105/0.118/0.223 -> 0.104/0.121/0.203 K,
+    # from 05 to 09 h 0.062/0.100/0.159 -> 0.060/0.098/0.146 K. None is the
+    # other nights' hours - a model saved before them.
+    weekend_asleep_from_hour: float | None = None
+    weekend_asleep_until_hour: float | None = None
     # The baseload asleep (W): the standby that runs day and night - the
     # fridge, the network - spread through the dwelling by floor area.
     asleep_baseload_w: float = 0.0

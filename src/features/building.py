@@ -17,6 +17,7 @@ than a term in its energy balance - not modelled here, and not yet anywhere.
 """
 
 import logging
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -24,6 +25,7 @@ import pandas as pd
 from pvlib import irradiance, solarposition
 from scipy.linalg import expm
 from scipy.optimize import least_squares
+from scipy.stats import chi2
 
 from domain.config import Config, HeatPumpStates
 from domain.dataset import DatasetDefinition
@@ -153,6 +155,20 @@ def _asleep_in_rest(model: BuildingThermalModel) -> float:
         return 1.0 - model.living_area_fraction
 
     return model.asleep_in_rest_fraction
+
+
+def _weekend(model: BuildingThermalModel) -> BuildingThermalModel:
+    """The model with its hours of sleep on the nights before a day off: the
+    other nights' for a model saved without them."""
+
+    if model.weekend_asleep_from_hour is None:
+        return model
+
+    return replace(
+        model,
+        asleep_from_hour=model.weekend_asleep_from_hour,
+        asleep_until_hour=model.weekend_asleep_until_hour,
+    )
 
 
 def _awake_in_living(model: BuildingThermalModel) -> float:
@@ -574,6 +590,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         self.shutter_closed_positions: list[float] = []
         self.shutter_sensors: list[SensorReference] = []
         self.presence_sensors: list[SensorReference] = []
+        self.tank_bottom_sensor: SensorReference | None = None
         self.room_temperature_columns: list[str] = []
         self.room_areas_m2: list[float] = []
         # Each room's floor thermostat mode (see Room.climate), aligned with
@@ -605,13 +622,16 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # left open until then.
         self.horizon_seen: tuple[bool, bool] = (True, True)
         # The household's hours of sleep (to bed, up, spread - see
-        # _measured_sleep) and its baseload asleep, read off its electricity
-        # before each fit; until then a model saved before them.
-        self.sleep: tuple[float, float, float, float] = (
+        # _measured_sleep), its baseload asleep, and its hours to bed and up
+        # on the nights before a day off, read off its electricity before
+        # each fit; until then a model saved before them.
+        self.sleep: tuple[float, float, float, float, float | None, float | None] = (
             BuildingThermalModel.asleep_from_hour,
             BuildingThermalModel.asleep_until_hour,
             BuildingThermalModel.asleep_spread_h,
             BuildingThermalModel.asleep_baseload_w,
+            None,
+            None,
         )
 
     @property
@@ -633,6 +653,33 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # sitting in the room radiating 75 W.
     HOME_PRESENCE_STATE = "home"
     HOME_PRESENCE_VALUE = 1.0
+
+    # A tracker can also say "away" for a phone that is at home: a router's
+    # tracker lost one for 16 days (18 Oct - 3 Nov 2026) while
+    # the household drew as much hot water as ever, and the newest weeks'
+    # fit then learned a house that kept warm on one occupant less - its
+    # forecasts 0.24 against 0.17 K out over 11 h once the tracker reported
+    # again (fitted to 4 Nov, scored on the four days after). The hot water
+    # tells, taken to be drawn in proportion to who is home: each day of a
+    # stretch away is weighed against the household's usual days (every
+    # tracker home) scaled to those the trackers still put in, and a stretch
+    # whose days together would happen less than STUCK_TRACKER_SIGNIFICANCE
+    # of the time if the trackers were right (Fisher's method) is the
+    # tracker's fault and goes unreported. A day's draws spread wide (Aug-
+    # Nov 2026: 4.5-28 K of drops from one day in ten to nine in ten, 13 K
+    # the median), so a fixed mark on a few days' median took one person's
+    # real trip for a fault one time in four (drawn from those days at half
+    # the water); this test does so one in a thousand, and the evidence of
+    # a stuck tracker grows with each day it stays stuck: caught 42, 69 and
+    # 94% of the time by 3, 7 and 16 days, those 16 days by their third. A
+    # week away together, 0 K most days, stays away. At 5% a trip went
+    # 1-2%, but that week's two days of departure (14 and 28 K) put it at
+    # 5.4%.
+    STUCK_TRACKER_SIGNIFICANCE = 0.01
+    # A tap draw lets cold water in under the tank's bottom sensor: a drop of
+    # more than this over a step (K). The tank's own loss is some 0.1-0.3 K
+    # an hour.
+    DRAW_DROP_K = 1.0
 
     # Home Assistant cover convention: current_position is a percentage with
     # 100 meaning fully open.
@@ -869,6 +916,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             asleep_until_hour=self.sleep[1],
             asleep_spread_h=self.sleep[2],
             asleep_baseload_w=self.sleep[3],
+            weekend_asleep_from_hour=self.sleep[4],
+            weekend_asleep_until_hour=self.sleep[5],
             screed_capacity_j_per_k=self.screed[0],
             screed_to_slab_w_per_k=self.screed[1],
             screed_layer_w_per_k=float(x[21]),
@@ -901,6 +950,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.model.asleep_until_hour,
                 self.model.asleep_spread_h,
                 self.model.asleep_baseload_w,
+                self.model.weekend_asleep_from_hour,
+                self.model.weekend_asleep_until_hour,
             )
             self.horizon_seen = (
                 self.model.horizon_east_deg > 0.0,
@@ -1017,13 +1068,73 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         if not self.presence_columns:
             return pd.Series(0.0, index=df.index)
 
-        at_home = [
-            (df[column] == self.HOME_PRESENCE_STATE)
-            | (pd.to_numeric(df[column], errors="coerce") == self.HOME_PRESENCE_VALUE)
-            for column in self.presence_columns
-        ]
+        at_home = [self._home(df[column]) for column in self.presence_columns]
 
         return pd.concat(at_home, axis=1).sum(axis=1).astype(float)
+
+    def _home(self, readings: pd.Series) -> pd.Series:
+        """Whether a tracker's readings say home."""
+
+        return (readings == self.HOME_PRESENCE_STATE) | (
+            pd.to_numeric(readings, errors="coerce") == self.HOME_PRESENCE_VALUE
+        )
+
+    def _trusted_presence(self, df: pd.DataFrame) -> pd.DataFrame:
+        """The frame (a row per step, oldest first) with each tracker's
+        stretches away that the household's hot water contradicts left
+        unreported (see STUCK_TRACKER_SIGNIFICANCE); as it is without the tank's
+        bottom sensor in it or a day with every tracker home."""
+
+        if not self.presence_columns or "tank_bottom_c" not in df.columns:
+            return df
+
+        day = pd.DatetimeIndex(df["time"]).tz_convert(LOCAL_TIMEZONE).normalize()
+        drop = -pd.to_numeric(df["tank_bottom_c"], errors="coerce").diff()
+        drawn = drop.where(drop > self.DRAW_DROP_K, 0.0).groupby(day).sum()
+        # Who was home some time of each day: the water is drawn per person
+        # and day, a shower whenever they are in.
+        home = (
+            pd.DataFrame(
+                {column: self._home(df[column]) for column in self.presence_columns}
+            )
+            .groupby(day)
+            .any()
+        )
+        usual = drawn[home.all(axis=1)].to_numpy()
+
+        if not len(usual):
+            return df
+
+        df = df.copy()
+
+        for column in self.presence_columns:
+            away = (df[column].notna() & ~self._home(df[column])).to_numpy()
+            # Each stretch away, as the rows it spans.
+            edges = np.flatnonzero(np.diff(np.r_[0, away.astype(int), 0]))
+
+            for start, end in zip(edges[::2], edges[1::2], strict=True):
+                days = day[start:end].unique()
+
+                # Each day's chance of drawing as much with only those the
+                # trackers had home some time of it - the stretch's first and
+                # last days the person themselves - (smoothed: one unseen
+                # usual day above it). A day out is no evidence either way.
+                share = home.loc[days].sum(axis=1).to_numpy() / len(
+                    self.presence_columns
+                )
+                as_much = (
+                    share[:, None] * usual[None, :]
+                    >= drawn.loc[days].to_numpy()[:, None]
+                )
+                chance = (as_much.sum(axis=1) + 1.0) / (len(usual) + 1.0)
+
+                if (
+                    chi2.sf(-2.0 * np.log(chance).sum(), 2 * len(chance))
+                    < self.STUCK_TRACKER_SIGNIFICANCE
+                ):
+                    df.loc[df.index[start:end], column] = np.nan
+
+        return df
 
     def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
         """Turns the loaded frame into the model's inputs on one regular grid.
@@ -1170,6 +1281,11 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         )
         local = pd.DatetimeIndex(df["time"]).tz_convert(LOCAL_TIMEZONE)
         df["hour"] = local.hour + local.minute / 60.0
+        # A night counted from the noon it begins (see physics.night_share):
+        # Friday's and Saturday's are before a day off.
+        df["weekend_night"] = np.isin(
+            (local - pd.Timedelta(hours=12)).day_of_week, (4, 5)
+        )
 
         # Optional: Open-Meteo's plane irradiance only from August 2026 on, and
         # a frame need not carry the array at all (see _measured_sky).
@@ -1274,6 +1390,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         df["shutter_open_fraction"] = self._shutter_open_fraction(df)
         df["open_living"] = self._shutter_open_fraction(df, thermostat_room=True)
         df["open_rest"] = self._shutter_open_fraction(df, thermostat_room=False)
+        df = self._trusted_presence(df)
         df["occupants"] = self._occupants(df)
 
         # A tracker that did not report - before it was recorded, say - says
@@ -1376,10 +1493,12 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # bedrooms instead, so what the thermostat's room has of them beyond
         # its asleep share moves to the rest - the dwelling's total unchanged,
         # and the same for what is awake below.
+        weekend = df["weekend_night"].to_numpy(dtype=bool)
+        day_off = _weekend(model)
         asleep = night_share(
             df["hour"].to_numpy(dtype=float),
-            model.asleep_from_hour,
-            model.asleep_until_hour,
+            np.where(weekend, day_off.asleep_from_hour, model.asleep_from_hour),
+            np.where(weekend, day_off.asleep_until_hour, model.asleep_until_hour),
             model.asleep_spread_h,
         )
         moved = (
@@ -2497,13 +2616,46 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         return angles[0], angles[1]
 
-    def _measured_sleep(self, df: pd.DataFrame) -> tuple[float, float, float, float]:
+    def _measured_sleep(
+        self, df: pd.DataFrame
+    ) -> tuple[float, float, float, float, float | None, float | None]:
         """The household's hours of sleep (to bed, up, spread - see
-        physics.night_share) and its baseload asleep (W) from its electricity:
-        the median baseload at each local time of day, one level awake and a
-        lower one asleep, stepping between them at those hours. Robustly - an
-        evening's cooking, a morning's kettle stand above the awake level
-        without being sleep."""
+        physics.night_share) and its baseload asleep (W) from its electricity,
+        then its hours to bed and up on the nights before a day off (see
+        BuildingThermalModel.weekend_asleep_from_hour; None without such
+        nights in the frame): on each kind of night the median baseload at
+        each local time of day, one level awake and a lower one asleep,
+        stepping between them at those hours. Robustly - an evening's
+        cooking, a morning's kettle stand above the awake level without
+        being sleep."""
+
+        weekend = df["weekend_night"].to_numpy(dtype=bool)
+        asleep_w, to_bed, up, spread = self._sleep_step(df[~weekend])
+        logger.info(
+            "Building thermal calibration: asleep from %.2f h to %.2f h "
+            "(spread %.2f h) at %.0f W",
+            to_bed,
+            up,
+            spread,
+            asleep_w,
+        )
+
+        if not weekend.any():
+            return to_bed, up, spread, asleep_w, None, None
+
+        _, weekend_to_bed, weekend_up, _ = self._sleep_step(df[weekend])
+        logger.info(
+            "Building thermal calibration: before a day off asleep from %.2f h "
+            "to %.2f h",
+            weekend_to_bed,
+            weekend_up,
+        )
+
+        return to_bed, up, spread, asleep_w, weekend_to_bed, weekend_up
+
+    def _sleep_step(self, df: pd.DataFrame) -> tuple[float, float, float, float]:
+        """(baseload asleep W, to bed, up, spread) from the frame's median
+        baseload by time of day (see _measured_sleep)."""
 
         profile = df.groupby("hour")["baseload_w"].median().dropna()
         hour = profile.index.to_numpy(dtype=float)
@@ -2545,17 +2697,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             f_scale=max(float(np.median(np.abs(baseload - median))), self.MIN_F_SCALE),
         )
         asleep_w, _, to_bed, up, spread = (float(value) for value in result.x)
-        logger.info(
-            "Building thermal calibration: asleep from %.2f h to %.2f h "
-            "(spread %.2f h), %.0f W against %.0f W awake",
-            to_bed,
-            up,
-            spread,
-            result.x[0],
-            result.x[1],
-        )
 
-        return to_bed, up, spread, asleep_w
+        return asleep_w, to_bed, up, spread
 
     def _fit_screed(self, df: pd.DataFrame) -> tuple[float, float]:
         """(screed J/K, its conductance down to the slabs W/K) from the
@@ -2964,7 +3107,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # Who is home ahead, and the shutters that follow them, as on that
         # weekday at that time of day over the past weeks (see forecast()).
         history = (
-            prepared.loc[known] if habits is None or habits.empty else habits
+            prepared.loc[known]
+            if habits is None or habits.empty
+            else self._trusted_presence(habits)
         ).set_index("time")
         past = history.index.map(to_local_time)
         habit = [
@@ -3143,6 +3288,16 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 name, sensor, interval="15m", aggregation="last", fill="previous"
             )
 
+        # The trackers' check (see STUCK_TRACKER_SIGNIFICANCE).
+        if self.presence_columns:
+            builder = builder.timeseries(
+                "tank_bottom_c",
+                self.tank_bottom_sensor,
+                interval="15m",
+                aggregation="mean",
+                fill="previous",
+            )
+
         return builder.build()
 
     def dataset(self, config: Config) -> DatasetDefinition:
@@ -3214,6 +3369,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         self.shutter_columns = [f"shutter_{i}" for i in range(len(shaded))]
         self.presence_columns = [f"presence_{i}" for i in range(len(config.presence))]
         self.presence_sensors = list(config.presence)
+        self.tank_bottom_sensor = config.heat_pump.boiler.bottom_temperature
 
         # Open-Meteo snapshots are the base frame because they are the only
         # source of irradiance. The sensor uses the minutely_15 endpoint, so its
@@ -3273,6 +3429,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             # Rate-like and unfilled: a gap - and every row ahead of now - is
             # no measurement, and leaves the forecast's sun as it is.
             ("pv_w", config.solar, "mean", "none"),
+            # What the household draws, to check its trackers against (see
+            # STUCK_TRACKER_SIGNIFICANCE).
+            ("tank_bottom_c", self.tank_bottom_sensor, "mean", "previous"),
         ]
 
         # Cover position is an event-driven state - it only changes when a

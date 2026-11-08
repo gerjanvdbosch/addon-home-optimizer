@@ -486,6 +486,49 @@ def test_occupancy_adds_metabolic_heat_to_the_air_node():
     )
 
 
+def test_a_tracker_away_while_the_hot_water_runs_as_usual_goes_unreported():
+    """A tracker away for days while the household draws hot water as it does
+    with everyone in is the tracker's fault; one person away with their
+    share of the water not drawn, away together with none drawn, or out for
+    the day, is the household's."""
+
+    identifier = _identifier()
+    identifier.presence_columns = ["presence_0", "presence_1"]
+    time = pd.date_range("2026-10-01", periods=30 * 96, freq="15min", tz="UTC")
+    day = (time - time[0]).days.to_numpy()
+    quarter = np.arange(len(time)) % 96
+    # A draw of 5 K at the bottom sensor in the morning and one at night,
+    # the tank reheated in the step after.
+    morning, night = quarter == 28, quarter == 88
+    trip = (day >= 3) & (day < 8)
+    together_away = (day >= 20) & (day < 27)
+    stuck = (day >= 10) & (day < 18)
+    # Out from noon on day 28 to noon the next.
+    day_out = ((day == 28) & (quarter >= 48)) | ((day == 29) & (quarter < 48))
+    drawn = (morning & ~trip) | night
+    bottom = np.where(drawn & ~together_away, 40.0, 45.0)
+    first = np.where(trip | together_away | day_out, "not_home", "home")
+    second = np.where(stuck | together_away, "not_home", "home")
+    frame = pd.DataFrame(
+        {
+            "time": time,
+            "presence_0": first,
+            "presence_1": second,
+            "tank_bottom_c": bottom,
+        }
+    )
+
+    trusted = identifier._trusted_presence(frame)
+
+    assert trusted.loc[stuck, "presence_1"].isna().all()
+    assert trusted.loc[~stuck, "presence_1"].notna().all()
+    assert trusted["presence_0"].notna().all()
+    assert (trusted.loc[trip | day_out, "presence_0"] == "not_home").all()
+    assert (trusted.loc[together_away, ["presence_0", "presence_1"]] == "not_home").all(
+        axis=None
+    )
+
+
 def test_presence_not_yet_recorded_is_the_usual_not_nobody_home():
     """Before its tracker was recorded the household is home as it usually is
     at that time of day, not away."""
@@ -535,6 +578,44 @@ def test_asleep_the_occupants_heat_moves_to_the_bedrooms():
         upstairs[:, 2] + upstairs[:, 3], by_area[:, 2] + by_area[:, 3], atol=1e-9
     )
     np.testing.assert_array_equal(upstairs[:, 1], by_area[:, 1])
+
+
+def test_before_a_day_off_the_household_sleeps_its_own_hours():
+    """Friday's and Saturday's nights take their own hours, read off the
+    electricity of those nights alone; the others keep theirs."""
+
+    identifier = _identifier()
+    prepared = identifier.prepare(_raw_frame())
+    weekend = prepared["weekend_night"].to_numpy(dtype=bool)
+    local = pd.DatetimeIndex(prepared["time"]).tz_convert(LOCAL_TIMEZONE)
+    assert weekend[(local.day_of_week == 6) & (local.hour == 8)].all()
+    assert not weekend[(local.day_of_week == 0) & (local.hour == 8)].any()
+
+    # A household up at 8:30 after those nights, at 6:30 after the others.
+    hour = prepared["hour"].to_numpy(dtype=float)
+    asleep = night_share(hour, 23.0, np.where(weekend, 8.5, 6.5), 0.25)
+    prepared["baseload_w"] = 120.0 + 200.0 * (1.0 - asleep)
+
+    to_bed, up, _, asleep_w, weekend_to_bed, weekend_up = identifier._measured_sleep(
+        prepared
+    )
+    assert (to_bed, up, weekend_to_bed, weekend_up) == pytest.approx(
+        (23.0, 6.5, 23.0, 8.5), abs=0.1
+    )
+    assert asleep_w == pytest.approx(120.0, abs=5.0)
+
+    # At 7:30 the household is up on a Monday and still asleep on a Sunday.
+    model = replace(
+        TRUE_MODEL, weekend_asleep_from_hour=23.0, weekend_asleep_until_hour=8.5
+    )
+    own = identifier._inputs(model, prepared)
+    shared = identifier._inputs(replace(model, weekend_asleep_from_hour=None), prepared)
+    morning = (local.hour == 7) & (local.minute == 30)
+    assert np.allclose(own[morning & ~weekend], shared[morning & ~weekend])
+    sunday = morning & weekend & (prepared["occupants"].to_numpy() > 0)
+    assert sunday.any()
+    # Asleep, their heat is upstairs rather than at the thermostat.
+    assert (own[sunday, 6] < shared[sunday, 6]).all()
 
 
 def test_awake_the_household_and_what_it_switches_on_are_in_the_living_room():
@@ -2106,6 +2187,8 @@ def test_a_horizon_is_found_where_no_single_day_sets_it():
         true_model.asleep_until_hour,
         true_model.asleep_spread_h,
         true_model.asleep_baseload_w,
+        true_model.weekend_asleep_from_hour,
+        true_model.weekend_asleep_until_hour,
     )
     raw = _simulate(np.random.default_rng(14), true_model=true_model)
     x = identifier._parameters(replace(true_model, horizon_east_deg=0.0))
