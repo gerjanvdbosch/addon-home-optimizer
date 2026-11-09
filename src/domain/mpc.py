@@ -184,15 +184,17 @@ class MPCInput:
     # days (see physics.envelope_conductance_w_per_k). Empty is the building
     # model's own, every step.
     zone_envelope_w_per_k: tuple[float, ...] = ()
-    # Each floor's open loop area the plan's runs go through, the living
+    # Each floor's open loop area a run goes through per step, the living
     # room's and the rest's, as shares of the zone's floor area (see
     # Room.climate): the floor's heat lands only there, and the circuit
-    # passes that share of its conductance. Empty is every loop open.
-    zone_floor_open: tuple[float, ...] = ()
-    # The pump's flow through them (L/min, see
+    # passes that share of its conductance. Per step, as a rest room's own
+    # thermostat closes its loops once it reaches its setpoint. Empty is
+    # every loop open.
+    zone_floor_open: tuple[tuple[float, float], ...] = ()
+    # The pump's flow through them per step (L/min, see
     # physics.floor_circuit_conductance_w_per_k): fewer loops open, more
-    # through each. None is the flow its runs ran at.
-    zone_floor_flow_lpm: float | None = None
+    # through each. Empty, or None in a step, is the flow its runs ran at.
+    zone_floor_flow_lpm: tuple[float | None, ...] = ()
     # Whether a run's heat may rise: with the controller steered through its
     # setpoint bias (see features.ecodan) the heat is the water's rise over the
     # return it is asked for. Left to itself the heat only falls within a run.
@@ -303,6 +305,9 @@ class MPCResult:
     space_schedule: tuple[int, ...] = ()
     space_heat_w: tuple[float, ...] = ()
     zone_temperatures: tuple[float, ...] = ()
+    # What the rest's thermostats read along the plan (deg C, see
+    # physics.zone_observations).
+    zone_rest_temperatures: tuple[float, ...] = ()
     # The slab under the thermostat's room the plan heats (deg C): the thermal
     # mass the floor's heat lands in, as planned rather than left alone.
     zone_mass_temperatures: tuple[float, ...] = ()

@@ -38,6 +38,7 @@ from domain.physics import (
     zone_heat_shortfall_j,
     zone_layers,
     zone_observation,
+    zone_observations,
     zone_state_space,
 )
 
@@ -3328,15 +3329,22 @@ class MPCOptimizer:
         a, b = zone_state_space(building)
         observation = zone_observation(building)
         num_states = a.shape[0]
-        # The loops the plan's runs go through (see MPCInput.zone_floor_open):
-        # where the floor's heat lands - the part of it moved under the living
-        # room per W, Q_floor_moved - and how much of the circuit takes it.
+        # The loops the plan's runs go through each step (see
+        # MPCInput.zone_floor_open): where the floor's heat lands - the part of
+        # it moved under the living room per W, Q_floor_moved - and how much of
+        # the circuit takes it.
         area_share = building.living_area_fraction
-        open_living, open_rest = data.zone_floor_open or (area_share, 1.0 - area_share)
-        living_fraction = float(
-            floor_living_fraction(open_living, open_rest, area_share)
+        floor_open = data.zone_floor_open or (
+            ((area_share, 1.0 - area_share),) * num_steps
         )
-        moved_per_w = float(floor_heat_moved_w(1.0, living_fraction, area_share))
+        living_fraction = [
+            float(floor_living_fraction(living, rest, area_share))
+            for living, rest in floor_open
+        ]
+        moved_per_w = [
+            float(floor_heat_moved_w(1.0, fraction, area_share))
+            for fraction in living_fraction
+        ]
         initial = np.array([float(t) for t in data.zone_state])
 
         if len(initial) != num_states:
@@ -3571,7 +3579,7 @@ class MPCOptimizer:
                         float(living_gain_w[k]),
                         float(rest_gain_w[k]),
                         heat_w,
-                        moved_per_w * heat_w,
+                        moved_per_w[k] * heat_w,
                         float(living_air_gain_w[k]),
                         float(living_sun_w[k]),
                         float(rest_sun_w[k]),
@@ -3623,7 +3631,7 @@ class MPCOptimizer:
                 model.zone_constraints.add(
                     model.zone_rise[k + 1, i]
                     == sum(a_d[i, j] * model.zone_rise[k, j] for j in model.ZONE_STATES)
-                    + (b_d[i, 4] + moved_per_w * b_d[i, 5]) * floor_w(k)
+                    + (b_d[i, 4] + moved_per_w[k] * b_d[i, 5]) * floor_w(k)
                 )
 
         # What a thermostat reads of the plan: an operative temperature, part
@@ -3657,7 +3665,10 @@ class MPCOptimizer:
                 bounds=(
                     -ZONE_BOUND_MARGIN_K * float(np.sum(capacities)) / J_PER_KWH,
                     zone_heat_shortfall_j(
-                        building, unheated[last], float(target_c[last]), living_fraction
+                        building,
+                        unheated[last],
+                        float(target_c[last]),
+                        living_fraction[last],
                     )
                     / J_PER_KWH,
                 )
@@ -3777,15 +3788,16 @@ class MPCOptimizer:
 
         # The temperature the floor's water delivers against: the screeds it
         # heats first where the floor has them, else the slabs' mean, one
-        # circuit running through both - the open loops (see zone_floor).
-        against = zone_floor(building, living_fraction)
+        # circuit running through both - each step's open loops (see
+        # zone_floor).
+        against = [zone_floor(building, fraction) for fraction in living_fraction]
 
-        def sink_c(state: np.ndarray) -> float:
-            return float(against @ state)
+        def sink_c(k: int, state: np.ndarray) -> float:
+            return float(against[k] @ state)
 
         def sink(k: int):
             return sum(
-                float(against[i]) * model.zone_state[k, i] for i in model.ZONE_STATES
+                float(against[k][i]) * model.zone_state[k, i] for i in model.ZONE_STATES
             )
 
         # How the heat pump runs the floor by itself, once heating runs have
@@ -3805,11 +3817,11 @@ class MPCOptimizer:
         # sink's range, which the unheated and flat-out rollouts bound - the
         # slabs' mean being monotone in the heat like each slab.
         model.space_sink_on = pyo.Var(model.K)
-        conductance = float(
-            floor_circuit_conductance_w_per_k(
-                operating, open_living + open_rest, data.zone_floor_flow_lpm
-            )
-        )
+        flow_lpm = data.zone_floor_flow_lpm or (None,) * num_steps
+        conductance = [
+            float(floor_circuit_conductance_w_per_k(operating, living + rest, flow))
+            for (living, rest), flow in zip(floor_open, flow_lpm, strict=True)
+        ]
         # The mode's own COP (EER) model, where runs have shown one. The heat
         # pump holds the supply it is given (its flow mode), so the plan
         # chooses it - heating only with that model: on a flat COP a warmer
@@ -3829,13 +3841,14 @@ class MPCOptimizer:
             model.space_power_kw = pyo.Var(model.K, domain=pyo.NonNegativeReals)
             model.space_power_w = _watts(model.space_power_kw)
 
-        def draw_w(moved_w: float, outdoor: float, sink_c: float) -> float:
+        def draw_w(k: int, moved_w: float, sink_c: float) -> float:
             """The electricity (W) to move this heat into (or, cooling, out of)
-            a mass at sink_c, at the supply that takes: sink_c +- Q / G."""
+            a mass at sink_c in step k, at the supply that takes: sink_c +-
+            Q / G."""
 
-            supply_c = sink_c + sign * moved_w / conductance
+            supply_c = sink_c + sign * moved_w / conductance[k]
 
-            return moved_w / float(efficiency.clamped_cop(outdoor, supply_c))
+            return moved_w / float(efficiency.clamped_cop(zone_outdoor_c[k], supply_c))
 
         supply_minimum_c = data.zone_supply_minimum_c or None
         model.space_supply_c = []
@@ -3843,8 +3856,9 @@ class MPCOptimizer:
         for k in range(num_steps):
             # The product stays exact for a binary 'on' however wide the
             # range: it only bounds the sink while off.
-            low = sink_c(coolest[k]) - ZONE_BOUND_MARGIN_K
-            high = sink_c(warmest[k]) + ZONE_BOUND_MARGIN_K
+            low = sink_c(k, coolest[k]) - ZONE_BOUND_MARGIN_K
+            high = sink_c(k, warmest[k]) + ZONE_BOUND_MARGIN_K
+            g = conductance[k]
             on = model.space_on[k]
             sink_on = model.space_sink_on[k]
 
@@ -3860,7 +3874,7 @@ class MPCOptimizer:
                 # The supply is the plan's to choose - the setpoint is given to
                 # the heat pump - so the heat is too, and the supply follows
                 # from it: T_supply = T_sink + Q / G.
-                model.space_supply_c.append(sink(k) + model.q_space_w[k] / conductance)
+                model.space_supply_c.append(sink(k) + model.q_space_w[k] / g)
 
                 # No less than the compressor at its lowest speed: asked for
                 # less it overshoots the setpoint rather than turn down. The
@@ -3879,9 +3893,8 @@ class MPCOptimizer:
                 # 24.1 for 24.3 degC a day ahead).
                 if not cooling and operating.min_supply_c:
                     model.zone_constraints.add(
-                        sink_on + model.q_space_w[k] / conductance
-                        >= min(operating.min_supply_c, low + max_heat_w / conductance)
-                        * on
+                        sink_on + model.q_space_w[k] / g
+                        >= min(operating.min_supply_c, low + max_heat_w / g) * on
                     )
 
                 # What that heat draws: the heat over the COP (EER) at the
@@ -3902,7 +3915,7 @@ class MPCOptimizer:
                 # planning twice, the second time against the mass the first
                 # planned, doubled the solve.
                 if efficiency is not None:
-                    reference_c = sink_c(unheated[k])
+                    reference_c = sink_c(k, unheated[k])
                     # A run the zone opens draws the start's measured power
                     # over its first step (HeatPumpCOPModel.start_step_power_w)
                     # in place of its running draw, as the tank's does: the
@@ -3917,9 +3930,7 @@ class MPCOptimizer:
                     if efficiency.start_step_power_w:
                         start_w = (
                             efficiency.start_step_power_w
-                            - draw_w(
-                                operating.min_heat_w, zone_outdoor_c[k], reference_c
-                            )
+                            - draw_w(k, operating.min_heat_w, reference_c)
                         ) * (
                             model.compressor_start[k]
                             - model.tank_start[k]
@@ -3927,13 +3938,9 @@ class MPCOptimizer:
                         )
 
                     for point_w in np.linspace(0.0, max_heat_w, 7):
-                        at_w = draw_w(point_w, zone_outdoor_c[k], reference_c)
-                        per_w = (
-                            draw_w(point_w + 1.0, zone_outdoor_c[k], reference_c) - at_w
-                        )
-                        per_k = (
-                            draw_w(point_w, zone_outdoor_c[k], reference_c + 0.1) - at_w
-                        ) / 0.1
+                        at_w = draw_w(k, point_w, reference_c)
+                        per_w = draw_w(k, point_w + 1.0, reference_c) - at_w
+                        per_k = (draw_w(k, point_w, reference_c + 0.1) - at_w) / 0.1
                         # Each tangent in its perspective, scaled by on: the
                         # same bound on or off, but a tighter relaxation for a
                         # step partly on (a heating day's solve 8.3 -> 6.1 s).
@@ -3951,16 +3958,13 @@ class MPCOptimizer:
                 # does both: the zone is then not cooled.
                 if cooling and supply_minimum_c is not None:
                     model.zone_constraints.add(
-                        -model.q_space_w[k]
-                        <= conductance * (sink_on - supply_minimum_c[k] * on)
+                        -model.q_space_w[k] <= g * (sink_on - supply_minimum_c[k] * on)
                     )
 
                 continue
 
             model.space_supply_c.append(operating.supply_c(zone_outdoor_c[k]))
-            floor_w = conductance * (
-                operating.supply_c(zone_outdoor_c[k]) * on - sink_on
-            )
+            floor_w = g * (operating.supply_c(zone_outdoor_c[k]) * on - sink_on)
             model.zone_constraints.add(model.q_space_w[k] <= floor_w)
 
             # Held to exactly that wherever it is within the compressor's own
@@ -3968,7 +3972,7 @@ class MPCOptimizer:
             # than its runs covered - the heat pump gives what it can, and the
             # floor's uptake only caps it.
             supply = operating.supply_c(zone_outdoor_c[k])
-            if conductance * (supply - low) <= max_heat_w:
+            if g * (supply - low) <= max_heat_w:
                 model.zone_constraints.add(model.q_space_w[k] >= floor_w)
 
         # Within a cooling run the supply only falls, within a heating run it
@@ -3994,11 +3998,11 @@ class MPCOptimizer:
         # supply bounded the same integer plans more loosely: a heating day's
         # solve 6.1 -> 5.2 s.
         if chosen:
-            least_c = operating.min_heat_w / conductance
-            most_c = max_heat_w / conductance
 
             def supply_range(k: int) -> tuple[float, float]:
-                low_c, high_c = sink_c(coolest[k]), sink_c(warmest[k])
+                low_c, high_c = sink_c(k, coolest[k]), sink_c(k, warmest[k])
+                least_c = operating.min_heat_w / conductance[k]
+                most_c = max_heat_w / conductance[k]
 
                 if cooling:
                     return low_c - most_c, high_c - least_c
@@ -4006,7 +4010,7 @@ class MPCOptimizer:
                 return low_c + least_c, high_c + most_c
 
             def supply_on(k: int):
-                return model.space_sink_on[k] + model.q_space_w[k] / conductance
+                return model.space_sink_on[k] + model.q_space_w[k] / conductance[k]
 
             # The steps a run's heat may rise in (see below): where the bias
             # steers the heat, those whose expected surplus - the grid meter's
@@ -4023,7 +4027,7 @@ class MPCOptimizer:
                 and data.zone_heat_may_rise
                 and efficiency is not None
                 and surplus_w[k]
-                > draw_w(operating.min_heat_w, zone_outdoor_c[k], sink_c(coolest[k]))
+                > draw_w(k, operating.min_heat_w, sink_c(k, coolest[k]))
             ]
             model.space_rises = pyo.Var(exporting, domain=pyo.Binary)
 
@@ -4183,6 +4187,7 @@ class MPCOptimizer:
         space_schedule: tuple[int, ...] = ()
         space_heat_w: tuple[float, ...] = ()
         zone_temperatures: tuple[float, ...] = ()
+        zone_rest_temperatures: tuple[float, ...] = ()
         zone_mass_temperatures: tuple[float, ...] = ()
         zone_screed_temperatures: tuple[float, ...] = ()
         space_supply_c: tuple[float, ...] = ()
@@ -4195,6 +4200,18 @@ class MPCOptimizer:
             # judged on (see zone_observation).
             zone_temperatures = tuple(
                 float(pyo.value(model.zone_measured(k))) for k in range(num_steps)
+            )
+            # What the rest's thermostats read, which the next plan takes their
+            # loops from (see MPCInput.zone_floor_open).
+            rest_row = zone_observations(self.building_model)[1]
+            zone_rest_temperatures = tuple(
+                float(
+                    sum(
+                        float(rest_row[i]) * pyo.value(model.zone_state[k, i])
+                        for i in model.ZONE_STATES
+                    )
+                )
+                for k in range(num_steps)
             )
             zone_mass_temperatures = tuple(
                 float(pyo.value(model.zone_state[k, ZONE_SLAB_STATES[0]]))
@@ -4261,6 +4278,7 @@ class MPCOptimizer:
             space_schedule=space_schedule,
             space_heat_w=space_heat_w,
             zone_temperatures=zone_temperatures,
+            zone_rest_temperatures=zone_rest_temperatures,
             zone_mass_temperatures=zone_mass_temperatures,
             zone_screed_temperatures=zone_screed_temperatures,
             space_supply_c=space_supply_c,

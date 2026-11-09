@@ -115,6 +115,14 @@ class ZoneHabit(BaseModel):
     day: date
     living_w: list[float]
     rest_w: list[float]
+    # Each room's rise in a heating run with its loops open per K of the
+    # rest's (see BuildingThermalIdentifier.room_run_rise), as
+    # building.rooms; empty is the rest's own.
+    run_rise: list[float] = Field(default_factory=list)
+    # The pump's flow (L/min) through each open loop area the runs held (see
+    # BuildingThermalIdentifier.loop_flows); empty is the last run's.
+    loop_open: list[float] = Field(default_factory=list)
+    loop_flow_lpm: list[float] = Field(default_factory=list)
 
 
 class TapHabit(BaseModel):
@@ -201,6 +209,9 @@ class BuildingSchedule(BaseModel):
     # do - not acted on yet (see Optimization._zone). Its heat and power are
     # the heat pump's (see HeatPumpSchedule).
     temperatures: list[SeriesPoint[float]] = Field(default_factory=list)
+    # What the rest's thermostats read along the plan: the next plan takes
+    # from it when their loops close (see Optimization._zone).
+    rest_temperatures: list[SeriesPoint[float]] = Field(default_factory=list)
     # The supply each planned step runs the floor at: while cooling, the
     # setpoint the plan would give the heat pump. Only steps it runs.
     supply: list[SeriesPoint[float]] = Field(default_factory=list)

@@ -2541,6 +2541,108 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             .reindex(range(0, 24 * 60, 15), fill_value=0.0)
         )
 
+    # The span a room's rise in a run is read over (see room_run_rise): the
+    # rooms' thermostats report every 30 minutes in 0.1 K steps, so a quarter
+    # hour's change is mostly one step or none.
+    RUN_RISE_WINDOW = timedelta(hours=1)
+    # The least hours of open run a room's ratio is taken from, else 1: a 0.1 K
+    # reading step leaves an hour's change some 0.04 K uncertain against a
+    # rise of about 0.14 K/h, so over n hours the ratio is 0.29 / sqrt(n)
+    # uncertain - 8% over 12, well within the rooms' 0.55-1.25.
+    RUN_RISE_MIN_HOURS = 12.0
+
+    def room_run_rise(self, prepared: pd.DataFrame, now: datetime) -> list[float]:
+        """How fast each room warms in a heating run with its loops open, per
+        K the rest's mean warms meanwhile - its loops' heat over its heat
+        capacity against the rest's - one per room (config.building.rooms):
+        over the frame's HABIT_HISTORY_DAYS up to now (real data, 25 Sep - 9
+        Nov 2026: bathroom 0.54-0.57, bedrooms 0.88-1.27, alike over 21 and 45
+        days). 1 for the thermostat's room, a room without a thermostat mode
+        and one too seldom open in a run. Between runs no such ratio holds:
+        there a room follows doors, windows and sleepers (the bathroom cools
+        0.8 times as fast as the mean by day, 3.2 times at night). From a
+        prepare()d frame."""
+
+        prepared = self._habit_weeks(prepared, now)
+        ratios = [1.0] * len(self.room_temperature_columns)
+
+        if prepared.empty:
+            return ratios
+
+        step = prepared["time"].diff().median()
+        steps = max(1, round(self.RUN_RISE_WINDOW / step))
+
+        def throughout(flags: pd.Series) -> pd.Series:
+            return flags.astype(float).rolling(steps).sum().eq(steps)
+
+        # Windows a heating run filled, on the grid without a gap.
+        heated = throughout(prepared["Q_floor_w"] > 0.0) & prepared["time"].diff(
+            steps
+        ).eq(steps * step)
+        rest_rise = prepared["T_rest"].diff(steps)
+
+        for i, column in enumerate(self.room_temperature_columns):
+            climate = (
+                self.room_climate_columns[i] if self.room_climate_columns else None
+            )
+
+            if i == self.thermostat_room_index or climate is None:
+                continue
+
+            rise = pd.to_numeric(prepared[column], errors="coerce").diff(steps)
+            is_open = (self._samples(prepared, climate) != self.CLIMATE_OFF_STATE).all(
+                axis=1
+            )
+            used = heated & throughout(is_open) & rise.notna() & rest_rise.notna()
+            hours = used.sum() * step / timedelta(hours=1)
+
+            if hours >= self.RUN_RISE_MIN_HOURS and rest_rise[used].sum() > 0.0:
+                ratios[i] = float(rise[used].sum() / rest_rise[used].sum())
+
+        return ratios
+
+    # The least a set of open loops is held in runs for its flow to count
+    # (see loop_flows): one held a lone quarter hour is mostly a switch, its
+    # loops opening or closing within it (real data: the living room alone at
+    # 18.5 L/min in two lone quarter hours, against 16-18 through more loops).
+    LOOP_FLOW_MIN_HOURS = 1.0
+
+    def loop_flows(
+        self, prepared: pd.DataFrame, now: datetime
+    ) -> tuple[list[float], list[float]]:
+        """The pump's flow (L/min) through each open loop area the heating
+        runs held, as a share of the zone's floor area (ascending): its median
+        over the HABIT_HISTORY_DAYS up to now, of the sets held at least
+        LOOP_FLOW_MIN_HOURS. Fewer loops, less flow (real data, 21 days to 9
+        Nov 2026: 15.95 L/min through the living room and bathroom, 17.6 with
+        two bedrooms more, 18.0 through all). From a prepare()d frame."""
+
+        prepared = self._habit_weeks(prepared, now)
+        ran = prepared[
+            prepared["floor_flow_lpm"].notna() & (prepared["Q_floor_w"] > 0.0)
+        ]
+
+        if ran.empty:
+            return [], []
+
+        step_hours = prepared["time"].diff().median() / timedelta(hours=1)
+        flows = (
+            ran["floor_flow_lpm"]
+            .groupby((ran["floor_open_living"] + ran["floor_open_rest"]).round(3))
+            .agg(["median", "count"])
+        )
+        flows = flows[flows["count"] * step_hours >= self.LOOP_FLOW_MIN_HOURS]
+
+        return flows.index.tolist(), flows["median"].tolist()
+
+    def _habit_weeks(self, prepared: pd.DataFrame, now: datetime) -> pd.DataFrame:
+        """A prepare()d frame's HABIT_HISTORY_DAYS up to now."""
+
+        return prepared[
+            (prepared["time"] <= now)
+            & (prepared["time"] >= now - timedelta(days=self.HABIT_HISTORY_DAYS))
+        ].reset_index(drop=True)
+
     def _unexplained_heat_w(
         self,
         model: BuildingThermalModel,
@@ -3270,27 +3372,6 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         flow = run["floor_flow_lpm"][[loop == held for loop in loops]].mean()
 
         return float(held[0]), float(held[1]), float(flow)
-
-    @staticmethod
-    def run_flow_lpm(zone: pd.DataFrame, loops: tuple[float, float]) -> float | None:
-        """The flow (L/min) of the latest floor run in a trajectory() that held
-        these loops open (open_living, open_rest), None without one: fewer
-        loops open, less flow from the pump (real data: 16 L/min through the
-        living room and bathroom, 18 through all)."""
-
-        columns = ["floor_open_living", "floor_open_rest"]
-        ran = zone[columns[0]].notna().to_numpy()
-        run = np.cumsum(ran & ~np.concatenate([[False], ran[:-1]]))
-        held = ran & np.all(
-            np.isclose(zone[columns].to_numpy(dtype=float), loops, atol=1e-3), axis=1
-        )
-
-        if not held.any():
-            return None
-
-        latest = held & (run == run[held].max())
-
-        return float(zone["floor_flow_lpm"].to_numpy(dtype=float)[latest].mean())
 
     def habit_dataset(self) -> DatasetDefinition:
         """The shutters and who is home alone, over the weeks forecast() takes

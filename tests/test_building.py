@@ -1535,20 +1535,28 @@ def test_a_plan_takes_the_loops_the_last_run_held_longest():
     assert BuildingThermalIdentifier.last_run_loops(zone.iloc[[3, 10]]) is None
 
 
-def test_a_loop_set_is_planned_at_the_flow_its_latest_run_had():
-    """The latest run that held the set, at its flow then: the pump gives
-    less through fewer loops. None where no run held it."""
+def test_the_pump_flow_is_learned_per_open_loop_area_held_an_hour():
+    """The median flow through each open loop area the heating runs held, as
+    a share of the floor area: a set held a lone quarter hour is a switch,
+    not counted; steps without a run neither."""
 
-    columns = ["floor_open_living", "floor_open_rest", "floor_flow_lpm"]
-    nan = (np.nan, np.nan, np.nan)
-    zone = pd.DataFrame(
-        [(0.5, 0.5, 17.0), nan, (0.5, 0.5, 18.0), (0.5, 0.07, 16.0), nan],
-        columns=columns,
+    now = datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc)
+    rows = (
+        [(0.5, 0.07, 16.0)] * 4
+        + [(0.5, 0.5, 18.0)] * 3
+        + [(0.5, 0.5, 17.0)] * 2
+        + [(0.5, 0.0, 18.5)]
+        + [(np.nan, np.nan, np.nan)] * 2
     )
+    frame = pd.DataFrame(
+        rows, columns=["floor_open_living", "floor_open_rest", "floor_flow_lpm"]
+    ).assign(
+        time=pd.date_range(end=now, periods=len(rows), freq="15min"),
+        Q_floor_w=[3000.0] * 10 + [0.0] * 2,
+    )
+    identifier = BuildingThermalIdentifier(latitude=52.39, longitude=5.79)
 
-    assert BuildingThermalIdentifier.run_flow_lpm(zone, (0.5, 0.5)) == 18.0
-    assert BuildingThermalIdentifier.run_flow_lpm(zone, (0.5, 0.07)) == 16.0
-    assert BuildingThermalIdentifier.run_flow_lpm(zone, (0.5, 0.0)) is None
+    assert identifier.loop_flows(frame, now) == ([0.57, 1.0], [16.0, 18.0])
 
 
 def test_a_room_that_closes_its_loops_takes_none_of_the_floors_heat():
@@ -2310,3 +2318,32 @@ def test_a_settled_filter_ends_where_the_step_by_step_one_does():
         kalman_filter(*arguments)[200:],
         atol=1e-9,
     )
+
+
+def test_a_rooms_run_rise_is_its_rise_per_k_of_the_rests_with_its_loops_open():
+    """Over a heating run a room with its loops open rises against the rest's
+    mean; one too seldom open, the thermostat's room and a room without a
+    thermostat mode keep the rest's own rise (1)."""
+
+    identifier = BuildingThermalIdentifier(latitude=52.39, longitude=5.79)
+    identifier.room_temperature_columns = [f"room_temperature_{i}" for i in range(4)]
+    identifier.room_climate_columns = [None, "room_climate_1", "room_climate_2", None]
+    identifier.thermostat_room_index = 0
+    now = datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc)
+    time = pd.date_range(end=now, periods=4 * 20, freq="15min")
+    hours = np.arange(len(time)) / 4.0
+    frame = pd.DataFrame(
+        {
+            "time": time,
+            "Q_floor_w": 3000.0,
+            "T_rest": 18.0 + 0.1 * hours,
+            "room_temperature_0": 20.0,
+            "room_temperature_1": 18.0 + 0.06 * hours,
+            "room_temperature_2": 18.0 + 0.125 * hours,
+            "room_temperature_3": 18.0 + 0.1 * hours,
+            "room_climate_1": "heat",
+            # Open the last 8 hours only: too seldom.
+            "room_climate_2": np.where(hours >= hours[-1] - 8.0, "heat", "off"),
+        }
+    )
+    assert identifier.room_run_rise(frame, now) == pytest.approx([1.0, 0.6, 1.0, 1.0])

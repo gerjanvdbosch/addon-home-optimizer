@@ -466,6 +466,7 @@ class StateManager:
         on: Sequence[int] = (),
         thermal_mass: Sequence[float] = (),
         screed: Sequence[float] = (),
+        rest: Sequence[float] = (),
     ) -> None:
         """The zone's part of the plan, not acted on yet. Its heat and power go
         into the heat pump's plan beside the tank's (see update_schedule, which
@@ -489,6 +490,10 @@ class StateManager:
         state.schedule.building.temperatures = [
             SeriesPoint(time=t, value=float(value))
             for t, value in zip(times, temperatures, strict=False)
+        ]
+        state.schedule.building.rest_temperatures = [
+            SeriesPoint(time=t, value=float(value))
+            for t, value in zip(times, rest, strict=False)
         ]
         # NaN where the floor is not run; left out, so no line is drawn there.
         state.schedule.building.supply = [

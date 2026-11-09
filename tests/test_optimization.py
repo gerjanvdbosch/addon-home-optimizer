@@ -1029,6 +1029,15 @@ def test_the_rooms_habit_is_made_once_a_day():
                 {"living": 1.0, "rest": 2.0}, index=range(0, 24 * 60, 15)
             )
 
+        def prepare(self, df):
+            return df
+
+        def room_run_rise(self, prepared, now):
+            return [0.5, 1.0]
+
+        def loop_flows(self, prepared, now):
+            return [0.57, 1.0], [16.0, 18.0]
+
     saved: list[ZoneHabit] = []
     optimization = Optimization(
         loader=SimpleNamespace(load=lambda *_: None),  # type: ignore[arg-type]
@@ -1052,6 +1061,7 @@ def test_the_rooms_habit_is_made_once_a_day():
 
     assert len(made) == 2
     assert first.loc[22 * 60, "rest"] == 2.0
+    assert state.predictions.zone_habit.run_rise == [0.5, 1.0]
     pd.testing.assert_frame_equal(first, again, check_dtype=False)
 
 
@@ -1183,7 +1193,7 @@ def _zone_bias(
         current_temp_bottom=45.0,
         boiler_on_current=False,
         zone_maximum_temperature=(21.0,) * 4,
-        zone_floor_flow_lpm=18.0,
+        zone_floor_flow_lpm=(18.0,) * 4,
     )
     since = START - timedelta(hours=1) if heating else None
     bias = optimization._zone_bias(  # type: ignore[arg-type]
@@ -1521,3 +1531,38 @@ def test_the_planned_runs_are_listed_by_their_start():
         f"{to_local_time(TIMES[2]):%H:%M}",
         f"{to_local_time(TIMES[3] + timedelta(minutes=15)):%H:%M}",
     ]
+
+
+def test_the_rest_rises_as_the_previous_plan_had_it():
+    """A replan takes a rest room to rise from now as the plan before it had
+    the rest rise, in that plan's runs at the room's own rate, held beyond
+    that plan's end; nothing from a plan made over a step before this one."""
+
+    step = timedelta(minutes=15)
+    times = [START + i * step for i in range(4)]
+    planned = [
+        SeriesPoint(time=START + i * step, value=18.6 + 0.2 * i) for i in range(3)
+    ]
+    # The previous plan heated the zone in the first step only.
+    on = [SeriesPoint(time=START + i * step, value=int(i == 0)) for i in range(3)]
+    now = START + timedelta(minutes=5)
+
+    def rise(points, run_rise=1.0):
+        return Optimization._planned_rest_rise_k(points, on, times, now, step, run_rise)
+
+    first = 0.2 / 3
+    assert rise(planned) == pytest.approx(
+        [-first, 0.2 - first, 0.4 - first] * 1 + [0.4 - first]
+    )
+    # 1.5 times as fast in the run: its step from 10:00, and the part of it
+    # from 10:05 the first increment (back to 10:00) takes back.
+    assert rise(planned, 1.5) == pytest.approx(
+        [-1.5 * first, 1.5 * (0.2 - first), 1.5 * (0.2 - first) + 0.2]
+        + [1.5 * (0.2 - first) + 0.2]
+    )
+
+    stale = [
+        SeriesPoint(time=point.time - 2 * step, value=point.value) for point in planned
+    ]
+
+    assert not rise(stale).any()

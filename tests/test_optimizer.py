@@ -1745,11 +1745,16 @@ def test_a_plan_through_the_living_rooms_loops_alone_heats_its_floor():
     """With the rest's loops closed (MPCInput.zone_floor_open) the plan's floor
     heat lands under the living room alone, and the circuit passes what the
     open pipes do at the flow through them: the supply is that floor plus
-    Q / G."""
+    Q / G. Per step: open first, the rest's loops closing within the run."""
 
     share = TWO_NODE.living_area_fraction
     circuit = replace(HEATING, pipe_ua_w_per_k=480.0, flow_lpm=18.0)
-    data = _cold_day(steps=48, zone_floor_open=(share, 0.0), zone_floor_flow_lpm=16.0)
+    closed = [k >= 8 for k in range(48)]
+    data = _cold_day(
+        steps=48,
+        zone_floor_open=tuple((share, 0.0 if shut else 1.0 - share) for shut in closed),
+        zone_floor_flow_lpm=tuple(16.0 if shut else 18.0 for shut in closed),
+    )
     result = MPCOptimizer(
         THERMAL_MODEL,
         MPCConfig(),
@@ -1758,22 +1763,31 @@ def test_a_plan_through_the_living_rooms_loops_alone_heats_its_floor():
         floor_circuit_model=circuit,
         space_cop_model=COP_MODEL,
     ).solve(data)
-    conductance = floor_circuit_conductance_w_per_k(circuit, share, 16.0)
+    conductance = np.array(
+        [
+            floor_circuit_conductance_w_per_k(circuit, share, 16.0)
+            if shut
+            else floor_circuit_conductance_w_per_k(circuit, 1.0, 18.0)
+            for shut in closed
+        ]
+    )
     heat = np.asarray(result.space_heat_w)
     living_floor = np.asarray(result.zone_mass_temperatures)
     on = heat > 1.0
 
-    assert on.any(), "expected the zone to be heated"
+    assert (on & np.array(closed)).any(), "expected heat with the rest closed"
+    assert (on & ~np.array(closed)).any(), "expected heat with the rest open"
     assert np.asarray(result.space_supply_c)[on] == pytest.approx(
-        living_floor[on] + heat[on] / conductance
+        living_floor[on] + heat[on] / conductance[on]
     )
 
     a_d, b_d = discretize_zoh(*zone_state_space(TWO_NODE), 900.0)
     state = np.array(data.zone_state)
 
     for k in range(len(heat) - 1):
+        moved = (1.0 - share) * heat[k] if closed[k] else 0.0
         state = a_d @ state + b_d @ np.array(
-            [5.0, 150.0, 0.0, 0.0, heat[k], (1.0 - share) * heat[k], 0.0, 0.0, 0.0]
+            [5.0, 150.0, 0.0, 0.0, heat[k], moved, 0.0, 0.0, 0.0]
         )
         assert living_floor[k + 1] == pytest.approx(state[2], abs=1e-4)
 

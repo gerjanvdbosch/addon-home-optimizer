@@ -1,15 +1,6 @@
 blueprint:
   name: Home Optimizer
-  description: >-
-    Runs the Home Optimizer plan: starts DHW on schedule, blocks it again once
-    the heat pump has left DHW, and sets the living room thermostat to
-    sensor.home_optimizer_zone_setpoint - a run's setpoint
-    while the zone is on (from the tank's last quarter hour when heating
-    follows, so the heat pump goes straight on to the floor), the comfort
-    band's edge between runs. The rest (bathroom and bedrooms) gets that
-    setpoint's attribute "rest" - the rest's minimum while a run is served,
-    so a room below it heats along and one above it does not, the idle
-    setpoint from the optimizer config otherwise.
+  description: Runs the Home Optimizer plan
   domain: automation
   source_url: https://github.com/gerjanvdbosch/addon-home-optimizer/blob/main/blueprints/home_optimizer.yaml
   input:
@@ -28,19 +19,6 @@ blueprint:
       selector:
         entity:
           domain: sensor
-    dhw_state:
-      name: Operating state while in DHW
-      default: SWW
-      selector:
-        text: { }
-    zone_after:
-      name: Zone not before
-      default: "08:00:00"
-      selector: { time: { } }
-    zone_before:
-      name: Zone not after
-      default: "20:00:00"
-      selector: { time: { } }
     living_climate:
       name: Living room thermostat
       selector:
@@ -77,11 +55,12 @@ triggers:
     id: dhw_start
   # The heat pump out of DHW for 10 minutes, so a started run is never cut off:
   # a defrost keeps the state on DHW, the 10 minutes ride out a flicker, and a
-  # sensor gone unavailable is no end.
+  # sensor gone unavailable is no end. "SWW" is the add-on's heat_pump mode
+  # dhw default.
   - trigger: state
     entity_id: !input heat_pump_state
-    from: !input dhw_state
-    not_to: [ !input dhw_state, unknown, unavailable ]
+    from: SWW
+    not_to: [ SWW, unknown, unavailable ]
     for: { minutes: 10 }
     id: dhw_end
   - trigger: state
@@ -153,9 +132,6 @@ actions:
           - condition: state
             entity_id: binary_sensor.home_optimizer_zone_status
             state: "on"
-          - condition: time
-            after: !input zone_after
-            before: !input zone_before
           - condition: template
             value_template: "{{ has_value('sensor.home_optimizer_zone_setpoint') }}"
         sequence:
@@ -181,16 +157,6 @@ actions:
             value_template: >-
               {{ rest | count > 0
                  and state_attr('sensor.home_optimizer_zone_setpoint', 'rest') is number }}
-          # Up only in the hours a run may start, as the living room: a rest
-          # room below its setpoint starts the heat pump too. Down always.
-          - or:
-              - condition: time
-                after: !input zone_after
-                before: !input zone_before
-              - condition: template
-                value_template: >-
-                  {{ state_attr('sensor.home_optimizer_zone_setpoint', 'rest')
-                     < state_attr(rest[0], 'temperature') | float(99) }}
         sequence:
           - &rest
             action: climate.set_temperature
@@ -222,17 +188,14 @@ actions:
             id: zone_setpoint
         sequence:
           - choose:
-              # Within a run only up, and only in the hours a run may start:
-              # the plan raises it as the run goes on, and a thermostat left
-              # at the start's setpoint ends the run once the room reaches it
+              # Within a run only up: the plan raises it as the run goes on,
+              # and a thermostat left at the start's setpoint ends the run once
+              # the room reaches it
               # (6 Nov 2026: 19.1 at the start, 20.3 later).
               - conditions:
                   - condition: state
                     entity_id: binary_sensor.home_optimizer_zone_status
                     state: "on"
-                  - condition: time
-                    after: !input zone_after
-                    before: !input zone_before
                   - condition: template
                     value_template: >-
                       {{ states('sensor.home_optimizer_zone_setpoint') | float(0)

@@ -571,6 +571,7 @@ class Optimization:
             on=result.space_schedule,
             thermal_mass=result.zone_mass_temperatures,
             screed=result.zone_screed_temperatures,
+            rest=result.zone_rest_temperatures,
         )
         self.publish_zone(
             result,
@@ -1538,26 +1539,33 @@ class Optimization:
         """The rooms' habit (see BuildingThermalIdentifier.room_heat_habit),
         made once a day and kept in the state: a median over three weeks moves
         little in a day (the forecast as good, within 0.002 K), and its weeks
-        load in some 2 s against the zone's own 0.6 s."""
+        load in some 2 s against the zone's own 0.6 s. The rooms' rise in a
+        run (see BuildingThermalIdentifier.room_run_rise) from the same weeks,
+        into state.predictions.zone_habit."""
 
         today = to_local_time(now).date()
         habit = state.predictions.zone_habit
 
-        if habit is None or habit.day != today:
-            frame = identifier.room_heat_habit(
-                self.loader.load(
-                    identifier.dataset(config),
-                    now - timedelta(days=identifier.HABIT_HISTORY_DAYS),
-                    now,
-                ),
+        # Made again where it lacks the rooms' rise (made before it was kept).
+        if habit is None or habit.day != today or not habit.run_rise:
+            weeks = self.loader.load(
+                identifier.dataset(config),
+                now - timedelta(days=identifier.HABIT_HISTORY_DAYS),
                 now,
             )
+            frame = identifier.room_heat_habit(weeks, now)
+            prepared = identifier.prepare(weeks)
+            loop_open, loop_flow_lpm = identifier.loop_flows(prepared, now)
             habit = ZoneHabit(
                 day=today,
                 living_w=frame["living"].tolist(),
                 rest_w=frame["rest"].tolist(),
+                run_rise=identifier.room_run_rise(prepared, now),
+                loop_open=loop_open,
+                loop_flow_lpm=loop_flow_lpm,
             )
             self.state_manager.update_habit("zone_habit", habit)
+            state.predictions.zone_habit = habit
 
         return pd.DataFrame(
             {"living": habit.living_w, "rest": habit.rest_w},
@@ -1704,29 +1712,65 @@ class Optimization:
         )
         # Every loop, at the flow its runs ran at, without a run in the frame.
         loops = identifier.last_run_loops(zone)
+        floor_open = ((loops[0], loops[1]),) * len(times) if loops else ()
+        floor_flow = (loops[2],) * len(times) if loops else ()
         rest_minimum_c = config.building.rest_temperature
 
         # Set to the rest's minimum while a heating run is served (see
         # publish_zone), each room's own thermostat opens its loops while the
-        # room is below it: the plan takes the rooms below it now to open, in
-        # every run - a replan corrects it as they warm or cool.
+        # room is below it and closes them once it gets there: per step, the
+        # plan takes the rooms open that are below it then - the room now,
+        # risen as the previous plan had the rest rise since, in its runs at
+        # the room's own rate (see _planned_rest_rise_k). Held at the room now,
+        # rooms 0.01-0.4 K below it stayed open all run though they closed
+        # within the hour, and tomorrow's rooms - cooled overnight below it -
+        # closed because they are above it now (9 Nov 2026: 12.6 kWh planned
+        # for tomorrow's floor against 17.9 with its upstairs loops open).
         if rest_minimum_c is not None and not cooling:
             rooms = config.building.rooms
             total_m2 = sum(room.area_m2 for room in rooms)
-            rest = 0.0
+            habit = state.predictions.zone_habit
+            run_rise = (
+                habit.run_rise
+                if habit is not None and len(habit.run_rise) == len(rooms)
+                else [1.0] * len(rooms)
+            )
+            rest = np.zeros(len(times))
 
-            for room in rooms:
+            for room, ratio in zip(rooms, run_rise, strict=True):
                 if room.temperature == config.building.thermostat.temperature:
                     continue
 
-                room_c = self._latest(room.temperature, now or times[0])
+                reading = self._last_reading(room.temperature, now)
 
-                if room_c is not None and room_c < rest_minimum_c:
-                    rest += room.area_m2 / total_m2
+                if reading is not None:
+                    read_at, room_c = reading
+                    rise_k = self._planned_rest_rise_k(
+                        state.schedule.building.rest_temperatures,
+                        state.schedule.building.on,
+                        times,
+                        read_at,
+                        timedelta(hours=mpc_config.step_hours),
+                        ratio,
+                    )
+                    rest += (room_c + rise_k < rest_minimum_c) * (
+                        room.area_m2 / total_m2
+                    )
 
             living = identifier.model.living_area_fraction
-            flow = identifier.run_flow_lpm(zone, (living, rest))
-            loops = (living, rest, flow or (loops[2] if loops else None))
+
+            # At the flow the runs had through as much open loop area, between
+            # two such between them; the last run's without any.
+            def flow_lpm(share: float) -> float | None:
+                if habit is not None and habit.loop_open:
+                    return float(
+                        np.interp(living + share, habit.loop_open, habit.loop_flow_lpm)
+                    )
+
+                return loops[2] if loops else None
+
+            floor_open = tuple((living, float(share)) for share in rest)
+            floor_flow = tuple(flow_lpm(float(share)) for share in rest)
         inputs = dict(
             zone_state=tuple(float(c) for c in planned[state_names].iloc[0]),
             zone_target_temperature=target_c,
@@ -1747,8 +1791,8 @@ class Optimization:
                     zone["envelope_w_per_k"].dropna().to_dict(), times
                 )
             ),
-            zone_floor_open=loops[:2] if loops else (),
-            zone_floor_flow_lpm=loops[2] if loops else None,
+            zone_floor_open=floor_open,
+            zone_floor_flow_lpm=floor_flow,
             zone_heat_may_rise=config.heat_pump.auto_adaptive,
             zone_cooling=cooling,
             zone_mass_minimum_c=(
@@ -1796,6 +1840,41 @@ class Optimization:
                 space_cop_model=space_cop.model,
             ),
         )
+
+    @staticmethod
+    def _planned_rest_rise_k(
+        planned: list[SeriesPoint],
+        on: list[SeriesPoint],
+        times: list[datetime],
+        since: datetime,
+        step: timedelta,
+        run_rise: float = 1.0,
+    ) -> np.ndarray:
+        """How far a rest room rises from its reading at since to each of
+        times (K) as the previous plan had the rest's thermostats rise
+        (planned), the
+        steps that plan heated the zone in (on) run_rise times as fast (see
+        BuildingThermalIdentifier.room_run_rise): what a replan, made every
+        few minutes, takes the room to do meanwhile. Held beyond that plan's
+        end; zero throughout where it was made over a step before this one's
+        start - from another state, or none at all."""
+
+        if not planned or planned[0].time < times[0] - step:
+            return np.zeros(len(times))
+
+        seconds = np.array([point.time.timestamp() for point in planned])
+        values = np.array([point.value for point in planned])
+        # np.interp holds the last value beyond the end.
+        level = np.interp([time.timestamp() for time in times], seconds, values)
+        increments = np.diff(
+            level, prepend=np.interp(since.timestamp(), seconds, values)
+        )
+        # Each increment over the step it ends: the first from since.
+        heated = {point.time for point in on if point.value}
+        spans = [times[0]] + times[:-1]
+        rate = np.array([run_rise if time in heated else 1.0 for time in spans])
+
+        return np.cumsum(rate * increments)
 
     def _dew_point_forecast(
         self, state: State, times: list[datetime], mpc_config: MPCConfig
@@ -2147,7 +2226,9 @@ class Optimization:
             flow_lpm = (
                 measured.flow[-1].value
                 if settled and measured.flow and measured.flow[-1].value > 0
-                else data.zone_floor_flow_lpm
+                else data.zone_floor_flow_lpm[k]
+                if data.zone_floor_flow_lpm
+                else None
             )
             outdoor_c = self._latest(outdoor, now)
             setpoint_c = run_setpoint_c if since is None else None
@@ -2441,6 +2522,36 @@ class Optimization:
         """The heat pump's DHW setpoint now (deg C), None without a reading."""
 
         return self._latest(config.heat_pump.boiler.setpoint, now)
+
+    def _last_reading(
+        self, reference: SensorReference, now: datetime
+    ) -> tuple[datetime, float] | None:
+        """A room thermometer's last reading in the hour before now and when
+        it was taken, None without: the rooms' thermostats report every 30
+        minutes, so a reading may be half an hour old - some 0.07 K of a
+        run's rise."""
+
+        frame = self.loader.load(
+            DatasetBuilder()
+            .timeseries("value", reference, aggregation="last", interval="1m")
+            .build(),
+            now - timedelta(hours=1),
+            now,
+        )
+
+        if frame.empty or "value" not in frame:
+            return None
+
+        readings = frame.assign(
+            value=pd.to_numeric(frame["value"], errors="coerce")
+        ).dropna(subset=["value"])
+
+        if readings.empty:
+            return None
+
+        last = readings.iloc[-1]
+
+        return pd.Timestamp(last["time"]).to_pydatetime(), float(last["value"])
 
     def _latest(self, reference: SensorReference, now: datetime) -> float | None:
         """A sensor's last reading in the quarter hour before now, None without."""
