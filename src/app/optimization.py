@@ -65,6 +65,9 @@ class Optimization:
     # HeatPumpConfig.auto_adaptive on.
     ZONE_BIAS_ENTITY = "sensor.home_optimizer_zone_bias"
     ZONE_SETPOINT_ENTITY = "sensor.home_optimizer_zone_setpoint"
+    # The rest's thermostats' setpoint, only with BuildingConfig.rest_temperature
+    # set (see publish_zone).
+    ZONE_REST_SETPOINT_ENTITY = "sensor.home_optimizer_zone_rest_setpoint"
 
     def __init__(
         self,
@@ -1261,7 +1264,7 @@ class Optimization:
         tank_share = np.divide(
             tank_w, tank_w + zone_w, out=np.zeros_like(drawn), where=tank_w + zone_w > 0
         )
-        # The house's import and export at the median sun and baseload, the
+        # The house's import and export at the median sun and mean baseload, the
         # day a forecast expects: the plan's own scenarios weight each
         # quarter's p90 baseload - its peaks - as if a third of the day drew
         # it (7.1 kWh for 7 Nov 2026 against 5.55 at p50; 6 Nov drew 5.2).
@@ -2313,15 +2316,11 @@ class Optimization:
 
         status = start = setpoint = room = "unknown"
         # The rest's thermostats' setpoint (see
-        # BuildingConfig.rest_temperature): the setpoint's attribute
-        # "rest", only with that minimum set - the minimum while a heating
-        # run is served, the idle setpoint otherwise.
+        # BuildingConfig.rest_temperature), only with that minimum set: the
+        # minimum while a heating run is served, the idle setpoint otherwise -
+        # also where the zone cannot be planned.
         minimum_c = config.building.rest_temperature
-        rest = (
-            {"rest": config.building.rest_idle_temperature}
-            if minimum_c is not None
-            else {}
-        )
+        rest_c = config.building.rest_idle_temperature
         published = None
         bias: float | None = None
 
@@ -2363,7 +2362,7 @@ class Optimization:
             status = "on" if running else "off"
 
             if minimum_c is not None and serving and not data.zone_cooling:
-                rest["rest"] = minimum_c
+                rest_c = minimum_c
 
             if first is not None:
                 start = (
@@ -2495,9 +2494,19 @@ class Optimization:
                 "friendly_name": "Home Optimizer zone setpoint",
                 "device_class": "temperature",
                 "unit_of_measurement": "°C",
-                **rest,
             },
         )
+
+        if minimum_c is not None:
+            self.home_assistant.set_state(
+                self.ZONE_REST_SETPOINT_ENTITY,
+                f"{rest_c:.1f}",
+                {
+                    "friendly_name": "Home Optimizer zone rest setpoint",
+                    "device_class": "temperature",
+                    "unit_of_measurement": "°C",
+                },
+            )
         self.home_assistant.set_state(
             self.ZONE_SUPPLY_ENTITY,
             setpoint,

@@ -624,6 +624,28 @@ def test_the_plan_is_solved_apart_from_its_warm_start(monkeypatch):
         assert warm_start is not plan
 
 
+def test_a_start_that_leaves_the_band_keeps_the_solver_searching():
+    """The solver's own search for plans is only switched off behind a start
+    near the optimum: a previous plan that leaves the zone's band - here one
+    that never heats it - is no such start, the plan itself is."""
+
+    optimizer = MPCOptimizer(THERMAL_MODEL, NO_EXPORT, building_model=BUILDING_MODEL)
+    data = _zone_input()
+    plan = tuple(optimizer.solve(data).space_schedule)
+    broken = {}
+
+    for name, previous in (("idle", (0,) * len(plan)), ("plan", plan)):
+        started = replace(data, previous_space_on=previous)
+        model = optimizer._build_model(started, optimizer._tank_setting(started))
+        solver = optimizer._solver()
+        solver.set_instance(model)
+        assert optimizer._warm_start(model, started, solver)
+        broken[name] = optimizer._breaks_promise(model)
+
+    assert any(plan)
+    assert broken == {"idle": True, "plan": False}
+
+
 def test_validate_input_rejects_mismatched_target_length():
     data = _make_input(target_temperature_top=(10.0, 10.0))  # wrong length
 
@@ -631,6 +653,18 @@ def test_validate_input_rejects_mismatched_target_length():
 
     with pytest.raises(ValueError):
         optimizer.solve(data)
+
+
+def test_validate_input_rejects_a_forecast_with_a_gap():
+    """A NaN reaching the solver hangs the job for good (see _validate_input)."""
+
+    forecast = [5.0] * len(SOLAR_FORECAST_W)
+    forecast[3] = float("nan")
+
+    with pytest.raises(ValueError, match="outdoor_temperature_forecast"):
+        MPCOptimizer(THERMAL_MODEL, MPCConfig()).solve(
+            _make_input(outdoor_temperature_forecast=tuple(forecast))
+        )
 
 
 def test_no_heating_scheduled_when_target_already_below_current():

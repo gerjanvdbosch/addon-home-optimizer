@@ -383,6 +383,7 @@ def _quantile_rows(n: int, lead_time_hours: float) -> pd.DataFrame:
             "p50": 1000.0,
             "p90": 1500.0,
             "lead_time_hours": lead_time_hours,
+            "solar_elevation": 40.0,
         }
     )
 
@@ -396,7 +397,7 @@ def test_fit_quantile_scale_makes_each_tail_hold_ten_percent():
 
     rows = _quantile_rows(MIN_QUANTILE_N * 2, lead_time_hours=1.0)
 
-    scale = _fit_quantile_scale(rows)
+    scale = _fit_quantile_scale(rows, _ElevationBiasModel(bins=ELEVATION_BINS))
 
     assert set(scale) == {"0-2h"}
     k10, k90 = scale["0-2h"]
@@ -411,7 +412,7 @@ def test_fit_quantile_scale_skips_buckets_with_too_little_data():
 
     rows = _quantile_rows(MIN_QUANTILE_N - 1, lead_time_hours=1.0)
 
-    assert _fit_quantile_scale(rows) == {}
+    assert _fit_quantile_scale(rows, _ElevationBiasModel(bins=ELEVATION_BINS)) == {}
 
 
 def test_fit_quantile_scale_only_calibrates_the_0_2h_bucket():
@@ -425,7 +426,9 @@ def test_fit_quantile_scale_only_calibrates_the_0_2h_bucket():
         ]
     )
 
-    assert set(_fit_quantile_scale(rows)) == {"0-2h"}
+    model = _ElevationBiasModel(bins=ELEVATION_BINS)
+
+    assert set(_fit_quantile_scale(rows, model)) == {"0-2h"}
 
 
 def test_quantile_scale_arrays_maps_by_lead_time_and_defaults_to_raw():
@@ -607,7 +610,12 @@ def test_predict_solar_band_scales_only_calibrated_lead_times():
     model.quantile_scale = {"0-2h": (0.8, 1.2)}
 
     low, high = predict_solar_band(
-        model, pd.Series(1000.0, index=times), pd.Series(2000.0, index=times), now
+        model,
+        pd.Series(1000.0, index=times),
+        pd.Series(2000.0, index=times),
+        now,
+        LATITUDE,
+        LONGITUDE,
     )
 
     assert low[times[0]] == pytest.approx(800.0)
@@ -618,6 +626,30 @@ def test_predict_solar_band_scales_only_calibrated_lead_times():
         diff == np.timedelta64(PREDICT_STEP_MINUTES, "m")
         for diff in low.index.diff()[1:]
     )
+
+
+def test_predict_solar_band_carries_the_elevation_bias():
+    """The installation's bias holds for every outcome of the weather, so the
+    band moves with p50 - or p10 ends up above the corrected p50 on a clear
+    day."""
+
+    now = datetime(2026, 6, 21, 10, 0, tzinfo=UTC)
+    times = pd.DatetimeIndex([now + timedelta(hours=h) for h in (3.0, 3.5)])
+    model = _ElevationBiasModel(bins=[0.0, 90.0]).fit(
+        pd.DataFrame({"solar_elevation": [40.0]}), pd.Series([0.9]), pd.Series([1.0])
+    )
+
+    low, high = predict_solar_band(
+        model,
+        pd.Series(1000.0, index=times),
+        pd.Series(2000.0, index=times),
+        now,
+        LATITUDE,
+        LONGITUDE,
+    )
+
+    assert low[times[0]] == pytest.approx(900.0)
+    assert high[times[0]] == pytest.approx(1800.0)
 
 
 def test_uncalibrated_model_keeps_the_raw_solcast_band():
@@ -632,6 +664,8 @@ def test_uncalibrated_model_keeps_the_raw_solcast_band():
         pd.Series(1000.0, index=times),
         pd.Series(2000.0, index=times),
         now,
+        LATITUDE,
+        LONGITUDE,
     )
 
     assert low[times[0]] == pytest.approx(1000.0)

@@ -19,8 +19,8 @@ NOW = pd.Timestamp("2026-10-28 06:00", tz="UTC")
 
 def _history(weeks: int = 13) -> pd.DataFrame:
     """100 W, except Wednesday at 10 local: 500 W at 10:00-10:15 in the last
-    8 weeks before today, 5000 W the whole hour in the 4 weeks before those,
-    and 9999 W today."""
+    8 weeks before today - 1300 W in the last of them - 5000 W the whole hour
+    in the 4 weeks before those, and 9999 W today."""
 
     time = pd.date_range(NOW - pd.Timedelta(weeks=weeks), NOW, freq="15min")
     local = time.tz_convert(LOCAL_TIMEZONE)
@@ -29,6 +29,9 @@ def _history(weeks: int = 13) -> pd.DataFrame:
     recent = local >= midnight - pd.DateOffset(weeks=8)
     power = np.full(len(time), 100.0)
     power[hour & (local.minute == 0) & recent] = 500.0
+    power[hour & (local.minute == 0) & (local >= midnight - pd.DateOffset(weeks=1))] = (
+        1300.0
+    )
     power[hour & ~recent] = 5000.0
     power[local >= midnight] = 9999.0
     return pd.DataFrame({"time": time, "P_baseload": power})
@@ -44,15 +47,16 @@ def habit() -> tuple[list[float], list[float], list[float]]:
     return BaseloadForecaster().habit(_history())
 
 
-def test_the_median_takes_eight_weeks_the_band_twelve_and_never_today(habit):
-    """The same quarter hour's median over the 8 weeks before midnight; the
-    band from that weekday's hour over 12 weeks - here the older spikes too;
-    today's readings in neither."""
+def test_the_mean_takes_eight_weeks_the_band_twelve_and_never_today(habit):
+    """The same quarter hour's mean over the 8 weeks before midnight, one
+    week's peak in it - its energy, which a median leaves out; the band from
+    that weekday's hour over 12 weeks - here the older spikes too; today's
+    readings in neither."""
 
     p10, p50, p90 = habit
 
-    assert p50[_slot("wed", 10)] == 500.0
-    assert p50[_slot("wed", 10, 15)] == 100.0
+    assert p50[_slot("wed", 10)] == pytest.approx(600.0)
+    assert p50[_slot("wed", 10, 15)] == pytest.approx(100.0)
     assert p90[_slot("wed", 10, 30)] == 5000.0
     assert p90[_slot("tue", 10)] == 100.0
     assert p10[_slot("wed", 10)] == 100.0
@@ -72,8 +76,8 @@ def test_the_forecast_keeps_the_local_clock_across_a_dst_change():
     assert (forecast["baseload"] == _slot("sat", 17, 45)).all()
 
 
-def test_the_band_holds_the_median():
-    """A quarter hour's median outside its hour's band widens the band to it."""
+def test_the_band_holds_the_mean():
+    """A quarter hour's mean outside its hour's band widens the band to it."""
 
     size = BaseloadForecaster.QUARTERS_PER_WEEK
     times = pd.DatetimeIndex(["2026-10-28 09:00Z"])
@@ -127,4 +131,4 @@ def test_the_habit_is_made_once_a_day_and_forecast_every_plan():
     )
 
     assert len(loads) == 2
-    assert forecast["baseload"].iloc[0] == 500.0
+    assert forecast["baseload"].iloc[0] == pytest.approx(600.0)

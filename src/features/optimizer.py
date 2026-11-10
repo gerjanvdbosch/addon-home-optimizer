@@ -3,7 +3,7 @@ import math
 import time
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 
 import highspy
 import numpy as np
@@ -104,7 +104,11 @@ COMFORT_TANGENT_SPACING_K = 0.2
 # what is left is proving it - on real data they took a quarter of the solve's
 # LP iterations and 21 sub-MIPs (heating with the zone 12.8 -> 9.1 s, cooling
 # 6.3 -> 1.7 s, and a better plan at the time limit over 48 hours). A solve
-# without a start keeps them: cold, they found the plan sooner.
+# without a start keeps them: cold, they found the plan sooner. So does one
+# whose start breaks a promise (see MPCOptimizer._breaks_promise): without a
+# plan near the optimum to cut its branching off against, the search took
+# 52-72 s on real data (9-10 Nov 2026, three replans) against 22-35 s with
+# them, the same plans.
 WARM_START_HIGHS_OPTIONS = {
     "mip_heuristic_effort": 0.0,
     "mip_heuristic_run_feasibility_jump": False,
@@ -941,9 +945,12 @@ class MPCOptimizer:
         # dearer). Once more around the zone as settled, that plan both a
         # tank plan and the start, and the cheaper of the two kept.
         settled = tuple(int(on) for on in result.space_schedule)
-        around = plan_tank(tank, settled, data.zone_cooling, data.zone_local_day)
 
-        if settled != tuple(data.previous_space_on) and _runs(around) != chosen:
+        if (
+            settled != tuple(data.previous_space_on)
+            and _runs(plan_tank(tank, settled, data.zone_cooling, data.zone_local_day))
+            != chosen
+        ):
             again, _ = self._solve_with_zone(
                 replace(data, previous_space_on=settled), tank
             )
@@ -1024,7 +1031,7 @@ class MPCOptimizer:
             solver,
         )
 
-        if solver.config.warmstart:
+        if solver.config.warmstart and not self._breaks_promise(model):
             solver.highs_options = {**solver.highs_options, **WARM_START_HIGHS_OPTIONS}
 
         # A start found is part of the solve and shares its time; one that
@@ -1261,6 +1268,23 @@ class MPCOptimizer:
 
         return solver
 
+    @staticmethod
+    def _breaks_promise(model: pyo.ConcreteModel) -> bool:
+        """Whether the start loaded into the model (see _warm_start) leaves the
+        tank's target band or the zone's comfort band: the slacks priced at
+        weight_temperature_slack, which measure only what a plan can still
+        change. Such a start is a previous plan the house no longer follows -
+        a run started by hand, a restart, a defrost - and far from optimal."""
+
+        return any(
+            pyo.value(model.slack[k])
+            - pyo.value(model.slack_in[k])
+            + pyo.value(model.zone_slack[k])
+            + pyo.value(model.zone_excess[k])
+            > ZONE_BOUND_MARGIN_K
+            for k in model.K
+        )
+
     def _warm_start(
         self, model: pyo.ConcreteModel, data: MPCInput, solver: Highs
     ) -> bool:
@@ -1328,6 +1352,21 @@ class MPCOptimizer:
                     f"{name} must be empty or have the same length as "
                     f"solar_forecast_w ({horizon}), got {len(getattr(data, name))}."
                 )
+
+        # A NaN in a series - a forecast with a gap - ends up in the program's
+        # rows, and HiGHS warns per row into the pipe Pyomo reads its log from
+        # on a thread that is waiting for the interpreter HiGHS holds: the job
+        # then never returns (replayed on real data, 8 Nov 2026 16:33 UTC, an
+        # outdoor forecast of only NaN).
+        for name in (f.name for f in fields(data)):
+            series = getattr(data, name)
+
+            if (
+                isinstance(series, (list, tuple))
+                and all(isinstance(value, (int, float)) for value in series)
+                and not np.all(np.isfinite(series))
+            ):
+                raise ValueError(f"{name} has values that are not finite.")
 
         if any(
             export > import_ for import_, export in zip(*self.prices(data), strict=True)
@@ -2840,9 +2879,7 @@ class MPCOptimizer:
         if cop is None or outdoor_c is None or not cop.q_in_at_zero_outdoor_w:
             return self._heat_w * gain
 
-        return (
-            cop.q_in_at_zero_outdoor_w + cop.q_in_per_outdoor_w_per_k * outdoor_c
-        ) * gain
+        return float(cop.heat_input_w(outdoor_c)) * gain
 
     def _initial_temperature(self, data: MPCInput) -> float:
         """The tank the plan starts from now (deg C) - its first step runs from
@@ -3078,10 +3115,7 @@ class MPCOptimizer:
                 cop.start_shortfall_at_zero_outdoor_j
                 + cop.start_shortfall_per_outdoor_j_per_k * outdoor_c
             )
-            heat_w = (
-                cop.q_in_at_zero_outdoor_w + cop.q_in_per_outdoor_w_per_k * outdoor_c
-            )
-            return max(2.0 * shortfall_j / heat_w, 0.0)
+            return max(2.0 * shortfall_j / float(cop.heat_input_w(outdoor_c)), 0.0)
 
         return (cop and cop.start_ramp_seconds) or self.thermal_model.q_in_ramp_seconds
 
@@ -3259,7 +3293,15 @@ class MPCOptimizer:
             else self.SPACE_HEATING_SUPPLY_C
         )
 
-        return float(cop_model.clamped_cop(outdoor_c, supply_c))
+        # At the floor's least heat, where its runs sit (see
+        # HeatPumpCOPModel.approach_per_heat_k_per_w).
+        heat_w = (
+            self.floor_circuit_model.min_heat_w
+            if self.floor_circuit_model is not None and not cooling
+            else None
+        )
+
+        return float(cop_model.clamped_cop(outdoor_c, supply_c, heat_w))
 
     def _add_space_heating(
         self,
@@ -3848,7 +3890,9 @@ class MPCOptimizer:
 
             supply_c = sink_c + sign * moved_w / conductance[k]
 
-            return moved_w / float(efficiency.clamped_cop(zone_outdoor_c[k], supply_c))
+            return moved_w / float(
+                efficiency.clamped_cop(zone_outdoor_c[k], supply_c, moved_w)
+            )
 
         supply_minimum_c = data.zone_supply_minimum_c or None
         model.space_supply_c = []
@@ -3898,7 +3942,9 @@ class MPCOptimizer:
                     )
 
                 # What that heat draws: the heat over the COP (EER) at the
-                # supply it takes, T_sink +- Q / G - so more heat moved means a
+                # supply it takes, T_sink +- Q / G, and at the approaches that
+                # heat takes (HeatPumpCOPModel.approach_per_heat_k_per_w) - so
+                # more heat moved means a
                 # higher lift and a lower COP (real cooling data: an EER of 5.3
                 # at the least cooling, 5.0 at 4.5 kW, from a 21 degC floor on
                 # a 25 degC day). Convex in the heat for a given mass, heating

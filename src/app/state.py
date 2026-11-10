@@ -196,6 +196,8 @@ class StateManager:
                 self._future_series(forecast.p10, now),
                 self._future_series(forecast.p90, now),
                 now,
+                self.latitude,
+                self.longitude,
             )
 
         # Without a calibrated band there is no forecast variance to weigh the

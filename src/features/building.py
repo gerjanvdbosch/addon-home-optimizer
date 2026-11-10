@@ -111,7 +111,15 @@ def facade_irradiance_w_per_m2(
     free parameters. A Perez-type model would be more accurate for diffuse on a
     vertical surface, but its extra empirical coefficients cannot be checked
     against anything measured at this installation, and the identified effective
-    aperture a_eff_m2 would silently absorb the difference.
+    aperture a_eff_m2 would silently absorb the difference. Hay and Davies's,
+    which has none - the beam's share of the sun's light outside the
+    atmosphere comes from around the sun - gave this facade 9-12% more under
+    a clear sky and did no better: walk-forward (eight folds, fitted up to 18
+    Aug - 3 Nov 2026, scored on the week after) the living room 0.0913 ->
+    0.0919 K, in the sun 0.105 -> 0.113 K, the rest the same, whether or not
+    the side walls shade that light as they do the beam. The PV array's
+    measured sky (see BuildingThermalIdentifier._measured_sky) already
+    carries how clear it is.
     """
 
     position = solarposition.get_solarposition(
@@ -447,10 +455,21 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # The windows opened overnight (see BuildingThermalModel.ua_window_w_per_k):
     # at most 300 W/K, some 900 m3/h - several wide open, the house aired
     # through at two to three air changes an hour. Half the nights open on a
-    # day between 10 degC, still heating, and 25 degC, a hot summer's day; the
-    # occupants' choice spread over at least 0.5 K, a sharper switch than a
-    # day's mean resolves from one night to the next, and at most 5 K, past
-    # which it is the season-long ramp the data rejects. Started where the
+    # day between 15.5 degC, the heating limit of degree-day practice under
+    # which a house wants heat rather than cooling, and 25 degC, a hot
+    # summer's day; the occupants' choice spread over at least 0.5 K, a
+    # sharper switch than a day's mean resolves from one night to the next,
+    # and at most 2 K, so that the term is gone in the heating season. Wider
+    # (from 10 degC, spread up to 5 K, closed up to 12 h) the fit, weighing
+    # the newest days most, made another term of it from mid October 2026:
+    # half the nights at 18.5-21.8 degC spread over 3.8-4.9 K and closed at
+    # 7.7-11.1 h, the envelope down from 86 to 70 W/K - a loss falling with
+    # the cold, the living room 0.11-0.17 K too warm in the nights of 3-9
+    # Nov. Walk-forward (seven folds Aug-Nov 2026, 12 h ahead) with these
+    # bounds: the living room 2% better (that week 0.127 -> 0.112 K, its
+    # bias at 12 h +0.08 -> +0.04 K), the rest 2% worse, runs with the floor
+    # active 1% worse; the shape held at summer's altogether, the living
+    # room 4% better and the rest 4% worse. Started where the
     # filter's missing loss puts them. Fitted on Jun-Oct 2026 with two weeks
     # held out (four folds): half the nights at 17.9-18.9 degC (+-0.2),
     # spread 0.9-1.2 K, the windows shut 71-97 W/K. Held out, the living
@@ -463,15 +482,16 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # rest's opened earlier (20-22 h) - no gain for four parameters more.
     MAX_UA_WINDOW_W_PER_K = 300.0
     INITIAL_UA_WINDOW_W_PER_K = 50.0
-    MIN_WINDOW_HALF_DAY_C = 10.0
+    MIN_WINDOW_HALF_DAY_C = 15.5
     MAX_WINDOW_HALF_DAY_C = 25.0
     INITIAL_WINDOW_HALF_DAY_C = 17.0
     MIN_WINDOW_SPREAD_K = 0.5
-    MAX_WINDOW_SPREAD_K = 5.0
+    MAX_WINDOW_SPREAD_K = 2.0
     INITIAL_WINDOW_SPREAD_K = 1.5
     # The household's own hours of opening and closing them: opened in the
     # evening or night, from 16 h to 4 h, and closed in the morning, from 3 to
-    # 12 h - the windows of a night. Their times spread from night to night
+    # 8 h, before the day's air is warmer than the house - the windows of a
+    # night. Their times spread from night to night
     # over at least a quarter of an hour, the data's own step, and at most
     # 3 h. Started at the hours the filter's missing loss shows (23 and 7).
     # On all of Jun-Oct 2026 opened at 21:50 (+-15 min) and closed at 05:35
@@ -483,7 +503,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     MAX_WINDOW_OPEN_HOUR = 28.0
     INITIAL_WINDOW_OPEN_HOUR = 23.0
     MIN_WINDOW_CLOSE_HOUR = 3.0
-    MAX_WINDOW_CLOSE_HOUR = 12.0
+    MAX_WINDOW_CLOSE_HOUR = 8.0
     INITIAL_WINDOW_CLOSE_HOUR = 7.0
     MIN_WINDOW_HOUR_SPREAD_H = 0.25
     MAX_WINDOW_HOUR_SPREAD_H = 3.0

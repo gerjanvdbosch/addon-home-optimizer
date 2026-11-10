@@ -137,7 +137,7 @@ class TapHabit(BaseModel):
 
 
 class BaseloadHabit(BaseModel):
-    """The baseload's habit (see BaseloadForecaster.habit): its p10, median and
+    """The baseload's habit (see BaseloadForecaster.habit): its p10, mean and
     p90 per local quarter hour of the week from Monday 00:00 (W, 672 each).
     Made once a day."""
 

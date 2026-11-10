@@ -4,7 +4,7 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import least_squares, minimize_scalar
+from scipy.optimize import isotonic_regression, least_squares, minimize_scalar
 
 from domain.config import Config, HeatPumpStates
 from domain.dataset import DatasetDefinition
@@ -512,10 +512,15 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             delta_t_evap, float(std_errors[1]), bool(result.active_mask[1])
         )
 
+        # The heat the approaches hold at: this fit's own readings', or the
+        # DHW fit's with its approach.
+        approach_heat_w = float(df["Q_th"].mean())
+
         if shared is not None:
             # With the approach fixed the COP is eta_carnot times the Carnot
             # COP, so eta_carnot is a least-squares solve through the origin.
-            delta_t_evap = shared
+            delta_t_evap = float(shared.delta_t_evap)
+            approach_heat_w = shared.approach_heat_w
             carnot = HeatPumpCOPModel(
                 eta_carnot=1.0,
                 delta_t_cond=self.FIXED_DELTA_T_COND,
@@ -534,17 +539,30 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             std_errors = np.array([eta_std_error, 0.0])
             self.parameter_std_errors = {"eta_carnot": eta_std_error}
 
+        approach_per_heat_k_per_w = 0.0
+
+        # Only at the DHW fit's approach, a tank run's heat apart from a floor
+        # run's: an approach of its own already fitted to the floor's heats
+        # leaves their growth nothing to be told from.
+        if self.key == "heating" and shared is not None and approach_heat_w:
+            part_load = self._fit_part_load(df, delta_t_evap, approach_heat_w)
+
+            if part_load is not None:
+                eta_carnot, approach_per_heat_k_per_w = part_load
+
         logger.info(
             "Heat pump COP parameters calibrated (%s): "
             "eta_carnot=%.4f±%.4f, "
             "delta_t_cond=%.3f K (fixed), "
-            "delta_t_evap=%.3f±%.3f K",
+            "delta_t_evap=%.3f±%.3f K at %.0f W, %+.2f K per kW beyond it",
             self.mode,
             eta_carnot,
             std_errors[0],
             self.FIXED_DELTA_T_COND,
             delta_t_evap,
             std_errors[1],
+            approach_heat_w,
+            approach_per_heat_k_per_w * 1000.0,
         )
 
         # Planning (MPCOptimizer) needs a stand-in for the heat pump's actual
@@ -564,6 +582,8 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             delta_t_cond=self.FIXED_DELTA_T_COND,
             delta_t_evap=delta_t_evap,
             cooling=self.cooling,
+            approach_heat_w=approach_heat_w,
+            approach_per_heat_k_per_w=approach_per_heat_k_per_w,
             start_step_power_w=start_step_power_w,
             start_ramp_seconds=start_ramp_seconds,
             start_shortfall_at_zero_outdoor_j=shortfall_at_zero_j,
@@ -615,13 +635,29 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             return self.model
 
         self.model.reference_supply_temperature_c = float(df["T_supply"].quantile(0.95))
+        speed = self._run_speed(df)
+
+        if speed is not None:
+            self.model.speed_outdoor_c, self.model.speed_hz = self._speed_steps(
+                df, speed
+            )
+            self.model.reference_speed_hz = float(speed.median())
+            logger.info(
+                "Heat pump COP calibration (%s): runs hold %s Hz at %s degC "
+                "outdoor, the lines given at %.0f Hz",
+                self.mode,
+                np.round(self.model.speed_hz, 1).tolist(),
+                np.round(self.model.speed_outdoor_c, 1).tolist(),
+                self.model.reference_speed_hz,
+            )
+
         # See the class docstring on POWER_FIT_T_LOW_C/HIGH_C and
         # USUAL_SPEED_ROBUST_STD. On all of it, like the COP parameters.
         (
             self.model.q_th_at_power_fit_low_w,
             self.model.q_th_at_power_fit_high_w,
             self.model.q_th_per_outdoor_w_per_k,
-        ) = self._fit_q_th_line(df, self.model)
+        ) = self._fit_q_th_line(df, self.model, speed)
         # On all of it, not a training split: the line is planned with at
         # the coming days' outdoor temperature, which the season moves past
         # what older runs saw, and the newest runs are the nearest to it.
@@ -633,7 +669,9 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         (
             self.model.q_in_at_zero_outdoor_w,
             self.model.q_in_per_outdoor_w_per_k,
-        ) = self._fit_heat_input(df)
+        ) = self._fit_heat_input(
+            df, 1.0 if speed is None else speed / self.model.reference_speed_hz
+        )
 
         logger.info(
             "Heat pump COP calibration (%s): reference_supply_temperature_c="
@@ -659,9 +697,9 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
 
     def _shared_delta_t_evap(
         self, delta_t_evap: float, std_error: float, at_bound: bool
-    ) -> float | None:
-        """The DHW model's outdoor coil approach, for a heating or cooling fit
-        that cannot pin down its own.
+    ) -> HeatPumpCOPModel | None:
+        """The DHW model, for its outdoor coil approach (and the heat that was
+        fitted at), for a heating or cooling fit that cannot pin down its own.
 
         Every mode exchanges heat with outdoor air through the same coil, so
         its approach is one physical quantity; what differs between them is the
@@ -714,10 +752,142 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             dhw.model.delta_t_evap,
         )
 
-        return float(dhw.model.delta_t_evap)
+        return dhw.model
+
+    # The least compressor readings, and the least spread in their speed (Hz,
+    # standard deviation), a part-load fit is made on: one speed says nothing
+    # of another.
+    MIN_PART_LOAD_READINGS = 100
+    MIN_PART_LOAD_SPEED_STD_HZ = 2.0
+
+    def _fit_part_load(
+        self, df: pd.DataFrame, delta_t_evap: float, approach_heat_w: float
+    ) -> tuple[float, float] | None:
+        """eta_carnot and how much the approaches grow per W of heat moved
+        (HeatPumpCOPModel.approach_per_heat_k_per_w), at the approaches given
+        for approach_heat_w. None where the readings do not show it.
+
+        Against the heat the compressor's speed gives, not the heat measured:
+        that one is the water's rise, read in 0.5 K steps on a rise of 3 K, and
+        its error stands in the measured COP too - a reading too high in heat
+        is too high in COP, which hid the effect and turned its sign (real
+        data, 185 quarter hours: +3.4% COP per kW against the heat measured,
+        -0.6% per Hz against the speed). The speed is read apart from both: the
+        heat as a line in it, steeper in warmer air, whose denser vapour the
+        compressor moves more of per turn (see q_th_per_outdoor_w_per_k).
+
+        No more than leaves an approach at no heat: an exchanger passing none
+        has none."""
+
+        if "compressor_frequency" not in df.columns:
+            return None
+
+        speed = pd.to_numeric(df["compressor_frequency"], errors="coerce")
+        df = df.loc[speed > 0.0]
+        speed = speed.loc[df.index].to_numpy(dtype=float)
+
+        if (
+            len(df) < self.MIN_PART_LOAD_READINGS
+            or speed.std() < self.MIN_PART_LOAD_SPEED_STD_HZ
+        ):
+            return None
+
+        T_outdoor = df["T_outdoor"].to_numpy(dtype=float)
+        T_supply = df["T_supply"].to_numpy(dtype=float)
+        COP_measured = df["COP_measured"].to_numpy(dtype=float)
+        design = np.column_stack(
+            [np.ones(len(df)), speed, T_outdoor, speed * T_outdoor]
+        )
+        heat_w = design @ np.linalg.lstsq(design, df["Q_th"], rcond=None)[0]
+
+        def residuals(parameters: np.ndarray) -> np.ndarray:
+            return (
+                HeatPumpCOPModel(
+                    eta_carnot=parameters[0],
+                    delta_t_cond=self.FIXED_DELTA_T_COND,
+                    delta_t_evap=delta_t_evap,
+                    approach_heat_w=approach_heat_w,
+                    approach_per_heat_k_per_w=parameters[1],
+                ).cop(T_outdoor, T_supply, heat_w)
+                - COP_measured
+            )
+
+        most = (self.FIXED_DELTA_T_COND + delta_t_evap) / approach_heat_w
+        result = least_squares(
+            residuals,
+            x0=np.array([self.INITIAL_ETA, 0.5 * most]),
+            bounds=(np.array([self.MIN_ETA, 0.0]), np.array([self.MAX_ETA, most])),
+        )
+        std_error = float(self._parameter_std_errors(result)[1])
+        per_heat = float(result.x[1])
+
+        if result.active_mask[1] or not np.isfinite(std_error) or std_error > per_heat:
+            logger.info(
+                "Heat pump COP calibration (%s): no growth of the approaches "
+                "with the heat identified (%.2f+/-%.2f K per kW)",
+                self.mode,
+                per_heat * 1000.0,
+                std_error * 1000.0,
+            )
+            return None
+
+        return float(result.x[0]), per_heat
+
+    def _run_speed(self, df: pd.DataFrame) -> pd.Series | None:
+        """The compressor speed (Hz) each reading's run rose to and held: the
+        highest of the run, as a run rises to the speed the outdoor unit caps
+        it at and only slows from there (see HeatPumpCOPModel.speed_hz). None
+        without a compressor frequency."""
+
+        frequency = pd.to_numeric(
+            df.get("compressor_frequency", pd.Series(np.nan, index=df.index)),
+            errors="coerce",
+        )
+
+        if frequency.notna().sum() < 2:
+            return None
+
+        run = (df["time"].diff() > self.RUN_GAP).cumsum()
+
+        return frequency.groupby(run).transform("max")
+
+    def _speed_steps(
+        self, df: pd.DataFrame, speed: pd.Series
+    ) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        """(outdoor temperatures degC, the speed runs hold at each Hz), see
+        HeatPumpCOPModel.speed_hz: the steps that fit the runs' speeds best by
+        least squares while never rising with the outdoor temperature - the
+        unit allows more speed in colder air, never less. Each step's coldest
+        and warmest run, so the speed is held across a step and interpolated
+        between two.
+
+        Against the forecast outdoor temperature the plan has, not the unit's
+        own reading the cap follows: where the two disagree a run sits in the
+        wrong step and the fit averages it with its neighbours - the speed to
+        expect at that forecast."""
+
+        run = (df["time"].diff() > self.RUN_GAP).cumsum()
+        runs = (
+            pd.DataFrame({"outdoor_c": df["T_outdoor"], "speed": speed})
+            .groupby(run)
+            .mean()
+            .dropna()
+            .sort_values("outdoor_c")
+        )
+        held = isotonic_regression(runs["speed"], increasing=False).x
+        ends = np.r_[True, np.diff(held) != 0.0]
+        ends |= np.r_[ends[1:], True]
+
+        return (
+            tuple(runs["outdoor_c"].to_numpy()[ends].tolist()),
+            tuple(held[ends].tolist()),
+        )
 
     def _fit_q_th_line(
-        self, df: pd.DataFrame, cop_model: HeatPumpCOPModel
+        self,
+        df: pd.DataFrame,
+        cop_model: HeatPumpCOPModel,
+        speed: pd.Series | None = None,
     ) -> tuple[float, float, float]:
         """Q_th at POWER_FIT_T_LOW_C/HIGH_C and 0 degC outdoor, and its rise
         per K outdoor (see HeatPumpCOPModel.q_th_per_outdoor_w_per_k), from a
@@ -726,7 +896,9 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         electrical power is what planning costs, so that is the error to
         minimize, not the Q_th error itself. Linear in its coefficients, so an
         ordinary least-squares solve. Uses only rows with the compressor at its
-        usual speed (see USUAL_SPEED_ROBUST_STD). A temperature that barely
+        usual speed (see USUAL_SPEED_ROBUST_STD): its run's own (speed, see
+        _run_speed) where given, with the power read at the model's reference
+        speed, to which it is proportional. A temperature that barely
         varies leaves its slope unidentifiable: the outdoor one is dropped
         first, then the supply one, down to a flat Q_th. All rows, with a
         warning, without a compressor frequency to tell them by.
@@ -738,9 +910,10 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         )
 
         if frequency.notna().sum() >= 2:
-            median = frequency.median()
-            spread = self.MAD_TO_STD * (frequency - median).abs().median()
-            rows = df[frequency >= median - self.USUAL_SPEED_ROBUST_STD * spread]
+            below = frequency if speed is None else frequency - speed
+            median = below.median()
+            spread = self.MAD_TO_STD * (below - median).abs().median()
+            rows = df[below >= median - self.USUAL_SPEED_ROBUST_STD * spread]
         else:
             logger.warning(
                 "Heat pump COP calibration (%s): no compressor frequency - "
@@ -752,6 +925,10 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
 
         T_supply = rows["T_supply"].to_numpy(dtype=float)
         P_el = rows["P_el"].to_numpy(dtype=float)
+
+        if speed is not None:
+            P_el = P_el * cop_model.reference_speed_hz / speed[rows.index].to_numpy()
+
         inverse_cop = 1.0 / cop_model.clamped_cop(
             rows["T_outdoor"].to_numpy(dtype=float), T_supply
         )
@@ -1055,15 +1232,18 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         return ramp_s, float(np.median(offsets))
 
     @staticmethod
-    def _fit_heat_input(df: pd.DataFrame) -> tuple[float, float]:
+    def _fit_heat_input(df: pd.DataFrame, speed_ratio=1.0) -> tuple[float, float]:
         """(heat at 0 degC outdoor W, its rise per K outdoor) from a line fitted
         by least squares to the calorimetric heat of every reading after the
         start-up (see STARTUP), so a run's full steps as the plan meets them,
-        modulation included. Flat, at the mean, where the outdoor temperature
-        barely varies: the slope is then not identifiable."""
+        modulation included - read at the reference speed, each reading's heat
+        over speed_ratio, the speed its run held over that one (see
+        HeatPumpCOPModel.speed_hz). Flat, at the mean, where the outdoor
+        temperature barely varies: the slope is then not identifiable."""
 
         return HeatPumpCOPIdentifier._outdoor_line(
-            df["T_outdoor"].to_numpy(dtype=float), df["Q_th"].to_numpy(dtype=float)
+            df["T_outdoor"].to_numpy(dtype=float),
+            (df["Q_th"] / speed_ratio).to_numpy(dtype=float),
         )
 
     @staticmethod
@@ -1128,19 +1308,9 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
 
         COP_measured = test_df["COP_measured"].to_numpy(dtype=float)
 
-        parameters = np.array(
-            [
-                model.eta_carnot,
-                model.delta_t_evap,
-            ]
-        )
-
-        COP_predicted = self._predict_cop(
-            parameters,
-            T_outdoor,
-            T_supply,
-            model.delta_t_cond,
-            model.cooling,
+        # At the heat each reading moved (see approach_per_heat_k_per_w).
+        COP_predicted = model.cop(
+            T_outdoor, T_supply, test_df["Q_th"].to_numpy(dtype=float)
         )
 
         r2 = r2_score(COP_measured, COP_predicted)

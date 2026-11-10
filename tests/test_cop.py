@@ -790,3 +790,91 @@ def test_the_start_up_is_read_only_from_runs_the_compressor_starts_for():
 
     assert ramp_s == pytest.approx(800.0, rel=0.02)
     assert power_w == pytest.approx(2000.0 * (1.0 - 400.0 / 900.0), rel=0.01)
+
+
+def test_heating_fit_reads_the_approach_growing_with_the_heat_off_the_speed(tmp_path):
+    """A floor run's approaches shrink with its heat below the tank run's the
+    DHW approach was fitted at. Read off the compressor's speed: the measured
+    heat carries the water temperatures' error into the measured COP too."""
+
+    dhw = HeatPumpCOPIdentifier(key="dhw")
+    dhw.model = dataclasses.replace(TRUE_COP_MODEL, approach_heat_w=6000.0)
+    dhw.save(tmp_path)
+    true = dataclasses.replace(dhw.model, approach_per_heat_k_per_w=1.5e-3)
+
+    rng = np.random.default_rng(3)
+    df = _simulate(rng, HEATING_STATE, t_supply=28.0)
+    # One outdoor temperature, so the approach is the DHW fit's.
+    df["T_outdoor"] = 5.0
+    df["compressor_frequency"] = rng.uniform(26.0, 50.0, size=N)
+    heat_w = 110.0 * df["compressor_frequency"]
+    df["P_el"] = heat_w / true.cop(5.0, 28.0, heat_w)
+    # The rise as the sensors give it, in steps of half a kelvin.
+    rise_k = heat_w / (FLOW_LPM / 60.0 * 4186.0)
+    df["T_return"] = 28.0 - (rise_k + rng.uniform(-0.25, 0.25, size=N))
+
+    model = HeatPumpCOPIdentifier(key="heating", models_path=tmp_path).calibrate(df)
+
+    assert model.approach_heat_w == 6000.0
+    assert model.approach_per_heat_k_per_w == pytest.approx(1.5e-3, rel=0.15)
+    assert model.cop(5.0, 28.0, 3000.0) == pytest.approx(
+        true.cop(5.0, 28.0, 3000.0), rel=0.02
+    )
+    # Less heat, a better COP at the same supply; none given, the fitted one.
+    assert model.cop(5.0, 28.0, 3000.0) > model.cop(5.0, 28.0, 4500.0)
+    assert model.cop(5.0, 28.0) == model.cop(5.0, 28.0, 6000.0)
+
+
+def test_heat_and_power_follow_the_speed_a_run_holds_at_its_outdoor_temperature():
+    """The outdoor unit lets the compressor run faster in cold air: 70 Hz
+    below 5 degC here, 60 Hz above. Heat and power follow the speed, so one
+    line per unit of speed describes both sets of runs."""
+
+    rng = np.random.default_rng(17)
+    readings_per_run = 20
+    runs = N // readings_per_run
+    outdoor_per_run = rng.uniform(0.0, 15.0, size=runs)
+    T_outdoor = np.repeat(outdoor_per_run, readings_per_run)
+    speed_hz = np.where(T_outdoor < 5.0, 70.0, 60.0)
+    q_th_w = speed_hz / 60.0 * (5000.0 + 100.0 * T_outdoor)
+    T_supply = np.tile(np.linspace(35.0, 58.0, readings_per_run), runs)
+    water_w_per_k = (RHO_WATER_KG_PER_L / 60.0) * CP_WATER_J_PER_KG_K * FLOW_LPM
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    df = pd.DataFrame(
+        {
+            "time": pd.to_datetime(
+                [
+                    start + timedelta(hours=2 * run, minutes=5 * reading)
+                    for run in range(runs)
+                    for reading in range(readings_per_run)
+                ],
+                utc=True,
+            ),
+            "T_outdoor": T_outdoor,
+            "T_supply": T_supply,
+            "T_return": T_supply - q_th_w / water_w_per_k,
+            "flow_lpm": FLOW_LPM,
+            "P_el": q_th_w / TRUE_COP_MODEL.cop(T_outdoor, T_supply),
+            "state": SWW_STATE,
+            "compressor_frequency": speed_hz,
+        }
+    )
+
+    identifier = HeatPumpCOPIdentifier(key="dhw")
+    model = identifier.calibrate(df)
+
+    assert model.reference_speed_hz == 60.0
+    assert model.speed_ratio(outdoor_per_run.min()) == pytest.approx(70.0 / 60.0)
+    assert model.speed_ratio(outdoor_per_run.max()) == pytest.approx(1.0)
+    assert model.q_in_per_outdoor_w_per_k == pytest.approx(100.0, rel=0.01)
+    assert model.heat_input_w(2.0) == pytest.approx(70.0 / 60.0 * 5200.0, rel=0.01)
+    assert model.heat_input_w(12.0) == pytest.approx(6200.0, rel=0.01)
+
+    prepared = identifier.prepare(df)
+
+    assert identifier._planned_power_w(model, prepared) == pytest.approx(
+        prepared["P_el"], rel=0.03
+    )
+    # Without the steps: the lines as they are.
+    assert dataclasses.replace(model, speed_hz=()).speed_ratio(2.0) == 1.0

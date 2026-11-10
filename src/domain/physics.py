@@ -57,6 +57,20 @@ Q_PERSON_SENSIBLE_W = 75.0
 # nodes, the living room's 4 h into a floor run 7-19%.
 SUN_ON_FLOOR_SHARE = 0.65
 
+# Share of a floor's surface exchange with its room that is convection, with
+# the room's air; the rest is radiation, with its walls and furnishings. EN
+# 1264's heated floor gives off 10.8 W/m2K in all, some 5.5 of it by
+# radiation: about half each. Taken the same for a cooled floor (assumption:
+# convection under a cold floor is weaker). Only where the air is a node of
+# its own (see BuildingThermalModel.ua_living_air_w_per_k). Real data, seven
+# walk-forward folds Aug-Nov 2026 against all of it to the room's walls: the
+# living room with the floor active 4% better (each of the six folds with
+# runs), 4 h into a heating run -0.11 K off against -0.15 K, the thermostat's
+# floor share and the surface conductance off their bounds; the living room
+# overall 0.6% better, the rest 0.6% worse. A wall thermostat sits in that
+# rising air: it warmed 1.5 times as fast in a run as a sensor on a cabinet.
+FLOOR_CONVECTIVE_SHARE = 0.5
+
 
 def tank_state_space(
     volume_l: float,
@@ -362,6 +376,8 @@ def zone_state_space(
     through its ceiling. Q_living_air is the heat of the occupants awake in
     the living room: it warms the air around them first, the thermostat's,
     which passes it on to the room - or without an air node the room itself.
+    With that node the living room's floor surface exchanges with it too, by
+    FLOOR_CONVECTIVE_SHARE of its conductance, and with the room by the rest.
 
     The envelope at ua_envelope_w_per_k where given - its conductance that
     day (see envelope_conductance_w_per_k) - else at the model's own.
@@ -438,6 +454,15 @@ def zone_state_space(
         a[0, air] = ua_air / c[0]
         a[air, 0] = ua_air / c[air]
         a[air, air] = -ua_air / c[air]
+        # The floor's convective share warms that air, not the walls.
+        top = _surfaces(model)[0]
+        ua_convective = FLOOR_CONVECTIVE_SHARE * ua_surface[0]
+        a[0, 0] += ua_convective / c[0]
+        a[0, top] -= ua_convective / c[0]
+        a[top, 0] -= ua_convective / c[top]
+        a[air, air] -= ua_convective / c[air]
+        a[air, top] = ua_convective / c[air]
+        a[top, air] = ua_convective / c[top]
         b[air, 6] = 1.0 / c[air]
         b[air, 7] = (1.0 - SUN_ON_FLOOR_SHARE) / c[air]
 

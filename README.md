@@ -383,6 +383,7 @@ Home Optimizer writes the following entities to Home Assistant:
 | `binary_sensor.home_optimizer_zone_status` | `on` while the current quarter hour is planned to heat or cool the zone     |
 | `sensor.home_optimizer_zone_start`         | Start of the zone run under way or the next one planned (`unknown` if none) |
 | `sensor.home_optimizer_zone_setpoint`      | Room temperature (°C) that run heats or cools to (`unknown` if none)        |
+| `sensor.home_optimizer_zone_rest_setpoint` | Other rooms' thermostats' setpoint (°C)                                     |
 | `sensor.home_optimizer_zone_supply`        | Supply setpoint (°C) while a zone run is under way (`unknown` otherwise)    |
 
 ## Blueprints

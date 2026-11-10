@@ -95,8 +95,10 @@ VALIDATION_HORIZONS = [(0.0, 2.0), (2.0, 6.0), (6.0, 24.0)]
 # lead-time bucket; below ~20 of those (n=200) it is mostly noise, so that
 # bucket keeps Solcast's raw p10/p90 instead.
 MIN_QUANTILE_N = 200
-# Only this bucket gets p10/p90 scale factors. A per-week coverage check over
-# 5 weeks found Solcast's interval at 0-2h too narrow every single week (on
+# Only this bucket gets p10/p90 scale factors, on top of the elevation-band
+# bias every lead time gets (see _fit_quantile_scale()). A per-week coverage
+# check over 5 weeks found Solcast's interval at 0-2h too narrow every single
+# week (on
 # average 18.7% below p10 and 17.8% above p90, an offset about twice the
 # week-to-week spread). At 2-6h the offset was smaller than that spread, at
 # 6-24h coverage was on target on average, and 30-day factors fitted there
@@ -240,19 +242,30 @@ def _pooled_fraction(results: list[dict], key: str) -> float:
     return sum(r[key] * r["n"] for r in results) / sum(r["n"] for r in results)
 
 
-def _fit_quantile_scale(df: pd.DataFrame) -> dict[str, tuple[float, float]]:
+def _fit_quantile_scale(
+    df: pd.DataFrame, model: "_ElevationBiasModel"
+) -> dict[str, tuple[float, float]]:
     """For each QUANTILE_CALIBRATED_HORIZONS bucket, the factors (k10, k90)
-    such that 10% of actual
-    daylight production falls below k10 * p10 and 10% above k90 * p90 -
-    Solcast's own interval was found too narrow for this site (0-2h: only
-    64% of actuals inside instead of 80%). Plain count-based quantiles of
-    actual/p10 and actual/p90, since coverage counts rows rather than
-    weighing Watts. Buckets with fewer than MIN_QUANTILE_N rows are left out,
-    so callers fall back to Solcast's raw p10/p90 there.
+    such that 10% of actual daylight production falls below k10 * p10 and 10%
+    above k90 * p90 - Solcast's own interval was found too narrow for this
+    site (0-2h: only 64% of actuals inside instead of 80%). Plain count-based
+    quantiles of actual/p10 and actual/p90, since coverage counts rows rather
+    than weighing Watts. Buckets with fewer than MIN_QUANTILE_N rows are left
+    out, so callers fall back to the bias-corrected p10/p90 there.
+
+    p10 and p90 are first scaled by `model`'s elevation-band bias, like p50:
+    that bias is the installation's (see _ElevationBiasModel), so it holds for
+    every outcome of the weather. Left raw beyond 0-2h, the band sat too high
+    around the corrected p50 - on clear days p10 above it. Walk-forward over
+    62 days this took the p10+p90 pinball loss from 79.0 to 76.7 W at 2-6h
+    and from 83.9 to 81.5 W at 6-24h (better in 4 of 5 two-week blocks),
+    actuals above p90 from 3% to 11-13%; 0-2h unchanged.
     """
 
     rows = df.dropna(subset=[TARGET_COLUMN, "p10", "p90"])
     rows = rows[rows["p50"] >= MIN_SOLAR_IRRADIANCE]
+    bias = model.predict(rows)
+    rows = rows.assign(p10=rows["p10"] * bias, p90=rows["p90"] * bias)
     lead = rows["lead_time_hours"]
 
     scale = {}
@@ -270,8 +283,8 @@ def _fit_quantile_scale(df: pd.DataFrame) -> dict[str, tuple[float, float]]:
 def _quantile_scale_arrays(
     scale: dict[str, tuple[float, float]], lead_time_hours: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Per-row (k10, k90) for the given lead times - 1.0 (raw Solcast) for
-    rows whose bucket has no fitted scale."""
+    """Per-row (k10, k90) for the given lead times - 1.0 (the bias-corrected
+    Solcast band as it is) for rows whose bucket has no fitted scale."""
 
     k10 = np.ones(lead_time_hours.size)
     k90 = np.ones(lead_time_hours.size)
@@ -423,11 +436,11 @@ class _ElevationBiasModel:
     with no training examples, rather than guessing.
     """
 
-    # (k10, k90) per lead-time bucket for Solcast's own p10/p90 (see
+    # (k10, k90) per lead-time bucket for Solcast's bias-corrected p10/p90 (see
     # _fit_quantile_scale()), kept on this calibrated object so it is saved and
     # loaded with the bias table. A class-level default, so a model saved
-    # before these factors existed loads with none (raw Solcast band) instead
-    # of failing every state update until the next calibration - calibrate()
+    # before these factors existed loads with none (only the bias applied)
+    # instead of failing every state update until the next calibration - calibrate()
     # always assigns a fresh dict and never mutates this shared one.
     quantile_scale: dict[str, tuple[float, float]] = {}
 
@@ -474,12 +487,8 @@ def predict_solar(
         return p50
 
     p50 = p50.sort_index()
-    elevation = _solar_elevation(pd.Series(p50.index), latitude, longitude)
-    scale = np.nan_to_num(
-        model.predict(pd.DataFrame({"solar_elevation": elevation.to_numpy()})),
-        nan=1.0,
-    )
-    return _on_predict_grid(pd.Series(p50.to_numpy() * scale, index=p50.index))
+
+    return _on_predict_grid(p50 * _bias(model, p50.index, latitude, longitude))
 
 
 def predict_solar_band(
@@ -487,18 +496,41 @@ def predict_solar_band(
     p10: pd.Series,
     p90: pd.Series,
     now: datetime,
+    latitude: float,
+    longitude: float,
 ) -> tuple[pd.Series, pd.Series]:
     """Scales Solcast's live p10/p90 curves (indexed by target time) by the
-    calibrated per-lead-time factors (see _fit_quantile_scale(); buckets
-    without a factor keep raw Solcast) and puts them on the same 15-minute
-    grid as predict_solar() - the MPC's pessimistic/optimistic solar
-    scenarios (see optimizer.SOLAR_SCENARIO_WEIGHTS).
+    elevation-band bias, as predict_solar() does p50, and by the calibrated
+    per-lead-time factors where there is one (see _fit_quantile_scale()), and
+    puts them on the same 15-minute grid - the MPC's pessimistic/optimistic
+    solar scenarios (see optimizer.SOLAR_SCENARIO_WEIGHTS).
     """
 
-    return (
-        _scaled_quantile(model.quantile_scale, p10, now, column=0),
-        _scaled_quantile(model.quantile_scale, p90, now, column=1),
-    )
+    def scaled(forecast: pd.Series, column: int) -> pd.Series:
+        if forecast.empty:
+            return forecast
+
+        forecast = forecast.sort_index()
+        lead_time_hours = (forecast.index - now).total_seconds().to_numpy() / 3600.0
+
+        return _on_predict_grid(
+            forecast
+            * _bias(model, forecast.index, latitude, longitude)
+            * _quantile_scale_arrays(model.quantile_scale, lead_time_hours)[column]
+        )
+
+    return scaled(p10, 0), scaled(p90, 1)
+
+
+def _bias(
+    model: _ElevationBiasModel,
+    times: pd.DatetimeIndex,
+    latitude: float,
+    longitude: float,
+) -> np.ndarray:
+    elevation = _solar_elevation(pd.Series(times), latitude, longitude)
+
+    return model.predict(pd.DataFrame({"solar_elevation": elevation.to_numpy()}))
 
 
 def nowcast_solar(
@@ -565,22 +597,6 @@ def nowcast_weight(measured: pd.Series, p10_w: float, p90_w: float) -> float:
     return var_forecast / (var_forecast + var_measured)
 
 
-def _scaled_quantile(
-    quantile_scale: dict[str, tuple[float, float]],
-    forecast: pd.Series,
-    now: datetime,
-    column: int,
-) -> pd.Series:
-    if forecast.empty:
-        return forecast
-
-    forecast = forecast.sort_index()
-    lead_time_hours = (forecast.index - now).total_seconds().to_numpy() / 3600.0
-    scale = _quantile_scale_arrays(quantile_scale, lead_time_hours)[column]
-
-    return _on_predict_grid(forecast * scale)
-
-
 def _on_predict_grid(series: pd.Series) -> pd.Series:
     step = pd.Timedelta(minutes=PREDICT_STEP_MINUTES)
     grid = (
@@ -643,7 +659,7 @@ class SolarBiasIdentifier(SystemIdentifier[_ElevationBiasModel]):
 
         model = _ElevationBiasModel(bins=ELEVATION_BINS)
         model.fit(X, y, weight)
-        model.quantile_scale = _fit_quantile_scale(df)
+        model.quantile_scale = _fit_quantile_scale(df, model)
         self.model = model
 
         logger.info(
@@ -656,7 +672,7 @@ class SolarBiasIdentifier(SystemIdentifier[_ElevationBiasModel]):
                 f"{label}=({k10:.3f}, {k90:.3f})"
                 for label, (k10, k90) in model.quantile_scale.items()
             )
-            or "none (too little data - raw Solcast p10/p90 kept)",
+            or "none (too little data - only the bias applied)",
         )
 
         return model
@@ -806,8 +822,8 @@ class SolarBiasIdentifier(SystemIdentifier[_ElevationBiasModel]):
     def _validate_window(self, window_df: pd.DataFrame) -> dict[str, float]:
         """Runs the walk-forward backtest (see _generate_walk_forward_folds)
         over one window and returns its baseline/ML MAE, sample count and
-        p10/p90 coverage (raw Solcast vs. scaled by the quantile factors
-        fitted on each fold's own training data - so the calibrated coverage
+        p10/p90 coverage (raw Solcast vs. scaled by the bias and the quantile
+        factors fitted on each fold's own training data - so the calibrated coverage
         is measured on data those factors never saw). See validate() for why
         several of these get pooled rather than trusted individually.
         """
@@ -829,7 +845,7 @@ class SolarBiasIdentifier(SystemIdentifier[_ElevationBiasModel]):
                     if not X_train.empty:
                         model = _ElevationBiasModel(bins=ELEVATION_BINS)
                         model.fit(X_train, y_train, weight_train)
-                        quantile_scale = _fit_quantile_scale(train_df)
+                        quantile_scale = _fit_quantile_scale(train_df, model)
                 except ValueError:
                     continue
 
@@ -859,8 +875,8 @@ class SolarBiasIdentifier(SystemIdentifier[_ElevationBiasModel]):
                 ("lead", lead),
                 ("below_p10_raw", actual < p10),
                 ("above_p90_raw", actual > p90),
-                ("below_p10", actual < k10 * p10),
-                ("above_p90", actual > k90 * p90),
+                ("below_p10", actual < k10 * scale * p10),
+                ("above_p90", actual > k90 * scale * p90),
             ):
                 chunks[key].append(values[daylight])
 

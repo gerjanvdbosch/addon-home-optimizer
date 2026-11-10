@@ -41,11 +41,39 @@ blueprint:
       selector:
         entity:
           domain: number
+    calibrate_time:
+      name: Nightly calibration time
+      description: When the models are calibrated.
+      default: "02:00:00"
+      selector:
+        time:
+    calibrate_days:
+      name: Calibration history (days)
+      description: How many past days the nightly calibration fits the models on.
+      default: 365
+      selector:
+        number:
+          min: 30
+          max: 365
+          step: 1
+          unit_of_measurement: days
+          mode: box
+    notify_service:
+      name: Notify action (optional)
+      description: >-
+        Where runs and warnings are sent, e.g. notify.mobile_app_phone. Empty
+        sends nothing.
+      default: ""
+      selector:
+        text:
 
 variables:
   living: !input living_climate
   rest: !input rest_climates
   bias_number: !input bias_number
+  calibrate_days: !input calibrate_days
+  notify_service: !input notify_service
+  heat_pump: !input heat_pump_state
 
 triggers:
   - trigger: state
@@ -79,13 +107,31 @@ triggers:
     not_to: [ unknown, unavailable ]
     id: zone_setpoint
   - trigger: state
-    entity_id: sensor.home_optimizer_zone_setpoint
-    attribute: rest
+    entity_id: sensor.home_optimizer_zone_rest_setpoint
+    not_to: [ unknown, unavailable ]
     id: rest
   - trigger: state
     entity_id: sensor.home_optimizer_zone_bias
     not_to: [ unknown, unavailable ]
     id: zone_bias
+  - trigger: time_pattern
+    minutes: /5
+    id: plan
+  - trigger: time
+    at: !input calibrate_time
+    id: calibrate
+  # Watchdog: a run planned for a quarter of an hour that the heat pump is not
+  # doing. "Uit" and "SWW" are the add-on's heat_pump.states defaults.
+  - trigger: state
+    entity_id: binary_sensor.home_optimizer_zone_status
+    to: "on"
+    for: { minutes: 15 }
+    id: zone_watchdog
+  - trigger: state
+    entity_id: binary_sensor.home_optimizer_dhw_status
+    to: "on"
+    for: { minutes: 15 }
+    id: dhw_watchdog
 
 conditions:
   - condition: state
@@ -105,9 +151,19 @@ actions:
             entity_id: !input dhw_switch
             state: "on"
         sequence:
-          - action: notify.notify
-            data:
-              message: Optimizer DHW start
+          - variables:
+              message: >-
+                Optimizer DHW start, to
+                {{ states('sensor.home_optimizer_dhw_setpoint') }} °C
+          # Sent only with a notify action set.
+          - &notify
+            if:
+              - condition: template
+                value_template: "{{ notify_service != '' }}"
+            then:
+              - action: "{{ notify_service }}"
+                data:
+                  message: "{{ message }}"
           - action: switch.turn_off
             target:
               entity_id: !input dhw_switch
@@ -119,9 +175,11 @@ actions:
             entity_id: !input dhw_switch
             state: "off"
         sequence:
-          - action: notify.notify
-            data:
-              message: Optimizer DHW end
+          - variables:
+              message: >-
+                Optimizer DHW end, tank
+                {{ states('sensor.home_optimizer_dhw_soc') }} %
+          - *notify
           - action: switch.turn_on
             target:
               entity_id: !input dhw_switch
@@ -135,11 +193,13 @@ actions:
           - condition: template
             value_template: "{{ has_value('sensor.home_optimizer_zone_setpoint') }}"
         sequence:
-          - action: notify.notify
-            data:
+          - variables:
               message: >-
                 Optimizer zone start, living room
-                {{ states('sensor.home_optimizer_zone_setpoint') }} °C
+                {{ states('sensor.home_optimizer_zone_setpoint') }} °C{{
+                  ', rest ' ~ states('sensor.home_optimizer_zone_rest_setpoint') ~ ' °C'
+                  if has_value('sensor.home_optimizer_zone_rest_setpoint') }}
+          - *notify
           # The thermostat calls for heat only above the room: left at a lower
           # setpoint the run never starts (6 Nov 2026: 15 degC, 40 min late).
           # Handed over from hot water the zone is on in the tank's last
@@ -156,14 +216,14 @@ actions:
           - condition: template
             value_template: >-
               {{ rest | count > 0
-                 and state_attr('sensor.home_optimizer_zone_setpoint', 'rest') is number }}
+                 and has_value('sensor.home_optimizer_zone_rest_setpoint') }}
         sequence:
           - &rest
             action: climate.set_temperature
             target:
               entity_id: !input rest_climates
             data:
-              temperature: "{{ state_attr('sensor.home_optimizer_zone_setpoint', 'rest') }}"
+              temperature: "{{ states('sensor.home_optimizer_zone_rest_setpoint') | float }}"
       - alias: Zone stop
         conditions:
           - condition: trigger
@@ -172,14 +232,16 @@ actions:
             entity_id: binary_sensor.home_optimizer_zone_status
             state: "off"
         sequence:
-          - action: notify.notify
-            data:
-              message: Optimizer zone stop
+          - variables:
+              message: >-
+                Optimizer zone stop, living room
+                {{ state_attr(living, 'current_temperature') }} °C
+          - *notify
           - if:
               - condition: template
                 value_template: >-
                   {{ rest | count > 0
-                     and state_attr('sensor.home_optimizer_zone_setpoint', 'rest') is number }}
+                     and has_value('sensor.home_optimizer_zone_rest_setpoint') }}
             then:
               - *rest
       - alias: Zone setpoint
@@ -227,6 +289,82 @@ actions:
               entity_id: "{{ bias_number }}"
             data:
               value: "{{ states('sensor.home_optimizer_zone_bias') | float(0) }}"
+      # The add-on runs its jobs one at a time in the order they come, so the
+      # plan is made from the state just updated.
+      - alias: Plan
+        conditions:
+          - condition: trigger
+            id: plan
+        sequence:
+          - action: rest_command.home_optimizer_api
+            data:
+              endpoint: update
+              payload: |
+                {{ {} | to_json }}
+            response_variable: update
+            continue_on_error: true
+          - if:
+              - condition: template
+                value_template: "{{ update is defined and update.status == 200 }}"
+            then:
+              - action: rest_command.home_optimizer_api
+                data:
+                  endpoint: optimize
+                  payload: |
+                    {{ {} | to_json }}
+            # Watchdog: the add-on unreachable, told at most once an hour.
+            else:
+              - condition: template
+                value_template: "{{ now().minute < 5 }}"
+              - variables:
+                  message: >-
+                    Optimizer warning: the add-on does not answer
+                    ({{ update.status if update is defined else 'no response' }})
+              - *notify
+      - alias: Calibrate
+        conditions:
+          - condition: trigger
+            id: calibrate
+        sequence:
+          - action: rest_command.home_optimizer_api
+            data:
+              endpoint: calibrate
+              payload: |
+                {{ {
+                  "days": calibrate_days | int
+                } | to_json }}
+      - alias: Zone watchdog
+        conditions:
+          - condition: trigger
+            id: zone_watchdog
+          - condition: state
+            entity_id: binary_sensor.home_optimizer_zone_status
+            state: "on"
+          - condition: state
+            entity_id: !input heat_pump_state
+            state: Uit
+        sequence:
+          - variables:
+              message: >-
+                Optimizer warning: zone run planned for 15 minutes but the heat
+                pump is off (thermostat {{ state_attr(living, 'temperature') }} °C,
+                room {{ state_attr(living, 'current_temperature') }} °C)
+          - *notify
+      - alias: DHW watchdog
+        conditions:
+          - condition: trigger
+            id: dhw_watchdog
+          - condition: state
+            entity_id: binary_sensor.home_optimizer_dhw_status
+            state: "on"
+          - condition: template
+            value_template: "{{ has_value(heat_pump) and states(heat_pump) != 'SWW' }}"
+        sequence:
+          - variables:
+              message: >-
+                Optimizer warning: hot water planned for 15 minutes but the heat
+                pump is {{ states(heat_pump) }}
+          - *notify
 
 # Queued: a bias change may come with a start.
 mode: queued

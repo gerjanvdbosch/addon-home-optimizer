@@ -12,6 +12,7 @@ from domain.dynamics import ScheduledSystem, discretize_zoh, kalman_states
 from domain.models import BuildingThermalModel
 from domain.physics import (
     CP_AIR_J_PER_KG_K,
+    FLOOR_CONVECTIVE_SHARE,
     Q_PERSON_SENSIBLE_W,
     RHO_AIR_KG_PER_M3,
     SUN_ON_FLOOR_SHARE,
@@ -1658,8 +1659,19 @@ def test_the_occupants_warm_the_living_rooms_air_first():
     capacity = zone_heat_capacities(model)
     assert capacity[:, None] * a == pytest.approx((capacity[:, None] * a).T)
 
+    # Settled, the air passes their heat on to the room and, by convection,
+    # to the floor's surface under it.
     settled = np.linalg.solve(a, -b @ people)
-    assert settled[4] - settled[0] == pytest.approx(150.0 / 600.0)
+    convective = (
+        FLOOR_CONVECTIVE_SHARE * model.ua_air_mass_w_per_k * model.living_area_fraction
+    )
+    assert 600.0 * (settled[4] - settled[0]) + convective * (
+        settled[4] - settled[2]
+    ) == pytest.approx(150.0)
+    assert capacity[2] * a[2, 4] == pytest.approx(convective)
+    assert capacity[2] * (a[2, 0] + a[2, 4]) == pytest.approx(
+        model.ua_air_mass_w_per_k * model.living_area_fraction
+    )
     assert zone_observation(model) @ settled == pytest.approx(settled[4])
 
 

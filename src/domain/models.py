@@ -520,6 +520,24 @@ class HeatPumpCOPModel:
     # own q_in_steady_w.
     q_in_at_zero_outdoor_w: float = 0.0
     q_in_per_outdoor_w_per_k: float = 0.0
+    # The compressor speed a DHW run rises to and holds (Hz) at the outdoor
+    # temperatures it was seen at (degC, rising), and the speed the heat and
+    # power lines above are given at. The outdoor unit caps its speed by its
+    # own outdoor reading, higher in colder air to make up for the thinner
+    # vapour (real data, Jun-Nov 2026: 48 Hz above 26.5 degC in 15 runs,
+    # 60 Hz down to 5.8 degC in 122, 70 Hz below 4.8 degC in 3). A compressor
+    # moves a fixed volume per turn, so heat and power follow the speed at
+    # the same temperatures (lines fitted on the 60 Hz runs alone and scaled
+    # read the others' power 3.5 and 7% low, where unscaled it was 16% high
+    # and 15% low) while the COP stays what the temperatures make it (70 Hz:
+    # 2% from the model). One line for all speeds also read autumn's heat
+    # 4% high, its outdoor slope flattened by summer's slow runs (49 runs,
+    # each fitted on the days before it: +4.2% against +0.1%).
+    # Between the temperatures seen the speed is interpolated, beyond them
+    # held. Empty until calibrated: the lines as they are.
+    speed_outdoor_c: tuple[float, ...] = ()
+    speed_hz: tuple[float, ...] = ()
+    reference_speed_hz: float = 0.0
     # The electrical power over a DHW run's first planning step (W), measured
     # (see HeatPumpCOPIdentifier._start_up): the compressor comes up
     # to speed and the loop warms, so the heat lags the power, and the steady
@@ -580,8 +598,20 @@ class HeatPumpCOPModel:
     # floor's return each time, so one energy rather than a capacity). 0.0
     # until calibrated, and for the other modes.
     handover_heat_j: float = 0.0
+    # The heat (W) the two approaches above were fitted at - the mean over
+    # this mode's readings, or the DHW fit's where the coil's approach is
+    # taken from it - and how much they grow per W moved beyond it (K/W): an
+    # exchanger's approach is the heat through it over its conductance, so a
+    # floor run at 3 kW has a smaller one than a tank run at 6.5 kW, and a
+    # compressor at its lowest speed a better COP than the supply alone tells
+    # (real heating data, 10 Oct-10 Nov 2026, at equal outdoor and return
+    # temperature: 10% between 26 and 42 Hz, where the fixed approaches gave
+    # 4%). Carried on the coil's side: the two enter the lift as their sum.
+    # 0.0 until calibrated, and for the other modes: the fixed approaches.
+    approach_heat_w: float = 0.0
+    approach_per_heat_k_per_w: float = 0.0
 
-    def cop(self, T_outdoor: float, T_supply: float) -> float:
+    def cop(self, T_outdoor: float, T_supply: float, heat_w=None) -> float:
         """Carnot COP scaled by eta_carnot - see
         HeatPumpCOPIdentifier's class docstring (features/cop.py) for the
         physical derivation. Kept on the model itself, not just the
@@ -592,26 +622,39 @@ class HeatPumpCOPModel:
         both by MPCOptimizer (scalars, one step at a time) and by
         HeatPumpCOPIdentifier._predict_cop (arrays, one call per fit
         iteration).
+
+        At heat_w moved (W) where given, the approaches grown or shrunk with
+        it (see approach_per_heat_k_per_w); without, at the heat they were
+        fitted at.
         """
+
+        delta_t_coil = self.delta_t_evap
+
+        if heat_w is not None:
+            delta_t_coil = delta_t_coil + self.approach_per_heat_k_per_w * (
+                heat_w - self.approach_heat_w
+            )
 
         if self.cooling:
             T_evap_K = T_supply - self.delta_t_cond + KELVIN_OFFSET_C
-            T_cond_K = T_outdoor + self.delta_t_evap + KELVIN_OFFSET_C
+            T_cond_K = T_outdoor + delta_t_coil + KELVIN_OFFSET_C
 
             return self.eta_carnot * T_evap_K / (T_cond_K - T_evap_K)
 
         T_cond_K = T_supply + self.delta_t_cond + KELVIN_OFFSET_C
-        T_evap_K = T_outdoor - self.delta_t_evap + KELVIN_OFFSET_C
+        T_evap_K = T_outdoor - delta_t_coil + KELVIN_OFFSET_C
 
         return self.eta_carnot * T_cond_K / (T_cond_K - T_evap_K)
 
-    def clamped_cop(self, T_outdoor, T_supply):
+    def clamped_cop(self, T_outdoor, T_supply, heat_w=None):
         """cop() held inside [MIN_COP, max_cop], so an outdoor/supply
         combination outside anything the model was fitted on cannot turn into
         an absurd power estimate. Scalars or arrays.
         """
 
-        return np.clip(self.cop(T_outdoor, T_supply), self.MIN_COP, self.max_cop)
+        return np.clip(
+            self.cop(T_outdoor, T_supply, heat_w), self.MIN_COP, self.max_cop
+        )
 
     def planned_power_at_reference_points(self, T_outdoor):
         """Electrical power (W) at POWER_FIT_T_LOW_C and POWER_FIT_T_HIGH_C
@@ -622,10 +665,33 @@ class HeatPumpCOPModel:
         """
 
         outdoor_w = self.q_th_per_outdoor_w_per_k * T_outdoor
+        speed = self.speed_ratio(T_outdoor)
 
         return (
-            (self.q_th_at_power_fit_low_w + outdoor_w)
+            speed
+            * (self.q_th_at_power_fit_low_w + outdoor_w)
             / self.clamped_cop(T_outdoor, self.POWER_FIT_T_LOW_C),
-            (self.q_th_at_power_fit_high_w + outdoor_w)
+            speed
+            * (self.q_th_at_power_fit_high_w + outdoor_w)
             / self.clamped_cop(T_outdoor, self.POWER_FIT_T_HIGH_C),
+        )
+
+    def speed_ratio(self, T_outdoor):
+        """The speed a DHW run holds at this outdoor temperature over the
+        speed its lines are given at (see speed_hz). Scalars or arrays."""
+
+        if not self.speed_hz:
+            return 1.0
+
+        return (
+            np.interp(T_outdoor, self.speed_outdoor_c, self.speed_hz)
+            / self.reference_speed_hz
+        )
+
+    def heat_input_w(self, T_outdoor):
+        """The heat a DHW run puts into the tank past its start-up (W), see
+        q_in_at_zero_outdoor_w. Scalars or arrays."""
+
+        return self.speed_ratio(T_outdoor) * (
+            self.q_in_at_zero_outdoor_w + self.q_in_per_outdoor_w_per_k * T_outdoor
         )

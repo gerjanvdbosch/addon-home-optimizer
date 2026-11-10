@@ -228,8 +228,13 @@ def _settled_covariance(
         strict=True,
     )
 
+    # A covariance is symmetric; its mean over the steps is so only to
+    # rounding (8e-15 seen), which the solver refuses.
     return np.stack(
-        [solve_discrete_are(a_s.T, h_s.T, q_s, noise) for a_s, q_s, h_s in systems]
+        [
+            solve_discrete_are(a_s.T, h_s.T, (q_s + q_s.T) / 2.0, noise)
+            for a_s, q_s, h_s in systems
+        ]
     ).reshape(a.shape)
 
 
