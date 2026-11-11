@@ -47,6 +47,17 @@ def min_rise_k(outdoor_c: float) -> float:
     return MIN_RISE_K + _cold_factor(outdoor_c) * (COLD_MIN_RISE_K - MIN_RISE_K)
 
 
+def least_bias_k(room_c: float, setpoint_c: float) -> float:
+    """The setpoint bias (K) at which the controller asks for its least: the
+    target strictly below the room, within a step of it, so the base rise."""
+
+    bias_k = (math.ceil(round((room_c - setpoint_c) / BIAS_STEP_K, 6)) - 1) * (
+        BIAS_STEP_K
+    )
+
+    return round(min(max(bias_k, -BIAS_LIMIT_K), BIAS_LIMIT_K), 1)
+
+
 def setpoint_bias_k(
     heat_w: float,
     flow_lpm: float,
@@ -78,12 +89,7 @@ def setpoint_bias_k(
     # In whole watts: at its least the plan's heat comes back from the solver
     # a fraction of a watt either side of it.
     if round(heat_w) <= max(least_k * water_w_per_k(flow_lpm), least_heat_w):
-        # Strictly below the room, within a step of it.
-        bias_k = (math.ceil(round((room_c - setpoint_c) / BIAS_STEP_K, 6)) - 1) * (
-            BIAS_STEP_K
-        )
-
-        return round(min(max(bias_k, -BIAS_LIMIT_K), BIAS_LIMIT_K), 1)
+        return least_bias_k(room_c, setpoint_c)
 
     error_range_k = ERROR_RANGE_K * (1.0 - 0.5 * min(_cold_factor(outdoor_c), 1.0))
     share = (heat_w / water_w_per_k(flow_lpm) - least_k) / (MAX_RISE_K - least_k)

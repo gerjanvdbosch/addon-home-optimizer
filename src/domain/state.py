@@ -220,10 +220,11 @@ class BuildingSchedule(BaseModel):
     # The supply setpoint last published during a cooling run, which a later
     # one in the same run may not exceed (see Optimization.zone_supply_c).
     supply_setpoint: SeriesPoint[float] | None = None
-    # The auto-adaptive controller's target (setpoint + bias, deg C) last
-    # published and when it last changed, which a later one holds to (see
-    # Optimization._zone_bias).
-    bias_target: SeriesPoint[float] | None = None
+    # The plan's heat (W) the auto-adaptive bias holds to and when it last
+    # changed, and the heat the measured solar surplus caps it at (W, None
+    # without a cap) (see Optimization._zone_bias).
+    bias_heat: SeriesPoint[float] | None = None
+    bias_cap_w: float | None = None
 
 
 class Schedule(BaseModel):

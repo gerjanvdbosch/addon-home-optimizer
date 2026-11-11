@@ -58,21 +58,32 @@ blueprint:
           step: 1
           unit_of_measurement: days
           mode: box
-    notify_service:
-      name: Notify action (optional)
+    notify_devices:
+      name: Notify devices (optional)
       description: >-
-        Where runs and warnings are sent, e.g. notify.mobile_app_phone. Empty
-        sends nothing.
-      default: ""
+        Phones (Companion app) that get runs and warnings. None sends nothing.
+      default: [ ]
       selector:
-        text:
+        device:
+          integration: mobile_app
+          multiple: true
+    dry_run:
+      name: Dry run
+      description: >-
+        Only notifies what the plan would do: switches, thermostats and the
+        bias are left alone, and the watchdogs are off.
+      default: false
+      selector:
+        boolean:
 
 variables:
   living: !input living_climate
   rest: !input rest_climates
   bias_number: !input bias_number
   calibrate_days: !input calibrate_days
-  notify_service: !input notify_service
+  notify_devices: !input notify_devices
+  dry_run: !input dry_run
+  dhw_switch: !input dhw_switch
   heat_pump: !input heat_pump_state
 
 triggers:
@@ -91,6 +102,12 @@ triggers:
     not_to: [ SWW, unknown, unavailable ]
     for: { minutes: 10 }
     id: dhw_end
+  # Dry run: the heat pump does its own hot water, so the plan's end is told.
+  - trigger: state
+    entity_id: binary_sensor.home_optimizer_dhw_status
+    from: "on"
+    to: "off"
+    id: dhw_plan_end
   - trigger: state
     entity_id: binary_sensor.home_optimizer_zone_status
     from: "off"
@@ -147,39 +164,42 @@ actions:
           - condition: state
             entity_id: binary_sensor.home_optimizer_dhw_status
             state: "on"
-          - condition: state
-            entity_id: !input dhw_switch
-            state: "on"
+          - condition: template
+            value_template: "{{ dry_run or is_state(dhw_switch, 'on') }}"
         sequence:
           - variables:
               message: >-
                 Optimizer DHW start, to
                 {{ states('sensor.home_optimizer_dhw_setpoint') }} °C
-          # Sent only with a notify action set.
+          # Sent only with notify devices chosen.
           - &notify
-            if:
-              - condition: template
-                value_template: "{{ notify_service != '' }}"
-            then:
-              - action: "{{ notify_service }}"
-                data:
-                  message: "{{ message }}"
+            repeat:
+              for_each: "{{ notify_devices }}"
+              sequence:
+                - action: >-
+                    notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify }}
+                  data:
+                    message: "{{ ('[dry run] ' if dry_run else '') ~ message }}"
+          - &control
+            condition: template
+            value_template: "{{ not dry_run }}"
           - action: switch.turn_off
             target:
               entity_id: !input dhw_switch
       - alias: DHW end
         conditions:
-          - condition: trigger
-            id: dhw_end
-          - condition: state
-            entity_id: !input dhw_switch
-            state: "off"
+          - condition: template
+            value_template: >-
+              {{ (dry_run and trigger.id == 'dhw_plan_end')
+                 or (not dry_run and trigger.id == 'dhw_end'
+                     and is_state(dhw_switch, 'off')) }}
         sequence:
           - variables:
               message: >-
                 Optimizer DHW end, tank
                 {{ states('sensor.home_optimizer_dhw_soc') }} %
           - *notify
+          - *control
           - action: switch.turn_on
             target:
               entity_id: !input dhw_switch
@@ -200,6 +220,7 @@ actions:
                   ', rest ' ~ states('sensor.home_optimizer_zone_rest_setpoint') ~ ' °C'
                   if has_value('sensor.home_optimizer_zone_rest_setpoint') }}
           - *notify
+          - *control
           # The thermostat calls for heat only above the room: left at a lower
           # setpoint the run never starts (6 Nov 2026: 15 degC, 40 min late).
           # Handed over from hot water the zone is on in the tank's last
@@ -213,6 +234,7 @@ actions:
         conditions:
           - condition: trigger
             id: rest
+          - *control
           - condition: template
             value_template: >-
               {{ rest | count > 0
@@ -237,6 +259,7 @@ actions:
                 Optimizer zone stop, living room
                 {{ state_attr(living, 'current_temperature') }} °C
           - *notify
+          - *control
           - if:
               - condition: template
                 value_template: >-
@@ -248,6 +271,7 @@ actions:
         conditions:
           - condition: trigger
             id: zone_setpoint
+          - *control
         sequence:
           - choose:
               # Within a run only up: the plan raises it as the run goes on,
@@ -281,6 +305,7 @@ actions:
         conditions:
           - condition: trigger
             id: zone_bias
+          - *control
           - condition: template
             value_template: "{{ bias_number != '' }}"
         sequence:
@@ -337,6 +362,7 @@ actions:
         conditions:
           - condition: trigger
             id: zone_watchdog
+          - *control
           - condition: state
             entity_id: binary_sensor.home_optimizer_zone_status
             state: "on"
@@ -354,6 +380,7 @@ actions:
         conditions:
           - condition: trigger
             id: dhw_watchdog
+          - *control
           - condition: state
             entity_id: binary_sensor.home_optimizer_dhw_status
             state: "on"
