@@ -56,6 +56,7 @@ from domain.physics import (
     zone_living_air,
     zone_observation,
     zone_observations,
+    zone_size,
     zone_slab,
     zone_state_space,
 )
@@ -427,6 +428,14 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
     # too small to matter, 0.15 K worse at 15 min. None for the rest of the
     # house, a mean of four rooms.
     READING_DRIFT_K = (0.1, 0.0)
+    # The water's reading of the screed's pipe half (see _water_reading), its
+    # spread (K): the heat's own, the supply and return each on a 0.5 K grid
+    # at some 1200 W/K of flow (~240 W), over the circuit's ~920 W/K, 0.26 K,
+    # and the supply's grid, 0.14 K. Read so, the floor's heat over the next
+    # hour, predicted during runs, came 9-15% closer (12 Nov 2026: Oct-Nov
+    # 220 against 201 W, 2-12 Nov 237 against 202 W), and as much at 0.2 or
+    # 0.5 K.
+    WATER_READING_K = 0.3
     THERMOSTAT_RECOVERY_SECONDS = 20 * 60.0
 
     # Home Assistant's hvac mode of a room thermostat that has closed its
@@ -634,8 +643,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # not fitted.
         self.extensions: dict[str, float] = {}
         # The floor's screed, (capacity J/K, conductance to its slab W/K), read
-        # off the floor's runs before each fit (see _fit_screed) and held
-        # through it; none until a model to read it against has been saved.
+        # off the floor's runs by calibrate (see _fit_screed) and held through
+        # its last fit.
         self.screed: tuple[float, float] = (0.0, 0.0)
         # Whether the data shows a horizon east and west of the facade's
         # normal (see _horizon_scan), read off it during each fit; a horizon
@@ -1989,7 +1998,6 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         sky = self._measured_sky(df)
         df["I_facade_w_per_m2"] *= sky
         df["I_facade_direct_w_per_m2"] *= sky
-        self.screed = self._fit_screed(df)
         self.sleep = self._measured_sleep(df)
         median_dt = float(df["dt_seconds"].median())
 
@@ -2023,18 +2031,41 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # most of its steps (365 d to 5 Nov 2026: 31 -> 22 s, every parameter
         # within 0.04 of its standard error; walk-forward as above the same,
         # its 15 Oct fit no longer finding a west horizon of 24 deg).
-        self.horizon_seen = (False, False)
-        x, _ = self._fit(train_df, plan)
-        angles = self._horizon_scan(x, train_df, plan, f_scale)
-        self.horizon_seen = (angles[0] > 0.0, angles[1] > 0.0)
-        x[[24, 25]] = angles
-        x, std_errors = self._fit(train_df, plan, (x, f_scale))
+        # Twice: without a screed, then with the screed read off the slabs
+        # that first fit estimates (see _fit_screed) - never off the saved
+        # model's, so the same data gives the same model however often it
+        # has run. Repeated with each fit's own slabs instead, the screed
+        # never settled: its conductance rose every round, up to its bound in
+        # 3 rounds with the sensor's mass share at its own, the filter's slabs
+        # taking up what the screed gave them (walk-forward to 22 Oct, 29 Oct
+        # and 5 Nov 2026: 5 rounds settled in none). Scored on the week after
+        # each, the second fit predicted as well as the fifth (living room
+        # 0.068-0.086 against 0.069-0.092 K, runs 0.081-0.129 against
+        # 0.082-0.125 K, the floor's heat 205-260 against 205-294 W, without
+        # any screed 262-540 W), at 15-17 MJ/K and 700-1100 W/K.
+        self.screed = (0.0, 0.0)
+
+        while True:
+            self.horizon_seen = (False, False)
+            x, _ = self._fit(train_df, plan)
+            angles = self._horizon_scan(x, train_df, plan, f_scale)
+            self.horizon_seen = (angles[0] > 0.0, angles[1] > 0.0)
+            x[[24, 25]] = angles
+            x, std_errors = self._fit(train_df, plan, (x, f_scale))
+            self.model = self._model_from_parameters(x)
+
+            if self.screed[0]:
+                break
+
+            self.screed = self._fit_screed(df)
+
+            # Too few runs to read one off: the fit without it stands.
+            if not self.screed[0]:
+                break
 
         self.parameter_std_errors = dict(
             zip(self.PARAMETER_NAMES, std_errors, strict=True)
         )
-
-        self.model = self._model_from_parameters(x)
 
         predicted, _, active, _ = self._simulate_windows(x, train_df, plan)
 
@@ -2822,20 +2853,81 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         return asleep_w, to_bed, up, spread
 
+    def _water_reading(
+        self,
+        model: BuildingThermalModel,
+        prepared: pd.DataFrame,
+        pipe_ua_w_per_k: float | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """(the temperature of the screed's pipe half the water gives the
+        floor its heat against (deg C), the row of states that is) at each row
+        of a prepared frame: supply - Q / G, G the pipes' UA at the row's open
+        loops and flow (see physics.floor_loops_conductance_w_per_k), the
+        floors under them by the water under each (see physics.zone_floor).
+        NaN off a run and before the compressor settled (see
+        HeatPumpCOPIdentifier.STARTUP), where the heat says nothing of the
+        floor, and without the pipes' UA."""
+
+        # Here, not at the top: see validate().
+        from features.cop import HeatPumpCOPIdentifier
+
+        living = floor_living_fraction(
+            prepared["floor_open_living"],
+            prepared["floor_open_rest"],
+            model.living_area_fraction,
+        )
+        rows = np.outer(living, zone_floor(model, 1.0)) + np.outer(
+            1.0 - living, zone_floor(model, 0.0)
+        )
+
+        if not pipe_ua_w_per_k:
+            return np.full(len(prepared), np.nan), rows
+
+        running = prepared["state"].isin((self.states.heating, self.states.cooling))
+        run = (
+            running
+            & (
+                ~running.shift(fill_value=False)
+                | (prepared["state"] != prepared["state"].shift())
+            )
+        ).cumsum()
+        start = prepared["time"].where(running).groupby(run).transform("min")
+        settled = (
+            running
+            & (prepared["time"] - start >= HeatPumpCOPIdentifier.STARTUP)
+            & (prepared["Q_floor_w"] != 0.0)
+        ).to_numpy()
+        conductance = floor_loops_conductance_w_per_k(
+            pipe_ua_w_per_k,
+            (prepared["floor_open_living"] + prepared["floor_open_rest"])
+            .fillna(1.0)
+            .to_numpy(dtype=float),
+            prepared["floor_flow_lpm"]
+            .fillna(prepared["flow_lpm"])
+            .to_numpy(dtype=float),
+        )
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            water = prepared["T_supply"].to_numpy(dtype=float) - prepared[
+                "Q_floor_w"
+            ].to_numpy(dtype=float) / np.where(conductance > 0.0, conductance, np.nan)
+
+        return np.where(settled, water, np.nan), rows
+
     def _fit_screed(self, df: pd.DataFrame) -> tuple[float, float]:
         """(screed J/K, its conductance down to the slabs W/K) from the
         floor's runs in a prepared frame, either mode: what the rooms alone
         hardly show - a layer that passes the heat on within the hour - the
         water sees in full, as a run's heat falling as it warms (see
-        physics.zone_state_space). (0, 0) without a saved model to estimate
-        the slabs by, or too few runs.
+        physics.zone_state_space). (0, 0) without a model to estimate the
+        slabs by, or too few runs.
 
         Each run followed from its start with the screed where the slab below
         and the room above hold it while nothing heats it - in between, by
         their conductances (real data, Oct 2026: started at the slab, runs
         from a night off read 800-1000 W short at first) - its heat from the
         water, Q = G (supply - screed), shared with the slabs below and the
-        rooms above through the floor's surface, at the saved model's
+        rooms above through the floor's surface, at the model's
         surface conductance: the slabs as that model estimates them, the
         rooms as measured, both floors taken as one by the water under each.
         G is the pipes' UA at each step's open loops and flow (see
@@ -2851,17 +2943,17 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # Here, not at the top: see validate().
         from features.cop import HeatPumpCOPIdentifier
 
-        saved = self.model
+        model = self.model
 
-        if saved is None:
+        if model is None:
             return 0.0, 0.0
 
         # Both floors as one, weighted by the water under each: the heated
         # part of the floor, which takes the open share of the circuit's
         # conductances and capacity alike - so only its heat scales with it.
-        states = self._filtered(saved, df)
+        states = self._filtered(model, df)
         living = floor_living_fraction(
-            df["floor_open_living"], df["floor_open_rest"], saved.living_area_fraction
+            df["floor_open_living"], df["floor_open_rest"], model.living_area_fraction
         )
         slab = (
             living * states[:, ZONE_SLAB_STATES[0]]
@@ -2895,10 +2987,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         floor_m2 = sum(self.room_areas_m2)
         dt_s = float(df["dt_seconds"].median())
-        surface = saved.ua_air_mass_w_per_k
-        # The screed in two halves where the saved model has them, the
+        surface = model.ua_air_mass_w_per_k
+        # The screed in two halves where the model has them, the
         # water against the pipes' (see BuildingThermalModel.screed_layer_w_per_k).
-        layer = saved.screed_layer_w_per_k
+        layer = model.screed_layer_w_per_k
 
         def residuals(log_x: np.ndarray) -> np.ndarray:
             pipes, capacity, down = np.exp(log_x)
@@ -2974,7 +3066,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 self.MAX_SCREED_W_PER_M2_K * floor_m2,
                 min(
                     self.MAX_SCREED_J_PER_M2_K * floor_m2,
-                    0.5 * saved.c_mass_j_per_k,
+                    0.5 * model.c_mass_j_per_k,
                 ),
                 self.MAX_SCREED_W_PER_M2_K * floor_m2,
             ]
@@ -3088,6 +3180,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         pv_w: pd.Series | None = None,
         habits: pd.DataFrame | None = None,
         room_heat_w: pd.DataFrame | None = None,
+        pipe_ua_w_per_k: float | None = None,
     ) -> pd.DataFrame:
         """Rolls the model forward past the last measurement, indexed by time.
 
@@ -3165,7 +3258,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         The rest is each sensor's last reading carried forward.
         """
 
-        zone, last = self._trajectory(df, now, baseload_w, pv_w, habits, room_heat_w)
+        zone, last = self._trajectory(
+            df, now, baseload_w, pv_w, habits, room_heat_w, pipe_ua_w_per_k
+        )
 
         return zone.iloc[last:]
 
@@ -3177,6 +3272,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         pv_w: pd.Series | None = None,
         habits: pd.DataFrame | None = None,
         room_heat_w: pd.DataFrame | None = None,
+        pipe_ua_w_per_k: float | None = None,
     ) -> pd.DataFrame:
         """The zone over the whole frame, indexed by time: the filter's estimate
         of every state up to now, then the free-running forecast from there (see
@@ -3185,7 +3281,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         is driven by, and the history it is drawn against.
         """
 
-        zone, _ = self._trajectory(df, now, baseload_w, pv_w, habits, room_heat_w)
+        zone, _ = self._trajectory(
+            df, now, baseload_w, pv_w, habits, room_heat_w, pipe_ua_w_per_k
+        )
 
         return zone
 
@@ -3197,6 +3295,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         pv_w: pd.Series | None,
         habits: pd.DataFrame | None,
         room_heat_w: pd.DataFrame | None,
+        pipe_ua_w_per_k: float | None = None,
     ) -> tuple[pd.DataFrame, int]:
 
         model = self.get_model()
@@ -3297,19 +3396,41 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
         last = int(np.flatnonzero(known)[-1])
 
+        # The thermometers and, while the floor runs, the water: what it gives
+        # the floor through the pipes the plan delivers it by (pipe_ua_w_per_k,
+        # see features.floor) says how warm the screed's pipe half is (see
+        # _water_reading) - the plan starts from it.
+        known_rows = prepared.iloc[: last + 1]
+        water, water_rows = self._water_reading(model, known_rows, pipe_ua_w_per_k)
+        observation = np.concatenate(
+            [
+                np.broadcast_to(
+                    zone_observations(model), (last + 1, 2, zone_size(model))
+                ),
+                water_rows[:, None, :],
+            ],
+            axis=1,
+        )
         estimates = kalman_states(
             a,
             b,
-            prepared[["T_living", "T_rest"]].to_numpy(dtype=float)[: last + 1],
+            np.column_stack(
+                [known_rows[["T_living", "T_rest"]].to_numpy(dtype=float), water]
+            ),
             inputs[: last + 1],
             dt_seconds[: last + 1],
             self.PROCESS_NOISE_W,
-            self.SENSOR_RESOLUTION_K**2 / 12.0,
-            zone_observations(model),
+            (
+                self.SENSOR_RESOLUTION_K**2 / 12.0,
+                self.SENSOR_RESOLUTION_K**2 / 12.0,
+                self.WATER_READING_K**2,
+            ),
+            observation,
             self.DISTURBANCE_INPUTS,
             _window(schedule, 0, last + 1),
-            reading_drift_k=self.READING_DRIFT_K,
+            reading_drift_k=(*self.READING_DRIFT_K, 0.0),
             reading_recovery_seconds=self.THERMOSTAT_RECOVERY_SECONDS,
+            observation_per_step=True,
         )
 
         # Nothing is delivered to the zone: this is what happens if the heat

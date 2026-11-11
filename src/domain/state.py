@@ -166,10 +166,6 @@ class Predictions(BaseModel):
     # horizon, and lagging and damped relative to the air as a heavy mass
     # should be. This is also the state an MPC must start a plan from.
     thermal_mass: list[SeriesPoint[float]] = Field(default_factory=list)
-    # The screed the floor's pipes lie in above that slab, the same way: it
-    # takes the floor's heat first and passes it on within hours. Empty
-    # where the building model has no screed.
-    screed: list[SeriesPoint[float]] = Field(default_factory=list)
     # The indoor dew point over the plan's horizon (see features.dew_point):
     # what a cooled floor must stay above.
     dew_point: list[SeriesPoint[float]] = Field(default_factory=list)

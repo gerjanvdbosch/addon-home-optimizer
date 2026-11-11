@@ -14,6 +14,16 @@ blueprint:
       selector:
         entity:
           domain: switch
+    dhw_setpoint_entity:
+      name: DHW setpoint (optional)
+      description: >-
+        The heat pump's DHW setpoint (number, climate or water heater), set to
+        sensor.home_optimizer_dhw_setpoint as each planned run starts. Empty
+        leaves the setpoint alone.
+      default: ""
+      selector:
+        entity:
+          domain: [ number, climate, water_heater ]
     heat_pump_state:
       name: Heat pump operating state
       selector:
@@ -84,6 +94,7 @@ variables:
   notify_devices: !input notify_devices
   dry_run: !input dry_run
   dhw_switch: !input dhw_switch
+  dhw_setpoint: !input dhw_setpoint_entity
   heat_pump: !input heat_pump_state
 
 triggers:
@@ -183,6 +194,31 @@ actions:
           - &control
             condition: template
             value_template: "{{ not dry_run }}"
+          # Before the block is lifted, so the run starts on it: the plan ends
+          # the run where its targets need it, the heat pump stopping on this
+          # setpoint (see the add-on's publish_dhw). Only at the start - a run
+          # under way is never cut short by a replan.
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ dhw_setpoint != ''
+                     and has_value('sensor.home_optimizer_dhw_setpoint') }}
+            then:
+              - if:
+                  - condition: template
+                    value_template: "{{ dhw_setpoint.startswith('number.') }}"
+                then:
+                  - action: number.set_value
+                    target:
+                      entity_id: "{{ dhw_setpoint }}"
+                    data:
+                      value: "{{ states('sensor.home_optimizer_dhw_setpoint') | float }}"
+                else:
+                  - action: "{{ dhw_setpoint.split('.')[0] }}.set_temperature"
+                    target:
+                      entity_id: "{{ dhw_setpoint }}"
+                    data:
+                      temperature: "{{ states('sensor.home_optimizer_dhw_setpoint') | float }}"
           - action: switch.turn_off
             target:
               entity_id: !input dhw_switch

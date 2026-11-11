@@ -1156,6 +1156,8 @@ def _zone_bias(
     cap_w: float | None = None,
     import_w: float = 50.0,
     outdoor_c: float | None = 8.0,
+    return_c: float | None = None,
+    min_supply_c: float = 0.0,
 ) -> tuple[float, list[tuple[SeriesPoint, float | None]]]:
     """The bias published, and what was stored: the plan's heat held and the
     surplus cap. surplus_w is the best minute of the last 5 and the worst
@@ -1184,6 +1186,12 @@ def _zone_bias(
         SeriesPoint(time=START, value=room_c)
     ]
     state.measurements.heat_pump.flow = [SeriesPoint(time=START, value=flow_lpm)]
+
+    if return_c is not None:
+        state.measurements.heat_pump.return_temperature = [
+            SeriesPoint(time=START, value=return_c)
+        ]
+
     state.schedule.building.bias_heat = previous
     state.schedule.building.bias_cap_w = cap_w
     result = MPCResult(
@@ -1209,8 +1217,17 @@ def _zone_bias(
         zone_floor_flow_lpm=(18.0,) * 4,
     )
     since = START - timedelta(hours=1) if heating else None
-    bias = optimization._zone_bias(  # type: ignore[arg-type]
-        config, data, result, state, 0, on, since, START, run_setpoint_c
+    bias, _ = optimization._zone_bias(  # type: ignore[arg-type]
+        config,
+        data,
+        result,
+        state,
+        0,
+        on,
+        since,
+        START,
+        run_setpoint_c,
+        min_supply_c=min_supply_c,
     )
 
     return bias, stored
@@ -1224,21 +1241,22 @@ def test_the_zone_bias_holds_the_plans_heat_within_a_run_and_its_least_after():
     free, _ = _zone_bias(None, on=True)
     assert free == 0.2
 
-    # Changed 10 minutes ago in this run: held, though 0.6 K off.
+    # Within the deadband - the same bias step as the plan's: held.
     held, stored = _zone_bias(
-        SeriesPoint(time=START - timedelta(minutes=10), value=3000.0), on=True
+        SeriesPoint(time=START - timedelta(minutes=10), value=4300.0), on=True
     )
-    assert (held, stored) == (-0.4, [])
+    assert (held, stored) == (0.2, [])
 
-    # Within the deadband: held however long ago.
-    held, _ = _zone_bias(
-        SeriesPoint(time=START - timedelta(minutes=40), value=4000.0), on=True
+    # A step off: moves.
+    moved, _ = _zone_bias(
+        SeriesPoint(time=START - timedelta(minutes=10), value=4000.0), on=True
     )
-    assert held == 0.1
+    assert moved == 0.2
 
-    # Past both: moves, and the change is stored.
+    # Further off, changed only 10 minutes ago: moves at once, and the change
+    # is stored.
     moved, stored = _zone_bias(
-        SeriesPoint(time=START - timedelta(minutes=40), value=3000.0), on=True
+        SeriesPoint(time=START - timedelta(minutes=10), value=3000.0), on=True
     )
     assert moved == 0.2 and stored == [(SeriesPoint(time=START, value=4500.0), None)]
 
@@ -1258,20 +1276,28 @@ def test_the_zone_bias_holds_the_plans_heat_within_a_run_and_its_least_after():
     assert blind == -0.6
 
 
+def test_the_zone_bias_asks_its_least_where_the_supply_floor_gives_the_heat():
+    # 24.3 degC over a 20.5 degC return at 18 L/min: 4.8 kW, above the plan's
+    # 4.5 - the least bias gives it. Over 21.5 degC 3.5 kW: the plan's bias.
+    cool, _ = _zone_bias(None, on=True, return_c=20.5, min_supply_c=24.3)
+    warm, _ = _zone_bias(None, on=True, return_c=21.5, min_supply_c=24.3)
+    assert (cool, warm) == (-0.6, 0.2)
+
+
 def test_a_heat_from_a_runs_start_up_is_not_held():
-    """Set in the run's first quarter hour - here 55 minutes after its start,
-    5 minutes ago - a heat 0.6 K off moves; set past it, it holds."""
+    """Set in the run's first quarter hour - here 55 minutes ago - a heat
+    within the deadband gives way to the plan's; set past it, it holds."""
 
     since = START - timedelta(hours=1)
-    moved, stored = _zone_bias(
-        SeriesPoint(time=since + timedelta(minutes=5), value=3000.0), on=True
+    _, stored = _zone_bias(
+        SeriesPoint(time=since + timedelta(minutes=5), value=4300.0), on=True
     )
-    assert moved == 0.2 and stored == [(SeriesPoint(time=START, value=4500.0), None)]
+    assert stored == [(SeriesPoint(time=START, value=4500.0), None)]
 
-    held, _ = _zone_bias(
-        SeriesPoint(time=since + timedelta(minutes=50), value=3000.0), on=True
+    _, stored = _zone_bias(
+        SeriesPoint(time=since + timedelta(minutes=50), value=4300.0), on=True
     )
-    assert held == -0.4
+    assert stored == []
 
 
 def test_within_a_run_the_bias_target_may_pass_the_band():
@@ -1289,7 +1315,7 @@ def test_within_a_run_the_bias_target_may_pass_the_band():
 
 def test_the_held_bias_follows_the_room_and_the_setpoint_at_once():
     """The heat held, the controller's error stays: the bias moves as much
-    as the room or the setpoint, within the hold."""
+    as the room or the setpoint."""
 
     recent = SeriesPoint(time=START - timedelta(minutes=10), value=4500.0)
 
@@ -1350,14 +1376,14 @@ def test_the_zone_bias_keeps_to_the_measured_surplus():
     kept, _ = _zone_bias(recent, on=True, surplus_w=(850.0, 600.0), cap_w=3250.0)
     assert kept == -0.2
 
-    # Back for 10 minutes: to the plan's at once, though within the hold.
+    # Back for 10 minutes: to the plan's at once.
     back, stored = _zone_bias(recent, on=True, surplus_w=(850.0, 850.0), cap_w=3250.0)
     assert (back, stored) == (0.2, [(recent, None)])
 
-    # Partly back: raised to what held, but only a deadband's worth.
+    # Partly back: raised to what held, but only past the deadband.
     partly, stored = _zone_bias(recent, on=True, surplus_w=(850.0, 700.0), cap_w=3250.0)
     assert (partly, stored) == (0.0, [(recent, 3750.0)])
-    little, _ = _zone_bias(recent, on=True, surplus_w=(850.0, 650.0), cap_w=3250.0)
+    little, _ = _zone_bias(recent, on=True, surplus_w=(850.0, 620.0), cap_w=3250.0)
     assert little == -0.2
 
 
@@ -1368,22 +1394,11 @@ def test_export_the_plan_expected_is_no_budget_for_the_surplus():
     assert covered == 0.2
 
 
-def test_in_sun_a_plans_raise_the_surplus_covers_is_not_held():
-    """The plan raised from 3.0 to 4.5 kW, the held heat changed 10 minutes
-    ago: in sun that covered it all of the last 10 minutes, at once."""
-
-    recent = SeriesPoint(time=START - timedelta(minutes=10), value=3000.0)
-
-    covered, stored = _zone_bias(recent, on=True, surplus_w=(900.0, 850.0))
-    assert covered == 0.2 and stored == [(SeriesPoint(time=START, value=4500.0), None)]
-
-    # Not covered all of it: held.
-    short, _ = _zone_bias(recent, on=True, surplus_w=(900.0, 300.0))
-    assert short == -0.4
-
-    # No sun, the plan's import covering it: held, as without a grid meter.
-    dark, _ = _zone_bias(recent, on=True, surplus_w=(0.0, -10.0), import_w=1000.0)
-    assert dark == -0.4
+def test_the_houses_draw_beyond_the_sun_does_not_cap_the_heat():
+    # At night the plan's 900 W all from the grid, the house drawing 300 W
+    # more: the plan's import is the heat pump's alone, so not capped.
+    night, _ = _zone_bias(None, on=True, surplus_w=(-300.0, -300.0), import_w=900.0)
+    assert night == 0.2
 
 
 def test_auto_adaptive_needs_the_units_outdoor_sensor():

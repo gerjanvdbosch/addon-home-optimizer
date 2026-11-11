@@ -312,19 +312,6 @@ def dashboard_chart(state: State, states: HeatPumpStates | None = None) -> str:
         decimal=2,
     )
 
-    # The screed the pipes lie in, above that slab: it takes the floor's heat
-    # first, so it leads the slab through a run.
-    series(
-        "Screed",
-        state.predictions.screed,
-        row=2,
-        col=1,
-        line=dict(width=1, color="#E58606", shape="spline", dash="dot"),
-        visible="legendonly",
-        unit="°C",
-        decimal=2,
-    )
-
     series(
         "Zone target",
         state.schedule.building.target_temperature,

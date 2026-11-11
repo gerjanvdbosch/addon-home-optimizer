@@ -433,19 +433,15 @@ class StateManager:
         self,
         temperature: pd.Series,
         thermal_mass: pd.Series,
-        screed: pd.Series | None = None,
     ) -> None:
         """The zone as the optimization job estimates it (see
         Optimization._zone): its measured temperature, and the
-        thermal mass and screed no sensor measures."""
+        thermal mass no sensor measures."""
 
         state = self.load()
 
         state.measurements.building.zone_temperature = self._series_points(temperature)
         state.predictions.thermal_mass = self._series_points(thermal_mass)
-        state.predictions.screed = (
-            self._series_points(screed) if screed is not None else []
-        )
 
         self.state_repository.save(state)
 
@@ -468,7 +464,6 @@ class StateManager:
         power_w: Sequence[float] = (),
         on: Sequence[int] = (),
         thermal_mass: Sequence[float] = (),
-        screed: Sequence[float] = (),
         rest: Sequence[float] = (),
     ) -> None:
         """The zone's part of the plan, not acted on yet. Its heat and power go
@@ -476,7 +471,7 @@ class StateManager:
         rewrote those this same run): one plan, one machine serving both. The
         thermal mass ahead is the plan's: update_zone stored the zone left
         alone from now on, and beside a planned floor run that showed the slab
-        cooling while the run heated the room. The screed likewise."""
+        cooling while the run heated the room."""
 
         state = self.load()
         heat_pump = state.schedule.heat_pump
@@ -519,9 +514,6 @@ class StateManager:
             state.predictions.thermal_mass = planned(
                 state.predictions.thermal_mass, thermal_mass
             )
-
-        if screed:
-            state.predictions.screed = planned(state.predictions.screed, screed)
 
         self.state_repository.save(state)
 

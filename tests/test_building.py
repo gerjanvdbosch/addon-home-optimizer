@@ -26,6 +26,7 @@ from domain.physics import (
     internal_gain_w,
     night_share,
     solar_gain_w,
+    zone_floor,
     zone_heat_capacities,
     zone_heat_shortfall_j,
     zone_observation,
@@ -215,7 +216,12 @@ class _ShutWindows(BuildingThermalIdentifier):
     six parameters this data cannot see, and the fit wanders through them -
     three times the evaluations for the same other parameters. Its living
     room has no air of its own either (see
-    test_the_occupants_warm_the_living_rooms_air_first), held likewise."""
+    test_the_occupants_warm_the_living_rooms_air_first), held likewise. Nor
+    a screed, and no water side to show one: each run's heat is constant at
+    a constant supply, which no floor - screed or none - gives."""
+
+    def _fit_screed(self, df: pd.DataFrame) -> tuple[float, float]:
+        return 0.0, 0.0
 
     def _bounds(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         lower, initial, upper = super()._bounds()
@@ -333,6 +339,31 @@ def _calibrated():
     identifier.parameter_std_errors = dict(std_errors or {})
 
     return identifier, df.copy(), now
+
+
+def test_calibrate_fits_the_screed_against_its_own_fit_without_one(monkeypatch):
+    """The screed is read off the slabs of a fit without one, made from the
+    same data - never off the saved model's - so how often calibration has
+    run does not change the model."""
+
+    screed = (6.0e6, 1900.0)
+    fitted_against = []
+
+    def fit_screed(self, df):
+        fitted_against.append(self.model.screed_capacity_j_per_k)
+        return screed
+
+    monkeypatch.setattr(_ShutWindows, "_fit_screed", fit_screed)
+    df = _simulate(np.random.default_rng(14))
+    identifier = _identifier()
+
+    first = identifier.calibrate(df.copy())
+
+    assert fitted_against == [0.0]
+    assert (first.screed_capacity_j_per_k, first.screed_to_slab_w_per_k) == screed
+
+    assert vars(identifier.calibrate(df.copy())) == pytest.approx(vars(first))
+    assert fitted_against == [0.0, 0.0]
 
 
 def test_calibrate_recovers_known_parameters():
@@ -1822,7 +1853,9 @@ def test_the_screed_is_read_off_how_runs_fall_off():
     states = np.zeros((len(slabs), 4))
     states[:, 2] = states[:, 3] = slabs
     identifier._filtered = lambda model, df: states
-    fitted, fitted_down = identifier._fit_screed(pd.DataFrame(rows))
+    fitted, fitted_down = BuildingThermalIdentifier._fit_screed(
+        identifier, pd.DataFrame(rows)
+    )
 
     assert fitted == pytest.approx(capacity, rel=0.15)
     assert fitted_down == pytest.approx(down, rel=0.15)
@@ -2359,3 +2392,90 @@ def test_a_rooms_run_rise_is_its_rise_per_k_of_the_rests_with_its_loops_open():
         }
     )
     assert identifier.room_run_rise(frame, now) == pytest.approx([1.0, 0.6, 1.0, 1.0])
+
+
+def test_a_reading_of_its_own_mixture_and_noise_corrects_a_hidden_state():
+    """A reading that sees a different mixture of states each step, with a
+    noise of its own, pulls a state no other thermometer sees towards it -
+    the more the less noisy it is - and corrects nothing where it is
+    missing."""
+
+    # A room read directly over a mass that nothing else reads, an
+    # unmodelled heat flow reaching the mass alone.
+    a = np.array([[-1.0e-4, 1.0e-4], [1.0e-5, -1.0e-5]])
+    b = np.array([[0.0, 0.0], [0.0, 1.0e-6]])
+    steps = 40
+    room = np.full((steps, 1), 20.0)
+    mass = np.full((steps, 1), np.nan)
+    mass[20:] = 23.0
+    rows = np.zeros((steps, 2, 2))
+    rows[:, 0, 0] = 1.0
+    rows[:, 1, 1] = 1.0
+
+    def mass_estimate(noise_k):
+        return kalman_states(
+            a,
+            b,
+            np.hstack([room, mass]),
+            np.zeros((steps, 2)),
+            np.full(steps, 900.0),
+            300.0,
+            (1.0e-4, noise_k**2),
+            rows,
+            (1,),
+            observation_per_step=True,
+        )[:, 1]
+
+    sharp, blunt = mass_estimate(0.1), mass_estimate(1.0)
+
+    # Nothing before the reading; then most of the way to it, the room's
+    # own reading holding the rest back through their coupling.
+    assert sharp[19] == pytest.approx(20.0, abs=0.01)
+    assert sharp[-1] > 21.5
+    assert blunt[-1] < sharp[-1] - 0.5
+
+
+def test_the_water_reads_the_screed_once_a_run_settled():
+    """The water's reading of the screed (see _water_reading): its supply
+    less its heat over the pipes at the step's open loops and flow, from a
+    run's second quarter hour, either mode; against the pipe halves under
+    the loops open; none off a run nor without the pipes' UA."""
+
+    identifier = _identifier()
+    share = identifier.living_area_fraction
+    model = replace(
+        TRUE_MODEL,
+        screed_capacity_j_per_k=6.0e6,
+        screed_to_slab_w_per_k=1900.0,
+        screed_layer_w_per_k=600.0,
+    )
+    df = pd.DataFrame(
+        {
+            "time": pd.Timestamp("2026-07-01T00:00Z")
+            + pd.to_timedelta(np.arange(5) * DT_SECONDS, unit="s"),
+            "state": ["Uit", "Verwarmen", "Verwarmen", "Verwarmen", "Koelen"],
+            "T_supply": [np.nan, 30.0, 30.0, 30.0, 16.0],
+            "Q_floor_w": [0.0, 4000.0, 3500.0, 3000.0, -1500.0],
+            # Only the living room's loops open in the fourth quarter hour.
+            "floor_open_living": [np.nan, share, share, share, share],
+            "floor_open_rest": [np.nan, 1 - share, 1 - share, 0.0, 1 - share],
+            "floor_flow_lpm": [np.nan, 18.0, 18.0, 16.0, 18.0],
+            "flow_lpm": [0.0, 18.0, 18.0, 16.0, 18.0],
+        }
+    )
+
+    water, rows = identifier._water_reading(model, df, 1600.0)
+
+    every = float(floor_loops_conductance_w_per_k(1600.0, 1.0, 18.0))
+    living = float(floor_loops_conductance_w_per_k(1600.0, share, 16.0))
+    assert water == pytest.approx(
+        [np.nan, np.nan, 30.0 - 3500.0 / every, 30.0 - 3000.0 / living, np.nan],
+        nan_ok=True,
+    )
+    assert rows[3] == pytest.approx(zone_floor(model, 1.0))
+    assert rows[2] == pytest.approx(
+        share * zone_floor(model, 1.0) + (1 - share) * zone_floor(model, 0.0)
+    )
+
+    unread, _ = identifier._water_reading(model, df, None)
+    assert np.isnan(unread).all()

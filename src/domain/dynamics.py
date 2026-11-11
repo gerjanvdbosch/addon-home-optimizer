@@ -147,12 +147,13 @@ def kalman_states(
     inputs: np.ndarray,
     dt_seconds: np.ndarray,
     process_noise_w: float,
-    measurement_variance: float,
+    measurement_variance: float | Sequence[float],
     observation: np.ndarray | None = None,
     disturbance_inputs: tuple[int, ...] = (1,),
     schedule: ScheduledSystem | None = None,
     reading_drift_k: tuple[float, ...] = (),
     reading_recovery_seconds: float | None = None,
+    observation_per_step: bool = False,
 ) -> np.ndarray:
     """Filtered state estimate at every sample, from one scalar measurement.
 
@@ -184,6 +185,11 @@ def kalman_states(
     thermometers are a matrix of such rows, with `measured` holding a column
     each; a reading that is missing (NaN) simply corrects nothing that step.
 
+    `measurement_variance` is the readings' noise (K2), one for all or one
+    per reading. With `observation_per_step` the observation has a matrix
+    per step (steps, readings, states): a reading that sees a different
+    mixture of states each step.
+
     With a `schedule` the system is its, step by step, in place of (a, b).
 
     `reading_drift_k` is, per thermometer, the spread (K) of a departure of
@@ -211,6 +217,7 @@ def kalman_states(
             if any(reading_drift_k)
             else None
         ),
+        observation_per_step=observation_per_step,
     )
 
 
@@ -244,13 +251,14 @@ def kalman_filter(
     measured: np.ndarray,
     inputs: np.ndarray,
     process_noise_w: float,
-    measurement_variance: float,
+    measurement_variance: float | Sequence[float],
     observation: np.ndarray,
     disturbance_inputs: tuple[int, ...],
     reading_drift_k: tuple[float, ...] = (),
     reading_decay: np.ndarray | None = None,
     same: Sequence[int] | None = None,
     stationary: bool = False,
+    observation_per_step: bool = False,
 ) -> np.ndarray:
     """kalman_states over steps discrete_steps() gives - or over many systems
     at once against the same readings, each along a leading axis of the steps,
@@ -274,7 +282,13 @@ def kalman_filter(
     renewed so that its spread stays reading_drift_k: an AR(1) departure added
     to what the thermometer reads. It is no part of the system, so it is left
     out of the estimate returned.
+
+    `observation_per_step` (see kalman_states) is for one system, its
+    covariance carried step by step.
     """
+
+    if observation_per_step and (stationary or same is not None):
+        raise ValueError("A per-step observation is for one system, step by step.")
 
     h = observation
     n = a_steps.shape[-1]
@@ -287,10 +301,10 @@ def kalman_filter(
     # are columns, so one product serves one system or many.
     first = readings[0]
     level = float(np.nanmean(first))
-    state = level + np.linalg.pinv(h) @ np.nan_to_num(first - level)[:, None]
-    covariance = np.broadcast_to(
-        np.eye(n) * measurement_variance, state.shape[:-2] + (n, n)
-    )
+    first_h = h[0] if observation_per_step else h
+    state = level + np.linalg.pinv(first_h) @ np.nan_to_num(first - level)[:, None]
+    variances = np.broadcast_to(np.asarray(measurement_variance, float), (h.shape[-2],))
+    covariance = np.broadcast_to(np.eye(n) * variances.min(), state.shape[:-2] + (n, n))
 
     # The drift, after the system's states: driven by nothing, read in its
     # thermometer's reading alone, starting at none at its own spread.
@@ -351,7 +365,7 @@ def kalman_filter(
         distinct = spread = slice(None)
     h_distinct = h[distinct]
     h_distinct_t = np.swapaxes(h_distinct, -1, -2)
-    noise = np.eye(h.shape[-2]) * measurement_variance
+    noise = np.diag(variances)
 
     if stationary:
         # The covariance a step's prediction settles to, and its gain.
@@ -383,14 +397,21 @@ def kalman_filter(
             )
 
         if any_seen[i]:
+            h_now, h_now_t = (
+                (h[i], np.swapaxes(h[i], -1, -2))
+                if observation_per_step
+                else (h_distinct, h_distinct_t)
+            )
+
             if all_seen[i]:
-                h_seen, noise_seen = h, noise
-                own_h, own_h_t = h_distinct, h_distinct_t
+                h_seen = h[i] if observation_per_step else h
+                noise_seen = noise
+                own_h, own_h_t = h_now, h_now_t
                 reading = readings[i][:, None]
             else:
                 seen = seen_rows[i]
-                h_seen = h[..., seen, :]
-                own_h, own_h_t = h_distinct[..., seen, :], h_distinct_t[..., seen]
+                h_seen = (h[i] if observation_per_step else h)[..., seen, :]
+                own_h, own_h_t = h_now[..., seen, :], h_now_t[..., seen]
                 noise_seen = noise[np.ix_(seen, seen)]
                 reading = readings[i][seen][:, None]
 

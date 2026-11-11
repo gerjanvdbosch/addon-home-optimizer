@@ -4235,7 +4235,6 @@ class MPCOptimizer:
         zone_temperatures: tuple[float, ...] = ()
         zone_rest_temperatures: tuple[float, ...] = ()
         zone_mass_temperatures: tuple[float, ...] = ()
-        zone_screed_temperatures: tuple[float, ...] = ()
         space_supply_c: tuple[float, ...] = ()
         space_electrical_w: tuple[float, ...] = ()
 
@@ -4263,22 +4262,6 @@ class MPCOptimizer:
                 float(pyo.value(model.zone_state[k, ZONE_SLAB_STATES[0]]))
                 for k in range(num_steps)
             )
-
-            # The pipes' half where the screed has two: what the water heats.
-            screed = next(
-                (
-                    i
-                    for i in (ZONE_PIPE_STATES[0], ZONE_SCREED_STATES[0])
-                    if i in model.ZONE_STATES
-                ),
-                None,
-            )
-
-            if screed is not None:
-                zone_screed_temperatures = tuple(
-                    float(pyo.value(model.zone_state[k, screed]))
-                    for k in range(num_steps)
-                )
             # The electricity that heat costs, as the objective prices it:
             # the heat moved, either way, over the step's COP.
             space_electrical_w = tuple(
@@ -4326,7 +4309,6 @@ class MPCOptimizer:
             zone_temperatures=zone_temperatures,
             zone_rest_temperatures=zone_rest_temperatures,
             zone_mass_temperatures=zone_mass_temperatures,
-            zone_screed_temperatures=zone_screed_temperatures,
             space_supply_c=space_supply_c,
             space_electrical_w=space_electrical_w,
             electricity_kwh=sum(electricity_step_kwh),
