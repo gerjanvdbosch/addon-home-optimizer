@@ -41,6 +41,7 @@ from domain.physics import (
     zone_observations,
     zone_state_space,
 )
+from features import ecodan
 
 logger = logging.getLogger(__name__)
 
@@ -4058,24 +4059,102 @@ class MPCOptimizer:
             def supply_on(k: int):
                 return model.space_sink_on[k] + model.q_space_w[k] / conductance[k]
 
-            # The steps a run's heat may rise in (see below): where the bias
-            # steers the heat, those whose expected surplus - the grid meter's
-            # export ahead, solar less the baseload as forecast - exceeds the
-            # floor's least draw.
+            # Where the bias steers, a run heats at the controller's least -
+            # the compressor's lowest speed, or its supply floor where that
+            # takes more - or at the heat the expected solar surplus (solar
+            # less the baseload as forecast) buys where that is more: what the
+            # bias asks for (see Optimization._zone_bias), so comfort is met
+            # by starting in time, not by more power (user's rule, 12 Nov
+            # 2026), and the plan expects the sun's heat the bias will give.
+            # The sun's heat at the floor left unheated, as the draw's
+            # tangents are taken.
             surplus_w = np.asarray(data.solar_forecast_w, dtype=float) - np.asarray(
                 data.baseload_forecast_w or np.zeros(len(data.solar_forecast_w)),
                 dtype=float,
             )
-            exporting = [
-                k
-                for k in range(1, num_steps)
-                if not cooling
-                and data.zone_heat_may_rise
-                and efficiency is not None
-                and surplus_w[k]
-                > draw_w(k, operating.min_heat_w, sink_c(k, coolest[k]))
-            ]
-            model.space_rises = pyo.Var(exporting, domain=pyo.Binary)
+            steered = not cooling and data.zone_auto_adaptive and efficiency is not None
+            sun_heat_w = np.zeros(num_steps)
+
+            def bought_w(k: int) -> float:
+                """The heat whose draw is the step's surplus, at most the most."""
+
+                reference_c = sink_c(k, unheated[k])
+
+                if draw_w(k, max_heat_w, reference_c) <= surplus_w[k]:
+                    return max_heat_w
+
+                low_w, high_w = 0.0, max_heat_w
+
+                # The draw rises with the heat: halved to within a watt.
+                while high_w - low_w > 1.0:
+                    middle_w = 0.5 * (low_w + high_w)
+
+                    if draw_w(k, middle_w, reference_c) <= surplus_w[k]:
+                        low_w = middle_w
+                    else:
+                        high_w = middle_w
+
+                return low_w
+
+            # The least is the larger of the compressor's and the supply
+            # floor's, G (min_supply - T_sink), which falls as the run warms
+            # the floor. Bounded from above by the chord of max(least, sun)
+            # over the floor's range: that is convex in the floor, so the
+            # chord never cuts it - exact at either end, and over a run under
+            # way, whose floor is known, all but exact; looser a day ahead,
+            # where the floor may lie anywhere between left unheated and
+            # heated flat out. A choice per step of which bounds (a binary)
+            # ran a day's solve into its time limit (real data, 12 Nov 2026).
+            # Not in the fallback (MPCInput.zone_above_least).
+            if steered:
+                for k in range(num_steps):
+                    # The bias asks for more than the least only past the
+                    # controller's least rise with the room at or below its
+                    # target, which widens in the cold (4.6 kW at 0 degC, 18
+                    # L/min): less sun leaves it at the least, the target just
+                    # below the room (see features.ecodan.setpoint_bias_k).
+                    if surplus_w[k] > 0.0:
+                        bought = bought_w(k)
+                        flow = flow_lpm[k] or operating.flow_lpm
+
+                        if bought > ecodan.min_rise_k(
+                            zone_outdoor_c[k]
+                        ) * ecodan.water_w_per_k(flow):
+                            sun_heat_w[k] = bought
+
+                    on = model.space_on[k]
+
+                    if sun_heat_w[k] > 0.0:
+                        model.zone_constraints.add(
+                            model.q_space_w[k] >= sun_heat_w[k] * on
+                        )
+
+                    if data.zone_above_least:
+                        continue
+
+                    low = sink_c(k, coolest[k]) - ZONE_BOUND_MARGIN_K
+                    high = sink_c(k, warmest[k]) + ZONE_BOUND_MARGIN_K
+
+                    def most_w(sink_c: float, k: int = k) -> float:
+                        least_w = max(operating.min_heat_w, sun_heat_w[k])
+
+                        if operating.min_supply_c:
+                            least_w = max(
+                                least_w,
+                                conductance[k] * (operating.min_supply_c - sink_c),
+                            )
+
+                        # Not capped at the most heat (its own bound): capped,
+                        # the bound would no longer be convex, and its chord
+                        # could cut the floor's least.
+                        return least_w
+
+                    slope = (most_w(high) - most_w(low)) / (high - low)
+                    model.zone_constraints.add(
+                        model.q_space_w[k]
+                        <= most_w(low) * on
+                        + slope * (model.space_sink_on[k] - low * on)
+                    )
 
             for k in range(num_steps - 1):
                 lo_k, hi_k = supply_range(k)
@@ -4091,25 +4170,13 @@ class MPCOptimizer:
                 # solver's own tolerance; on eight days this held runs steady
                 # for at most 0.23 cent, every solve as quick. Exact in the
                 # binaries' four cases: no bound beyond the most heat unless
-                # both steps run. The bias can raise it (5 Nov 2026: supply
-                # within 0.1-0.5 K of its setpoint), but only into solar the
-                # house would otherwise export: the raised step draws no more
-                # than the expected surplus. Any other rise is a near tie the
-                # solver turned either way between replans (7 Nov 2026: a
-                # 1.4 K step at noon on 0.1-0.3 kW of surplus, 3 cent from a
-                # steady run) - a steady run preferred (user's rule). Live the
-                # bias holds the heat to the meter's measured surplus (see
-                # Optimization._zone_bias). The power bound's big M is the most
-                # heat: a draw never exceeds its heat.
-                rise_w = 0.0
-
-                if k + 1 in exporting:
-                    rises = model.space_rises[k + 1]
-                    rise_w = max_heat_w * rises
-                    model.zone_constraints.add(
-                        model.space_power_w[k + 1]
-                        <= surplus_w[k + 1] + max_heat_w * (1 - rises)
-                    )
+                # both steps run. The bias raises it (5 Nov 2026: supply
+                # within 0.1-0.5 K of its setpoint) into the sun's heat above,
+                # and only there. Any other rise is a near tie the solver
+                # turned either way between replans (7 Nov 2026: a 1.4 K step
+                # at noon on 0.1-0.3 kW of surplus, 3 cent from a steady run) -
+                # a steady run preferred (user's rule).
+                rise_w = max_heat_w if sun_heat_w[k + 1] > 0.0 else 0.0
 
                 model.zone_constraints.add(
                     sign * model.q_space_w[k + 1]
@@ -4315,4 +4382,10 @@ class MPCOptimizer:
             grid_kwh=sum(grid_step_kwh),
             electricity_step_kwh=electricity_step_kwh,
             grid_step_kwh=grid_step_kwh,
+            zone_below_band_k=max(
+                (float(pyo.value(model.zone_slack[k])) for k in model.K),
+                default=0.0,
+            )
+            if hasattr(model, "zone_slack")
+            else 0.0,
         )

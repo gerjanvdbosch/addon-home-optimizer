@@ -66,16 +66,18 @@ def setpoint_bias_k(
     setpoint_c: float,
     maximum_c: float,
     least_heat_w: float = 0.0,
+    round_up: bool = True,
 ) -> float:
     """The setpoint bias (K) at which the controller asks for heat_w into the
     floor: the law inverted for the room's error, the room target it needs
     never past the comfort band's maximum. Rounded up to the bias step, so at
-    least that heat.
+    least that heat - or down (round_up False), so at most that heat.
 
     No more than the heat pump's least heat (least_heat_w, its compressor at
-    the lowest speed) or less than the least rise at or below the target -
-    which in the cold is more than that (4.1 kW at 2 degC, 18 L/min) - is
-    asked for with the target one step below the room: the base rise, which
+    the lowest speed) - rounded down also less than the least rise at or
+    below the target, which in the cold is more than that (4.1 kW at 2 degC,
+    18 L/min) - is asked for with the target one step below the room: the
+    base rise, which
     the compressor at its lowest speed gives at least. Asked for through the
     curve instead, the least heat sets a supply the lowest speed only just
     reaches over a cool return, and the controller speeds the compressor up to
@@ -85,10 +87,15 @@ def setpoint_bias_k(
     """
 
     least_k = min_rise_k(outdoor_c)
+    # Between the base rise below the target and the cold-widened least rise
+    # at it the controller asks for nothing: rounded down that is the least
+    # below the room, rounded up the least rise, the target at the room (the
+    # curve's start below).
+    rise_k = least_k if not round_up else MIN_RISE_K
 
     # In whole watts: at its least the plan's heat comes back from the solver
     # a fraction of a watt either side of it.
-    if round(heat_w) <= max(least_k * water_w_per_k(flow_lpm), least_heat_w):
+    if round(heat_w) <= max(rise_k * water_w_per_k(flow_lpm), least_heat_w):
         return least_bias_k(room_c, setpoint_c)
 
     error_range_k = ERROR_RANGE_K * (1.0 - 0.5 * min(_cold_factor(outdoor_c), 1.0))
@@ -98,6 +105,7 @@ def setpoint_bias_k(
     x = 0.5 - math.sin(math.asin(1.0 - 2.0 * share) / 3.0)
     target_c = min(room_c + x * error_range_k, maximum_c)
 
-    bias_k = math.ceil(round((target_c - setpoint_c) / BIAS_STEP_K, 6)) * BIAS_STEP_K
+    steps = round((target_c - setpoint_c) / BIAS_STEP_K, 6)
+    bias_k = (math.ceil(steps) if round_up else math.floor(steps)) * BIAS_STEP_K
 
     return round(min(max(bias_k, -BIAS_LIMIT_K), BIAS_LIMIT_K), 1)

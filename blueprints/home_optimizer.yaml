@@ -357,6 +357,24 @@ actions:
           - condition: trigger
             id: plan
         sequence:
+          # The bias number back to the add-on's where something else set it
+          # - another automation, the unit restarting - since the add-on's
+          # last change: the bias trigger fires only on that (12 Nov 2026: a
+          # script's -0.7..-0.5 held from 14:06 to the run's end).
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ not dry_run and bias_number != ''
+                     and has_value('sensor.home_optimizer_zone_bias')
+                     and has_value(bias_number)
+                     and (states(bias_number) | float | round(1))
+                         != (states('sensor.home_optimizer_zone_bias') | float | round(1)) }}
+            then:
+              - action: number.set_value
+                target:
+                  entity_id: "{{ bias_number }}"
+                data:
+                  value: "{{ states('sensor.home_optimizer_zone_bias') | float }}"
           - action: rest_command.home_optimizer_api
             data:
               endpoint: update

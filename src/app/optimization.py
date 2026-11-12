@@ -31,7 +31,12 @@ from features.cop import HeatPumpCOPIdentifier
 from features.dataset import DatasetBuilder, DatasetLoader
 from features.dew_point import DewPointIdentifier
 from features.floor import FloorCircuitIdentifier
-from features.optimizer import SOLAR_SCENARIO_WEIGHTS, MPCOptimizer, surplus_scenarios
+from features.optimizer import (
+    SOLAR_SCENARIO_WEIGHTS,
+    ZONE_BOUND_MARGIN_K,
+    MPCOptimizer,
+    surplus_scenarios,
+)
 from features.price import (
     PRICE_PERIOD,
     SOLCAST_PERIOD,
@@ -497,6 +502,22 @@ class Optimization:
             zone, optimizer, planned = None, dhw_only, data
             result = optimizer.solve(planned)
 
+        # Held to its least, a steered run that still leaves the comfort band
+        # - started late, by hand or a forecast too warm - may heat harder:
+        # only then, and the bias follows that plan (user, 12 Nov 2026). The
+        # band's slack measures only what more heat could change.
+        if (
+            zone is not None
+            and planned.zone_auto_adaptive
+            and result.zone_below_band_k > ZONE_BOUND_MARGIN_K
+        ):
+            logger.warning(
+                "Zone %.2f K below its band at the least heat: planned again above it",
+                result.zone_below_band_k,
+            )
+            planned = dataclasses.replace(planned, zone_above_least=True)
+            result = optimizer.solve(planned)
+
         logger.info(
             "Optimization completed: schedule=%s objective=%.3f",
             result.schedule,
@@ -582,12 +603,13 @@ class Optimization:
             heat_pump_changes[0],
             now,
             # The compressor's least heat into the floor (see
-            # features.ecodan.setpoint_bias_k), and the controller's least
-            # supply.
+            # features.ecodan.setpoint_bias_k), the controller's least
+            # supply, and the most heat the floor's runs have moved.
             *(
                 (
                     optimizer.floor_circuit_model.min_heat_w,
                     optimizer.floor_circuit_model.min_supply_c,
+                    optimizer.floor_circuit_model.max_heat_w or math.inf,
                 )
                 if optimizer.floor_circuit_model is not None
                 else ()
@@ -1817,7 +1839,7 @@ class Optimization:
             ),
             zone_floor_open=floor_open,
             zone_floor_flow_lpm=floor_flow,
-            zone_heat_may_rise=config.heat_pump.auto_adaptive,
+            zone_auto_adaptive=config.heat_pump.auto_adaptive,
             zone_cooling=cooling,
             zone_mass_minimum_c=(
                 tuple(c + config.building.dew_point_margin for c in dew_point_c)
@@ -2140,25 +2162,26 @@ class Optimization:
 
         return f"{setpoint_c:.1f}"
 
-    # The plan's heat is held: a new one only past this from the held one, at
-    # the controller's target: near the plan's heats the controller moves
-    # ~3-4 kW of heat per K of error (5 Nov 2026, 17.5 L/min, 8 degC), so a
-    # 0.1 K step is ~0.4 kW. One step: at two a plan one step off was never
-    # followed, ~1 kWh over a 3-hour run (11 Nov 2026). Successive plans' heats
-    # differ by less (2.96-3.46 kW over 80 replayed solves, 10-11 Nov 2026);
-    # a 30-minute hold on top changed the bias at 4 of them (24 against 20
-    # steps), so there is none.
-    ZONE_BIAS_DEADBAND_K = 0.1
-    # The surplus the grid meter measures (its reading without the heat pump's
-    # own draw) caps the heat - the same as holding the meter to the plan's
-    # import: lowered once a shortfall lasted one decision interval (the plan
-    # runs every 5 minutes; its best minute, so a kettle or a passing cloud
-    # does not) and raised again once the surplus held for
-    # ZONE_BIAS_RAISE_WINDOW (its worst minute), both at once. Over 128
-    # sunny days (Jun-Nov 2026, 1-minute P1 and heat pump power, the plan's
-    # heat then held 30 minutes) that took 5.8 bias steps a day, 0.6 of them
-    # back up within half an hour, the import and export it costs within
-    # 0.2 ct a day; raised at once it took 13.5 at the same.
+    # A run heats at the controller's least, more only into solar surplus
+    # (user's rule, 12 Nov 2026): the plan's own heat, re-solved every 5
+    # minutes, moved the bias 24 times in 2.75 hours that afternoon, 16 of
+    # them with the room unchanged - near ties at the least (3.0-3.7 kW).
+    # The sun's heat moves two bias steps at least (~0.7 kW at the
+    # controller's ~3.5 kW per K): one step, ~70 W of draw, is far finer than
+    # the surplus itself moves. Over 28 heating-season days (20 Sep-12 Nov
+    # 2026, 1-minute meter and heat pump readings, 08-17 h) two steps took
+    # 8.5 bias changes a day against 13.4 at one, 1.8 of them reversed
+    # within half an hour against 2.6, at the same export.
+    ZONE_BIAS_DEADBAND_K = 0.2
+    # The surplus the grid meter measures (its reading without the heat
+    # pump's own draw) sets the sun's heat: lowered once it fell short all of
+    # ZONE_BIAS_LOWER_WINDOW (its best minute; a median of 10 minutes took
+    # more changes, as many reversed), raised to what held all of
+    # ZONE_BIAS_RAISE_WINDOW (its worst minute) - a passing cloud moves
+    # neither, the floor stores what a few minutes of import cost. A little
+    # import is fine, the meter at 0 not required; 10 minutes, not 20, which
+    # halved the reversals but left ~0.35 kWh of sun a day unused (user,
+    # 12 Nov 2026).
     ZONE_BIAS_LOWER_WINDOW = timedelta(minutes=5)
     ZONE_BIAS_RAISE_WINDOW = timedelta(minutes=10)
 
@@ -2175,30 +2198,25 @@ class Optimization:
         run_setpoint_c: float | None = None,
         least_heat_w: float = 0.0,
         min_supply_c: float = 0.0,
+        max_heat_w: float = math.inf,
     ) -> tuple[float, str]:
         """The bias to publish now, and why (for the log): for a heating run
         under way or handed over (step k its first), the bias at which the
-        controller asks for the plan's mean heat over its next hour; outside
-        one, or without the readings, the bias at which it asks for its
-        least, at most 0; 0 - the controller left to its setpoint - while
-        cooling or without the room or its setpoint.
+        controller asks for its least, or for the heat the measured solar
+        surplus buys where that is more; outside one, or without the
+        readings, its least, at most 0; 0 - the controller left to its
+        setpoint - while cooling or without the room or its setpoint.
 
-        What is held within a run under way since `since` is the heat, not
-        the bias: the bias follows the room and the setpoint at once, so the
-        controller's error - and its heat - stays the plan's when the sun
-        warms the room or the blueprint raises the setpoint. The plan's heat
-        itself is held within the deadband; a run's first quarter hour and
-        the 0 after it are not held.
+        The least is the target a step below the room, so the bias follows
+        the room and the setpoint at once and nothing else. The sun's heat is
+        held within a run under way since `since` (see ZONE_BIAS_RAISE_WINDOW)
+        and never aims past the comfort band's maximum: it is surplus stored
+        in the floor, not heat the room needs.
 
         Against the thermostat's setpoint, which the controller follows -
         before the heat pump heats, run_setpoint_c, the room setpoint the
         blueprint gives the run as it starts: the one measured is still the
-        one before (6 Nov 2026: 15 degC, the bias clamped at 2.5 K).
-
-        The heat is at most what the measured solar surplus plus the plan's
-        own expected import buys at the plan's COP: the plan chose that
-        import, more is the forecast's error (sun or load). That cap moves
-        at once, see ZONE_BIAS_LOWER_WINDOW."""
+        one before (6 Nov 2026: 15 degC, the bias clamped at 2.5 K)."""
 
         outdoor = config.heat_pump.outdoor_temperature
         assert outdoor is not None
@@ -2233,16 +2251,7 @@ class Optimization:
         if not on or not result.space_heat_w:
             return least_k, f"{least} | no heating run | {readings}"
 
-        schedule = result.space_schedule
-        step_hours = MPCConfig().step_hours
-        step = timedelta(hours=step_hours)
-        steps_per_hour = round(1.0 / step_hours)
-        steps = [
-            j
-            for j in range(k, min(k + steps_per_hour, len(schedule)))
-            if schedule[j] == 1
-        ] or [k]
-        plan_w = float(np.mean([result.space_heat_w[j] for j in steps]))
+        step = timedelta(hours=MPCConfig().step_hours)
 
         # The flow measured once the heat pump has heated this run for a
         # quarter hour, as zone_supply_c takes it: before, the quarter's mean
@@ -2293,135 +2302,86 @@ class Optimization:
         if cop:
             readings += f", COP {cop:.1f}"
 
-        def bias_k(heat_w: float) -> float:
+        # The sun's heat rounded down - no more than the surplus buys, nor
+        # past the floor's most - the plan's (the band fallback) up: at least
+        # the heat the band needs.
+        def bias_k(heat_w: float, round_up: bool = False) -> float:
             return ecodan.setpoint_bias_k(
                 heat_w=heat_w,
                 flow_lpm=flow_lpm,
                 outdoor_c=outdoor_c,
                 room_c=room_c,
                 setpoint_c=setpoint_c,
-                # Within a run under way the plan's heat, wherever the sun
-                # has taken the air (see zone_setpoint_c).
-                maximum_c=(
-                    data.zone_maximum_temperature[k] if since is None else math.inf
-                ),
+                maximum_c=data.zone_maximum_temperature[k],
                 least_heat_w=least_heat_w,
+                round_up=round_up,
             )
 
-        previous = state.schedule.building.bias_heat
-        # Held only from a heat set once the run has settled - its first
-        # quarter hour, as the flow above: before it the compressor is not yet
-        # up and the plan may not count the run as under way.
+        previous = state.schedule.building.sun_heat_w
         held = (
             previous
-            if previous is not None
-            and since is not None
-            and previous.time >= since + step
+            if previous is not None and since is not None and previous.time >= since
             else None
         )
-        heat_w = plan_w
-        plan_kw = f"plan {kw(plan_w)}"
-        why = "plan"
-
-        if (
-            held is not None
-            and abs(bias_k(plan_w) - bias_k(held.value))
-            < self.ZONE_BIAS_DEADBAND_K - 1e-9
-        ):
-            heat_w = held.value
-
-            if heat_w != plan_w:
-                why = f"held, {plan_kw} too close (< {self.ZONE_BIAS_DEADBAND_K:.1f} K)"
-
-        cap_w = state.schedule.building.bias_cap_w if held is not None else None
+        held_w = held.value if held is not None else 0.0
+        sun_w = held_w
         surplus = self._surplus_w(config, now)
-        # What set the cap: kept until the sun holds, or this surplus.
-        sun_note = " (kept until the sun holds 10 min)"
+        why = "held" if sun_w else "no sun"
 
-        if surplus is not None and result.grid_step_kwh and cop:
-            # Export the plan expected is no budget: what the heat pump draws
-            # within the measured surplus imports nothing.
-            planned_import_w = max(
-                float(
-                    np.mean(
-                        [
-                            result.grid_step_kwh[j]
-                            * 1000.0
-                            / (
-                                data.first_step_hours
-                                if j == 0 and data.first_step_hours
-                                else step_hours
-                            )
-                            for j in steps
-                        ]
-                    )
-                ),
-                0.0,
-            )
-            # At least 0, as the plan's (see optimizer.surplus_scenarios): its
-            # import is the heat pump's own draw beyond the sun, the rest of
-            # the house's draw beyond it is not the heat pump's to make up.
-            # Below 0 it took that draw off the heat at night (a 300 W house:
-            # a 4.5 kW plan capped at 3 kW).
-            best_w, worst_w = (max(surplus_w, 0.0) for surplus_w in surplus)
-            lowered_w = (best_w + planned_import_w) * cop
-            raised_w = (worst_w + planned_import_w) * cop
-            capped_w = heat_w if cap_w is None else min(heat_w, cap_w)
-
-            def sun(surplus_w: float) -> str:
-                return (
-                    f" (surplus {surplus_w / 1000:.2f} + planned grid "
-                    f"{planned_import_w / 1000:.2f})"
-                )
-
-            if bias_k(lowered_w) < bias_k(capped_w):
-                cap_w = lowered_w
-                sun_note = sun(best_w)
-            # The cap lifted at once as far as the surplus held covers.
-            elif (
-                cap_w is not None
-                and bias_k(min(plan_w, raised_w))
-                >= bias_k(capped_w) + self.ZONE_BIAS_DEADBAND_K - 1e-9
-            ):
-                heat_w = plan_w
-                cap_w = raised_w
-                why = "plan"
-                sun_note = sun(worst_w)
+        if surplus is None or not cop:
+            sun_w, why = 0.0, "no surplus reading"
         else:
-            cap_w = None
+            # At most the heat the floor's runs have moved, as the plan's
+            # (see MPCOptimizer): the range the COP is known in. Asked for
+            # more, the controller's curve gives up to ~8 kW at a supply
+            # whose lower COP draws past the surplus.
+            best_w, worst_w = surplus
+            note = f"surplus best {best_w:.0f} W, worst {worst_w:.0f} W"
 
-        if cap_w is not None and cap_w >= heat_w:
-            cap_w = None
+            if (
+                bias_k(min(worst_w * cop, max_heat_w))
+                >= bias_k(sun_w) + self.ZONE_BIAS_DEADBAND_K - 1e-9
+            ):
+                sun_w, why = min(worst_w * cop, max_heat_w), f"raised, {note}"
+            elif (
+                bias_k(best_w * cop) <= bias_k(sun_w) - self.ZONE_BIAS_DEADBAND_K + 1e-9
+            ):
+                sun_w, why = min(best_w * cop, max_heat_w), f"lowered, {note}"
+            else:
+                why = f"{why}, {note}"
 
-        if cap_w is not None:
-            why = f"{plan_kw}, sun allows {kw(cap_w)}{sun_note}"
+        if sun_w != held_w:
+            self.state_manager.update_sun_heat(SeriesPoint(time=now, value=sun_w))
 
-        # Its time is when the plan's heat last moved.
-        point = (
-            previous
-            if previous is not None and previous.value == heat_w
-            else SeriesPoint(time=now, value=heat_w)
+        plan_w = result.space_heat_w[k]
+        plan = f"plan {kw(plan_w)}"
+        # The fallback's plan heats above the least where the band needs it
+        # (see MPCInput.zone_above_least): followed, the sun's on top.
+        by_plan = data.zone_above_least and plan_w > sun_w
+        asked_w = plan_w if by_plan else sun_w
+
+        if by_plan:
+            why = f"band fallback, {why}"
+
+        # Past the band's maximum the target falls below the room, which
+        # asks for no less than the least.
+        bias = max(
+            bias_k(asked_w, round_up=by_plan),
+            ecodan.least_bias_k(room_c, setpoint_c),
         )
 
-        if point is not previous or cap_w != state.schedule.building.bias_cap_w:
-            self.state_manager.update_zone_bias(point, cap_w)
-
-        asked_w = heat_w if cap_w is None else cap_w
-        bias = bias_k(asked_w)
-
-        # Less than the controller can ask for: at the least bias it gives the
-        # base rise, or the compressor's lowest speed where that is more (see
-        # ecodan.setpoint_bias_k) - more than the heat asked.
+        # At the least bias the controller gives the base rise, or the
+        # compressor's lowest speed or its supply floor where that is more
+        # (see ecodan.setpoint_bias_k).
         if bias == ecodan.least_bias_k(room_c, setpoint_c):
             given_w = max(
                 ecodan.MIN_RISE_K * ecodan.water_w_per_k(flow_lpm), least_heat_w
             )
             asked = f"minimum (~{kw(given_w)})"
-            why = plan_kw if why == "plan" else why
         else:
-            asked = kw(asked_w)
+            asked = f"{'plan' if by_plan else 'sun'} {kw(asked_w)}"
 
-        return bias, f" = {asked} | {why} | {readings}"
+        return bias, f" = {asked} | {why} | {plan} | {readings}"
 
     def publish_zone(
         self,
@@ -2434,6 +2394,7 @@ class Optimization:
         now: datetime,
         least_heat_w: float = 0.0,
         min_supply_c: float = 0.0,
+        max_heat_w: float = math.inf,
     ) -> None:
         """Writes the plan's floor decision to Home Assistant, as publish_dhw
         does the hot water's: on/off for the quarter hour running now, the
@@ -2574,6 +2535,7 @@ class Optimization:
                     float(room) if room != "unknown" else None,
                     least_heat_w,
                     min_supply_c,
+                    max_heat_w,
                 )
 
             if serving and result.space_supply_c:
@@ -2717,9 +2679,9 @@ class Optimization:
         return float(readings.iloc[-1]) if not readings.empty else None
 
     def _surplus_w(self, config: Config, now: datetime) -> tuple[float, float] | None:
-        """The solar surplus the heat pump had (W): its own draw less the grid
-        meter's, per minute - solar less the rest of the house - at its best
-        minute of ZONE_BIAS_LOWER_WINDOW and its worst of
+        """The solar surplus the heat pump had (W), at least 0: its own draw
+        less the grid meter's, per minute - solar less the rest of the house -
+        at its best minute of ZONE_BIAS_LOWER_WINDOW and its worst of
         ZONE_BIAS_RAISE_WINDOW. None without readings."""
 
         frame = self.loader.load(
@@ -2738,9 +2700,12 @@ class Optimization:
             now - self.ZONE_BIAS_RAISE_WINDOW,
             now,
         )
-        surplus = pd.to_numeric(
-            frame.get("heat_pump"), errors="coerce"
-        ) - pd.to_numeric(frame.get("grid"), errors="coerce")
+        # Beyond the sun the rest of the house's draw is not the heat pump's
+        # to make up (as optimizer.surplus_scenarios).
+        surplus = (
+            pd.to_numeric(frame.get("heat_pump"), errors="coerce")
+            - pd.to_numeric(frame.get("grid"), errors="coerce")
+        ).clip(lower=0.0)
         recent = surplus[
             pd.to_datetime(frame["time"], utc=True) >= now - self.ZONE_BIAS_LOWER_WINDOW
         ].dropna()

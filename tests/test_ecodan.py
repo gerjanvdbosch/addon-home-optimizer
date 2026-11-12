@@ -20,15 +20,18 @@ def test_the_bias_never_aims_past_the_comfort_band_nor_the_number():
     assert setpoint_bias_k(4500.0, 18.0, 8.0, 19.0, 15.0, 21.0) == 2.5
 
 
-def test_less_than_the_cold_least_rise_aims_just_below_the_room():
-    """Past its target the controller asks for the base rise, not the
-    cold-widened least (4.1 kW at 2 degC, 18 L/min): 3 kW is asked for with the
-    target one step under the room."""
+def test_less_than_the_cold_least_rise_rounds_to_either_least():
+    """Past its target the controller asks for the base rise, at it the
+    cold-widened least rise (4.1 kW at 2 degC, 18 L/min), nothing between:
+    3 kW rounded down is the target one step under the room, rounded up (at
+    least that heat) the target at the room."""
 
-    bias = setpoint_bias_k(3000.0, 18.0, 2.0, 19.18, 21.0, 21.5)
+    down = setpoint_bias_k(3000.0, 18.0, 2.0, 19.18, 21.0, 21.5, round_up=False)
+    up = setpoint_bias_k(3000.0, 18.0, 2.0, 19.18, 21.0, 21.5)
 
-    assert bias == -1.9
-    assert 19.18 - 0.1 <= 21.0 + bias < 19.18
+    assert down == -1.9
+    assert 19.18 - 0.1 <= 21.0 + down < 19.18
+    assert 19.18 <= 21.0 + up < 19.18 + 0.1
 
 
 def test_the_heat_pumps_least_heat_aims_just_below_the_room():

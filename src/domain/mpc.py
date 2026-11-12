@@ -195,10 +195,15 @@ class MPCInput:
     # physics.floor_circuit_conductance_w_per_k): fewer loops open, more
     # through each. Empty, or None in a step, is the flow its runs ran at.
     zone_floor_flow_lpm: tuple[float | None, ...] = ()
-    # Whether a run's heat may rise: with the controller steered through its
-    # setpoint bias (see features.ecodan) the heat is the water's rise over the
-    # return it is asked for. Left to itself the heat only falls within a run.
-    zone_heat_may_rise: bool = False
+    # Whether the controller is steered through its setpoint bias (see
+    # features.ecodan): a run then heats at its least, more - and rising -
+    # only into expected solar surplus. Left to itself the heat only falls
+    # within a run.
+    zone_auto_adaptive: bool = False
+    # The fallback where the least cannot hold the comfort band (see
+    # MPCResult.zone_below_band_k): a steered run may then heat above its
+    # least wherever the plan needs it.
+    zone_above_least: bool = False
     # Whether the heat pump is serving the zone right now, the space-heating
     # counterpart of boiler_on_current.
     space_on_current: bool = False
@@ -327,3 +332,7 @@ class MPCResult:
     # proportion to the power each of its steps draws.
     electricity_step_kwh: tuple[float, ...] = ()
     grid_step_kwh: tuple[float, ...] = ()
+    # The most the zone ends below its comfort band's minimum where a plan
+    # could still change it (K, the zone's slack): more heat than the plan
+    # gives would have held it.
+    zone_below_band_k: float = 0.0
