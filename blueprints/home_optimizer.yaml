@@ -296,6 +296,19 @@ actions:
                 {{ state_attr(living, 'current_temperature') }} °C
           - *notify
           - *control
+          # The living room to the comfort band's edge with the rest: left at
+          # the run's setpoint the thermostat keeps the heat pump going. Not
+          # without a published setpoint (the zone not planned).
+          - if:
+              - condition: template
+                value_template: "{{ has_value('sensor.home_optimizer_zone_setpoint') }}"
+            then:
+              - &living
+                action: climate.set_temperature
+                target:
+                  entity_id: !input living_climate
+                data:
+                  temperature: "{{ states('sensor.home_optimizer_zone_setpoint') | float }}"
           - if:
               - condition: template
                 value_template: >-
@@ -322,21 +335,22 @@ actions:
                     value_template: >-
                       {{ states('sensor.home_optimizer_zone_setpoint') | float(0)
                          > state_attr(living, 'temperature') | float(99) }}
-                sequence: &living
-                  - action: climate.set_temperature
-                    target:
-                      entity_id: !input living_climate
-                    data:
-                      temperature: "{{ states('sensor.home_optimizer_zone_setpoint') | float }}"
+                sequence:
+                  - *living
               # Between runs the comfort band's edge: the thermostat asks for
               # heat only where the room passed what the plan allows - left at
               # the run's setpoint the heat pump ran on 20-75 minutes past the
-              # plan's end (3-5 Nov 2026).
+              # plan's end (3-5 Nov 2026). Only once off for the 10 minutes a
+              # stop waits (see zone_stop, which lowers it then): at once the
+              # published edge ended the run before them. Through a tank's run
+              # the zone hands over to, the run's setpoint.
               - conditions:
                   - condition: state
                     entity_id: binary_sensor.home_optimizer_zone_status
                     state: "off"
-                sequence: *living
+                    for: { minutes: 10 }
+                sequence:
+                  - *living
       - alias: Zone bias
         conditions:
           - condition: trigger

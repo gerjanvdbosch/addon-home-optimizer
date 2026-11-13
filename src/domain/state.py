@@ -220,6 +220,10 @@ class BuildingSchedule(BaseModel):
     # bias holds a run to above its least, and when it last changed (see
     # Optimization._zone_bias).
     sun_heat_w: SeriesPoint[float] | None = None
+    # When the plan stopped the floor run still under way: from then the run
+    # counts as ended (see Optimization.run). None once the compressor no
+    # longer serves the zone, or a plan goes on with it.
+    stopped: datetime | None = None
 
 
 class Schedule(BaseModel):

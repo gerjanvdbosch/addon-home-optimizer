@@ -2054,6 +2054,111 @@ def test_in_the_cold_the_plan_expects_no_sun_the_bias_cannot_ask_for():
     assert most_w(5.0) > HEATING.min_heat_w + 1000.0
 
 
+def test_a_steered_runs_sun_heat_does_not_follow_the_baseloads_quarter_hours():
+    """The bias follows the surplus over 10-20 minutes past a deadband, and the
+    baseload forecast's shape within an hour is noise (13 Nov 2026: 0.5-1 kW
+    up and down per quarter hour): steady sun with a load alternating by
+    quarter hour plans a steady run."""
+
+    steps = 48
+    baseload_w = tuple(300.0 if k % 2 else 600.0 for k in range(steps))
+    result = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE,
+        floor_circuit_model=HEATING,
+        space_cop_model=COP_MODEL,
+    ).solve(
+        _cold_day(
+            steps=steps,
+            solar_forecast_w=[1300.0] * steps,
+            baseload_forecast_w=baseload_w,
+            outdoor_temperature_forecast=(5.0,) * steps,
+            zone_state=_zone_state(19.8, 19.8),
+            zone_auto_adaptive=True,
+            space_on_current=True,
+        )
+    )
+    heat = np.asarray(result.space_heat_w)
+    on = np.asarray(result.space_schedule, dtype=bool)
+    run = heat[2:8][on[2:8]]
+
+    assert len(run) >= 4, "expected a run in the sun"
+    assert run.max() - run.min() < 100.0
+
+
+def test_a_steered_run_expects_the_sun_the_bias_holds():
+    """The bias rises only to a surplus held 20 minutes, so the plan expects
+    the least of this step's and the one before's under the forecast's
+    spread: less sun's heat with a wide band than with a narrow one, and none
+    in the first sunny step after a dark one."""
+
+    steps = 48
+    sun_w = [0.0] * 4 + [800.0] * (steps - 4)
+
+    def heat(p10_w: float, p90_w: float) -> np.ndarray:
+        return np.asarray(
+            MPCOptimizer(
+                THERMAL_MODEL,
+                MPCConfig(),
+                cop_model=COP_MODEL,
+                building_model=TWO_NODE,
+                floor_circuit_model=HEATING,
+                space_cop_model=COP_MODEL,
+            )
+            .solve(
+                _cold_day(
+                    steps=steps,
+                    solar_forecast_w=sun_w,
+                    solar_p10_w=tuple(max(s - p10_w, 0.0) for s in sun_w),
+                    solar_p90_w=tuple(s + p90_w if s else 0.0 for s in sun_w),
+                    outdoor_temperature_forecast=(5.0,) * steps,
+                    zone_state=_zone_state(19.8, 19.8),
+                    zone_auto_adaptive=True,
+                    space_on_current=True,
+                )
+            )
+            .space_heat_w
+        )
+
+    narrow, wide = heat(50.0, 50.0), heat(400.0, 400.0)
+
+    assert narrow[4] < narrow[6] - 500.0, "expected no sun's heat before it held"
+    assert wide[6:10].mean() < narrow[6:10].mean() - 300.0
+
+
+def test_a_steered_run_goes_on_at_its_least_once_the_sun_has_gone():
+    """The bias lowers the supply with the heat once the sun's heat ends; the
+    controller never asks below the loop's water, so the run goes on - not
+    stopped a quarter hour and started again (13 Nov 2026)."""
+
+    steps = 48
+    sun_w = [3000.0] * 2 + [0.0] * (steps - 2)
+    result = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE,
+        floor_circuit_model=HEATING,
+        space_cop_model=COP_MODEL,
+    ).solve(
+        _cold_day(
+            steps=steps,
+            solar_forecast_w=sun_w,
+            outdoor_temperature_forecast=(0.0,) * steps,
+            zone_state=_zone_state(19.8, 19.8),
+            zone_auto_adaptive=True,
+            space_on_current=True,
+        )
+    )
+    on = result.space_schedule
+    supply = result.space_supply_c
+
+    assert on[0] and on[1] and on[2], "expected the run to go on past the sun"
+    assert supply[2] < supply[1] - 0.5, "expected the supply to fall after it"
+
+
 def test_where_the_least_cannot_hold_the_band_the_fallback_heats_harder():
     """Started just above a band that a run at its least cannot hold - the
     floor slower than the room - the plan reports how far the zone falls

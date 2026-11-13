@@ -963,6 +963,18 @@ def test_a_floor_run_is_under_way_only_with_the_compressor_running():
     assert not Optimization.zone_running([], running, "Verwarmen")
 
 
+def test_a_stopped_run_stays_stopped_until_a_plan_takes_it_up_again():
+    """13 Nov 2026: stopped at 15:15, taken up again at 15:20 for free while
+    the compressor ran on in the blueprint's 10 minutes."""
+
+    later = START + timedelta(minutes=5)
+
+    assert Optimization.zone_stopped(None, True, False, START) == START
+    assert Optimization.zone_stopped(START, True, False, later) == START
+    assert Optimization.zone_stopped(START, True, True, later) is None
+    assert Optimization.zone_stopped(START, False, False, later) is None
+
+
 def test_a_defrost_does_not_end_a_floor_run():
     """The compressor stops in a defrost and comes up again in the same run
     (7 Nov 2026: 0 Hz 16 minutes into a run); a stop outside one ends it."""

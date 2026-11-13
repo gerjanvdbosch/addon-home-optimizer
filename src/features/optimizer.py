@@ -11,6 +11,7 @@ import pyomo.environ as pyo
 from pyomo.contrib.appsi.base import TerminationCondition
 from pyomo.contrib.appsi.solvers.highs import Highs
 from scipy.optimize import minimize_scalar
+from scipy.stats import norm
 
 from domain.dynamics import ScheduledSystem, discretize_zoh
 from domain.models import (
@@ -4044,6 +4045,15 @@ class MPCOptimizer:
         # and hi otherwise - cooling its mirror. A single big-M from the warmest
         # supply bounded the same integer plans more loosely: a heating day's
         # solve 6.1 -> 5.2 s.
+        #
+        # Not where the bias steers a heating run (see
+        # features.ecodan): the controller asks for a rise over the return, at
+        # least MIN_RISE_K, never a setpoint below the loop's water, and its
+        # supply falls with the heat once the sun's heat ends (13 Nov 2026:
+        # 1.4-2 K at 12:20 and 13:50, the compressor running on). Held to
+        # rise, a run with the sun's heat could not go on at its least after
+        # it: every such plan stopped it a quarter hour and paid a start for
+        # it, and each replan took the stop back.
         if chosen:
 
             def supply_range(k: int) -> tuple[float, float]:
@@ -4068,9 +4078,64 @@ class MPCOptimizer:
             # 2026), and the plan expects the sun's heat the bias will give.
             # The sun's heat at the floor left unheated, as the draw's
             # tangents are taken.
-            surplus_w = np.asarray(data.solar_forecast_w, dtype=float) - np.asarray(
+            #
+            # The baseload over the hour around each step, not its quarter
+            # hour: the bias follows the surplus only once it held 10-20
+            # minutes, past a deadband of ~0.7 kW of heat (see
+            # Optimization.ZONE_BIAS_DEADBAND_K), and the forecast's shape
+            # within an hour is noise - 09-16 h over 20 days (Oct-Nov 2026)
+            # it missed the half hour's load by 183 W per quarter hour, 179
+            # W over the hour, 187 W as one flat day. Per quarter hour the
+            # planned heat went up and down 0.5-1 kW with it. The step under
+            # way keeps the load measured now (see
+            # StateManager.baseload_forecast), which is real.
+            baseload_w = np.asarray(
                 data.baseload_forecast_w or np.zeros(len(data.solar_forecast_w)),
                 dtype=float,
+            )
+            hourly_w = np.array(
+                [
+                    baseload_w[max(k - 1, 1) : k + 3].mean() if k else baseload_w[0]
+                    for k in range(len(baseload_w))
+                ]
+            )
+            # The surplus the bias holds, not the step's mean: it rises only
+            # to what held all of its raise window (20 minutes, this step and
+            # the one before) and falls within 10 minutes (see
+            # Optimization.ZONE_BIAS_RAISE_WINDOW), so its level is the lower
+            # of the two steps' - and of what the sun really does, which the
+            # forecast knows to its spread: the expected least of two normal
+            # surpluses (Clark, 1961), each the median with the spread of its
+            # p10-p90 band. No term fitted: on 1-minute meter readings, the
+            # bias's rule replayed over 54 days with sun (Sep-Nov 2026, 08-17
+            # h, Solcast 1-3 h ahead) drew 0.53 kWh a day above the least,
+            # this expects 0.53 (0.42-0.66 against 0.37-0.72 by period), the
+            # median alone 0.84; on the 37 sunniest days per quarter hour it
+            # missed by 61 W against 89.
+            mean_w = np.asarray(data.solar_forecast_w, dtype=float) - hourly_w
+            spread_w = np.full(len(mean_w), 1.0)
+
+            if data.solar_p10_w and data.solar_p90_w:
+                spread_w = np.maximum(
+                    (
+                        np.asarray(data.solar_p90_w, dtype=float)
+                        - np.asarray(data.solar_p10_w, dtype=float)
+                    )
+                    / (2.0 * norm.ppf(0.9)),
+                    1.0,
+                )
+
+            # The step under way against itself: its first quarter hour is
+            # the window's too.
+            before_w = np.r_[mean_w[:1], mean_w[:-1]]
+            before_spread_w = np.r_[spread_w[:1], spread_w[:-1]]
+            theta_w = np.hypot(spread_w, before_spread_w)
+            apart = (before_w - mean_w) / theta_w
+            surplus_w = np.maximum(
+                mean_w * norm.cdf(apart)
+                + before_w * norm.cdf(-apart)
+                - theta_w * norm.pdf(apart),
+                0.0,
             )
             steered = not cooling and data.zone_auto_adaptive and efficiency is not None
             sun_heat_w = np.zeros(num_steps)
@@ -4194,7 +4259,7 @@ class MPCOptimizer:
                         - hi_next * on_k
                         + lo_k * on_next
                     )
-                elif not cooling and hi_k >= lo_next:
+                elif not cooling and not steered and hi_k >= lo_next:
                     model.zone_constraints.add(
                         supply_on(k + 1)
                         >= supply_on(k)

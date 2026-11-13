@@ -442,6 +442,7 @@ class Optimization:
             thermal_model=thermal_model, config=mpc_config, cop_model=cop_model
         )
         optimizer, planned = dhw_only, data
+        serving = False
         estimate, zone = self._zone(
             state,
             config,
@@ -461,9 +462,17 @@ class Optimization:
             )
             states = config.heat_pump.states
             mode = states.cooling if inputs["zone_cooling"] else states.heating
-            running = self.zone_running(
+            serving = running = self.zone_running(
                 *heat_pump_changes, mode, state.measurements.heat_pump.defrost
             )
+            # A run the plan stopped is over, though the compressor runs on
+            # until the blueprint lowers the thermostats 10 minutes later: going
+            # on is a start again. Seen as under way, the next solve took it up
+            # again for free: near ties between stopping now and a quarter later
+            # turned the status off and on 6 times on 13 Nov 2026 (0-6 a day
+            # in Nov), and the run went on an hour past the plan's first stop.
+            if running and state.schedule.building.stopped is not None:
+                running = False
             planned = dataclasses.replace(
                 data,
                 **inputs,
@@ -517,6 +526,26 @@ class Optimization:
             )
             planned = dataclasses.replace(planned, zone_above_least=True)
             result = optimizer.solve(planned)
+
+        # A stop of the run under way holds until the compressor no longer
+        # serves the zone or a plan takes the run up again (see
+        # BuildingSchedule.stopped) - none without the zone planned, so a
+        # stop left from before never ends a run started meanwhile.
+        stopped = self.zone_stopped(
+            state.schedule.building.stopped,
+            serving and zone is not None,
+            # A run planned again from the next quarter hour is a pause the
+            # blueprint's 10 minutes bridge, not a stop: held as one, each
+            # solve after put the start off by another quarter hour (replay of
+            # 13 Nov 2026: 12:10-14:10). Nor is one handed over to the tank:
+            # the compressor goes on, and held as stopped the tank's block
+            # would be priced as a start.
+            any(result.space_schedule[:2]) or any(result.schedule[:2]),
+            now,
+        )
+
+        if stopped != state.schedule.building.stopped:
+            self.state_manager.update_zone_stopped(stopped)
 
         logger.info(
             "Optimization completed: schedule=%s objective=%.3f",
@@ -1980,6 +2009,20 @@ class Optimization:
         )
 
     @staticmethod
+    def zone_stopped(
+        stopped: datetime | None, serving: bool, planned_on: bool, now: datetime
+    ) -> datetime | None:
+        """When the plan stopped the floor run under way (see
+        BuildingSchedule.stopped): from the first plan that leaves it off
+        (planned_on, now and next quarter hour) while the compressor serves
+        the zone, until it no longer does or a plan takes the run up again."""
+
+        if not serving or planned_on:
+            return None
+
+        return stopped or now
+
+    @staticmethod
     def running_since(changes: list[SeriesPoint], mode_state: str) -> datetime | None:
         """When the heat pump entered the mode it is in now (from its state's
         own changes), None when it is not in it."""
@@ -2179,11 +2222,15 @@ class Optimization:
     # more changes, as many reversed), raised to what held all of
     # ZONE_BIAS_RAISE_WINDOW (its worst minute) - a passing cloud moves
     # neither, the floor stores what a few minutes of import cost. A little
-    # import is fine, the meter at 0 not required; 10 minutes, not 20, which
-    # halved the reversals but left ~0.35 kWh of sun a day unused (user,
-    # 12 Nov 2026).
-    ZONE_BIAS_LOWER_WINDOW = timedelta(minutes=5)
-    ZONE_BIAS_RAISE_WINDOW = timedelta(minutes=10)
+    # import is fine, the meter at 0 not required. The compressor takes 5-10
+    # minutes to follow a step (13 Nov 2026: flow setpoint within 2 minutes,
+    # +100-230 W of draw only after 10), so a shorter raise draws next to
+    # nothing: only stable sun (user, 13 Nov 2026). Over 37 sunny days (20
+    # Sep-12 Nov 2026, 08-17 h, the draw lagged 5 minutes) 20 and 10 minutes
+    # took 4.2 changes a day against 6.7 at 10 and 5, 0.3 reversed within
+    # half an hour against 1.5, for 0.13 kWh of sun a day (~1.7 ct).
+    ZONE_BIAS_LOWER_WINDOW = timedelta(minutes=10)
+    ZONE_BIAS_RAISE_WINDOW = timedelta(minutes=20)
 
     def _zone_bias(
         self,
@@ -2506,13 +2553,17 @@ class Optimization:
                     data.zone_cooling,
                     tank,
                 )
-                # Held within a run under way: never short of the thermostat's
-                # setpoint, which the blueprint only raises within a run - a
-                # replan lowering it changes nothing there (7 Nov 2026: 20.0
-                # and 20.5 in turn, the thermostat at 21).
+                # Held within a run under way or handed over: never short of
+                # the thermostat's setpoint, which the blueprint only raises
+                # then - a replan lowering it changes nothing there (7 Nov
+                # 2026: 20.0 and 20.5 in turn, the thermostat at 21), and the
+                # bias, set against the published one until the floor heats,
+                # aimed past the room (13 Nov 2026: 20.0 and 20.5 in turn
+                # through the tank's run, the thermostat at 20.5, at the
+                # hand-over the target 0.46 K above the room).
                 measured = state.measurements.building.setpoint
 
-                if running and since is not None and measured:
+                if (hand_over or (running and since is not None)) and measured:
                     held = (min if data.zone_cooling else max)(
                         float(room), measured[-1].value
                     )

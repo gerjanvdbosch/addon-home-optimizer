@@ -428,6 +428,11 @@ class StateManager:
         state.schedule.building.sun_heat_w = heat
         self.state_repository.save(state)
 
+    def update_zone_stopped(self, stopped: datetime | None) -> None:
+        state = self.load()
+        state.schedule.building.stopped = stopped
+        self.state_repository.save(state)
+
     def update_zone(
         self,
         temperature: pd.Series,
