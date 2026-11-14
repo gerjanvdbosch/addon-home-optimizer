@@ -16,6 +16,15 @@ class MPCConfig:
     # made by itself are about as long (real cooling data: 20-30 min); longer
     # runs show the demand of their day, not a limit of the machine.
     compressor_min_runtime_steps: int = 2
+    # A run the floor starts serves the floor at least this long (1 hour) - a
+    # rule, not a fit: its first half hour goes into the compressor coming up
+    # to speed, the loops coming up to its supply and the room thermostats
+    # opening theirs, which the plan knows least of. Priced, half an hour of
+    # floor ahead of hot water came out level with an hour and with the tank
+    # first (real data, 14 Nov 2026: within 1 ct), and the user wants no such
+    # run. A run the tank hands over may run a single step: it carries the
+    # loop's heat into the floor.
+    zone_min_runtime_steps: int = 4
     # The heat pump stays off this many steps after a run (0.5 hour). A start is not
     # free: real runs put an estimated 0.4-0.5 kWh into reheating the loops and
     # plate exchanger before the tank gains anything (estimated from how far the tank
@@ -68,11 +77,13 @@ class MPCConfig:
     weight_comfort_eur_per_k2h: float = 0.5
     # A fallback, not the usual case (s): on real data a plan is proven optimal
     # in 1-8 s. Should a harder one come up, the best plan found by then is
-    # used - better than a plan that never comes. 60 rather than 30: the Home
+    # used - better than a plan that never comes. 120 rather than 30: the Home
     # Assistant host is some four times slower, and on 4 Oct stopped at 30 s
     # with the optimal plan already found but not yet proven (replayed: proven
-    # in 6.8 s here).
-    solve_time_limit_s: float = 60.0
+    # in 6.8 s here); on 14 Nov at 60 s still at the program's root (36 s
+    # here, 29 of them its first branching), publishing about the previous
+    # plan. The whole solve's, within the five minutes between jobs.
+    solve_time_limit_s: float = 120.0
     # The most the solve's starting point may take (s; see
     # MPCOptimizer._warm_start): with all but the first step's decisions
     # fixed it took 0.2 s on real data, where the whole solve took 10 s - a
@@ -208,9 +219,9 @@ class MPCInput:
     # counterpart of boiler_on_current.
     space_on_current: bool = False
     # How long that run has served the zone since the compressor started it
-    # there (hours): it goes on for the minimum runtime, as one the plan starts
-    # does (see MPCOptimizer._zone_held). 0 without one, and for a run the
-    # tank handed over, which may run a single step.
+    # there (hours): it goes on for the floor's minimum runtime, as one the
+    # plan starts does (see MPCOptimizer._zone_held). 0 without one, and for
+    # a run the tank handed over, which may run a single step.
     space_elapsed_hours: float = 0.0
     # Whether the zone is cooled rather than heated: the heat pump serves the
     # floor in the one mode it is set to (see HeatPumpConfig.mode).
@@ -320,6 +331,12 @@ class MPCResult:
     # the heat pump's own curve while heating, the plan's choice while cooling
     # - the setpoint to give it. Empty without a space-heating model.
     space_supply_c: tuple[float, ...] = ()
+    # The least heat each step's run moves (W): the compressor at the speed
+    # its runs hold, and a start's excess over it (see
+    # MPCOptimizer.least_heat_w, HeatPumpCOPModel.start_excess_hz) - what the
+    # heat pump gives at the bias that asks for its least. Empty without a
+    # space-heating model.
+    space_least_heat_w: tuple[float, ...] = ()
     # The electricity the zone's plan draws per step (W), positive either way:
     # its heat, taken or given, over the COP.
     space_electrical_w: tuple[float, ...] = ()

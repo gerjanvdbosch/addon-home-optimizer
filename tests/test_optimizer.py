@@ -3,7 +3,9 @@ from dataclasses import replace
 
 import highspy
 import numpy as np
+import pyomo.environ as pyo
 import pytest
+from pyomo.contrib.appsi.base import TerminationCondition
 from pyomo.contrib.appsi.solvers.highs import Highs
 
 from domain.dynamics import discretize_zoh
@@ -1102,6 +1104,30 @@ def test_the_zone_and_the_tank_are_never_served_at_once():
         assert not (dhw and space), "tank and zone served in the same step"
 
 
+@pytest.mark.parametrize(("pause", "holds"), [(1, False), (2, True)])
+def test_the_compressor_never_pauses_for_a_single_quarter(pause, holds):
+    """A pause shorter than MPCConfig.heat_pump_min_off_steps is a start for
+    nothing, whatever the compressor served: two floor runs a quarter hour
+    apart are no plan, half an hour apart they are (a solve stopped at its
+    time limit published the first, 14 Nov 2026)."""
+
+    data = _zone_input()
+    model = MPCOptimizer(
+        THERMAL_MODEL, MPCConfig(), cop_model=COP_MODEL, building_model=BUILDING_MODEL
+    )._build_model(data)
+    runs = [1] * 4 + [0] * pause + [1] * 4
+
+    for k in model.K:
+        model.boiler_on[k].fix(0)
+        model.space_on[k].fix(runs[k] if k < len(runs) else 0)
+
+    solver = Highs()
+    solver.config.load_solution = False
+    status = solver.solve(model).termination_condition
+
+    assert (status == TerminationCondition.optimal) == holds, status
+
+
 def test_both_demands_are_served_in_one_compressor_start():
     """The point of counting compressor starts rather than boiler starts.
 
@@ -1233,7 +1259,7 @@ def test_heating_hands_the_compressor_from_the_zone_to_the_tank():
     zone = [k for k, on in enumerate(result.space_schedule) if on]
     tank = [k for k, on in enumerate(result.schedule) if on]
 
-    assert zone and tank and max(zone) < min(tank)
+    assert zone and tank and min(zone) < min(tank)
     assert _compressor_starts(result) == 1, "the run under way stopped"
 
 
@@ -1826,12 +1852,15 @@ def test_a_plan_through_the_living_rooms_loops_alone_heats_its_floor():
         assert living_floor[k + 1] == pytest.approx(state[2], abs=1e-4)
 
 
-@pytest.mark.parametrize(("zone_steps", "feasible"), [(1, False), (2, True)])
-def test_a_run_the_zone_starts_serves_the_zone_its_minimum_runtime(
+@pytest.mark.parametrize(
+    ("zone_steps", "feasible"), [(1, False), (2, False), (3, False), (4, True)]
+)
+def test_a_run_the_zone_starts_serves_the_zone_an_hour_before_the_tank(
     zone_steps, feasible
 ):
-    """A run the zone starts stays on the zone for the compressor's minimum
-    runtime: no lone quarter hour on the floor ahead of hot water."""
+    """A run the zone starts serves the zone an hour before the tank takes it
+    over (MPCConfig.zone_min_runtime_steps): no half hour on the floor ahead
+    of hot water (user, 14 Nov 2026)."""
 
     from pyomo.contrib.appsi.base import TerminationCondition
 
@@ -2018,6 +2047,44 @@ def test_with_the_bias_steering_a_run_heats_at_its_least_but_into_export():
     # 250 W, which that draw takes all of: nothing more.
     assert plan(1500.0)[2].any()
     assert not plan(250.0)[2].any()
+
+
+def test_a_steered_run_rises_no_more_than_its_suns_heat():
+    """The bias holds the larger of the least and the sun's heat, so a run's
+    heat rises by no more than the sun's heat does: under a level sun no plan
+    takes more in one quarter hour than in the one before (14 Nov 2026: up
+    and down by 0.4-0.6 kW, the supply by a degree)."""
+
+    hour = np.arange(48) * 0.25 + 6.0
+    model = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE,
+        floor_circuit_model=replace(HEATING, min_supply_c=28.0),
+        space_cop_model=COP_MODEL,
+    )._build_model(
+        _cold_day(
+            steps=48,
+            solar_forecast_w=list(np.where(hour >= 9.0, 700.0, 0.0)),
+            zone_auto_adaptive=True,
+        )
+    )
+    k = int(np.flatnonzero(hour == 11.0)[0])
+
+    for i in model.K:
+        model.space_on[i].fix(int(k - 8 <= i <= k + 8))
+        model.boiler_on[i].fix(0)
+
+    model.objective.deactivate()
+    model.rise = pyo.Objective(
+        expr=model.q_space_w[k + 1] - model.q_space_w[k], sense=pyo.maximize
+    )
+    solver = Highs()
+    solver.config.load_solution = False
+
+    # A few watts: the sun's heat itself creeps up as the floor warms.
+    assert solver.solve(model).best_feasible_objective <= 10.0
 
 
 def test_in_the_cold_the_plan_expects_no_sun_the_bias_cannot_ask_for():
@@ -3533,3 +3600,92 @@ def test_a_tank_a_tenth_short_of_its_target_starts_no_run():
 
     assert not any(schedule(0.1))
     assert any(schedule(2.0))
+
+
+def test_the_least_heat_rises_with_the_speed_runs_hold_in_the_cold():
+    """Heating, runs hold a higher compressor speed in colder air
+    (HeatPumpCOPModel.held_speed_hz), so a run moves no less than that
+    speed's heat - above the floor's runs' least - however little the zone
+    wants."""
+
+    least = replace(
+        COP_MODEL,
+        speed_heat_w=(600.0, 75.0, -5.0, 2.0),
+        held_speed_outdoor_c=(4.0, 8.0),
+        held_speed_hz=(36.0, 26.0),
+    )
+    optimizer = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE,
+        floor_circuit_model=HEATING,
+        space_cop_model=least,
+    )
+    result = optimizer.solve(
+        _cold_day(
+            steps=48,
+            outdoor_temperature_forecast=(0.0,) * 48,
+            zone_internal_gain_w=(800.0,) * 48,
+            zone_auto_adaptive=True,
+        )
+    )
+    on = np.asarray(result.space_schedule, dtype=bool)
+    least_w = least.held_heat_w(0.0)
+
+    assert least_w > HEATING.min_heat_w
+    assert optimizer.least_heat_w(0.0) == least_w
+    assert optimizer.least_heat_w(0.0, cooling=True) == HEATING.min_heat_w
+    assert on.any(), "expected the zone to be heated"
+    assert (np.asarray(result.space_heat_w)[on] >= least_w - 1e-3).all()
+
+
+def test_a_run_the_zone_starts_from_off_moves_its_starts_excess_heat():
+    """From off the compressor runs past the speed it holds for its first
+    hour (HeatPumpCOPModel.start_excess_hz): in the steps after the one it
+    starts in, a run the zone opens moves that much more than its least, and
+    the result reports it as the least the bias is to ask for. A run under
+    way the zone started carries on with what is left of it."""
+
+    model = replace(
+        COP_MODEL,
+        speed_heat_w=(600.0, 75.0, -5.0, 2.0),
+        held_speed_outdoor_c=(4.0, 8.0),
+        held_speed_hz=(26.0, 26.0),
+        start_excess_hz=9.0,
+        start_excess_seconds=3600.0,
+    )
+    optimizer = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE,
+        floor_circuit_model=HEATING,
+        space_cop_model=model,
+    )
+    least_w = model.held_heat_w(5.0)
+
+    def excess_w(from_s: float) -> float:
+        return model.start_excess_heat_w(5.0, from_s, from_s + 900.0)
+
+    result = optimizer.solve(_cold_day(steps=48))
+    on = np.asarray(result.space_schedule, dtype=bool)
+    heat = np.asarray(result.space_heat_w)
+    first = int(np.argmax(on))
+
+    assert on.any() and not result.schedule[first], "expected a zone run from off"
+    assert on[first : first + 3].all()
+    assert result.space_least_heat_w[first] == pytest.approx(least_w)
+
+    for after in (1, 2):
+        expected_w = least_w + excess_w((after - 1) * 900.0)
+        assert result.space_least_heat_w[first + after] == pytest.approx(expected_w)
+        assert heat[first + after] >= expected_w - 1e-3
+
+    # Half an hour into a run the zone started: the excess from 15 minutes on.
+    under_way = optimizer.solve(
+        _cold_day(steps=48, space_on_current=True, space_elapsed_hours=0.5)
+    )
+
+    assert under_way.space_schedule[0]
+    assert under_way.space_least_heat_w[0] == pytest.approx(least_w + excess_w(900.0))

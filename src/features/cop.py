@@ -430,6 +430,9 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         power_ramp_s, power_offset_s = (
             self._power_ramp(df) if self.key == "dhw" else (0.0, None)
         )
+        excess_hz, excess_s = (
+            self._start_excess(df) if self.key == "heating" else (0.0, 0.0)
+        )
         df = self.prepare(df)
 
         if len(df) < 10:
@@ -540,12 +543,18 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             self.parameter_std_errors = {"eta_carnot": eta_std_error}
 
         approach_per_heat_k_per_w = 0.0
+        speed_heat_w = self._fit_speed_heat(df) if self.key == "heating" else ()
+        held_outdoor_c, held_hz = (
+            self._held_speed_line(df) if speed_heat_w else ((), ())
+        )
 
         # Only at the DHW fit's approach, a tank run's heat apart from a floor
         # run's: an approach of its own already fitted to the floor's heats
         # leaves their growth nothing to be told from.
-        if self.key == "heating" and shared is not None and approach_heat_w:
-            part_load = self._fit_part_load(df, delta_t_evap, approach_heat_w)
+        if speed_heat_w and shared is not None and approach_heat_w:
+            part_load = self._fit_part_load(
+                df, delta_t_evap, approach_heat_w, speed_heat_w
+            )
 
             if part_load is not None:
                 eta_carnot, approach_per_heat_k_per_w = part_load
@@ -564,6 +573,20 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             approach_heat_w,
             approach_per_heat_k_per_w * 1000.0,
         )
+
+        if held_hz:
+            logger.info(
+                "Heat pump COP calibration (%s): heat %.0f %+.1f*f %+.1f*T "
+                "%+.2f*f*T W at f Hz, T degC outdoor; runs hold %s Hz at %s "
+                "degC outdoor; from off %.1f Hz faster as the first step ends, "
+                "falling over %.0f min",
+                self.mode,
+                *speed_heat_w,
+                np.round(held_hz, 1).tolist(),
+                np.round(held_outdoor_c, 1).tolist(),
+                excess_hz,
+                excess_s / 60.0,
+            )
 
         # Planning (MPCOptimizer) needs a stand-in for the heat pump's actual
         # supply temperature - a quantity it has no forecast for - to
@@ -584,6 +607,9 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             cooling=self.cooling,
             approach_heat_w=approach_heat_w,
             approach_per_heat_k_per_w=approach_per_heat_k_per_w,
+            speed_heat_w=speed_heat_w,
+            held_speed_outdoor_c=held_outdoor_c,
+            held_speed_hz=held_hz,
             start_step_power_w=start_step_power_w,
             start_ramp_seconds=start_ramp_seconds,
             start_shortfall_at_zero_outdoor_j=shortfall_at_zero_j,
@@ -591,6 +617,8 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             handover_heat_j=handover_heat_j,
             defrost_restart_share=defrost_restart_share,
             start_power_ramp_seconds=power_ramp_s,
+            start_excess_hz=excess_hz if speed_heat_w else 0.0,
+            start_excess_seconds=excess_s if speed_heat_w else 0.0,
             defrost_power_offset_seconds=power_offset_s,
         )
 
@@ -755,13 +783,119 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         return dhw.model
 
     # The least compressor readings, and the least spread in their speed (Hz,
-    # standard deviation), a part-load fit is made on: one speed says nothing
-    # of another.
-    MIN_PART_LOAD_READINGS = 100
-    MIN_PART_LOAD_SPEED_STD_HZ = 2.0
+    # standard deviation), the heat per speed is fitted on: one speed says
+    # nothing of another.
+    MIN_SPEED_HEAT_READINGS = 100
+    MIN_SPEED_HEAT_STD_HZ = 2.0
+    # From when a run's speed is read as the one it holds: 45 minutes after
+    # its mode was entered, past a start's own (real data, 14 cold starts
+    # Sep-Nov 2026: 42-46 Hz over their second and third quarter hour, 35-38
+    # Hz after). prepare() already leaves out the first STARTUP of it.
+    HELD_SPEED_SETTLE = pd.Timedelta(minutes=45)
+
+    @staticmethod
+    def _running(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+        """The readings with the compressor running, and their speed (Hz)."""
+
+        speed = pd.to_numeric(
+            df.get("compressor_frequency", pd.Series(np.nan, index=df.index)),
+            errors="coerce",
+        )
+        running = speed > 0.0
+
+        return df.loc[running], speed.loc[running]
+
+    def _fit_speed_heat(self, df: pd.DataFrame) -> tuple[float, ...]:
+        """The heat a heating run moves per compressor speed (see
+        HeatPumpCOPModel.speed_heat_w), by least squares on the readings
+        with the compressor running; () where they do not show it."""
+
+        df, speed = self._running(df)
+
+        if (
+            len(df) < self.MIN_SPEED_HEAT_READINGS
+            or speed.std() < self.MIN_SPEED_HEAT_STD_HZ
+        ):
+            return ()
+
+        T_outdoor = df["T_outdoor"].to_numpy(dtype=float)
+        speed = speed.to_numpy(dtype=float)
+        design = np.column_stack(
+            [np.ones(len(df)), speed, T_outdoor, speed * T_outdoor]
+        )
+
+        return tuple(
+            float(c) for c in np.linalg.lstsq(design, df["Q_th"], rcond=None)[0]
+        )
+
+    def _held_speed_line(
+        self, df: pd.DataFrame
+    ) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        """(outdoor temperatures degC, the speed Hz runs hold), see
+        HeatPumpCOPModel.held_speed_hz: each run's median speed from
+        HELD_SPEED_SETTLE on, as a line falling with the outdoor temperature
+        down to a floor speed it holds in milder air - the unit turns down
+        less in colder air, never more, and no further than its least speed.
+        Knee (at one of the runs' temperatures), floor and slope by least
+        squares on the runs. The speed the plan's runs hold rather than the
+        lowest the outdoor unit allows: each day on the runs before it, the
+        power at the least in the quarter hours the supply stood past its
+        setpoint read +0.6% (113 W per quarter hour) on the median from 45
+        minutes, -6.6% (139 W) on each run's lowest speed held a quarter hour,
+        +12% on its mean from the start (real data, Aug-Nov 2026).
+
+        A line, not steps never rising (as _speed_steps): the runs' speeds
+        scatter 26-36 Hz at one outdoor temperature (what the bias asked, the
+        floor's warmth), and steps through them jumped up to 90 Hz/K, so a
+        forecast 0.2 K colder raised a plan's power 10%. On the same days the
+        line read -0.3% (112 W) against +0.9% (118 W), 143 against 160 W at
+        6-8 degC (real data, Aug-Nov 2026, 59 quarter hours)."""
+
+        df, speed = self._running(df)
+        run = (df["time"].diff() > self.RUN_GAP).cumsum()
+        since = df["time"] - df["time"].groupby(run).transform("first")
+        settled = since + self.STARTUP >= self.HELD_SPEED_SETTLE
+        runs = pd.DataFrame(
+            {
+                "outdoor_c": df["T_outdoor"].groupby(run).mean(),
+                "speed": speed[settled].groupby(run[settled]).median(),
+            }
+        ).dropna()
+
+        if runs.empty:
+            return (), ()
+
+        outdoor_c = runs["outdoor_c"].to_numpy()
+        held_hz = runs["speed"].to_numpy()
+        best = None
+
+        # The coldest knee is a flat line (slope 0), so one always fits.
+        for knee_c in np.unique(outdoor_c):
+            design = np.column_stack(
+                [np.ones(len(runs)), np.maximum(knee_c - outdoor_c, 0.0)]
+            )
+            floor_hz, slope_hz_per_k = np.linalg.lstsq(design, held_hz, rcond=None)[0]
+
+            if slope_hz_per_k < 0.0:
+                continue
+
+            error = float(np.sum((design @ (floor_hz, slope_hz_per_k) - held_hz) ** 2))
+
+            if best is None or error < best[0]:
+                best = (error, knee_c, floor_hz, slope_hz_per_k)
+
+        _, knee_c, floor_hz, slope_hz_per_k = best
+        points_c = np.unique([outdoor_c.min(), knee_c, outdoor_c.max()])
+        points_hz = floor_hz + slope_hz_per_k * np.maximum(knee_c - points_c, 0.0)
+
+        return tuple(points_c.tolist()), tuple(points_hz.tolist())
 
     def _fit_part_load(
-        self, df: pd.DataFrame, delta_t_evap: float, approach_heat_w: float
+        self,
+        df: pd.DataFrame,
+        delta_t_evap: float,
+        approach_heat_w: float,
+        speed_heat_w: tuple[float, ...],
     ) -> tuple[float, float] | None:
         """eta_carnot and how much the approaches grow per W of heat moved
         (HeatPumpCOPModel.approach_per_heat_k_per_w), at the approaches given
@@ -774,31 +908,18 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         data, 185 quarter hours: +3.4% COP per kW against the heat measured,
         -0.6% per Hz against the speed). The speed is read apart from both: the
         heat as a line in it, steeper in warmer air, whose denser vapour the
-        compressor moves more of per turn (see q_th_per_outdoor_w_per_k).
+        compressor moves more of per turn (see HeatPumpCOPModel.speed_heat_w).
 
         No more than leaves an approach at no heat: an exchanger passing none
         has none."""
 
-        if "compressor_frequency" not in df.columns:
-            return None
-
-        speed = pd.to_numeric(df["compressor_frequency"], errors="coerce")
-        df = df.loc[speed > 0.0]
-        speed = speed.loc[df.index].to_numpy(dtype=float)
-
-        if (
-            len(df) < self.MIN_PART_LOAD_READINGS
-            or speed.std() < self.MIN_PART_LOAD_SPEED_STD_HZ
-        ):
-            return None
-
+        df, speed = self._running(df)
         T_outdoor = df["T_outdoor"].to_numpy(dtype=float)
         T_supply = df["T_supply"].to_numpy(dtype=float)
         COP_measured = df["COP_measured"].to_numpy(dtype=float)
-        design = np.column_stack(
-            [np.ones(len(df)), speed, T_outdoor, speed * T_outdoor]
+        heat_w = HeatPumpCOPModel.heat_at_speed_w(
+            speed_heat_w, speed.to_numpy(dtype=float), T_outdoor
         )
-        heat_w = design @ np.linalg.lstsq(design, df["Q_th"], rcond=None)[0]
 
         def residuals(parameters: np.ndarray) -> np.ndarray:
             return (
@@ -1230,6 +1351,81 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             return ramp_s, None
 
         return ramp_s, float(np.median(offsets))
+
+    # The longest a start's excess speed may take to fall away: past any seen
+    # (9 cold starts, Oct-Nov 2026: 68 minutes fitted).
+    MAX_START_EXCESS_SECONDS = 3 * 3600.0
+
+    def _start_excess(self, df: pd.DataFrame) -> tuple[float, float]:
+        """(Hz, s) of HeatPumpCOPModel.start_excess_hz/_seconds: by least
+        squares over the minutes after the first planning step of each run
+        the compressor starts from off, of its speed above the median it
+        holds from HELD_SPEED_SETTLE on (see _held_speed_line), against
+        a line falling from its value as that step ends to none. Out of a
+        defrost the compressor runs its own restart. (0.0, 0.0) without
+        enough such runs, or none faster."""
+
+        df = self._minute_readings(df)
+        frequency = df["compressor_frequency"].to_numpy()
+        running = (df["state"] == self.mode).to_numpy(dtype=bool)
+        steady = ~defrost_active(df).to_numpy() & (frequency > 0.0)
+        seconds = elapsed_seconds(df)
+        step_s = MPCConfig().step_hours * 3600.0
+        settle_s = self.HELD_SPEED_SETTLE.total_seconds()
+        stretches = []
+
+        for first in np.flatnonzero(self._cold_starts(df)):
+            end = first
+
+            while end + 1 < len(df) and running[end + 1]:
+                end += 1
+
+            rows = np.arange(first, end + 1)
+            rows = rows[steady[rows]]
+            # From the middle of each minute.
+            since = seconds[rows] - seconds[first] + 30.0
+            held = since >= settle_s
+
+            if not held.any():
+                continue
+
+            after = since >= step_s
+            stretches.append(
+                (
+                    since[after] - step_s,
+                    frequency[rows][after] - np.median(frequency[rows][held]),
+                )
+            )
+
+        if len(stretches) < BoilerThermalIdentifier.MIN_RAMP_RUNS:
+            return 0.0, 0.0
+
+        def fit(duration_s: float) -> tuple[float, float]:
+            # (squared Hz^2, Hz): the excess at the step's end is linear.
+            shares = [np.clip(1.0 - t / duration_s, 0.0, None) for t, _ in stretches]
+            excess_hz = sum(
+                float(g @ x) for g, (_, x) in zip(shares, stretches, strict=True)
+            ) / max(sum(float(g @ g) for g in shares), 1e-9)
+            squared = sum(
+                float(np.sum((x - excess_hz * g) ** 2))
+                for g, (_, x) in zip(shares, stretches, strict=True)
+            )
+
+            return squared, excess_hz
+
+        duration_s = float(
+            minimize_scalar(
+                lambda d: fit(d)[0],
+                bounds=(60.0, self.MAX_START_EXCESS_SECONDS),
+                method="bounded",
+            ).x
+        )
+        excess_hz = fit(duration_s)[1]
+
+        if excess_hz <= 0.0:
+            return 0.0, 0.0
+
+        return excess_hz, duration_s
 
     @staticmethod
     def _fit_heat_input(df: pd.DataFrame, speed_ratio=1.0) -> tuple[float, float]:

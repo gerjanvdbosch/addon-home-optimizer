@@ -610,6 +610,71 @@ class HeatPumpCOPModel:
     # 0.0 until calibrated, and for the other modes: the fixed approaches.
     approach_heat_w: float = 0.0
     approach_per_heat_k_per_w: float = 0.0
+    # The heat (W) a heating run moves at a compressor speed f (Hz) and
+    # outdoor temperature T (degC): c0 + c1 f + c2 T + c3 f T - a compressor
+    # moves a fixed volume per turn, of a vapour denser in warmer air. Empty
+    # until calibrated, and for the other modes.
+    speed_heat_w: tuple[float, ...] = ()
+    # The speed (Hz) heating runs hold once past their start, at the outdoor
+    # temperatures they were seen at (degC, rising): the outdoor unit turns
+    # down less in colder air (real data, Oct-Nov 2026: 26 Hz above ~8 degC,
+    # 32-40 Hz at 4-6 degC with the supply already past its setpoint, so
+    # 3.5-4.1 kW of heat where the floor's runs' least was 3.0 kW).
+    # Interpolated between the temperatures seen, held beyond them. Empty
+    # until calibrated: the floor's own least (FloorCircuitModel.min_heat_w).
+    held_speed_outdoor_c: tuple[float, ...] = ()
+    held_speed_hz: tuple[float, ...] = ()
+    # How much faster (Hz) than that a heating run the compressor starts from
+    # off runs as its first planning step ends, and over how long (s) after
+    # that it falls linearly to none: from off the loop's water lies below the
+    # controller's supply floor, so it speeds the compressor up to reach it
+    # and turns it down only slowly once past (real data, 9 cold starts
+    # Oct-Nov 2026: 8.6 Hz falling over 68 minutes; 14 Nov 42-55 Hz for 40
+    # minutes where 36 Hz held). A run the tank hands over is at its speed
+    # within minutes (31 runs). 0.0 until calibrated, and for the other modes.
+    start_excess_hz: float = 0.0
+    start_excess_seconds: float = 0.0
+
+    @staticmethod
+    def heat_at_speed_w(speed_heat_w: tuple[float, ...], speed_hz, T_outdoor):
+        """The heat (W) a heating run moves at this compressor speed and
+        outdoor temperature, by the line speed_heat_w. Scalars or arrays."""
+
+        c0, c1, c2, c3 = speed_heat_w
+
+        return c0 + c1 * speed_hz + c2 * T_outdoor + c3 * speed_hz * T_outdoor
+
+    def held_heat_w(self, T_outdoor: float) -> float:
+        """The heat (W) a heating run moves at the speed it holds at this
+        outdoor temperature (see held_speed_hz); 0.0 until calibrated."""
+
+        if not self.held_speed_hz or not self.speed_heat_w:
+            return 0.0
+
+        speed_hz = np.interp(T_outdoor, self.held_speed_outdoor_c, self.held_speed_hz)
+
+        return float(self.heat_at_speed_w(self.speed_heat_w, speed_hz, T_outdoor))
+
+    def start_excess_heat_w(
+        self, T_outdoor: float, from_s: float, to_s: float
+    ) -> float:
+        """The mean heat (W) a heating run started from off moves beyond its
+        held speed's between from_s and to_s seconds after its first planning
+        step ended - none before that, see start_excess_hz; 0.0 until
+        calibrated."""
+
+        if not self.start_excess_seconds or not self.speed_heat_w or to_s <= from_s:
+            return 0.0
+
+        def integral_s(t: float) -> float:
+            # Of the excess's share, 1 - t / start_excess_seconds, from 0 to t.
+            t = min(max(t, 0.0), self.start_excess_seconds)
+            return t - t * t / (2.0 * self.start_excess_seconds)
+
+        share = (integral_s(to_s) - integral_s(from_s)) / (to_s - from_s)
+        _, per_hz, _, per_hz_k = self.speed_heat_w
+
+        return float(self.start_excess_hz * share * (per_hz + per_hz_k * T_outdoor))
 
     def cop(self, T_outdoor: float, T_supply: float, heat_w=None) -> float:
         """Carnot COP scaled by eta_carnot - see

@@ -936,7 +936,10 @@ class MPCOptimizer:
         if not self._zone_planned(data):
             return self._tank_result(data, tank)
 
-        result, chosen = self._solve_with_zone(data, tank)
+        # One time limit for the whole solve, the second round below included:
+        # the jobs queue one after another, every five minutes.
+        deadline = time.monotonic() + self.config.solve_time_limit_s
+        result, chosen = self._solve_with_zone(data, tank, deadline)
 
         # The tank's plans were built around the zone's runs as estimated
         # beforehand, and the zone the program settles on may hand the
@@ -945,16 +948,18 @@ class MPCOptimizer:
         # its pattern holds on overheat the tank (real data, 17 Oct 2026, a
         # solve without a previous plan: 50.7 degC against 47.9, 4.8 ct
         # dearer). Once more around the zone as settled, that plan both a
-        # tank plan and the start, and the cheaper of the two kept.
+        # tank plan and the start, and the cheaper of the two kept - with the
+        # time the first left, so not after one stopped at the limit.
         settled = tuple(int(on) for on in result.space_schedule)
 
         if (
-            settled != tuple(data.previous_space_on)
+            result.termination_condition == str(TerminationCondition.optimal)
+            and settled != tuple(data.previous_space_on)
             and _runs(plan_tank(tank, settled, data.zone_cooling, data.zone_local_day))
             != chosen
         ):
             again, _ = self._solve_with_zone(
-                replace(data, previous_space_on=settled), tank
+                replace(data, previous_space_on=settled), tank, deadline
             )
 
             if again.objective_value < result.objective_value:
@@ -963,13 +968,12 @@ class MPCOptimizer:
         return result
 
     def _solve_with_zone(
-        self, data: MPCInput, tank: TankSetting
+        self, data: MPCInput, tank: TankSetting, deadline: float
     ) -> tuple[MPCResult, tuple[tuple[int, int], ...]]:
-        """The plan with the zone, and the tank's pattern in it (see _runs)."""
+        """The plan with the zone, and the tank's pattern in it (see _runs),
+        searched for until `deadline` (time.monotonic())."""
 
         model = self._build_model(data, tank)
-
-        time_limit_s = self.config.solve_time_limit_s
         started = time.monotonic()
         solver = self._solver()
         # Pyomo's translation of the model into HiGHS took as long as the warm
@@ -1038,10 +1042,10 @@ class MPCOptimizer:
 
         # A start found is part of the solve and shares its time; one that
         # failed takes none of it - the cold solve then needs all of it.
-        solver.config.time_limit = (
-            time_limit_s - (time.monotonic() - started)
-            if solver.config.warmstart
-            else time_limit_s
+        # At least what the start may take: a solve left less found no plan.
+        solver.config.time_limit = max(
+            deadline - (time.monotonic() if solver.config.warmstart else started),
+            self.config.warm_start_time_limit_s,
         )
         results = solver.solve(model)
         stopped_early = (
@@ -1064,11 +1068,14 @@ class MPCOptimizer:
             logger.info(
                 "MPC stopped at its %.0f s time limit: best plan %.3f EUR, at most "
                 "%.3f EUR from optimal",
-                time_limit_s,
+                self.config.solve_time_limit_s,
                 results.best_feasible_objective,
-                # The bound comes back in HiGHS's scaled units, the plan not.
+                # From HiGHS's relative gap: its bound comes back scaled (see
+                # OBJECTIVE_SCALE_EXPONENT) up to highspy 1.15 and unscaled
+                # from 1.16 (the add-on installs the newest), which divided
+                # once more read as "2.031 EUR from optimal" on a 2.033 plan.
                 results.best_feasible_objective
-                - results.best_objective_bound / 2.0**OBJECTIVE_SCALE_EXPONENT,
+                * solver._solver_model.getInfo().mip_gap,
             )
 
         chosen = tuple(
@@ -1161,8 +1168,9 @@ class MPCOptimizer:
 
     def _zone_held(self, data: MPCInput, tank: TankSetting) -> tuple[int, ...]:
         """Per step, whether a floor run under way that the zone started still
-        holds the compressor: for the minimum runtime from its start, as a run
-        the plan starts does (see _build_model) - a rule, as there. Without it
+        holds the compressor: for the floor's minimum runtime from its start
+        (MPCConfig.zone_min_runtime_steps), as a run the plan starts does (see
+        _build_model) - a rule, as there. Without it
         the tank took over a run minutes into it, priced as a start saved: a
         run started by hand at the thermostat, which no plan stops, was
         planned over to hot water 9 minutes in, and every replan after it
@@ -1176,9 +1184,7 @@ class MPCOptimizer:
             and data.space_on_current
             and data.space_elapsed_hours > 0.0
         ):
-            minimum_h = (
-                self.config.compressor_min_runtime_steps * self.config.step_hours
-            )
+            minimum_h = self.config.zone_min_runtime_steps * self.config.step_hours
 
             for k in tank.steps_within(minimum_h - data.space_elapsed_hours):
                 held[k] = 1
@@ -2193,11 +2199,13 @@ class MPCOptimizer:
                     heating(model, k) >= model.boiler_on[start] - previous_tank
                 )
 
-            # Likewise a run the zone starts serves the zone as long - a rule,
-            # not physics: priced alone, a quarter hour on the floor ahead of a
-            # hot water run came out level with starting on the tank (real
-            # plan, 1 Nov 2026: 0.07 ct, within the solver's gap), and the user
-            # wants no such quarter. A zone the tank hands over to may run one.
+            # Likewise a run the zone starts serves the zone its own minimum
+            # runtime (MPCConfig.zone_min_runtime_steps) - a rule, not
+            # physics: priced alone, a quarter hour on the floor ahead of a hot
+            # water run came out level with starting on the tank (real plan, 1
+            # Nov 2026: 0.07 ct, within the solver's gap), half an hour within
+            # 1 ct of an hour (14 Nov 2026), and the user wants no such run. A
+            # zone the tank hands over to may run one.
             if hasattr(model, "space_on"):
                 zone_start = (
                     model.compressor_start[start]
@@ -2205,7 +2213,9 @@ class MPCOptimizer:
                     + model.tank_handover[start]
                 )
 
-                for k in steps_within(min_runtime * self.config.step_hours, start):
+                for k in steps_within(
+                    self.config.zone_min_runtime_steps * self.config.step_hours, start
+                ):
                     model.minimum_runtime.add(model.space_on[k] >= zone_start)
 
         # A run already heating keeps heating until its minimum runtime has
@@ -2246,6 +2256,16 @@ class MPCOptimizer:
         model.minimum_off_time = pyo.ConstraintList()
         min_off = self.config.heat_pump_min_off_steps
 
+        # The compressor likewise, whichever it served: a stop between two
+        # floor runs, or a floor run and the tank, is a start the pause buys
+        # back at once. Priced alone, a solve stopped at its time limit on the
+        # Home Assistant host published a floor run off for one quarter hour
+        # and on again (14 Nov 2026), and the user wants no such run, optimal
+        # or not. Cooling's own stop to reverse for the tank is no such pause
+        # (see _add_space_heating): there the floor's runs alone.
+        def running(m: pyo.ConcreteModel, k: int):
+            return m.space_on[k] if data.zone_cooling else compressor(m, k)
+
         for stop in range(num_steps):
             for offset in range(1, min_off + 1):
                 k = stop + offset
@@ -2256,6 +2276,10 @@ class MPCOptimizer:
                 model.minimum_off_time.add(
                     heating(model, k)
                     <= 1 - (heating(model, stop) - heating(model, stop + 1))
+                )
+                model.minimum_off_time.add(
+                    running(model, k)
+                    <= 1 - (running(model, stop) - running(model, stop + 1))
                 )
 
         if not data.boiler_on_current:
@@ -3295,15 +3319,35 @@ class MPCOptimizer:
             else self.SPACE_HEATING_SUPPLY_C
         )
 
-        # At the floor's least heat, where its runs sit (see
+        # At the least heat, where its runs sit (see
         # HeatPumpCOPModel.approach_per_heat_k_per_w).
         heat_w = (
-            self.floor_circuit_model.min_heat_w
+            self.least_heat_w(outdoor_c)
             if self.floor_circuit_model is not None and not cooling
             else None
         )
 
         return float(cop_model.clamped_cop(outdoor_c, supply_c, heat_w))
+
+    def least_heat_w(self, outdoor_c: float, cooling: bool = False) -> float:
+        """The least heat (W, a magnitude) a zone run moves at this outdoor
+        temperature: heating, the compressor at the speed its runs hold
+        past their start, which rises in colder air (see
+        HeatPumpCOPModel.held_speed_hz); else, or before that is known, the
+        floor's runs' least (FloorCircuitModel.min_heat_w). 0.0 without a
+        floor circuit model."""
+
+        if self.floor_circuit_model is None:
+            return 0.0
+
+        model = self.space_cop_model
+        least_w = (
+            model.held_heat_w(outdoor_c)
+            if not cooling and model is not None and not model.cooling
+            else 0.0
+        )
+
+        return least_w or self.floor_circuit_model.min_heat_w
 
     def _add_space_heating(
         self,
@@ -3857,6 +3901,13 @@ class MPCOptimizer:
         if operating is None:
             return
 
+        # The compressor's least heat each step (see least_heat_w), never past
+        # the most, so a run stays possible.
+        least_heat_w = [
+            min(self.least_heat_w(zone_outdoor_c[k], cooling), max_heat_w)
+            for k in range(num_steps)
+        ]
+
         # The product T_sink * space_on, exact for a binary decision within the
         # sink's range, which the unheated and flat-out rollouts bound - the
         # slabs' mean being monotone in the heat like each slab.
@@ -3884,6 +3935,58 @@ class MPCOptimizer:
         if efficiency is not None:
             model.space_power_kw = pyo.Var(model.K, domain=pyo.NonNegativeReals)
             model.space_power_w = _watts(model.space_power_kw)
+
+        # A run the zone starts from off runs faster than the speed it holds
+        # for its first hour or so (see HeatPumpCOPModel.start_excess_hz), so
+        # its heat is no less than that speed's: the excess (W) each step k
+        # has from the start at step j, j -1 the run under way the zone
+        # started - excess[k][j]. A step a run the tank handed over has none.
+        excess: list[dict[int, float]] = [{} for _ in range(num_steps)]
+        # The zone starting the compressor (see minimum_runtime).
+        opened = [
+            model.compressor_start[k] - model.tank_start[k] + model.tank_handover[k]
+            for k in range(num_steps)
+        ]
+
+        if not cooling and efficiency is not None and efficiency.start_excess_seconds:
+            step_s = self.config.step_hours * 3600.0
+            begins_s = np.r_[0.0, np.cumsum(dt_hours)] * 3600.0
+            # Each start's time from now (s).
+            starts_s = {j: begins_s[j] for j in range(num_steps)}
+
+            if data.space_on_current and data.space_elapsed_hours > 0.0:
+                starts_s[-1] = -data.space_elapsed_hours * 3600.0
+
+            for k in range(num_steps):
+                for j, start_s in starts_s.items():
+                    if j > k:
+                        continue
+
+                    excess_w = min(
+                        efficiency.start_excess_heat_w(
+                            zone_outdoor_c[k],
+                            begins_s[k] - start_s - step_s,
+                            begins_s[k + 1] - start_s - step_s,
+                        ),
+                        max_heat_w - least_heat_w[k],
+                    )
+
+                    if excess_w > 0.0:
+                        excess[k][j] = excess_w
+
+        def started(k: int, j: int):
+            """1 where step k is in the run the start j opened, 0 or less
+            otherwise: on, from that start, and no start since."""
+
+            since = sum(opened[i] for i in range(j + 1, k + 1))
+
+            if j < 0:
+                return model.space_on[k] - since
+
+            return opened[j] + model.space_on[k] - 1 - since
+
+        # For the result: what the bias is to ask for as the least.
+        model.space_least_heat_w = (least_heat_w, excess, started)
 
         def draw_w(k: int, moved_w: float, sink_c: float) -> float:
             """The electricity (W) to move this heat into (or, cooling, out of)
@@ -3927,8 +4030,14 @@ class MPCOptimizer:
                 # bias asks for that much in the cold too, with the target just
                 # below the room (see features.ecodan).
                 model.zone_constraints.add(
-                    sign * model.q_space_w[k] >= operating.min_heat_w * on
+                    sign * model.q_space_w[k] >= least_heat_w[k] * on
                 )
+
+                for j, excess_w in excess[k].items():
+                    model.zone_constraints.add(
+                        model.q_space_w[k]
+                        >= (least_heat_w[k] + excess_w) * started(k, j)
+                    )
 
                 # Nor a supply below the controller's own floor: into a cool
                 # floor that takes more than the least heat. Never past what
@@ -3978,7 +4087,7 @@ class MPCOptimizer:
                     if efficiency.start_step_power_w:
                         start_w = (
                             efficiency.start_step_power_w
-                            - draw_w(k, operating.min_heat_w, reference_c)
+                            - draw_w(k, least_heat_w[k], reference_c)
                         ) * (
                             model.compressor_start[k]
                             - model.tank_start[k]
@@ -4058,7 +4167,7 @@ class MPCOptimizer:
 
             def supply_range(k: int) -> tuple[float, float]:
                 low_c, high_c = sink_c(k, coolest[k]), sink_c(k, warmest[k])
-                least_c = operating.min_heat_w / conductance[k]
+                least_c = least_heat_w[k] / conductance[k]
                 most_c = max_heat_w / conductance[k]
 
                 if cooling:
@@ -4201,7 +4310,7 @@ class MPCOptimizer:
                     high = sink_c(k, warmest[k]) + ZONE_BOUND_MARGIN_K
 
                     def most_w(sink_c: float, k: int = k) -> float:
-                        least_w = max(operating.min_heat_w, sun_heat_w[k])
+                        least_w = max(least_heat_w[k], sun_heat_w[k])
 
                         if operating.min_supply_c:
                             least_w = max(
@@ -4215,10 +4324,15 @@ class MPCOptimizer:
                         return least_w
 
                     slope = (most_w(high) - most_w(low)) / (high - low)
+                    # And a start's excess on top: the compressor's own.
                     model.zone_constraints.add(
                         model.q_space_w[k]
                         <= most_w(low) * on
                         + slope * (model.space_sink_on[k] - low * on)
+                        + sum(
+                            excess_w * (1 if j < 0 else opened[j])
+                            for j, excess_w in excess[k].items()
+                        )
                     )
 
             for k in range(num_steps - 1):
@@ -4240,13 +4354,31 @@ class MPCOptimizer:
                 # and only there. Any other rise is a near tie the solver
                 # turned either way between replans (7 Nov 2026: a 1.4 K step
                 # at noon on 0.1-0.3 kW of surplus, 3 cent from a steady run) -
-                # a steady run preferred (user's rule).
-                rise_w = max_heat_w if sun_heat_w[k + 1] > 0.0 else 0.0
+                # a steady run preferred (user's rule). Nor by more than the
+                # sun's heat or the least (colder air) rises: the heat the bias
+                # holds is the larger of the two, which the step before
+                # already had. Free to rise in full there, the plan banked
+                # 0.4-0.6 kW of sun in single quarter hours its sun's heat
+                # stayed level in, the supply up and down by a degree (14 Nov
+                # 2026).
+                rise_w = max(
+                    max(least_heat_w[k + 1], sun_heat_w[k + 1])
+                    - max(least_heat_w[k], sun_heat_w[k]),
+                    0.0,
+                )
+
+                # A start's excess as it rises past its first step.
+                excess_rise = sum(
+                    max(excess_w - excess[k].get(j, 0.0), 0.0)
+                    * (1 if j < 0 else opened[j])
+                    for j, excess_w in excess[k + 1].items()
+                )
 
                 model.zone_constraints.add(
                     sign * model.q_space_w[k + 1]
                     <= sign * model.q_space_w[k]
                     + rise_w
+                    + excess_rise
                     + max_heat_w * (2 - on_k - on_next)
                 )
 
@@ -4368,6 +4500,7 @@ class MPCOptimizer:
         zone_rest_temperatures: tuple[float, ...] = ()
         zone_mass_temperatures: tuple[float, ...] = ()
         space_supply_c: tuple[float, ...] = ()
+        space_least_heat_w: tuple[float, ...] = ()
         space_electrical_w: tuple[float, ...] = ()
 
         if hasattr(model, "q_space_w"):
@@ -4411,6 +4544,21 @@ class MPCOptimizer:
                     for k, on in enumerate(space_schedule)
                 )
 
+            if hasattr(model, "space_least_heat_w"):
+                least_w, excess, started = model.space_least_heat_w
+                space_least_heat_w = tuple(
+                    least_w[k]
+                    + max(
+                        (
+                            excess_w
+                            for j, excess_w in excess[k].items()
+                            if pyo.value(started(k, j)) > 0.5
+                        ),
+                        default=0.0,
+                    )
+                    for k in range(len(least_w))
+                )
+
         # The objective's own energy terms (see _build_objective), so what is
         # reported of a plan's cost is what the plan was chosen on.
         electricity_step_kwh = tuple(
@@ -4442,6 +4590,7 @@ class MPCOptimizer:
             zone_rest_temperatures=zone_rest_temperatures,
             zone_mass_temperatures=zone_mass_temperatures,
             space_supply_c=space_supply_c,
+            space_least_heat_w=space_least_heat_w,
             space_electrical_w=space_electrical_w,
             electricity_kwh=sum(electricity_step_kwh),
             grid_kwh=sum(grid_step_kwh),

@@ -351,16 +351,22 @@ def dashboard_chart(state: State, states: HeatPumpStates | None = None) -> str:
         decimal=1,
     )
 
-    # The supply the plan runs the floor at - while cooling, the
-    # setpoint it would give the heat pump - only while a run holds it.
+    # The supply measured while water flowed (heating, the tank, cooling),
+    # then the one the plan runs the floor at - while cooling, the setpoint it
+    # would give the heat pump - only while a run holds it. A temperature, so
+    # a line; straight, as a spline would overshoot a tank run's jump.
     series(
-        "Supply plan",
+        "Supply",
         broken_between_runs(
-            state.schedule.building.supply, timedelta(hours=MPCConfig().step_hours)
+            joined(
+                state.measurements.heat_pump.supply_temperature,
+                state.schedule.building.supply,
+            ),
+            timedelta(hours=MPCConfig().step_hours),
         ),
         row=2,
         col=1,
-        line=dict(width=1, color="#AB63FA", shape="hv"),
+        line=dict(width=1, color="#AB63FA", shape="linear"),
         visible="legendonly",
         unit="°C",
         decimal=1,

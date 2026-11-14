@@ -80,8 +80,8 @@ blueprint:
     dry_run:
       name: Dry run
       description: >-
-        Only notifies what the plan would do: switches, thermostats and the
-        bias are left alone, and the watchdogs are off.
+        Only notifies what the plan would do: switches and thermostats are
+        left alone, and the watchdogs are off. The bias is still set.
       default: false
       selector:
         boolean:
@@ -128,7 +128,6 @@ triggers:
     entity_id: binary_sensor.home_optimizer_zone_status
     from: "on"
     to: "off"
-    for: { minutes: 10 }
     id: zone_stop
   - trigger: state
     entity_id: sensor.home_optimizer_zone_setpoint
@@ -340,22 +339,20 @@ actions:
               # Between runs the comfort band's edge: the thermostat asks for
               # heat only where the room passed what the plan allows - left at
               # the run's setpoint the heat pump ran on 20-75 minutes past the
-              # plan's end (3-5 Nov 2026). Only once off for the 10 minutes a
-              # stop waits (see zone_stop, which lowers it then): at once the
-              # published edge ended the run before them. Through a tank's run
-              # the zone hands over to, the run's setpoint.
+              # plan's end (3-5 Nov 2026). Through a tank's run the zone hands
+              # over to, the run's setpoint.
               - conditions:
                   - condition: state
                     entity_id: binary_sensor.home_optimizer_zone_status
                     state: "off"
-                    for: { minutes: 10 }
                 sequence:
                   - *living
+      # Also in a dry run: the runs the heat pump then starts by itself get
+      # the plan's heat.
       - alias: Zone bias
         conditions:
           - condition: trigger
             id: zone_bias
-          - *control
           - condition: template
             value_template: "{{ bias_number != '' }}"
         sequence:
@@ -378,7 +375,7 @@ actions:
           - if:
               - condition: template
                 value_template: >-
-                  {{ not dry_run and bias_number != ''
+                  {{ bias_number != ''
                      and has_value('sensor.home_optimizer_zone_bias')
                      and has_value(bias_number)
                      and (states(bias_number) | float | round(1))

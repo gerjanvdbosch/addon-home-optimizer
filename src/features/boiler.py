@@ -382,16 +382,15 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
         return df["boiler_on"].shift(fill_value=False) & ~df["boiler_on"]
 
     def _bridge_flow_reporting_gaps(self, df: pd.DataFrame) -> pd.DataFrame:
-        """flow_lpm is rate-like: dataset() fetches it with no InfluxDB fill at
-        all, so a real reporting gap shows up here as NaN rather than a
-        guessed value. The compressor's own, separately and reliably reported
-        state settles what a gap actually means: bridging forward while state
-        confirms it is still active (confirmed on real data - T_supply/
-        T_return kept rising smoothly through a 15-minute flow_lpm gap during
-        a DHW ramp-up, a real reporting hiccup, not zero flow), but resetting
-        to 0 the moment state reports idle regardless of how long ago the last
-        reading was - the exact bug this replaces (a stale nonzero reading
-        persisting for minutes past a real, confirmed shutoff).
+        """flow_lpm is stored only on change (see dataset()), so the
+        compressor's own, separately and reliably reported state settles what
+        a reading carried forward means: it holds while state confirms the
+        pump still runs (confirmed on real data - T_supply/T_return kept
+        rising smoothly through a 15-minute flow_lpm gap during a DHW
+        ramp-up, a real reporting hiccup, not zero flow), but is reset to 0
+        the moment state reports idle regardless of how long ago the last
+        reading was (a stale nonzero reading persisted for minutes past a
+        real, confirmed shutoff).
         """
 
         df = df.copy()
@@ -2648,19 +2647,17 @@ class BoilerThermalIdentifier(SystemIdentifier[BoilerThermalModel]):
                 config.heat_pump.flow,
                 interval=self.SAMPLE_INTERVAL,
                 aggregation="mean",
-                # Unlike a state string, flow physically drops to ~0 as soon as the
-                # circulation pump stops. If the sensor itself stops publishing
-                # while idle (no raw points in a bucket), fill="previous" would
-                # keep carrying forward the last active flow reading indefinitely -
-                # observed directly in this installation's data (flow still showing
-                # ~14 L/min minutes after state flipped to "Uit"). fill="none" (no
-                # InfluxDB fill at all) leaves a genuine reporting gap as a real
-                # gap instead of guessing at either extreme here - prepare()
-                # resolves it using the compressor's own separately-reported
-                # state: bridge a brief gap while state confirms it is still
-                # active, but trust 0 the moment state reports idle, regardless of
-                # how long ago the last reading was.
-                fill="none",
+                # Stored only on change, so the reading in force holds - also
+                # the one from before the window: a run handed over from
+                # heating keeps the pump's flow and reports none for up to 16
+                # minutes (real data, 14 Nov 2026: 17.5 l/min last at 11:16, the
+                # run at 11:47, the next reading 12:02). A run's minutes loaded
+                # from just before it (see Optimization._run_minutes) read those
+                # minutes as no flow, and its heat balance came out 1.4 kWh -
+                # 5.8 K - short. A stale reading after the pump stopped
+                # (observed: ~14 l/min minutes after "Uit") is set to 0 by
+                # prepare() from the compressor's state.
+                fill="previous",
             )
             .timeseries(
                 "state",

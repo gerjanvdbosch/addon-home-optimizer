@@ -12,7 +12,7 @@ import pandas as pd
 from app.state import StateManager
 from domain.config import BoilerConfig, Config, Price, Tariff
 from domain.jobs import OptimizeConfig
-from domain.models import BoilerThermalModel
+from domain.models import BoilerThermalModel, FloorCircuitModel
 from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.physics import (
     CP_WATER_J_PER_KG_K,
@@ -73,6 +73,9 @@ class Optimization:
     # The rest's thermostats' setpoint, only with BuildingConfig.rest_temperature
     # set (see publish_zone).
     ZONE_REST_SETPOINT_ENTITY = "sensor.home_optimizer_zone_rest_setpoint"
+    # Today's and tomorrow's cost, heat pump, baseload and grid, measured up to now
+    # and planned on (see publish_day): kind, then today or tomorrow.
+    DAY_ENTITY = "sensor.home_optimizer_{}_{}"
 
     def __init__(
         self,
@@ -114,7 +117,7 @@ class Optimization:
         # The baseload ahead (see BaseloadForecaster), into the predictions the
         # plan, the zone and the charts read.
         for name, series in self._baseload(state, config, now, forecast_times).items():
-            self.state_manager.update_prediction(name, series)
+            self.state_manager.update_prediction(str(name), series)
 
         state = self.state_manager.load()
 
@@ -191,12 +194,11 @@ class Optimization:
 
         dhw_state = config.heat_pump.states.dhw
 
-        import_price, export_price = (
-            self._price(key, price, state, forecast_times)
-            for key, price in (
-                ("import", config.prices.import_),
-                ("export", config.prices.export),
-            )
+        import_price = self._price(
+            "import", config.prices.import_, state, forecast_times
+        )
+        export_price = self._price(
+            "export", config.prices.export, state, forecast_times
         )
         heat_pump_changes = self._heat_pump_changes(config, now)
         boiler_on_current, run_start, idle_elapsed_hours = self.dhw_timing(
@@ -309,7 +311,7 @@ class Optimization:
         # as the plan starts from it.
         run_heat_j = (
             self._run_heat_j(run_minutes, run_start, [*run_quarters, now])
-            if run_minutes is not None
+            if run_minutes is not None and run_start is not None
             else None
         )
 
@@ -334,8 +336,8 @@ class Optimization:
             habit=self._tap_habit(state, config, tap, now),
         )
         self.state_manager.update_prediction("tap", tap_w)
-        tap_forecast = extended(
-            [SeriesPoint(time=t, value=float(w)) for t, w in tap_w.items()], 0.0
+        tap_forecast = tuple(
+            self.state_manager.extend_forecast(tap_w, forecast_times, 0.0)
         )
         run_end = now - timedelta(hours=idle_elapsed_hours)
         hot_water_c = (
@@ -466,7 +468,7 @@ class Optimization:
                 *heat_pump_changes, mode, state.measurements.heat_pump.defrost
             )
             # A run the plan stopped is over, though the compressor runs on
-            # until the blueprint lowers the thermostats 10 minutes later: going
+            # until the thermostats the blueprint lowers have stopped it: going
             # on is a start again. Seen as under way, the next solve took it up
             # again for free: near ties between stopping now and a quarter later
             # turned the status off and on 6 times on 13 Nov 2026 (0-6 a day
@@ -534,8 +536,8 @@ class Optimization:
         stopped = self.zone_stopped(
             state.schedule.building.stopped,
             serving and zone is not None,
-            # A run planned again from the next quarter hour is a pause the
-            # blueprint's 10 minutes bridge, not a stop: held as one, each
+            # A run planned again from the next quarter hour is a pause, not a
+            # stop: held as one, each
             # solve after put the start off by another quarter hour (replay of
             # 13 Nov 2026: 12:10-14:10). Nor is one handed over to the tank:
             # the compressor goes on, and held as stopped the tank's block
@@ -590,7 +592,7 @@ class Optimization:
                 # The tank the plan starts from: mixed, or by its heat balance
                 # through a run under way (see MPCOptimizer._initial_temperature).
                 result.temperatures[0],
-                data.mains_water_temperature,
+                mains_c,
                 self._dhw_setpoint_c(config, now),
                 thermal_model.volume_l,
                 tap.drawn_j(draws),
@@ -631,18 +633,7 @@ class Optimization:
             planned if zone is not None else None,
             heat_pump_changes[0],
             now,
-            # The compressor's least heat into the floor (see
-            # features.ecodan.setpoint_bias_k), the controller's least
-            # supply, and the most heat the floor's runs have moved.
-            *(
-                (
-                    optimizer.floor_circuit_model.min_heat_w,
-                    optimizer.floor_circuit_model.min_supply_c,
-                    optimizer.floor_circuit_model.max_heat_w or math.inf,
-                )
-                if optimizer.floor_circuit_model is not None
-                else ()
-            ),
+            optimizer.floor_circuit_model,
         )
         # Last, so it reads after what was published.
         self.log_day_costs(
@@ -683,16 +674,18 @@ class Optimization:
         if heat_w.isna().all():
             return None
 
-        start = df["time"].clip(lower=pd.Timestamp(run_start))
-        end = df["time"].shift(-1, fill_value=pd.Timestamp(times[-1]))
+        # Each minute from its reading to the next (s since the run began).
+        elapsed_s = (df["time"] - pd.Timestamp(run_start)).dt.total_seconds()
+        start_s = elapsed_s.clip(lower=0.0)
+        end_s = elapsed_s.shift(-1, fill_value=(times[-1] - run_start).total_seconds())
 
         return [
             float(
                 (
                     heat_w.fillna(0.0)
-                    * (end.clip(upper=pd.Timestamp(t)) - start)
-                    .dt.total_seconds()
-                    .clip(lower=0.0)
+                    * (
+                        end_s.clip(upper=(t - run_start).total_seconds()) - start_s
+                    ).clip(lower=0.0)
                 ).sum()
             )
             for t in times
@@ -1112,6 +1105,41 @@ class Optimization:
         "house",
         "cost",
     )
+    # What draws the electricity (see costed).
+    CONSUMERS = ("dhw", "heating", "cooling", "standby", "house")
+    HEAT_PUMP = ("dhw", "heating", "cooling", "standby")
+
+    @classmethod
+    def costed(cls, frame: pd.DataFrame, import_price, export_price) -> pd.DataFrame:
+        """`frame` (see DAY_COLUMNS) with what the grid costs, `cost` (EUR), and
+        what makes it up, `<column>_cost`: the import at the import price, the
+        export earning the export price. Each consumer pays its share of a
+        step's draw as the step pays it: its import at the import price, its
+        own sun at the export price - what that sun would have earned exported
+        (as dhw_summary prices a run). The sun then earns its yield at the
+        export price, and consumers and sun add up to the grid's cost."""
+
+        import_price = np.asarray(import_price, dtype=float)
+        export_price = np.asarray(export_price, dtype=float)
+        bought = frame["import"].to_numpy(dtype=float)
+        drawn = bought - frame["export"].to_numpy(dtype=float) + frame["solar"]
+        drawn = np.asarray(drawn, dtype=float)
+        # A step drawing nothing has no consumer to pay; its price is moot.
+        price = np.divide(
+            bought * import_price + (drawn - bought) * export_price,
+            drawn,
+            out=import_price.copy(),
+            where=drawn > 0.0,
+        )
+        frame["import_cost"] = bought * import_price
+        frame["export_cost"] = -frame["export"] * export_price
+        frame["cost"] = frame["import_cost"] + frame["export_cost"]
+        frame["solar_cost"] = -frame["solar"] * export_price
+
+        for column in cls.CONSUMERS:
+            frame[f"{column}_cost"] = frame[column] * price
+
+        return frame
 
     def log_day_costs(
         self,
@@ -1123,12 +1151,27 @@ class Optimization:
         times: list[datetime],
         now: datetime,
     ) -> None:
-        """Logs per local day the grid's import and export, the solar, the heat
-        pump's electricity per mode, the rest of the house and their cost:
+        """Publishes today's and tomorrow's cost and energy (see publish_day),
+        then logs per local day the grid's import and export, the solar, the
+        heat pump's electricity per mode, the rest of the house and their cost:
         today measured up to now and planned on from it, tomorrow planned."""
 
         measured = self.measured_energy(config, state, now)
         planned = self.planned_energy(result, data, times, optimizer)
+        # The sensors first, the log after them, as the other sensors (see
+        # publish_zone).
+        today = to_local_time(now).date()
+
+        for days, name in ((0, "today"), (1, "tomorrow")):
+            date = today + timedelta(days=days)
+            self.publish_day(
+                name,
+                *(
+                    frame[[to_local_time(t).date() == date for t in frame["time"]]]
+                    for frame in (measured, planned)
+                ),
+            )
+
         step = timedelta(hours=optimizer.config.step_hours)
         logger.info(
             "Planned runs (kWh):\n%s",
@@ -1167,6 +1210,70 @@ class Optimization:
             lines.append(f"{date:%a %d %b}" + "".join(cells))
 
         logger.info("Day costs (EUR, kWh):\n%s", "\n".join(lines))
+
+    def publish_day(
+        self, name: str, measured: pd.DataFrame, planned: pd.DataFrame
+    ) -> None:
+        """A day's cost (EUR), the heat pump's electricity, the rest of the
+        house's, its baseload, and the grid meter's balance (kWh), as four
+        sensors, measured up to now and planned on, each with those two parts
+        as attributes: the cost with what makes it up (see costed), the heat
+        pump with its modes, the grid with its import and export. Through the
+        day their history shows how the plan's day turned out."""
+
+        # The meter's net import, negative on a day that exports more; what it
+        # costs stays with the cost, as import and export are priced apart.
+        measured, planned = (
+            frame.assign(grid=frame["import"] - frame["export"])
+            for frame in (measured, planned)
+        )
+        day = pd.concat([measured, planned])
+
+        def total(columns, frame: pd.DataFrame = day) -> float:
+            # Summed by pandas: a day without measured minutes yet has none of
+            # the cost columns there (NaN in the concat).
+            return round(float(frame[list(np.atleast_1d(columns))].sum().sum()), 2)
+
+        cost_parts = {
+            **{f"{c}_eur": total(f"{c}_cost") for c in ("import", "export", "solar")},
+            "heat_pump_eur": total([f"{c}_cost" for c in self.HEAT_PUMP]),
+            **{f"{c}_eur": total(f"{c}_cost") for c in self.HEAT_PUMP},
+            "baseload_eur": total("house_cost"),
+        }
+        sensors = (
+            ("cost", "cost", "EUR", "monetary", "eur", cost_parts),
+            (
+                "heat_pump_energy",
+                self.HEAT_PUMP,
+                "kWh",
+                "energy",
+                "kwh",
+                {f"{c}_kwh": total(c) for c in self.HEAT_PUMP},
+            ),
+            ("baseload_energy", "house", "kWh", "energy", "kwh", {}),
+            (
+                "grid_energy",
+                "grid",
+                "kWh",
+                "energy",
+                "kwh",
+                {f"{c}_kwh": total(c) for c in ("import", "export")},
+            ),
+        )
+
+        for kind, columns, unit, device_class, suffix, parts in sensors:
+            self.home_assistant.set_state(
+                self.DAY_ENTITY.format(kind, name),
+                f"{total(columns):.2f}",
+                {
+                    "friendly_name": f"Home Optimizer {kind.replace('_', ' ')} {name}",
+                    "device_class": device_class,
+                    "unit_of_measurement": unit,
+                    f"measured_{suffix}": total(columns, measured),
+                    f"planned_{suffix}": total(columns, planned),
+                    **parts,
+                },
+            )
 
     @staticmethod
     def planned_runs(
@@ -1281,13 +1388,12 @@ class Optimization:
         quarters = minutes.groupby("time").sum().reset_index()
         quarter_times = [t.to_pydatetime() for t in quarters["time"]]
         prices = config.prices
-        quarters["cost"] = quarters["import"] * np.array(
-            self._price("import", prices.import_, state, quarter_times)
-        ) - quarters["export"] * np.array(
-            self._price("export", prices.export, state, quarter_times)
-        )
 
-        return quarters
+        return self.costed(
+            quarters,
+            self._price("import", prices.import_, state, quarter_times),
+            self._price("export", prices.export, state, quarter_times),
+        )
 
     @staticmethod
     def planned_energy(
@@ -1343,11 +1449,10 @@ class Optimization:
                 "house": baseload_w * hours / 1000.0,
             }
         )
-        frame["cost"] = frame["import"] * np.array(import_price[: len(drawn)]) - frame[
-            "export"
-        ] * np.array(export_price[: len(drawn)])
 
-        return frame
+        return Optimization.costed(
+            frame, import_price[: len(drawn)], export_price[: len(drawn)]
+        )
 
     # How much earlier explain_dhw_plan has the first run finish (hours): the
     # question a plan usually raises is why it does not run earlier, in more sun.
@@ -1692,10 +1797,12 @@ class Optimization:
                 predictions.baseload_p90,
             )
         ]
+        p10, p50, p90 = bands
+        w10, w50, w90 = SOLAR_SCENARIO_WEIGHTS
         baseload = (
-            sum(w * band for w, band in zip(SOLAR_SCENARIO_WEIGHTS, bands, strict=True))
-            if all(not band.empty for band in bands)
-            else bands[1]
+            w10 * p10 + w50 * p50 + w90 * p90
+            if not (p10.empty or p50.empty or p90.empty)
+            else p50
         )
 
         # The sun on the facade ahead, from the array's own forecast (see
@@ -1762,9 +1869,12 @@ class Optimization:
             logger.info("Zone not planned: no zone estimate at %s", times[0])
             return zone, None
 
-        dew_point_c = self._dew_point_forecast(state, times, mpc_config)
+        # Only cooling keeps the floor above the dew point.
+        dew_point_c = (
+            self._dew_point_forecast(state, times, mpc_config) if cooling else []
+        )
 
-        if cooling and dew_point_c is None:
+        if dew_point_c is None:
             logger.info(
                 "Zone not planned: no dew point to keep the floor above while "
                 "cooling (see building.dew_points)"
@@ -1773,9 +1883,7 @@ class Optimization:
 
         def gain(column: str) -> tuple[float, ...]:
             return tuple(
-                self.state_manager.extend_forecast(
-                    zone[column].dropna().to_dict(), times, 0.0
-                )
+                self.state_manager.extend_forecast(zone[column].dropna(), times, 0.0)
             )
 
         target_c, minimum_c, maximum_c = (
@@ -1863,22 +1971,18 @@ class Optimization:
             # Beyond the forecast the envelope a day earlier, else the nearest.
             zone_envelope_w_per_k=tuple(
                 self.state_manager.extend_forecast(
-                    zone["envelope_w_per_k"].dropna().to_dict(), times
+                    zone["envelope_w_per_k"].dropna(), times
                 )
             ),
             zone_floor_open=floor_open,
             zone_floor_flow_lpm=floor_flow,
             zone_auto_adaptive=config.heat_pump.auto_adaptive,
             zone_cooling=cooling,
-            zone_mass_minimum_c=(
-                tuple(c + config.building.dew_point_margin for c in dew_point_c)
-                if cooling
-                else ()
+            zone_mass_minimum_c=tuple(
+                c + config.building.dew_point_margin for c in dew_point_c
             ),
             zone_supply_minimum_c=(
-                tuple(dew_point_c)
-                if cooling and not config.building.insulated_pipes
-                else ()
+                tuple(dew_point_c) if not config.building.insulated_pipes else ()
             ),
         )
 
@@ -2439,9 +2543,7 @@ class Optimization:
         data: MPCInput | None,
         heat_pump_state: list[SeriesPoint],
         now: datetime,
-        least_heat_w: float = 0.0,
-        min_supply_c: float = 0.0,
-        max_heat_w: float = math.inf,
+        floor_circuit: FloorCircuitModel | None = None,
     ) -> None:
         """Writes the plan's floor decision to Home Assistant, as publish_dhw
         does the hot water's: on/off for the quarter hour running now, the
@@ -2584,9 +2686,21 @@ class Optimization:
                     since if running else None,
                     now,
                     float(room) if room != "unknown" else None,
-                    least_heat_w,
-                    min_supply_c,
-                    max_heat_w,
+                    # The compressor's least heat into the floor this step, as
+                    # the plan has it (see features.ecodan.setpoint_bias_k), the
+                    # controller's least supply, and the most heat the floor's
+                    # runs have moved.
+                    *(
+                        (
+                            result.space_least_heat_w[k]
+                            if result.space_least_heat_w
+                            else 0.0,
+                            floor_circuit.min_supply_c,
+                            floor_circuit.max_heat_w or math.inf,
+                        )
+                        if floor_circuit is not None
+                        else (0.0, 0.0, math.inf)
+                    ),
                 )
 
             if serving and result.space_supply_c:
@@ -2725,7 +2839,9 @@ class Optimization:
             now - timedelta(minutes=15),
             now,
         )
-        readings = pd.to_numeric(frame.get("value"), errors="coerce").dropna()
+        readings = pd.to_numeric(
+            frame.get("value", pd.Series(dtype=float)), errors="coerce"
+        ).dropna()
 
         return float(readings.iloc[-1]) if not readings.empty else None
 
@@ -2754,8 +2870,10 @@ class Optimization:
         # Beyond the sun the rest of the house's draw is not the heat pump's
         # to make up (as optimizer.surplus_scenarios).
         surplus = (
-            pd.to_numeric(frame.get("heat_pump"), errors="coerce")
-            - pd.to_numeric(frame.get("grid"), errors="coerce")
+            pd.to_numeric(
+                frame.get("heat_pump", pd.Series(dtype=float)), errors="coerce"
+            )
+            - pd.to_numeric(frame.get("grid", pd.Series(dtype=float)), errors="coerce")
         ).clip(lower=0.0)
         recent = surplus[
             pd.to_datetime(frame["time"], utc=True) >= now - self.ZONE_BIAS_LOWER_WINDOW

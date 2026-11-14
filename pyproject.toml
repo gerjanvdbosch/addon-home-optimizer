@@ -34,6 +34,8 @@ dependencies = [
 dev = [
     "pyflakes>=3.2",
     "pyright>=1.1,<2.0",
+    # pandas ships no types; without them pyright guesses from its source.
+    "pandas-stubs>=3.0,<4",
     "pytest>=8.0",
     "pytest-xdist>=3.6",
     "ruff>=0.4",

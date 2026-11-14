@@ -10,6 +10,32 @@ prices.
 > Features, configuration, and API endpoints may change at any time. It is not yet
 > recommended for production use.
 
+## Features
+
+- **Smart scheduling** – plans heating, cooling and hot water a day ahead at the
+  lowest cost while keeping every room comfortable
+- **Solar first** – shifts runs to hours with your own solar power
+- **Dynamic prices** – runs when electricity is cheap, with a price forecast beyond
+  the published prices
+- **COP aware** – heats in the warmest hours at the lowest water temperature,
+  where the heat pump is most efficient
+- **Knows your house** – learns its thermal mass, sun through the windows and how
+  fast it cools, so it stores heat in the floor when it's cheap or sunny
+- **Solar power steering** – raises the heat pump's output to use surplus solar
+  power instead of exporting it (auto-adaptive bias)
+- **Fewer compressor starts** – combines hot water and heating in one run, for a
+  longer heat pump life
+- **Safe cooling** – keeps the floor above the dew point, so it never condenses
+- **Hot water when you need it** – learns when you use hot water and heats the
+  tank just in time
+- **Self-learning** – learns your house, tank, heat pump and household from
+  history and recalibrates every night
+- **Cost insight** – today's and tomorrow's cost and energy as sensors in Home
+  Assistant
+- **Plug and play** – a ready-made blueprint controls the heat pump and
+  thermostats, with a dry run to try it first
+- **Web dashboard** – charts of the plan against what really happened
+
 ## Requirements
 
 Home Optimizer requires the [InfluxDB addon](https://github.com/vistalba/addon-influxdb)
@@ -374,17 +400,25 @@ actions:
 
 Home Optimizer writes the following entities to Home Assistant:
 
-| Entity                                     | Description                                                                 |
-|--------------------------------------------|-----------------------------------------------------------------------------|
-| `binary_sensor.home_optimizer_dhw_status`  | `on` while the current quarter hour is planned to heat DHW                  |
-| `sensor.home_optimizer_dhw_start`          | Start of the next planned DHW run (`unknown` if none)                       |
-| `sensor.home_optimizer_dhw_setpoint`       | DHW setpoint (°C) for that run (`unknown` if none)                          |
-| `sensor.home_optimizer_dhw_soc`            | DHW tank state of charge (%)                                                |
-| `binary_sensor.home_optimizer_zone_status` | `on` while the current quarter hour is planned to heat or cool the zone     |
-| `sensor.home_optimizer_zone_start`         | Start of the zone run under way or the next one planned (`unknown` if none) |
-| `sensor.home_optimizer_zone_setpoint`      | Room temperature (°C) that run heats or cools to (`unknown` if none)        |
-| `sensor.home_optimizer_zone_rest_setpoint` | Other rooms' thermostats' setpoint (°C)                                     |
-| `sensor.home_optimizer_zone_supply`        | Supply setpoint (°C) while a zone run is under way (`unknown` otherwise)    |
+| Entity                                                    | Description                                                                                |
+|-----------------------------------------------------------|--------------------------------------------------------------------------------------------|
+| `binary_sensor.home_optimizer_dhw_status`                 | `on` while the current quarter hour is planned to heat DHW                                 |
+| `sensor.home_optimizer_dhw_start`                         | Start of the next planned DHW run (`unknown` if none)                                      |
+| `sensor.home_optimizer_dhw_setpoint`                      | DHW setpoint (°C) for that run (`unknown` if none)                                         |
+| `sensor.home_optimizer_dhw_soc`                           | DHW tank state of charge (%)                                                               |
+| `binary_sensor.home_optimizer_zone_status`                | `on` while the current quarter hour is planned to heat or cool the zone                    |
+| `sensor.home_optimizer_zone_start`                        | Start of the zone run under way or the next one planned (`unknown` if none)                |
+| `sensor.home_optimizer_zone_setpoint`                     | Room temperature (°C) that run heats or cools to (`unknown` if none)                       |
+| `sensor.home_optimizer_zone_rest_setpoint`                | Other rooms' thermostats' setpoint (°C)                                                    |
+| `sensor.home_optimizer_zone_supply`                       | Supply setpoint (°C) while a zone run is under way (`unknown` otherwise)                   |
+| `sensor.home_optimizer_zone_bias`                         | Auto-adaptive setpoint bias (°C) for the heat pump, only with `heat_pump.auto_adaptive` on |
+| `sensor.home_optimizer_cost_{today,tomorrow}`             | Electricity cost of the day (EUR)                                                          |
+| `sensor.home_optimizer_heat_pump_energy_{today,tomorrow}` | Heat pump electricity of the day (kWh)                                                     |
+| `sensor.home_optimizer_baseload_energy_{today,tomorrow}`  | Electricity of the rest of the house of the day (kWh)                                      |
+| `sensor.home_optimizer_grid_energy_{today,tomorrow}`      | Net grid import of the day (kWh): import minus export, negative when exporting more        |
+
+The day sensors' `today` is measured up to now and planned for the rest of the day,
+`tomorrow` is planned.
 
 ## Blueprints
 

@@ -1479,6 +1479,13 @@ def test_the_plans_day_energy_splits_the_heat_pump_and_prices_the_grid():
     assert list(frame["heating"]) == pytest.approx([0.0, 0.25, 0.0])
     assert list(frame["house"]) == pytest.approx([0.075, 0.075, 0.075])
     assert frame["cost"].sum() == pytest.approx(0.325 * 0.2 - 0.125 * 0.08)
+    # The parts add up to the grid's cost: the tank's quarter hour draws its
+    # 0.25 kWh import at 0.2 and its 0.325 kWh own sun at 0.08.
+    parts = [f"{c}_cost" for c in (*Optimization.CONSUMERS, "solar")]
+    assert list(frame[parts].sum(axis=1)) == pytest.approx(list(frame["cost"]))
+    assert frame["dhw_cost"].iloc[0] == pytest.approx(
+        0.5 / 0.575 * (0.25 * 0.2 + 0.325 * 0.08)
+    )
     # The balance: in - out = heat pump + house - sun.
     assert (frame["import"] - frame["export"]).sum() == pytest.approx(
         (frame[["dhw", "heating", "house"]].sum(axis=1) - frame["solar"]).sum()
@@ -1533,6 +1540,8 @@ def test_the_measured_day_counts_import_and_export_per_minute():
     assert quarters["export"].iloc[0] == pytest.approx(7 * 500.0 / 60000.0)
     assert quarters["heating"].iloc[0] == pytest.approx(15 * 800.0 / 60000.0)
     assert quarters["cost"].iloc[0] == pytest.approx(7 * 500.0 / 60000.0 * (0.2 - 0.08))
+    parts = [f"{c}_cost" for c in (*Optimization.CONSUMERS, "solar")]
+    assert quarters[parts].to_numpy().sum() == pytest.approx(quarters["cost"].iloc[0])
 
 
 def test_the_day_costs_are_one_table_with_today_measured_and_planned(caplog):
@@ -1541,18 +1550,38 @@ def test_the_day_costs_are_one_table_with_today_measured_and_planned(caplog):
 
     today, tomorrow = START, START + timedelta(days=1)
 
-    def frame(time, cost, heating):
-        row = dict.fromkeys(Optimization.DAY_COLUMNS, 0.0)
-        return pd.DataFrame([{**row, "time": time, "cost": cost, "heating": heating}])
+    def frame(time, cost, heating, **grid):
+        row = dict.fromkeys(Optimization.DAY_COLUMNS, 0.0) | grid
+        costs = {f"{c}_cost": 0.0 for c in ("import", "export", "solar")}
+        costs |= {f"{c}_cost": 0.0 for c in Optimization.CONSUMERS}
+        return pd.DataFrame(
+            [
+                {
+                    **row,
+                    **costs,
+                    "time": time,
+                    "cost": cost,
+                    "heating": heating,
+                    "heating_cost": cost,
+                }
+            ]
+        )
 
+    published = {}
     optimization = Optimization(
         loader=None,  # type: ignore[arg-type]
         state_manager=None,  # type: ignore[arg-type]
         config_repository=None,  # type: ignore[arg-type]
         models_path=Path("."),
-        home_assistant=None,  # type: ignore[arg-type]
+        home_assistant=SimpleNamespace(  # type: ignore[arg-type]
+            set_state=lambda entity, state, attributes: published.update(
+                {entity: (state, attributes)}
+            )
+        ),
     )
-    optimization.measured_energy = lambda config, state, now: frame(today, 0.5, 1.0)  # type: ignore[method-assign]
+    optimization.measured_energy = lambda config, state, now: frame(  # type: ignore[method-assign]
+        today, 0.5, 1.0, **{"import": 1.5, "export": 2.0}
+    )
     optimization.planned_energy = lambda *args: pd.concat(  # type: ignore[method-assign]
         [frame(today, 0.25, 0.0), frame(tomorrow, 1.0, 2.0)]
     )
@@ -1576,6 +1605,28 @@ def test_the_day_costs_are_one_table_with_today_measured_and_planned(caplog):
     assert today_cells[:3] == ["0.75", "0.50", "0.25"]
     assert today_cells[6] == "1.00" and today_cells[8] == "1.00"
     assert tomorrow_cells[:3] == ["1.00", "-", "1.00"]
+
+    # Sensors per day: today's measured and planned, tomorrow's planned.
+    def sensor(kind, day):
+        return published[Optimization.DAY_ENTITY.format(kind, day)]
+
+    state, attributes = sensor("cost", "today")
+    assert state == "0.75"
+    assert (attributes["measured_eur"], attributes["planned_eur"]) == (0.5, 0.25)
+    assert attributes["heat_pump_eur"] == attributes["heating_eur"] == 0.75
+    state, attributes = sensor("heat_pump_energy", "today")
+    assert state == "1.00"
+    assert (attributes["measured_kwh"], attributes["planned_kwh"]) == (1.0, 0.0)
+    assert attributes["heating_kwh"] == 1.0
+    state, attributes = sensor("cost", "tomorrow")
+    assert state == "1.00"
+    assert (attributes["measured_eur"], attributes["planned_eur"]) == (0.0, 1.0)
+    assert sensor("heat_pump_energy", "tomorrow")[0] == "2.00"
+    assert sensor("baseload_energy", "tomorrow")[0] == "0.00"
+    state, attributes = sensor("grid_energy", "today")
+    assert state == "-0.50"
+    assert (attributes["import_kwh"], attributes["export_kwh"]) == (1.5, 2.0)
+    assert (attributes["measured_kwh"], attributes["planned_kwh"]) == (-0.5, 0.0)
 
 
 def test_the_planned_runs_are_listed_by_their_start():

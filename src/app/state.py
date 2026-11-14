@@ -226,17 +226,20 @@ class StateManager:
         # over its minimum runtime was already close to what it really drew,
         # and stayed so (within 0.01 kWh either way).
         shift = 0.0
+        shifted_at = None
 
         if nowcast is not None and nowcast[0] in p50.index:
-            shift = weight * (nowcast[1] - p50[nowcast[0]])
+            shifted_at = nowcast[0]
+            shift = weight * (nowcast[1] - p50[shifted_at])
 
         def from_now(series: pd.Series) -> pd.Series:
             # Only quarter hours that haven't ended.
             series = series[series.index > now - step]
 
-            if shift and nowcast[0] in series.index:
+            if shift and shifted_at is not None:
+                at = series.index == shifted_at
                 series = series.copy()
-                series[nowcast[0]] = max(series[nowcast[0]] + shift, 0.0)
+                series[at] = (series[at] + shift).clip(lower=0.0)
 
             return series
 
@@ -352,7 +355,7 @@ class StateManager:
     def _series_points(series: pd.Series) -> list[SeriesPoint]:
         return [
             SeriesPoint(time=pd.Timestamp(t).to_pydatetime(), value=float(v))
-            for t, v in series.items()
+            for t, v in zip(series.index, series, strict=True)
         ]
 
     def update_prediction(self, name: str, series: pd.Series) -> None:
@@ -552,6 +555,18 @@ class StateManager:
             df, "heat_pump_return_temperature"
         )
         state.measurements.heat_pump.flow = self._parse_series(df, "heat_pump_flow")
+
+        # Only while water flows past the sensor - heating, the tank or
+        # cooling: standing, it reads the water at the unit, not the loop's.
+        if "heat_pump_supply_temperature" in df and "heat_pump_flow" in df:
+            state.measurements.heat_pump.supply_temperature = self._parse_series(
+                df.assign(
+                    heat_pump_supply_temperature=df[
+                        "heat_pump_supply_temperature"
+                    ].where(df["heat_pump_flow"] > 0.0)
+                ),
+                "heat_pump_supply_temperature",
+            )
         state.measurements.heat_pump.power = self._parse_series(df, "heat_pump_power")
         state.measurements.heat_pump.compressor_frequency = self._parse_series(
             df, "heat_pump_compressor_frequency"
@@ -659,7 +674,7 @@ class StateManager:
             ),
             index=minutes["time"],
         ).where(pd.notna(top) & pd.notna(bottom))
-        quarter = held.groupby(held.index.floor("15min")).last()
+        quarter = held.resample("15min").last()
 
         return times.map(quarter)
 
@@ -775,7 +790,7 @@ class StateManager:
 
     @staticmethod
     def extend_forecast(
-        values: Mapping[datetime, float],
+        values: Mapping[datetime, float] | pd.Series,
         times: list[datetime],
         fallback: float | None = None,
     ) -> list[float]:
@@ -790,7 +805,7 @@ class StateManager:
 
         day = timedelta(days=1)
         known = {t: v for t, v in values.items() if not math.isnan(v)}
-        extended = []
+        extended: list[float] = []
 
         for t in times:
             value = known.get(t, known.get(t - day))
@@ -899,6 +914,14 @@ class StateManager:
                 interval="15m",
                 aggregation="last",
                 fill="previous",
+            )
+            # Only drawn (see _map): the quarter's mean, as the plan's supply
+            # is one per quarter.
+            .timeseries(
+                "heat_pump_supply_temperature",
+                config.heat_pump.supply_temperature,
+                interval="15m",
+                aggregation="time_mean",
             )
             .timeseries(
                 "heat_pump_flow",

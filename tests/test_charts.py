@@ -127,10 +127,16 @@ def test_the_dashboard_draws_a_cooling_plan():
     measured_at = now - timedelta(minutes=37)
     state.measurements.building.dew_point = [SeriesPoint(time=measured_at, value=15.2)]
     state.predictions.dew_point = [SeriesPoint(time=t, value=15.6) for t in times]
+    # The supply measured while water flowed, then planned: one line.
+    supplied_at = now - timedelta(minutes=45)
+    state.measurements.heat_pump.supply_temperature = [
+        SeriesPoint(time=supplied_at, value=16.0)
+    ]
 
     html = dashboard_chart(state)
 
-    assert "Supply plan" in html
+    assert html.count('"name":"Supply"') == 1
+    assert to_local_time(supplied_at).isoformat() in html
     assert html.count('"name":"Dew point"') == 1
     assert to_local_time(measured_at).isoformat() in html
 

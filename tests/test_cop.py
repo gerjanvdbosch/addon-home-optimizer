@@ -878,3 +878,131 @@ def test_heat_and_power_follow_the_speed_a_run_holds_at_its_outdoor_temperature(
     )
     # Without the steps: the lines as they are.
     assert dataclasses.replace(model, speed_hz=()).speed_ratio(2.0) == 1.0
+
+
+def test_heating_fit_learns_the_speed_runs_hold_past_their_start_by_outdoor(tmp_path):
+    """The outdoor unit turns down less in colder air: runs come down from a
+    start's speed and hold 26 Hz above 10 degC, 1.5 Hz more per K below. The
+    heat per speed is one line in speed and outdoor temperature, so the least
+    heat is higher in the cold than the floor's runs' least alone tells."""
+
+    dhw = HeatPumpCOPIdentifier(key="dhw")
+    dhw.model = dataclasses.replace(TRUE_COP_MODEL, approach_heat_w=6000.0)
+    dhw.save(tmp_path)
+
+    rng = np.random.default_rng(5)
+    line = (600.0, 75.0, -5.0, 2.0)
+    runs, minutes = 24, 60
+    outdoor_per_run = rng.uniform(0.0, 14.0, size=runs)
+    T_outdoor = np.repeat(outdoor_per_run, minutes)
+    # Runs at one outdoor temperature hold scattered speeds (what was asked).
+    scatter_hz = np.repeat(rng.normal(0.0, 2.0, size=runs), minutes)
+    held_hz = 26.0 + 1.5 * np.maximum(10.0 - T_outdoor, 0.0) + scatter_hz
+    # 20 minutes coming down from the start's speed, then settled.
+    speed_hz = np.where(np.tile(np.arange(minutes), runs) < 20, 45.0, held_hz)
+    q_th_w = HeatPumpCOPModel.heat_at_speed_w(line, speed_hz, T_outdoor)
+    T_supply = 26.0
+    water_w_per_k = (RHO_WATER_KG_PER_L / 60.0) * CP_WATER_J_PER_KG_K * FLOW_LPM
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    df = pd.DataFrame(
+        {
+            "time": pd.to_datetime(
+                [
+                    start + timedelta(hours=3 * run, minutes=minute)
+                    for run in range(runs)
+                    for minute in range(minutes)
+                ],
+                utc=True,
+            ),
+            "T_outdoor": T_outdoor,
+            "T_supply": T_supply,
+            "T_return": T_supply - q_th_w / water_w_per_k,
+            "flow_lpm": FLOW_LPM,
+            "P_el": q_th_w / TRUE_COP_MODEL.cop(T_outdoor, T_supply),
+            "state": HEATING_STATE,
+            "compressor_frequency": speed_hz,
+        }
+    )
+
+    model = HeatPumpCOPIdentifier(key="heating", models_path=tmp_path).calibrate(df)
+
+    assert model.speed_heat_w == pytest.approx(line, rel=1e-6)
+
+    def held(outdoor_c: float) -> float:
+        return float(
+            np.interp(outdoor_c, model.held_speed_outdoor_c, model.held_speed_hz)
+        )
+
+    assert held(2.0) == pytest.approx(38.0, abs=2.0)
+    assert held(12.0) == pytest.approx(26.0, abs=1.0)
+    # Through the scatter, not stepping with it: a forecast a little colder
+    # asks no jump in speed.
+    assert np.all(
+        -np.diff(model.held_speed_hz) / np.diff(model.held_speed_outdoor_c) < 3.0
+    )
+    assert model.held_heat_w(2.0) == pytest.approx(
+        HeatPumpCOPModel.heat_at_speed_w(line, held(2.0), 2.0)
+    )
+    assert model.held_heat_w(2.0) > model.held_heat_w(10.0)
+    # The other modes, and a model before it, leave the floor's own least.
+    assert HeatPumpCOPModel(1.0, 5.0, 10.0).held_heat_w(2.0) == 0.0
+
+
+def test_a_heating_run_from_off_starts_faster_and_falls_to_its_held_speed():
+    """From off the compressor runs past the speed it holds as its first
+    quarter hour ends, and falls linearly back over the next hour; a run
+    hot water hands over is at its speed at once. The fit reads the line's
+    height and length off the cold starts alone."""
+
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    rows = []
+
+    for run in range(4):
+        began = start + timedelta(hours=4 * run)
+        handed_over = run == 3
+
+        for minute in range(-5, 120):
+            since_s = minute * 60.0 + 30.0
+            excess_hz = (
+                0.0
+                if handed_over
+                else 9.0 * max(0.0, 1.0 - max(since_s - 900.0, 0.0) / 3600.0)
+            )
+            state = (
+                (SWW_STATE if handed_over else "Uit") if minute < 0 else HEATING_STATE
+            )
+            on = minute >= 0 or handed_over
+            rows.append(
+                {
+                    "time": began + timedelta(minutes=minute),
+                    "state": state,
+                    "compressor_frequency": 30.0 + excess_hz if on else 0.0,
+                    "T_outdoor": 5.0,
+                    "T_supply": 26.0,
+                    "T_return": 22.0,
+                    "flow_lpm": FLOW_LPM,
+                    "P_el": 700.0 if on else 0.0,
+                }
+            )
+
+    identifier = HeatPumpCOPIdentifier(key="heating")
+    identifier.states = HeatPumpStates(off="Uit", dhw=SWW_STATE, heating=HEATING_STATE)
+    excess_hz, excess_s = identifier._start_excess(pd.DataFrame(rows))
+
+    assert excess_hz == pytest.approx(9.0, rel=0.05)
+    assert excess_s == pytest.approx(3600.0, rel=0.05)
+
+    model = HeatPumpCOPModel(
+        1.0,
+        5.0,
+        10.0,
+        speed_heat_w=(600.0, 75.0, -5.0, 2.0),
+        start_excess_hz=9.0,
+        start_excess_seconds=3600.0,
+    )
+    # The mean over the quarter after the first, a share of 7/8, at 85 W/Hz.
+    assert model.start_excess_heat_w(5.0, 0.0, 900.0) == pytest.approx(
+        9.0 * 7.0 / 8.0 * 85.0
+    )
+    assert model.start_excess_heat_w(5.0, -900.0, 0.0) == 0.0
+    assert model.start_excess_heat_w(5.0, 3600.0, 4500.0) == 0.0
