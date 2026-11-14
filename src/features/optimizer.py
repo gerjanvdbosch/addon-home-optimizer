@@ -162,6 +162,17 @@ INFEASIBLE = 1e12
 # horizon, 2 h about the same.
 FRONT_RELAXATION_HOURS = 4.0
 
+# How far a replan tries moving the zone's hand-over to the next tank block
+# (see MPCOptimizer._solve_with_zone), in steps: half an hour, earlier or
+# later. From six moments of two real days and three varied ones, the plan
+# came within 0.1 ct (the MIP gap) of the best hand-over a solve weighing
+# every one at once found, in at most 17 replans; an hour either way stopped
+# half an hour short (15 Nov 2026).
+HANDOVER_SHIFTS_STEPS = (-2, 2)
+# Up to how far ahead the next tank block's hand-over is moved (h): each try
+# costs a solve 2-10 s, and a block further ahead has replans enough to come.
+HANDOVER_LEAD_HOURS = 6.0
+
 W_PER_KW = 1000.0
 J_PER_KWH = 3.6e6
 
@@ -1018,6 +1029,59 @@ class MPCOptimizer:
         for runs in dict.fromkeys((relaxed, partly)):
             if any(runs) and runs != previous:
                 plans.append(around(runs))
+
+        # And around the zone handing the compressor over a little before or
+        # after the previous plan's next tank block, not one under way:
+        # plan_tank puts a block where the zone's pattern ends, the hand-over
+        # saving its start, and the patterns above end a zone run only at the
+        # floor's minimum runtime or at its very end, so a block in the middle
+        # of a run never moved (real data, 15 Nov 2026: hot water at 10:30 at
+        # 4 degC, kept by every replan; at 13:00, 7 degC, 1.3 ct cheaper).
+        # One step per replan, one way this quarter hour and the other the
+        # next - the quarter's parity read off where tomorrow begins: every
+        # hand-over point at once made the solve two to four times as long,
+        # the program weighing each against the rest, and both ways each
+        # replan still up to half again, most where the hand-over hardly
+        # matters (real data, 15 Nov 2026). The zone on up to the hand-over
+        # from where the relaxation last runs it that day - it runs the zone
+        # in scattered quarters, the one before the hand-over often not among
+        # them - and free after it that day; cooling shares no run with the
+        # tank (see plan_tank).
+        tank_on = data.previous_tank_on[: tank.num_steps]
+        day = data.zone_local_day
+        start = next(
+            (k for k in range(1, len(tank_on)) if tank_on[k] and not tank_on[k - 1]),
+            None,
+        )
+        tomorrow = next((k for k in range(1, len(day)) if day[k] != day[k - 1]), 0)
+        end = (
+            start + HANDOVER_SHIFTS_STEPS[tomorrow % len(HANDOVER_SHIFTS_STEPS)]
+            if start is not None
+            and not data.zone_cooling
+            and tank.step_start_h[start] < HANDOVER_LEAD_HOURS
+            else 0
+        )
+        last = next(
+            (k for k in range(min(end, len(partly)) - 1, -1, -1) if partly[k]), None
+        )
+
+        if (
+            end < len(partly)
+            and last is not None
+            and not (day and day[last] != day[end])
+        ):
+            stop = next(
+                (j for j in range(end, len(partly)) if day and day[j] != day[end]),
+                len(partly),
+            )
+            plans.append(
+                around(
+                    partly[:last]
+                    + (1,) * (end - last)
+                    + (0,) * (stop - end)
+                    + partly[stop:]
+                )
+            )
 
         self._choose_tank(model, plans)
         solver.update()

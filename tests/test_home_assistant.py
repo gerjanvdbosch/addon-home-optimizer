@@ -33,7 +33,7 @@ def test_set_state_writes_the_entity_and_logs_it(monkeypatch, caplog):
         home_assistant.urllib.request, "urlopen", _fake_urlopen(requests, {})
     )
 
-    with caplog.at_level(logging.INFO):
+    with caplog.at_level(logging.DEBUG):
         HomeAssistant("secret-token").set_state(
             "binary_sensor.home_optimizer_dhw_status", "on", {"friendly_name": "DHW"}
         )

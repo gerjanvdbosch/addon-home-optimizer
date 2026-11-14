@@ -1104,6 +1104,49 @@ def test_the_zone_and_the_tank_are_never_served_at_once():
         assert not (dhw and space), "tank and zone served in the same step"
 
 
+@pytest.mark.parametrize(("tomorrow", "shift"), [(20, -2), (21, 2)])
+def test_a_replan_tries_handing_the_zone_over_to_the_tank_earlier_or_later(
+    monkeypatch, tomorrow, shift
+):
+    """The tank's plans to choose from include the zone handing over a little
+    before the previous plan's block one quarter hour, a little after it the
+    next: plan_tank only hands over where a zone pattern ends, so a block
+    planned in the middle of a run never moved (real data, 15 Nov 2026)."""
+
+    num_steps = len(SOLAR_FORECAST_W)
+    target = [10.0] * num_steps
+    target[num_steps - 6 : num_steps - 2] = [45.0] * 4
+    start = 10
+    previous_space_on = tuple(int(k < start) for k in range(num_steps))
+    previous_tank_on = tuple(int(start <= k < start + 5) for k in range(num_steps))
+    first_steps = []
+    choose_tank = MPCOptimizer._choose_tank
+
+    def recording(model, plans):
+        first_steps.extend(
+            next(
+                (k for k, (on, _) in enumerate(optimizer_module._runs(plan)) if on),
+                None,
+            )
+            for plan in plans
+        )
+        choose_tank(model, plans)
+
+    monkeypatch.setattr(MPCOptimizer, "_choose_tank", staticmethod(recording))
+    MPCOptimizer(
+        THERMAL_MODEL, MPCConfig(), cop_model=COP_MODEL, building_model=BUILDING_MODEL
+    ).solve(
+        _zone_input(
+            target_temperature_top=tuple(target),
+            previous_space_on=previous_space_on,
+            previous_tank_on=previous_tank_on,
+            zone_local_day=tuple(int(k >= tomorrow) for k in range(num_steps)),
+        )
+    )
+
+    assert start + shift in first_steps
+
+
 @pytest.mark.parametrize(("pause", "holds"), [(1, False), (2, True)])
 def test_the_compressor_never_pauses_for_a_single_quarter(pause, holds):
     """A pause shorter than MPCConfig.heat_pump_min_off_steps is a start for

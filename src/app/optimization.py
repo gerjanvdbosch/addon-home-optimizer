@@ -2740,16 +2740,6 @@ class Optimization:
         )
 
         self.home_assistant.set_state(
-            self.ZONE_STATUS_ENTITY,
-            status,
-            {"friendly_name": "Home Optimizer zone status"},
-        )
-        self.home_assistant.set_state(
-            self.ZONE_START_ENTITY,
-            start,
-            {"friendly_name": "Home Optimizer zone start", "device_class": "timestamp"},
-        )
-        self.home_assistant.set_state(
             self.ZONE_SETPOINT_ENTITY,
             room,
             {
@@ -2777,6 +2767,20 @@ class Optimization:
                 "device_class": "temperature",
                 "unit_of_measurement": "°C",
             },
+        )
+        # The status after the setpoints: the blueprint acts on its change at
+        # once and reads them then - before, a run's start read the comfort
+        # band's edge still published between runs (15 Nov 2026: started at
+        # 15 degC, the run's 19 a moment later).
+        self.home_assistant.set_state(
+            self.ZONE_START_ENTITY,
+            start,
+            {"friendly_name": "Home Optimizer zone start", "device_class": "timestamp"},
+        )
+        self.home_assistant.set_state(
+            self.ZONE_STATUS_ENTITY,
+            status,
+            {"friendly_name": "Home Optimizer zone status"},
         )
 
         if config.heat_pump.auto_adaptive:
@@ -2961,12 +2965,6 @@ class Optimization:
             next_start = times[start].isoformat()
             setpoint = str(math.floor(round(2 * end_temperature, 2) + 0.5) / 2)
 
-        self.home_assistant.set_state(
-            self.DHW_STATUS_ENTITY,
-            "on" if heating_now else "off",
-            {"friendly_name": "Home Optimizer DHW status"},
-        )
-
         if tank_level is not None:
             soc, attributes = tank_level
             self.home_assistant.set_state(
@@ -2993,4 +2991,11 @@ class Optimization:
                 "device_class": "temperature",
                 "unit_of_measurement": "°C",
             },
+        )
+        # Last: the blueprint sets the heat pump to the setpoint as the
+        # status turns on (see publish_zone).
+        self.home_assistant.set_state(
+            self.DHW_STATUS_ENTITY,
+            "on" if heating_now else "off",
+            {"friendly_name": "Home Optimizer DHW status"},
         )

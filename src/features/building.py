@@ -2866,7 +2866,17 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         floors under them by the water under each (see physics.zone_floor).
         NaN off a run and before the compressor settled (see
         HeatPumpCOPIdentifier.STARTUP), where the heat says nothing of the
-        floor, and without the pipes' UA."""
+        floor, and without the pipes' UA.
+
+        Settled counts from the latest a run can have begun: a step's state
+        is the one at its end (see prepare), so a run begins within the
+        first of the samples that end the step in its state. Counted from the
+        step's start, a run begun at 08:19 was read from 08:30, the loops
+        still taking up the supply's warm-up: the screed read 0.9 K under the
+        filter's, and the slab estimate fell 0.18 K in that quarter hour
+        while the floor was heated (15 Nov 2026; over Oct-Nov the runs' first
+        such quarter hours from off read 0.20 K low, the next ones 0.04 K
+        high)."""
 
         # Here, not at the top: see validate().
         from features.cop import HeatPumpCOPIdentifier
@@ -2891,7 +2901,14 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 | (prepared["state"] != prepared["state"].shift())
             )
         ).cumsum()
-        start = prepared["time"].where(running).groupby(run).transform("min")
+        samples = self._samples(prepared, "state").to_numpy()
+        held = np.cumprod(
+            samples[:, ::-1] == prepared["state"].to_numpy()[:, None], axis=1
+        ).sum(axis=1)
+        began = prepared["time"] + prepared["time"].diff().median() * (
+            (samples.shape[1] - held + 1) / samples.shape[1]
+        )
+        start = began.where(running).groupby(run).transform("first")
         settled = (
             running
             & (prepared["time"] - start >= HeatPumpCOPIdentifier.STARTUP)

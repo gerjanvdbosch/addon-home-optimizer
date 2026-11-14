@@ -47,7 +47,7 @@ class HomeAssistant:
             )
             return
 
-        logger.info("Home Assistant: wrote %s = %s %s", entity_id, state, attributes)
+        logger.debug("Home Assistant: wrote %s = %s %s", entity_id, state, attributes)
 
     def _request(
         self, method: str, path: str, body: dict[str, Any] | None = None

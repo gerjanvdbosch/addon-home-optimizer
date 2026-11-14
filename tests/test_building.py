@@ -2437,8 +2437,9 @@ def test_a_reading_of_its_own_mixture_and_noise_corrects_a_hidden_state():
 
 def test_the_water_reads_the_screed_once_a_run_settled():
     """The water's reading of the screed (see _water_reading): its supply
-    less its heat over the pipes at the step's open loops and flow, from a
-    run's second quarter hour, either mode; against the pipe halves under
+    less its heat over the pipes at the step's open loops and flow, once the
+    compressor settled since the latest the run can have begun (here the end
+    of its step's second sample), either mode; against the pipe halves under
     the loops open; none off a run nor without the pipes' UA."""
 
     identifier = _identifier()
@@ -2449,18 +2450,23 @@ def test_the_water_reads_the_screed_once_a_run_settled():
         screed_to_slab_w_per_k=1900.0,
         screed_layer_w_per_k=600.0,
     )
+    state = ["Uit", "Verwarmen", "Verwarmen", "Verwarmen", "Verwarmen", "Koelen"]
     df = pd.DataFrame(
         {
             "time": pd.Timestamp("2026-07-01T00:00Z")
-            + pd.to_timedelta(np.arange(5) * DT_SECONDS, unit="s"),
-            "state": ["Uit", "Verwarmen", "Verwarmen", "Verwarmen", "Koelen"],
-            "T_supply": [np.nan, 30.0, 30.0, 30.0, 16.0],
-            "Q_floor_w": [0.0, 4000.0, 3500.0, 3000.0, -1500.0],
-            # Only the living room's loops open in the fourth quarter hour.
-            "floor_open_living": [np.nan, share, share, share, share],
-            "floor_open_rest": [np.nan, 1 - share, 1 - share, 0.0, 1 - share],
-            "floor_flow_lpm": [np.nan, 18.0, 18.0, 16.0, 18.0],
-            "flow_lpm": [0.0, 18.0, 18.0, 16.0, 18.0],
+            + pd.to_timedelta(np.arange(6) * DT_SECONDS, unit="s"),
+            "state": state,
+            # Begun in the second of the step's three samples.
+            "state_0": ["Uit", "Uit", *state[2:]],
+            "state_1": state,
+            "state_2": state,
+            "T_supply": [np.nan, 30.0, 30.0, 30.0, 30.0, 16.0],
+            "Q_floor_w": [0.0, 4500.0, 4000.0, 3500.0, 3000.0, -1500.0],
+            # Only the living room's loops open in the fifth quarter hour.
+            "floor_open_living": [np.nan, share, share, share, share, share],
+            "floor_open_rest": [np.nan, 1 - share, 1 - share, 1 - share, 0.0, 1 - share],
+            "floor_flow_lpm": [np.nan, 18.0, 18.0, 18.0, 16.0, 18.0],
+            "flow_lpm": [0.0, 18.0, 18.0, 18.0, 16.0, 18.0],
         }
     )
 
@@ -2468,12 +2474,20 @@ def test_the_water_reads_the_screed_once_a_run_settled():
 
     every = float(floor_loops_conductance_w_per_k(1600.0, 1.0, 18.0))
     living = float(floor_loops_conductance_w_per_k(1600.0, share, 16.0))
+    # The second quarter hour starts 5 minutes after the run's latest start.
     assert water == pytest.approx(
-        [np.nan, np.nan, 30.0 - 3500.0 / every, 30.0 - 3000.0 / living, np.nan],
+        [
+            np.nan,
+            np.nan,
+            np.nan,
+            30.0 - 3500.0 / every,
+            30.0 - 3000.0 / living,
+            np.nan,
+        ],
         nan_ok=True,
     )
-    assert rows[3] == pytest.approx(zone_floor(model, 1.0))
-    assert rows[2] == pytest.approx(
+    assert rows[4] == pytest.approx(zone_floor(model, 1.0))
+    assert rows[3] == pytest.approx(
         share * zone_floor(model, 1.0) + (1 - share) * zone_floor(model, 0.0)
     )
 
