@@ -6,6 +6,7 @@ physical constants and its own target schedule.
 
 from datetime import time
 from pathlib import Path
+from typing import Annotated
 
 from pydantic import (
     BaseModel,
@@ -195,7 +196,13 @@ class SouthGlazing(BaseModel):
     # and the plan heated the zone 1 K hotter for it. Unset, it is fitted. For
     # the thermostat's room's glazing only: the rest's, upstairs, looks over
     # them.
-    extensions: tuple[NonNegativeFloat, NonNegativeFloat] | None = Field(default=None)
+    extensions: (
+        tuple[
+            Annotated[NonNegativeFloat, Field(title="East (m)")],
+            Annotated[NonNegativeFloat, Field(title="West (m)")],
+        ]
+        | None
+    ) = Field(default=None)
 
     @model_validator(mode="before")
     @classmethod
@@ -284,7 +291,15 @@ class Thermostat(BaseModel):
 # MPCConfig.weight_comfort_eur_per_k2h; the band's edges are hard. The other
 # side is free up to its edge: warmer while heating is heat buffered in the
 # floor, cooler while cooling cold buffered - both already paid for in energy.
-ComfortSchedule = list[tuple[time, float, NonNegativeFloat, NonNegativeFloat]]
+# The titles head the columns of the config page's schedule table.
+ComfortSchedule = list[
+    tuple[
+        time,
+        Annotated[float, Field(title="Target (°C)")],
+        Annotated[NonNegativeFloat, Field(title="Below (K)")],
+        Annotated[NonNegativeFloat, Field(title="Above (K)")],
+    ]
+]
 
 
 class ComfortTargets(BaseModel):

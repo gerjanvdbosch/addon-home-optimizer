@@ -34,3 +34,542 @@ h1 {
 .js-plotly-plot .edrag {
     pointer-events: none !important;
 }
+
+.header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+.header h1 {
+    margin: 0;
+}
+
+.header .icon {
+    display: flex;
+    padding: 6px;
+    border-radius: 50%;
+    color: #cccccc;
+}
+
+.header .icon:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: #ffffff;
+}
+
+.header .icon svg {
+    width: 26px;
+    height: 26px;
+    fill: currentColor;
+}
+
+/* Config page, in Home Assistant's dark style: cards of rows, the label on
+   the left and a filled field on the right; the chart's blue as accent. */
+.page {
+    max-width: 960px;
+    margin: 0 auto;
+}
+
+.config {
+    --divider: rgba(225, 225, 225, 0.1);
+    --fill: #2c2c2c;
+    --line: rgba(225, 225, 225, 0.42);
+    --text: #e1e1e1;
+    --muted: #9e9e9e;
+    --primary: #636efa;
+    --error: #ef553b;
+    /* A remove button and its gap: kept free right of every field, so fields
+       end in line whether or not one stands beside them. */
+    --remove: 42px;
+    /* Native pickers (the time field's clock) dark too. */
+    color-scheme: dark;
+    color: var(--text);
+    font-size: 14px;
+}
+
+.card {
+    background: #1c1c1c;
+    border: 1px solid rgba(225, 225, 225, 0.12);
+    border-radius: 12px;
+    margin-bottom: 16px;
+}
+
+.card > h2 {
+    margin: 0;
+    padding: 16px;
+    font-size: 24px;
+    font-weight: normal;
+}
+
+.fields {
+    display: flex;
+    flex-direction: column;
+}
+
+/* As in Home Assistant, a line above every field and group: what lies
+   between two lines belongs together. */
+.group {
+    border-top: 1px solid var(--divider);
+}
+
+/* Every group stands flat, its fields level with the card's, under a
+   heading: larger than a label and unfilled, so neither a field nor a button. */
+.heading,
+.choice:not(.side) > .pick > .label {
+    padding: 24px 16px 8px;
+    color: var(--muted);
+    font-size: 18px;
+}
+
+/* The heading opens the group: no line between it and its first row or item. */
+.heading + .fields > :first-child,
+.heading + .fields > :first-child > .item:first-child {
+    border-top: none;
+}
+
+.row {
+    display: grid;
+    grid-template-columns: 2fr 3fr;
+    align-items: center;
+    gap: 16px;
+    padding: 12px calc(16px + var(--remove)) 12px 16px;
+    min-height: 40px;
+    border-top: 1px solid var(--divider);
+}
+
+/* A row's list puts its remove buttons in that room, the columns kept. */
+.row .item {
+    margin-right: calc(-1 * var(--remove));
+}
+
+.item .row {
+    padding-right: 0;
+}
+
+.inline {
+    display: flex;
+    gap: 8px;
+    min-width: 0;
+}
+
+.inline > input {
+    flex: 1;
+    min-width: 0;
+}
+
+.inline > .entity {
+    flex: 2;
+}
+
+.config input,
+.config select {
+    font: inherit;
+    font-size: 15px;
+    color: var(--text);
+    background: var(--fill);
+    border: none;
+    border-bottom: 1px solid var(--line);
+    border-radius: 4px 4px 0 0;
+    padding: 11px 12px;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+/* One height for every field: a time field's own editor would make it
+   taller than a number beside it. */
+.config input:not([type="checkbox"]),
+.config select {
+    height: 42px;
+}
+
+/* The time field's clock as muted as the other icons. */
+.config input::-webkit-calendar-picker-indicator {
+    opacity: 0.4;
+    cursor: pointer;
+}
+
+.config input::-webkit-calendar-picker-indicator:hover {
+    opacity: 0.7;
+}
+
+.config input::placeholder {
+    color: var(--muted);
+}
+
+.config input:focus,
+.config select:focus {
+    outline: none;
+    border-bottom: 2px solid var(--primary);
+    padding-bottom: 10px;
+}
+
+.config select {
+    appearance: none;
+    cursor: pointer;
+    padding-right: 36px;
+    background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+        linear-gradient(-45deg, transparent 50%, var(--muted) 50%);
+    background-position: right 18px center, right 13px center;
+    background-size: 5px 5px;
+    background-repeat: no-repeat;
+}
+
+/* A choice between variants: stacked as a group, or side by side as a row,
+   the choice under the label and the variant in the fields' column. */
+.choice {
+    border-top: 1px solid var(--divider);
+}
+
+.pick {
+    display: flex;
+    flex-direction: column;
+}
+
+/* Under a heading the choice is a row of its own: Type and the variant. */
+.pick > .label + .row {
+    border-top: none;
+}
+
+/* As a row: the label on the left, the choice in the fields' column and
+   its variant (a field or a schedule) under it. */
+.choice.side {
+    display: grid;
+    grid-template-columns: 2fr 3fr;
+    align-items: center;
+    gap: 8px 16px;
+    padding: 12px calc(16px + var(--remove)) 12px 16px;
+}
+
+.choice.side > .pick,
+.choice.side > .pick > .row {
+    display: contents;
+}
+
+/* Beside its own label the choice needs no other. */
+.choice.side > .pick > .row > span {
+    display: none;
+}
+
+.choice.side .label {
+    grid-column: 1;
+    grid-row: 1;
+    padding: 0;
+    font-size: inherit;
+}
+
+.choice.side select {
+    grid-column: 2;
+    grid-row: 1;
+}
+
+.choice.side > div:last-child {
+    grid-column: 2;
+    grid-row: 2;
+}
+
+/* None chosen: no empty line under the choice. */
+.choice.side > div:last-child:empty {
+    display: none;
+}
+
+.choice.side .schedule,
+.row .schedule {
+    padding: 0;
+}
+
+/* A schedule's label level with its headings. */
+.row:has(> .schedule) {
+    align-items: start;
+}
+
+/* Booleans as switches. */
+.config input[type="checkbox"] {
+    appearance: none;
+    justify-self: start;
+    position: relative;
+    width: 36px;
+    height: 14px;
+    padding: 0;
+    border: none;
+    border-radius: 7px;
+    background: rgba(255, 255, 255, 0.3);
+    cursor: pointer;
+}
+
+.config input[type="checkbox"]::before {
+    content: "";
+    position: absolute;
+    top: -3px;
+    left: -2px;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: #bbbbbb;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+    transition: left 0.15s;
+}
+
+.config input[type="checkbox"]:checked {
+    background: rgba(99, 110, 250, 0.5);
+}
+
+.config input[type="checkbox"]:checked::before {
+    left: 18px;
+    background: var(--primary);
+}
+
+.config .invalid {
+    border-bottom-color: var(--error);
+}
+
+.error {
+    color: var(--error);
+    font-size: 12px;
+    padding: 4px 16px 8px;
+}
+
+/* An item of several rows (a room, a glazing) is one block: a line above
+   it, none between its own rows. A list of single fields is one row. */
+.item {
+    display: flex;
+    align-items: flex-start;
+}
+
+.item:has(> .fields) {
+    padding: 6px 0;
+    border-top: 1px solid var(--divider);
+}
+
+/* The last item closed too, so + Add stands apart from it. */
+.item:has(> .fields):last-child {
+    border-bottom: 1px solid var(--divider);
+}
+
+.item .row {
+    border-top: none;
+    padding-top: 6px;
+    padding-bottom: 6px;
+}
+
+.item > :first-child {
+    flex: 1;
+    min-width: 0;
+}
+
+.item > .inline {
+    padding: 4px 0 4px 16px;
+}
+
+.item > .inline + .remove {
+    margin-top: 6px;
+}
+
+/* A list of single fields in a row's field column. */
+.row .item > .inline {
+    padding: 4px 0;
+}
+
+.row .item > .remove {
+    margin: 4px 0 4px 8px;
+}
+
+.row .fields > button.add {
+    margin-left: 0;
+}
+
+.schedule {
+    --gap: 8px;
+    padding: 6px 16px 0;
+}
+
+.schedule table {
+    align-self: flex-start;
+    border-collapse: collapse;
+}
+
+.schedule td:last-child {
+    padding-right: 0;
+}
+
+/* A number or a time holds a few characters: a compact field, in a row, a
+   pair or a schedule alike. */
+.config input[type="number"] {
+    width: 96px;
+}
+
+.inline > input[type="number"] {
+    flex: none;
+}
+
+.config input[type="time"] {
+    width: 120px;
+}
+
+/* iOS draws a time field as its own control: taller than the fixed height,
+   wider than its cell and centred. Unstyled, it is drawn as the others. */
+.config input[type="time"] {
+    -webkit-appearance: none;
+    appearance: none;
+    min-width: 0;
+}
+
+.config input::-webkit-date-and-time-value {
+    text-align: left;
+    margin: 0;
+}
+
+/* No rows yet: no headings over nothing, only + Add. */
+.schedule table:has(tbody:empty) {
+    display: none;
+}
+
+.schedule th {
+    vertical-align: bottom;
+    font-weight: normal;
+    font-size: 12px;
+    color: var(--muted);
+    text-align: left;
+    padding: 0 var(--gap) 6px 0;
+}
+
+.schedule td {
+    padding: 0 var(--gap) 8px 0;
+}
+
+.schedule button.remove {
+    margin: 0;
+}
+
+.config button {
+    font: inherit;
+    cursor: pointer;
+    background: none;
+    border: none;
+}
+
+/* A text button on the fields' left edge: no hover box to stick out. */
+.config button.add {
+    align-self: flex-start;
+    color: var(--primary);
+    font-weight: 500;
+    padding: 6px 0;
+    margin: 2px 16px;
+}
+
+/* Hovered, the Save button's colour. */
+.config button.add:hover {
+    background: none;
+    color: #5260f0;
+}
+
+.schedule button.add {
+    margin-left: 0;
+}
+
+.config button.remove {
+    flex: none;
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    color: var(--muted);
+    font-size: 15px;
+    margin: 4px 16px 4px 8px;
+}
+
+.config button:hover {
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.savebar {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 16px;
+    padding: 8px 0 32px;
+    color: #e1e1e1;
+}
+
+.savebar .primary {
+    font: inherit;
+    font-size: 15px;
+    font-weight: 500;
+    color: #ffffff;
+    background: #636efa;
+    border: none;
+    border-radius: 4px;
+    padding: 10px 28px;
+    cursor: pointer;
+}
+
+.savebar .primary:hover {
+    background: #5260f0;
+}
+
+.status.failed {
+    color: #ef553b;
+}
+
+@media (max-width: 600px) {
+    /* The remove buttons' gutter kept, narrower: every field still ends in
+       line, the buttons beside them. */
+    .config {
+        --remove: 36px;
+    }
+
+    .config button.remove {
+        width: 28px;
+    }
+
+    .row {
+        grid-template-columns: 1fr;
+        gap: 6px;
+    }
+
+    .choice.side {
+        grid-template-columns: 1fr;
+        gap: 6px;
+    }
+
+    .choice.side .label,
+    .choice.side select,
+    .choice.side > div:last-child {
+        grid-column: 1;
+        grid-row: auto;
+    }
+
+    .inline {
+        flex-wrap: wrap;
+    }
+
+    /* On a phone every field takes the full width. */
+    .config input[type="number"],
+    .config input[type="time"] {
+        width: 100%;
+    }
+
+    .inline > input[type="number"] {
+        flex: 1;
+    }
+
+    .schedule {
+        --gap: 4px;
+    }
+
+    /* A schedule shares that width equally between its columns, its remove
+       buttons' column in the gutter, so it ends in line with the rest. */
+    .schedule table {
+        width: calc(100% + var(--remove));
+        table-layout: fixed;
+    }
+
+    .schedule th:last-child {
+        width: calc(var(--remove) - var(--gap));
+        padding-right: 0;
+    }
+
+    .schedule input {
+        padding: 11px 4px 11px 8px;
+    }
+}

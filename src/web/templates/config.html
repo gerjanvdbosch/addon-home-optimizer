@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Configuration · Home Optimizer</title>
+    <link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+<div class="page">
+<header class="header">
+    <h1>Configuration</h1>
+    <a class="icon" href="./" title="Dashboard" aria-label="Dashboard">
+        <svg viewBox="0 0 24 24"><path d="M20,11V13H8L13.5,18.5L12.08,19.92L4.16,12L12.08,4.08L13.5,5.5L8,11H20Z"/></svg>
+    </a>
+</header>
+<form id="config" class="config" novalidate></form>
+<div class="savebar">
+    <span id="status" class="status"></span>
+    <button type="submit" form="config" class="primary">Save</button>
+</div>
+</div>
+<script id="schema" type="application/json">{{ schema | tojson }}</script>
+<script id="value" type="application/json">{{ config | tojson }}</script>
+<script src="static/config.js"></script>
+</body>
+</html>

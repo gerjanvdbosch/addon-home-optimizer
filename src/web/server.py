@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import plotly
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -66,6 +66,9 @@ app.mount(
 templates = Jinja2Templates(
     directory=BASE_DIR / "templates",
 )
+# The config page's form follows the schema's field order, which tojson
+# would otherwise sort.
+templates.env.policies["json.dumps_kwargs"] = {"sort_keys": False}
 
 
 @app.exception_handler(RequestValidationError)
@@ -85,7 +88,7 @@ async def dashboard(request: Request):
     try:
         config = repositories.config.load()
     except Exception:
-        return templates.TemplateResponse(request=request, name="setup.html")
+        return config_page(request)
 
     state = repositories.state.load()
 
@@ -98,6 +101,26 @@ async def dashboard(request: Request):
     )
 
 
+@app.get("/config", response_class=HTMLResponse)
+async def config_form(request: Request):
+    return config_page(request)
+
+
+def config_page(request: Request) -> HTMLResponse:
+    """The form is built from the config's own schema, so it follows every
+    field the model has. It is filled with the file as stored, not as
+    validated: a config that no longer validates is shown to be fixed."""
+
+    return templates.TemplateResponse(
+        request=request,
+        name="config.html",
+        context={
+            "schema": Config.model_json_schema(),
+            "config": request.app.state.repositories.config.storage.load(),
+        },
+    )
+
+
 @app.get("/api/status")
 async def status(request: Request):
     return list(request.app.state.worker.jobs.values())
@@ -106,6 +129,17 @@ async def status(request: Request):
 @app.get("/api/state")
 async def state(request: Request):
     return request.app.state.repositories.state.load()
+
+
+@app.get("/api/config")
+async def get_config(request: Request) -> Config:
+    """Validated, so with the defaults filled in: the form POST takes back."""
+    data = request.app.state.repositories.config.storage.load()
+
+    if not data:
+        raise HTTPException(status_code=404, detail="No config found")
+
+    return Config.model_validate(data)
 
 
 @app.post("/api/config")
