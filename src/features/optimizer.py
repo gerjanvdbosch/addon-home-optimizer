@@ -194,9 +194,9 @@ def _watts(power_kw: pyo.Var) -> pyo.Expression:
 
 
 @dataclass
-class TankSetting:
-    """The tank over the plan's steps as physics and the rules fix it before
-    anything is decided (see MPCOptimizer._tank_setting)."""
+class TankDynamics:
+    """The lumped tank over the plan's steps: how it cools to its surroundings
+    and loses heat to taps, before any rule or decision."""
 
     dt_hours: list[float]
     # The tank's own continuous dynamics (see physics.lumped_tank_state_space).
@@ -204,54 +204,7 @@ class TankSetting:
     b_continuous: np.ndarray
     ambient_c: float
     tap_w: tuple[float, ...]
-    # The heat a running heat pump puts in per step (W).
-    heat_w: list[float]
-    initial_c: float
-    # The tank left alone, and heated flat out to what can heat it, per step.
-    floor_c: list[float]
-    ceiling_c: list[float]
-    heat_pump_max_c: float | None
-    max_tank_c: float
-    heat_pump_limit_c: float
-    booster_heat_w: float | None
-    # Whether the booster can be of use at all, and in which steps.
-    booster_possible: bool
-    booster_allowed: list[bool]
-    # The target per step (deg C), and what a run ending before it adds (K).
-    required_c: list[float]
-    overshoot_c: list[float]
-    # Electrical power alpha + beta * T for the share of a step the heat pump
-    # runs (see MPCOptimizer._power_line_coefficients).
-    power_lines: list[tuple[float, float]]
-    # The share of a step's heat a run starting in it delivers.
-    ramp: list[float]
-    start_power_w: float
-    # The share of the power line a run under way draws at full use in each
-    # step, its power still rising (see MPCOptimizer._tank_setting); 1 where
-    # it does not.
-    power_share: list[float]
-    booster_draw_per_heat: float
-    import_price: tuple[float, ...]
-    export_price: tuple[float, ...]
-    # (weight, surplus W per step) per solar scenario.
-    scenarios: list[tuple[float, np.ndarray]]
-    weight_switching: float
-    # Short of a target: EUR per K^2 per hour within band_k of it, then
-    # weight_slack EUR per K (see MPCConfig.weight_tank_target_eur_per_k2h).
-    weight_target: float
-    band_k: float
-    weight_slack: float
-    min_runtime_hours: float
-    min_off_steps: int
-    # Steps from now the heat pump stays off, after a run that just ended.
-    idle_steps: int
-    # A run under way, and the steps it still has to go on for.
-    running: bool
-    running_steps: int
-    # Whether the compressor runs now for anything else (the zone): a run of
-    # the tank cannot start in the first step then.
-    compressor_busy: bool
-    _cache: dict = field(default_factory=dict, repr=False)
+    _cache: dict = field(default_factory=dict, init=False, repr=False)
 
     @property
     def num_steps(self) -> int:
@@ -310,6 +263,60 @@ class TankSetting:
             temperatures.append(decay * temperatures[-1] + passive)
 
         return temperatures
+
+
+@dataclass
+class TankSetting(TankDynamics):
+    """The tank over the plan's steps as physics and the rules fix it before
+    anything is decided (see MPCOptimizer._tank_setting)."""
+
+    # The heat a running heat pump puts in per step (W).
+    heat_w: list[float]
+    initial_c: float
+    # The tank left alone, and heated flat out to what can heat it, per step.
+    floor_c: list[float]
+    ceiling_c: list[float]
+    heat_pump_max_c: float | None
+    max_tank_c: float
+    heat_pump_limit_c: float
+    booster_heat_w: float | None
+    # Whether the booster can be of use at all, and in which steps.
+    booster_possible: bool
+    booster_allowed: list[bool]
+    # The target per step (deg C), and what a run ending before it adds (K).
+    required_c: list[float]
+    overshoot_c: list[float]
+    # Electrical power alpha + beta * T for the share of a step the heat pump
+    # runs (see MPCOptimizer._power_line_coefficients).
+    power_lines: list[tuple[float, float]]
+    # The share of a step's heat a run starting in it delivers.
+    ramp: list[float]
+    start_power_w: float
+    # The share of the power line a run under way draws at full use in each
+    # step, its power still rising (see MPCOptimizer._tank_setting); 1 where
+    # it does not.
+    power_share: list[float]
+    booster_draw_per_heat: float
+    import_price: tuple[float, ...]
+    export_price: tuple[float, ...]
+    # (weight, surplus W per step) per solar scenario.
+    scenarios: list[tuple[float, np.ndarray]]
+    weight_switching: float
+    # Short of a target: EUR per K^2 per hour within band_k of it, then
+    # weight_slack EUR per K (see MPCConfig.weight_tank_target_eur_per_k2h).
+    weight_target: float
+    band_k: float
+    weight_slack: float
+    min_runtime_hours: float
+    min_off_steps: int
+    # Steps from now the heat pump stays off, after a run that just ended.
+    idle_steps: int
+    # A run under way, and the steps it still has to go on for.
+    running: bool
+    running_steps: int
+    # Whether the compressor runs now for anything else (the zone): a run of
+    # the tank cannot start in the first step then.
+    compressor_busy: bool
 
 
 @dataclass(frozen=True)
@@ -1542,26 +1549,23 @@ class MPCOptimizer:
         if data.first_step_hours is not None:
             dt_hours[0] = data.first_step_hours
 
+        # Unlike the two-node calibration model, the lumped tank node has no
+        # on/off mixing-regime switch (only the heat input, not the loss
+        # coefficient, depends on boiler_on), so its exact zero-order-hold
+        # dynamics depend only on each step's own duration.
+        a, b = lumped_tank_state_space(
+            self.thermal_model.volume_l,
+            self.thermal_model.ua_top_w_per_k + self.thermal_model.ua_bottom_w_per_k,
+        )
+        ambient_c = float(data.ambient_temperature)
+        tap_w = data.tap_forecast_w or (0.0,) * num_steps
+        dynamics = TankDynamics(dt_hours, a, b, ambient_c, tuple(tap_w))
+        steps_within = dynamics.steps_within
+        discretized = dynamics.discretized
         # When each step begins, in hours from now.
-        step_start_h = np.cumsum([0.0, *dt_hours[:-1]])
-
-        def steps_within(hours: float, first: int = 0) -> range:
-            """The steps from `first` on that begin within `hours` of it: what
-            a duration covers counted in the plan's own steps, the first of
-            which may be the rest of a quarter."""
-
-            end = first
-
-            while (
-                end < num_steps
-                and step_start_h[end] - step_start_h[first] < hours - 1e-9
-            ):
-                end += 1
-
-            return range(first, end)
+        step_start_h = dynamics.step_start_h
 
         solar_scenarios = surplus_scenarios(data)
-        tap_w = data.tap_forecast_w or (0.0,) * num_steps
         outdoor_c = list(data.outdoor_temperature_forecast)
         heat_w = [
             self._heat_at(outdoor_c[k] if outdoor_c else None) for k in range(num_steps)
@@ -1636,26 +1640,6 @@ class MPCOptimizer:
 
         initial_temperature = self._initial_temperature(data)
 
-        # Exact zero-order-hold dynamics for the lumped tank node. Unlike the
-        # two-node calibration model, this simplified model has no on/off
-        # mixing-regime switch (only the heat input, not the loss
-        # coefficient, depends on boiler_on), so (A_d, B_d) depends only on
-        # each step's own duration - cached per distinct duration (the first
-        # step and the rest) rather than recomputed per step.
-        a, b = lumped_tank_state_space(
-            self.thermal_model.volume_l,
-            self.thermal_model.ua_top_w_per_k + self.thermal_model.ua_bottom_w_per_k,
-        )
-        discretization_cache: dict[float, tuple[np.ndarray, np.ndarray]] = {}
-
-        def discretized(hours: float) -> tuple[np.ndarray, np.ndarray]:
-            if hours not in discretization_cache:
-                discretization_cache[hours] = discretize_zoh(a, b, hours * 3600.0)
-
-            return discretization_cache[hours]
-
-        ambient_c = float(data.ambient_temperature)
-
         # A draw replaces hot water with cold from the mains, so taps cannot
         # take the tank below the mains' temperature, however much the forecast
         # expects: held there along the tank left unheated, where it would get
@@ -1717,18 +1701,9 @@ class MPCOptimizer:
                     ),
                 )
 
-        def unheated(start_c: float, first: int = 0) -> list[float]:
-            """The tank temperature at each step from `first` on with no heating
-            from start_c on."""
+            dynamics = replace(dynamics, tap_w=tuple(tap_w))
 
-            temperatures = [start_c]
-
-            for k in range(first, num_steps - 1):
-                a_d, b_d = discretized(dt_hours[k])
-                passive = b_d[0, 0] * ambient_c + b_d[0, 2] * float(tap_w[k])
-                temperatures.append(float(a_d[0, 0] * temperatures[-1] + passive))
-
-            return temperatures
+        unheated = dynamics.unheated
 
         # The booster only matters where the tank may need to be above the heat
         # pump's limit: it is the only source that heats there. That is so for a
@@ -1820,10 +1795,9 @@ class MPCOptimizer:
         t_ceiling = [initial_temperature]
 
         for k in range(num_steps - 1):
-            a_d, b_d = discretized(dt_hours[k])
-            passive = b_d[0, 0] * ambient_c + b_d[0, 2] * float(tap_w[k])
-            heated = a_d[0, 0] * t_ceiling[-1] + passive + b_d[0, 1] * max_heat_w
-            t_ceiling.append(min(t_upper, float(heated)))
+            decay, gain, passive = dynamics.step(k)
+            heated = decay * t_ceiling[-1] + passive + gain * max_heat_w
+            t_ceiling.append(min(t_upper, heated))
 
         # A heat pump run does not end where the plan stops it: it settles
         # setpoint_overshoot_k above its setpoint (see the target rule in
@@ -1926,10 +1900,8 @@ class MPCOptimizer:
         num_steps = tank.num_steps
         dt_hours = tank.dt_hours
         steps_within = tank.steps_within
-        discretized = tank.discretized
         unheated = tank.unheated
         solar_scenarios = tank.scenarios
-        tap_w = tank.tap_w
         outdoor_c = list(data.outdoor_temperature_forecast)
         heat_w = tank.heat_w
         target_c = data.target_temperature_top
@@ -1937,7 +1909,6 @@ class MPCOptimizer:
         max_tank_c = tank.max_tank_c
         booster_heat_w = tank.booster_heat_w
         initial_temperature = tank.initial_c
-        ambient_c = tank.ambient_c
         booster_possible = tank.booster_possible
         t_floor = tank.floor_c
         t_ceiling = tank.ceiling_c
@@ -2355,15 +2326,14 @@ class MPCOptimizer:
         model.thermal_dynamics = pyo.ConstraintList()
 
         for k in range(num_steps - 1):
-            a_d, b_d = discretized(dt_hours[k])
+            decay, gain, passive = tank.step(k)
 
             model.thermal_dynamics.add(
                 model.T[k + 1]
-                == a_d[0, 0] * model.T[k]
-                + b_d[0, 0] * float(data.ambient_temperature)
-                + b_d[0, 1] * model.q_heat_pump_w[k]
-                + b_d[0, 1] * model.q_booster_w[k]
-                + b_d[0, 2] * float(tap_w[k])
+                == decay * model.T[k]
+                + passive
+                + gain * model.q_heat_pump_w[k]
+                + gain * model.q_booster_w[k]
             )
 
         # The heat pump cannot lift the tank past its own limit; above it only
@@ -2470,12 +2440,11 @@ class MPCOptimizer:
             # stays under it. Skipped where the step's ceiling already rules that
             # out.
             if k + 1 < num_steps and t_ceiling[k + 1] > heat_pump_limit_c:
-                a_d, b_d = discretized(dt_hours[k])
-                passive = b_d[0, 0] * ambient_c + b_d[0, 2] * float(tap_w[k])
+                decay, gain, passive = tank.step(k)
                 model.heat_source_constraints.add(
-                    a_d[0, 0] * model.heat_pump_temperature[k]
+                    decay * model.heat_pump_temperature[k]
                     + passive * on
-                    + b_d[0, 1] * model.q_heat_pump_w[k]
+                    + gain * model.q_heat_pump_w[k]
                     <= heat_pump_limit_c * on
                 )
 
@@ -2532,14 +2501,13 @@ class MPCOptimizer:
             if last:
                 continue
 
-            a_d, b_d = discretized(dt_hours[k])
-            passive = b_d[0, 0] * ambient_c + b_d[0, 2] * float(tap_w[k])
+            decay, gain, passive = tank.step(k)
             model.heat_source_constraints.add(
-                a_d[0, 0] * model.heat_pump_temperature[k]
+                decay * model.heat_pump_temperature[k]
                 + passive * on
-                + b_d[0, 1] * model.q_heat_pump_w[k]
+                + gain * model.q_heat_pump_w[k]
                 >= heat_pump_limit_c * on
-                - max(heat_pump_limit_c - a_d[0, 0] * t_floor[k] - passive, 0.0)
+                - max(heat_pump_limit_c - decay * t_floor[k] - passive, 0.0)
                 * (1 - booster)
             )
             # The tank's thermostat cuts the booster out at the boiler's maximum.
@@ -2569,9 +2537,9 @@ class MPCOptimizer:
                     break
 
                 reaching[k].append(j)
-                a_d, b_d = discretized(dt_hours[k])
+                decay, gain, _ = tank.step(k)
                 ramp = tank.ramp[k] if k == j else 1.0
-                rise_k = float(a_d[0, 0] * rise_k + b_d[0, 1] * heat_w[k] * ramp)
+                rise_k = decay * rise_k + gain * heat_w[k] * ramp
 
         model.run_length = pyo.ConstraintList()
 
@@ -2786,8 +2754,7 @@ class MPCOptimizer:
                     )
 
             for k in range(num_steps - 1):
-                a_d, b_d = discretized(dt_hours[k])
-                decay, rise_k_per_w = float(a_d[0, 0]), float(b_d[0, 1])
+                decay, rise_k_per_w, _ = tank.step(k)
                 weight_wh_per_k2 = min(
                     max(power_lines[k][1], 0.0)
                     / heat_w[k]

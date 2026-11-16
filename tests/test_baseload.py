@@ -55,12 +55,33 @@ def test_the_mean_takes_eight_weeks_the_band_twelve_and_never_today(habit):
 
     p10, p50, p90 = habit
 
-    assert p50[_slot("wed", 10)] == pytest.approx(600.0)
-    assert p50[_slot("wed", 10, 15)] == pytest.approx(100.0)
+    # The hour's trend (see test_the_mean_is_moved_along_its_hours_trend)
+    # moves its four quarter hours alike.
+    assert p50[_slot("wed", 10)] - p50[_slot("wed", 10, 15)] == pytest.approx(500.0)
+    assert p50[_slot("wed", 11)] == pytest.approx(100.0)
     assert p90[_slot("wed", 10, 30)] == 5000.0
     assert p90[_slot("tue", 10)] == 100.0
     assert p10[_slot("wed", 10)] == 100.0
     assert max(p50) < 9999.0 and max(p90) < 9999.0
+
+
+def test_the_mean_is_moved_along_its_hours_trend():
+    """A baseload rising 1 W a day, by the local calendar across the DST
+    change, comes out at today's level; a flat hour keeps its mean."""
+
+    time = pd.date_range(NOW - pd.Timedelta(weeks=13), NOW, freq="15min")
+    local = time.tz_convert(LOCAL_TIMEZONE)
+    midnight = pd.Timestamp(local[-1]).normalize().tz_localize(None)
+    days = np.asarray((local.tz_localize(None).normalize() - midnight).days, float)
+    power = np.where(local.hour == 20, 500.0 + days, 100.0)
+
+    _, p50, _ = BaseloadForecaster().habit(
+        pd.DataFrame({"time": time, "P_baseload": power})
+    )
+
+    assert p50[_slot("mon", 20)] == pytest.approx(500.0)
+    assert p50[_slot("sun", 20, 45)] == pytest.approx(500.0)
+    assert p50[_slot("wed", 3)] == pytest.approx(100.0)
 
 
 def test_the_forecast_keeps_the_local_clock_across_a_dst_change():
@@ -131,4 +152,6 @@ def test_the_habit_is_made_once_a_day_and_forecast_every_plan():
     )
 
     assert len(loads) == 2
-    assert forecast["baseload"].iloc[0] == pytest.approx(600.0)
+    assert forecast["baseload"].iloc[0] == pytest.approx(
+        saved[-1].p50_w[_slot("wed", 10)]
+    )

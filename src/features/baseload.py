@@ -38,6 +38,18 @@ class BaseloadForecaster:
     10 Oct): the living room 0.103 against 0.108 K off and -0.04 against
     -0.07 K low, 0.100 and -0.02 K with the baseload as measured. Per hour or
     over 4 weeks instead did no better.
+
+    The mean moved to today along each hour's trend over the same 8 weeks
+    (see _trend): autumn's longer evenings indoors raise the baseload week by
+    week. Walk-forward (each day 1 Aug - 15 Nov 2026) a day's energy came out
+    1.11 against 1.16 kWh off, better in every month, per quarter hour 136.6
+    against 136.9 W; from 15 Oct 0.61 against 0.89 kWh/day low and 17-22 h 73
+    against 118 W low. A least-squares trend took more of autumn's shortfall
+    (0.19 kWh/day) but pulled 8% of the quarter hours below three quarters of
+    their mean, against 0.6%, and was 5 W further off per quarter hour. A
+    trend per 3 h or per day, the last 1 or 2 weeks' level per hour, 6 weeks,
+    or the dark hours (sun below -3 degrees) as the season's driver did less.
+    Too little history yet for last year's same month.
     """
 
     MEAN_WEEKS = 8
@@ -66,10 +78,52 @@ class BaseloadForecaster:
         midnight = pd.Timestamp(y.index[-1]).normalize()
         low, high = self.BAND_QUANTILES
 
+        mean = np.asarray(self._habit(y, midnight, self.MEAN_WEEKS, None, 1))
+        quarter = np.arange(self.QUARTERS_PER_WEEK)
+        hour = quarter // self.QUARTERS_PER_HOUR % 24
+        # A quarter hour's mean is of its weekday's days, a week apart, the
+        # last of them 1-7 days before today: their middle is this many days ago.
+        last = (quarter // (24 * self.QUARTERS_PER_HOUR) - midnight.day_of_week) % 7
+        days_ago = 7 - last + 7 * (self.MEAN_WEEKS - 1) / 2
+        trend = self._trend(y, midnight)[hour] * days_ago
+
         return (
             self._habit(y, midnight, self.BAND_WEEKS, low, self.QUARTERS_PER_HOUR),
-            self._habit(y, midnight, self.MEAN_WEEKS, None, 1),
+            np.clip(mean + trend, 0.0, None).tolist(),
             self._habit(y, midnight, self.BAND_WEEKS, high, self.QUARTERS_PER_HOUR),
+        )
+
+    def _trend(self, y: pd.Series, midnight: pd.Timestamp) -> np.ndarray:
+        """Per local hour of the day, its linear trend over the MEAN_WEEKS
+        (W per day): the season moves the baseload - autumn's evenings drew
+        ~150 W more within 6 weeks - and a mean over 8 weeks stands ~4 weeks
+        behind it."""
+
+        recent = y.loc[
+            (y.index >= midnight - pd.DateOffset(weeks=self.MEAN_WEEKS))
+            & (y.index < midnight)
+        ]
+        index = pd.DatetimeIndex(recent.index)
+        # Days by the local calendar, as a DST day is 23 or 25 h long.
+        day = index.tz_localize(None).normalize()
+        daily = recent.groupby([day, index.hour]).mean().unstack()
+        daily = daily.reindex(columns=range(24)).dropna()
+
+        if len(daily) < 2:
+            return np.zeros(24)
+
+        days = np.asarray(
+            (pd.DatetimeIndex(daily.index) - midnight.tz_localize(None)).days, float
+        )
+        # Theil-Sen, the median of every two days' slope: a few days with the
+        # washing or the oven on in an hour tilt a least-squares line - early
+        # in the weeks, they pulled a whole hour ~50 W below its mean.
+        first, second = np.triu_indices(len(days), 1)
+        values = daily.to_numpy()
+
+        return np.median(
+            (values[second] - values[first]) / (days[second] - days[first])[:, None],
+            axis=0,
         )
 
     def predict(
