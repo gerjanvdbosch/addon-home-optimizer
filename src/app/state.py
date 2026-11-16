@@ -11,7 +11,14 @@ from domain.config import Config
 from domain.dataset import DatasetDefinition
 from domain.mpc import MPCConfig
 from domain.physics import tank_stratification_k
-from domain.state import BaseloadHabit, SeriesPoint, State, TapHabit, ZoneHabit
+from domain.state import (
+    BaseloadHabit,
+    Plan,
+    SeriesPoint,
+    State,
+    TapHabit,
+    ZoneHabit,
+)
 from domain.time import local_day_start, to_local_time
 from features.dataset import DatasetBuilder, DatasetLoader
 from features.solar import (
@@ -429,6 +436,11 @@ class StateManager:
     def update_sun_heat(self, heat: SeriesPoint | None) -> None:
         state = self.load()
         state.schedule.building.sun_heat_w = heat
+        self.state_repository.save(state)
+
+    def update_plan(self, plan: Plan) -> None:
+        state = self.load()
+        state.plan = plan
         self.state_repository.save(state)
 
     def update_zone_stopped(self, stopped: datetime | None) -> None:

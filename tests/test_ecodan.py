@@ -1,4 +1,7 @@
-from features.ecodan import setpoint_bias_k
+import pytest
+
+from features import ecodan
+from features.ecodan import asked_rise_k, rise_heat_w, setpoint_bias_k
 
 
 def test_the_bias_is_what_the_controller_ran_at_on_5_november():
@@ -47,3 +50,31 @@ def test_the_heat_pumps_least_heat_aims_just_below_the_room():
 
     assert setpoint_bias_k(2976.0, 16.0, 9.0, 19.35, 20.5, 21.5) == -0.7
     assert setpoint_bias_k(3500.0, 16.0, 9.0, 19.35, 20.5, 21.5, 2976.0) == -0.6
+
+
+def test_the_heat_given_is_the_rise_asked_plus_the_supplys_overshoot():
+    """The supply sits above the flow setpoint, most at a small rise asked
+    (real data, Oct-Nov 2026: 0.63 K at the base rise, none from 3.9 K): the
+    bias asks for less rise than the heat over the water's flow tells, and
+    the base rise past the target already gives 3 kW."""
+
+    overshoot = (0.63, 3.9)
+    water_w_per_k = ecodan.water_w_per_k(18.0)
+
+    assert rise_heat_w(2.0, 18.0, overshoot) == pytest.approx(2.63 * water_w_per_k)
+    assert rise_heat_w(4.5, 18.0, overshoot) == pytest.approx(4.5 * water_w_per_k)
+    assert rise_heat_w(2.5, 18.0) == pytest.approx(2.5 * water_w_per_k)
+
+    for heat_w in (3000.0, 3500.0, 4000.0, 4800.0, 6000.0):
+        rise_k = asked_rise_k(heat_w, 18.0, overshoot)
+        assert rise_heat_w(rise_k, 18.0, overshoot) == pytest.approx(heat_w)
+
+    def bias(heat_w: float, overshoot=ecodan.NO_OVERSHOOT) -> float:
+        return setpoint_bias_k(
+            heat_w, 18.0, 9.0, 19.35, 20.5, 21.5, overshoot=overshoot
+        )
+
+    least = ecodan.least_bias_k(19.35, 20.5)
+    assert bias(3000.0) > least
+    assert bias(3000.0, overshoot) == least
+    assert bias(4500.0, overshoot) < bias(4500.0)

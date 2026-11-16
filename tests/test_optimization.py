@@ -1,3 +1,4 @@
+import json
 import math
 import re
 from dataclasses import replace
@@ -14,7 +15,7 @@ from domain.config import BoilerConfig, HeatPumpStates, LegionellaConfig, Prices
 from domain.models import BoilerThermalModel
 from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.sensors import SensorReference
-from domain.state import SeriesPoint, State, ZoneHabit
+from domain.state import Plan, SeriesPoint, State, ZoneHabit
 from domain.time import local_day_start, to_local_time
 from features.boiler import BoilerThermalIdentifier
 from features.optimizer import MPCOptimizer
@@ -763,6 +764,36 @@ def test_the_heat_pump_changes_are_read_per_series():
     assert optimization._heat_pump_changes(config, DAY)[1] == []
 
 
+def test_a_rooms_reading_holds_until_its_thermostats_last_report():
+    """A reading is recorded only when it changes: an older one is still the
+    room's at the thermostat's last report, on the grid of its most common
+    gap between records; a newer one when it was read, and a single one in
+    the day now."""
+
+    now = DAY + timedelta(hours=12)
+    optimization = Optimization.__new__(Optimization)
+    room = SensorReference(entity_id="room")
+
+    def read(*minutes_before):
+        frame = pd.DataFrame(
+            {
+                "time": [now - timedelta(minutes=m) for m in minutes_before],
+                "value": [18.5 + 0.1 * i for i in range(len(minutes_before))],
+            }
+        )
+        optimization.loader = SimpleNamespace(load=lambda *_: frame)
+        return optimization._last_reading(room, now)
+
+    # Reported every 30 minutes (one report between, 7 minutes after one),
+    # unchanged for the last 110: held at 20 minutes before now.
+    assert read(200, 193, 170, 140, 110) == (
+        now - timedelta(minutes=20),
+        pytest.approx(18.9),
+    )
+    assert read(70, 40, 10) == (now - timedelta(minutes=10), pytest.approx(18.7))
+    assert read(600) == (now, pytest.approx(18.5))
+
+
 def test_a_runs_measured_heat_is_summed_to_each_trace_time(monkeypatch):
     """Per minute, from the run's start: 20 L/min warmed 5 K is 6977 W, the
     first minute's 0 K (no heat yet) - so 4 and 9 minutes of it by 10:05 and
@@ -1216,6 +1247,7 @@ def _zone_bias(
         space_schedule=(1, 1, 1, 1),
         space_heat_w=(heat_w,) * 4,
         space_electrical_w=(heat_w / 5.0,) * 4,
+        zone_floor_flow_lpm=(18.0,) * 4,
     )
     data = MPCInput(
         solar_forecast_w=[0.0] * 4,
@@ -1224,7 +1256,6 @@ def _zone_bias(
         current_temp_bottom=45.0,
         boiler_on_current=False,
         zone_maximum_temperature=(21.0,) * 4,
-        zone_floor_flow_lpm=(18.0,) * 4,
         zone_above_least=above_least,
     )
     since = START - timedelta(hours=1) if heating else None
@@ -1580,7 +1611,7 @@ def test_the_day_costs_are_one_table_with_today_measured_and_planned(caplog):
         ),
     )
     optimization.measured_energy = lambda config, state, now: frame(  # type: ignore[method-assign]
-        today, 0.5, 1.0, **{"import": 1.5, "export": 2.0}
+        today, 0.5, 1.0, **{"import": 1.5, "export": 2.0, "solar": 3.0}
     )
     optimization.planned_energy = lambda *args: pd.concat(  # type: ignore[method-assign]
         [frame(today, 0.25, 0.0), frame(tomorrow, 1.0, 2.0)]
@@ -1626,6 +1657,7 @@ def test_the_day_costs_are_one_table_with_today_measured_and_planned(caplog):
     state, attributes = sensor("grid_energy", "today")
     assert state == "-0.50"
     assert (attributes["import_kwh"], attributes["export_kwh"]) == (1.5, 2.0)
+    assert attributes["solar_kwh"] == 3.0
     assert (attributes["measured_kwh"], attributes["planned_kwh"]) == (-0.5, 0.0)
 
 
@@ -1651,36 +1683,109 @@ def test_the_planned_runs_are_listed_by_their_start():
     ]
 
 
-def test_the_rest_rises_as_the_previous_plan_had_it():
-    """A replan takes a rest room to rise from now as the plan before it had
-    the rest rise, in that plan's runs at the room's own rate, held beyond
-    that plan's end; nothing from a plan made over a step before this one."""
+def _status_optimization() -> tuple[Optimization, _RecordingHomeAssistant]:
+    home_assistant = _RecordingHomeAssistant()
 
-    step = timedelta(minutes=15)
-    times = [START + i * step for i in range(4)]
-    planned = [
-        SeriesPoint(time=START + i * step, value=18.6 + 0.2 * i) for i in range(3)
-    ]
-    # The previous plan heated the zone in the first step only.
-    on = [SeriesPoint(time=START + i * step, value=int(i == 0)) for i in range(3)]
-    now = START + timedelta(minutes=5)
-
-    def rise(points, run_rise=1.0):
-        return Optimization._planned_rest_rise_k(points, on, times, now, step, run_rise)
-
-    first = 0.2 / 3
-    assert rise(planned) == pytest.approx(
-        [-first, 0.2 - first, 0.4 - first] * 1 + [0.4 - first]
-    )
-    # 1.5 times as fast in the run: its step from 10:00, and the part of it
-    # from 10:05 the first increment (back to 10:00) takes back.
-    assert rise(planned, 1.5) == pytest.approx(
-        [-1.5 * first, 1.5 * (0.2 - first), 1.5 * (0.2 - first) + 0.2]
-        + [1.5 * (0.2 - first) + 0.2]
+    return (
+        Optimization(
+            loader=None,  # type: ignore[arg-type]
+            state_manager=None,  # type: ignore[arg-type]
+            config_repository=None,  # type: ignore[arg-type]
+            models_path=Path("."),
+            home_assistant=home_assistant,  # type: ignore[arg-type]
+        ),
+        home_assistant,
     )
 
-    stale = [
-        SeriesPoint(time=point.time - 2 * step, value=point.value) for point in planned
-    ]
 
-    assert not rise(stale).any()
+def test_a_failed_plan_follows_the_previous_one_from_this_quarter_hour():
+    """The previous plan, kept in the state, from the quarter hour running
+    now: its runs still start and stop where it had them, and past its end
+    nothing is planned - off, no heat - the temperatures held at its last."""
+
+    result = MPCResult(
+        schedule=(0, 1, 1, 0),
+        temperatures=TEMPERATURES,
+        electrical_power_w=(0.0, 2000.0, 2000.0, 0.0),
+        heat_w=(0.0, 6000.0, 6000.0, 0.0),
+        objective_value=1.0,
+        termination_condition="optimal",
+        space_schedule=(1, 1, 0, 1),
+        space_heat_w=(3000.0, 3000.0, 0.0, 3500.0),
+        zone_temperatures=(20.0, 20.1, 20.2, 20.3, 20.4),
+        # No supply where the floor is not run, no flow without its loops.
+        space_supply_c=(25.0, 25.5, math.nan, 26.0),
+        zone_floor_flow_lpm=(18.0, 18.0, None, 17.0),
+    )
+    state = State()
+    state.plan = Plan(made=START, times=TIMES, result=result)
+    # As state.json holds it.
+    plan = State.model_validate(
+        json.loads(json.dumps(state.model_dump(mode="json")))
+    ).plan
+
+    assert plan is not None
+    assert plan.result.zone_floor_flow_lpm == (18.0, 18.0, None, 17.0)
+    assert math.isnan(plan.result.space_supply_c[2])
+
+    # Two quarter hours on, over a horizon a quarter hour longer.
+    times = [TIMES[2] + timedelta(minutes=15 * i) for i in range(3)]
+    made, followed = Optimization.previous_plan(plan, times)
+
+    assert made == START
+    assert followed.schedule == (1, 0, 0)
+    assert followed.heat_w == (6000.0, 0.0, 0.0)
+    assert followed.temperatures == (48.3, 48.2, 48.2)
+    assert followed.space_schedule == (0, 1, 0)
+    assert followed.space_heat_w == (0.0, 3500.0, 0.0)
+    # One more than the steps: the state after the last.
+    assert followed.zone_temperatures == (20.2, 20.3, 20.4, 20.4)
+    # None planned for the zone: none followed.
+    assert (
+        Optimization.shifted_result(
+            replace(result, space_schedule=()), 1, 3
+        ).space_schedule
+        == ()
+    )
+
+    # Past its end, or none kept: nothing to follow.
+    assert Optimization.previous_plan(plan, [TIMES[-1] + timedelta(minutes=15)]) is None
+    assert Optimization.previous_plan(None, times) is None
+
+    # Kept from before an update that changed MPCResult: the plan dropped,
+    # not the rest of the state.
+    saved = state.model_dump(mode="json")
+    saved["schedule"]["building"]["stopped"] = START.isoformat()
+    del saved["plan"]["result"]["objective_value"]
+    loaded = State.model_validate(saved)
+
+    assert loaded.plan is None
+    assert loaded.schedule.building.stopped == START
+
+
+def test_the_status_says_which_plan_is_in_force_and_why_the_last_failed():
+    optimization, home_assistant = _status_optimization()
+
+    assert (
+        optimization.failure_reason(
+            RuntimeError(
+                "MPC optimization failed. Termination condition: "
+                "TerminationCondition.infeasible"
+            )
+        )
+        == "infeasible"
+    )
+    assert optimization.failure_reason(ValueError("no forecast")) == (
+        "ValueError: no forecast"
+    )
+
+    optimization.publish_status("previous_plan", START, "infeasible")
+    state, attributes = home_assistant.states[Optimization.STATUS_ENTITY]
+
+    assert state == "previous_plan"
+    assert attributes["plan_time"] == START.isoformat()
+    assert attributes["reason"] == "infeasible"
+
+    optimization.publish_status("ok", START, None)
+
+    assert home_assistant.states[Optimization.STATUS_ENTITY][1]["reason"] is None

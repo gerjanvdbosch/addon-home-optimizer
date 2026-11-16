@@ -251,6 +251,7 @@ actions:
             "supply_temperature": "sensor.ecodan_heatpump_ca09ec_aanvoer_temp",
             "return_temperature": "sensor.ecodan_heatpump_ca09ec_retour_temp",
             "outdoor_temperature": "sensor.ecodan_heatpump_ca09ec_buiten_temp",
+            "flow_setpoint": "sensor.ecodan_heatpump_ca09ec_zone_1_flow_setpoint_waarde",
             "flow": "sensor.ecodan_heatpump_ca09ec_flow_waarde",
             "compressor_frequency": "sensor.ecodan_heatpump_compressor_frequentie",
             "booster": "binary_sensor.ecodan_heatpump_ca09ec_status_booster_heater", 
@@ -284,15 +285,15 @@ actions:
             },
             "target_temperature": {
               "heating": [
-                ["18:00", 20.0, 1.0, 1.5],
-                ["22:00", 19.0, 1.0, 2.5]
+                ["18:00", 20.0, 1.0, 1.0],
+                ["22:00", 19.0, 0.5, 1.5]
               ],
               "cooling": [
                 ["00:00", 24.0, 2.0, 1.0]
               ]
             },
             "comfort_weight": 0.5,
-            "rest_temperature": 18.5,
+            "rest_temperature": 19.0,
             "rest_idle_temperature": 15.0,
             "rooms": [
               [6.0, "sensor.danfoss_0_temperature", "climate.danfoss_icon_badkamer"],

@@ -4,10 +4,15 @@ The running picture the dashboard draws and the optimizer starts from, as
 plain series of timestamped points.
 """
 
+import logging
 from datetime import date, datetime, timezone
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError, field_validator
+
+from domain.mpc import MPCResult
+
+logger = logging.getLogger(__name__)
 
 P = TypeVar("P")
 
@@ -226,6 +231,15 @@ class BuildingSchedule(BaseModel):
     stopped: datetime | None = None
 
 
+class Plan(BaseModel):
+    """The last plan solved, whole: what a solve that fails follows from the
+    quarter hour running then (see Optimization.previous_plan)."""
+
+    made: datetime
+    times: list[datetime]
+    result: MPCResult
+
+
 class Schedule(BaseModel):
     heat_pump: HeatPumpSchedule = Field(default_factory=HeatPumpSchedule)
     building: BuildingSchedule = Field(default_factory=BuildingSchedule)
@@ -237,3 +251,18 @@ class State(BaseModel):
     forecast: Forecast = Field(default_factory=Forecast)
     predictions: Predictions = Field(default_factory=Predictions)
     schedule: Schedule = Field(default_factory=Schedule)
+    plan: Plan | None = None
+
+    @field_validator("plan", mode="wrap")
+    @classmethod
+    def plan_or_none(cls, value: Any, handler) -> Plan | None:
+        """A plan kept from before an update that changed MPCResult is
+        dropped, not the whole state with it: a state that does not validate
+        is started afresh (see StateRepository.load), and MPCResult changes
+        far more often than the rest."""
+
+        try:
+            return handler(value)
+        except ValidationError as error:
+            logger.warning("Previous plan dropped, it no longer fits: %s", error)
+            return None

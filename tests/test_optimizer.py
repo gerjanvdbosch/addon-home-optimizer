@@ -25,6 +25,7 @@ from domain.physics import (
     mains_water_temperature_c,
     tank_sensor_temperatures,
     zone_observation,
+    zone_observations,
     zone_size,
     zone_state_space,
 )
@@ -1856,7 +1857,7 @@ def test_a_plan_through_the_living_rooms_loops_alone_heats_its_floor():
     data = _cold_day(
         steps=48,
         zone_floor_open=tuple((share, 0.0 if shut else 1.0 - share) for shut in closed),
-        zone_floor_flow_lpm=tuple(16.0 if shut else 18.0 for shut in closed),
+        zone_loop_flows=((share, 16.0), (1.0, 18.0)),
     )
     result = MPCOptimizer(
         THERMAL_MODEL,
@@ -1893,6 +1894,42 @@ def test_a_plan_through_the_living_rooms_loops_alone_heats_its_floor():
             [5.0, 150.0, 0.0, 0.0, heat[k], moved, 0.0, 0.0, 0.0]
         )
         assert living_floor[k + 1] == pytest.approx(state[2], abs=1e-4)
+
+
+def test_a_rest_rooms_loops_open_where_left_alone_it_would_be_below_its_setpoint():
+    """A rest room's loops are open in the steps the room, carried along the
+    rest's drift with the zone left alone, is below its thermostat's setpoint
+    - whatever the plan's own runs do - at the flow through the loops open."""
+
+    share = TWO_NODE.living_area_fraction
+    a_d, b_d = discretize_zoh(*zone_state_space(TWO_NODE), 900.0)
+    data = _cold_day(steps=48, zone_loop_flows=((share, 16.0), (1.0, 18.0)))
+    unheated = [np.array(data.zone_state)]
+
+    for _ in range(47):
+        unheated.append(
+            a_d @ unheated[-1] + b_d @ np.array([5.0, 150.0, 0, 0, 0, 0, 0, 0, 0])
+        )
+
+    rest_row = zone_observations(TWO_NODE)[1]
+    drift_k = np.array([rest_row @ (state - unheated[0]) for state in unheated])
+    # Above its setpoint now, below it once the rest has cooled halfway.
+    headroom_k = float(drift_k[24])
+    result = MPCOptimizer(
+        THERMAL_MODEL,
+        MPCConfig(),
+        cop_model=COP_MODEL,
+        building_model=TWO_NODE,
+        floor_circuit_model=replace(HEATING, pipe_ua_w_per_k=480.0, flow_lpm=18.0),
+        space_cop_model=COP_MODEL,
+    ).solve(replace(data, zone_rest_rooms=((1.0 - share, headroom_k),)))
+
+    assert headroom_k < 0.0
+    assert result.zone_floor_flow_lpm == pytest.approx(
+        np.where(drift_k < headroom_k, 18.0, 16.0)
+    )
+    assert 16.0 in result.zone_floor_flow_lpm
+    assert 18.0 in result.zone_floor_flow_lpm
 
 
 @pytest.mark.parametrize(
@@ -2153,7 +2190,7 @@ def test_in_the_cold_the_plan_expects_no_sun_the_bias_cannot_ask_for():
                 steps=48,
                 solar_forecast_w=sun_w,
                 outdoor_temperature_forecast=(outdoor_c,) * 48,
-                zone_floor_flow_lpm=(18.0,) * 48,
+                zone_loop_flows=((1.0, 18.0),),
                 zone_auto_adaptive=True,
                 zone_above_least=False,
             )

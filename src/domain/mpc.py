@@ -198,14 +198,22 @@ class MPCInput:
     # Each floor's open loop area a run goes through per step, the living
     # room's and the rest's, as shares of the zone's floor area (see
     # Room.climate): the floor's heat lands only there, and the circuit
-    # passes that share of its conductance. Per step, as a rest room's own
-    # thermostat closes its loops once it reaches its setpoint. Empty is
-    # every loop open.
+    # passes that share of its conductance. Empty is every loop open; the
+    # rest's rooms, where given, decide the rest's share (zone_rest_rooms).
     zone_floor_open: tuple[tuple[float, float], ...] = ()
-    # The pump's flow through them per step (L/min, see
-    # physics.floor_circuit_conductance_w_per_k): fewer loops open, more
-    # through each. Empty, or None in a step, is the flow its runs ran at.
-    zone_floor_flow_lpm: tuple[float | None, ...] = ()
+    # The rest's rooms whose own thermostats open and close their loops in a
+    # heating run: per room, its floor area as a share of the zone's and how
+    # far it lies below its thermostat's setpoint now (K). A room's loops are
+    # open in the steps it would still be below it left alone, the rest's
+    # drift carrying it along. Empty: the rest's share of zone_floor_open.
+    zone_rest_rooms: tuple[tuple[float, float], ...] = ()
+    # The pump's flow (L/min) by open loop area (share of the zone's floor
+    # area), ascending, as the runs held them (see
+    # BuildingThermalIdentifier.loop_flows; physics.
+    # floor_circuit_conductance_w_per_k): fewer loops open, more through
+    # each. Interpolated, held beyond the ends. Empty is the flow the floor
+    # circuit's runs ran at.
+    zone_loop_flows: tuple[tuple[float, float], ...] = ()
     # Whether the controller is steered through its setpoint bias (see
     # features.ecodan): a run then heats at its least, more - and rising -
     # only into expected solar surplus. Left to itself the heat only falls
@@ -327,6 +335,9 @@ class MPCResult:
     # The slab under the thermostat's room the plan heats (deg C): the thermal
     # mass the floor's heat lands in, as planned rather than left alone.
     zone_mass_temperatures: tuple[float, ...] = ()
+    # The pump's flow through the loops a run goes through each step (L/min,
+    # see MPCInput.zone_loop_flows), None without those flows.
+    zone_floor_flow_lpm: tuple[float | None, ...] = ()
     # The supply each step runs the floor at (deg C), NaN where it does not:
     # the heat pump's own curve while heating, the plan's choice while cooling
     # - the setpoint to give it. Empty without a space-heating model.

@@ -127,6 +127,11 @@ class HeatPumpConfig(BaseModel):
     # building's own dynamics. The building takes Open-Meteo's temperature,
     # which planning has to use for the future in any case.
     outdoor_temperature: SensorReference | None = Field(default=None)
+    # Optional: the zone's flow setpoint the controller sets. The supply it
+    # holds sits above it, and by how much is fitted from the two (see
+    # HeatPumpCOPModel.supply_overshoot_k); without it the plan takes the
+    # supply at the setpoint.
+    flow_setpoint: SensorReference | None = Field(default=None)
     # The operating mode the heat pump is set to (on the Ecodan a select whose
     # options read "Verwarmen ..." or "Koelen ..."): a mode starting with
     # states.cooling plans the zone cooled rather than heated. Set by hand,

@@ -11,6 +11,7 @@ from domain.dataset import DatasetDefinition
 from domain.models import HeatPumpCOPModel
 from domain.mpc import MPCConfig
 from domain.physics import CP_WATER_J_PER_KG_K, RHO_WATER_KG_PER_L
+from features import ecodan
 from features.boiler import (
     BoilerThermalIdentifier,
     booster_active,
@@ -547,6 +548,9 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         held_outdoor_c, held_hz = (
             self._held_speed_line(df) if speed_heat_w else ((), ())
         )
+        overshoot_k, overshoot_gone_rise_k = (
+            self._supply_overshoot(df) if self.key == "heating" else (0.0, 0.0)
+        )
 
         # Only at the DHW fit's approach, a tank run's heat apart from a floor
         # run's: an approach of its own already fitted to the floor's heats
@@ -620,6 +624,8 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             start_excess_hz=excess_hz if speed_heat_w else 0.0,
             start_excess_seconds=excess_s if speed_heat_w else 0.0,
             defrost_power_offset_seconds=power_offset_s,
+            supply_overshoot_k=overshoot_k,
+            supply_overshoot_gone_rise_k=overshoot_gone_rise_k,
         )
 
         # Cooling is planned down to a lift of a kelvin or two - water just
@@ -792,6 +798,20 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
     # Sep-Nov 2026: 42-46 Hz over their second and third quarter hour, 35-38
     # Hz after). prepare() already leaves out the first STARTUP of it.
     HELD_SPEED_SETTLE = pd.Timedelta(minutes=45)
+    # How long a speed is held to count as one a run holds, not a pass on
+    # the way down: a quarter hour, the plan's step.
+    HELD_SPEED_WINDOW = pd.Timedelta(minutes=15)
+
+    @classmethod
+    def _lowest_held_hz(cls, speed: pd.Series) -> float:
+        """The lowest speed (Hz) a run held for HELD_SPEED_WINDOW, its median
+        over each such window: speed is its readings from HELD_SPEED_SETTLE
+        on, by time. NaN where that part of the run is shorter."""
+
+        held = speed.rolling(cls.HELD_SPEED_WINDOW).median()
+        held = held[held.index >= held.index[0] + cls.HELD_SPEED_WINDOW]
+
+        return float(held.min()) if len(held) else np.nan
 
     @staticmethod
     def _running(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
@@ -832,33 +852,40 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         self, df: pd.DataFrame
     ) -> tuple[tuple[float, ...], tuple[float, ...]]:
         """(outdoor temperatures degC, the speed Hz runs hold), see
-        HeatPumpCOPModel.held_speed_hz: each run's median speed from
-        HELD_SPEED_SETTLE on, as a line falling with the outdoor temperature
-        down to a floor speed it holds in milder air - the unit turns down
-        less in colder air, never more, and no further than its least speed.
-        Knee (at one of the runs' temperatures), floor and slope by least
-        squares on the runs. The speed the plan's runs hold rather than the
-        lowest the outdoor unit allows: each day on the runs before it, the
-        power at the least in the quarter hours the supply stood past its
-        setpoint read +0.6% (113 W per quarter hour) on the median from 45
-        minutes, -6.6% (139 W) on each run's lowest speed held a quarter hour,
-        +12% on its mean from the start (real data, Aug-Nov 2026).
+        HeatPumpCOPModel.held_speed_hz: each run's lowest speed held from
+        HELD_SPEED_SETTLE on (see _lowest_held_hz), as a line falling with the
+        outdoor temperature down to a floor speed it holds in milder air - the
+        unit turns down less in colder air, never more, and no further than
+        its least speed. Knee (at one of the runs' temperatures), floor and
+        slope by least squares on the runs.
+
+        The lowest, not the median: the speed follows what the controller
+        asks over the return - at 7.5-9 degC 28 Hz at its least ask (the flow
+        setpoint 2 K over the return), 30 at 2.5 K, 35 at 3 K, 38 beyond -
+        and a run's median holds whatever the plan asked of it, more than the
+        least the plan bounds its runs by. Each day on the runs before it, in
+        the quarter hours the controller asked for its least, the power read
+        +10.9% (96 W per quarter hour) on the median from 45 minutes, -0.6%
+        (68 W) on the lowest held a quarter hour (real data, Aug-Nov 2026, 160
+        quarter hours; 16 Nov a run held 26-28 Hz at 8 degC for 2.5 hours
+        where the median line said 33.7).
 
         A line, not steps never rising (as _speed_steps): the runs' speeds
-        scatter 26-36 Hz at one outdoor temperature (what the bias asked, the
-        floor's warmth), and steps through them jumped up to 90 Hz/K, so a
-        forecast 0.2 K colder raised a plan's power 10%. On the same days the
-        line read -0.3% (112 W) against +0.9% (118 W), 143 against 160 W at
-        6-8 degC (real data, Aug-Nov 2026, 59 quarter hours)."""
+        scatter at one outdoor temperature (what the bias asked, the floor's
+        warmth), and steps through them jumped up to 90 Hz/K, so a forecast
+        0.2 K colder raised a plan's power 10%."""
 
         df, speed = self._running(df)
         run = (df["time"].diff() > self.RUN_GAP).cumsum()
         since = df["time"] - df["time"].groupby(run).transform("first")
         settled = since + self.STARTUP >= self.HELD_SPEED_SETTLE
+        held = pd.Series(speed[settled].to_numpy(), index=df["time"][settled])
         runs = pd.DataFrame(
             {
                 "outdoor_c": df["T_outdoor"].groupby(run).mean(),
-                "speed": speed[settled].groupby(run[settled]).median(),
+                "speed": held.groupby(run[settled].to_numpy()).apply(
+                    self._lowest_held_hz
+                ),
             }
         ).dropna()
 
@@ -889,6 +916,78 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
         points_hz = floor_hz + slope_hz_per_k * np.maximum(knee_c - points_c, 0.0)
 
         return tuple(points_c.tolist()), tuple(points_hz.tolist())
+
+    # The least readings the supply's overshoot is fitted on.
+    MIN_OVERSHOOT_READINGS = 100
+
+    def _supply_overshoot(self, df: pd.DataFrame) -> tuple[float, float]:
+        """(K, K) of HeatPumpCOPModel.supply_overshoot_k and
+        supply_overshoot_gone_rise_k: by least squares, the supply's rise over
+        the flow setpoint against the rise the setpoint asks over the return
+        (see features.ecodan.supply_overshoot_k), on the readings from
+        HELD_SPEED_SETTLE on that ask more than the base rise - at it the
+        compressor's least speed sets the heat, not the setpoint (see
+        held_speed_hz). (0.0, 0.0) without the setpoint, or where the readings
+        show no overshoot falling with the rise asked."""
+
+        if "flow_setpoint" not in df:
+            return 0.0, 0.0
+
+        df, _ = self._running(df)
+        run = (df["time"].diff() > self.RUN_GAP).cumsum()
+        since = df["time"] - df["time"].groupby(run).transform("first")
+        flow_setpoint_c = pd.to_numeric(df["flow_setpoint"], errors="coerce")
+        asked_k = flow_setpoint_c - df["T_return"]
+        rows = (since + self.STARTUP >= self.HELD_SPEED_SETTLE) & (
+            asked_k > ecodan.MIN_RISE_K
+        )
+
+        if rows.sum() < self.MIN_OVERSHOOT_READINGS:
+            return 0.0, 0.0
+
+        asked_k = asked_k[rows].to_numpy(dtype=float)
+        over_k = (df["T_supply"] - flow_setpoint_c)[rows].to_numpy(dtype=float)
+        slope, intercept = np.polyfit(asked_k, over_k, 1)
+
+        if slope >= 0.0 or intercept + slope * ecodan.MIN_RISE_K <= 0.0:
+            logger.info(
+                "Heat pump COP calibration (%s): no supply overshoot falling "
+                "with the rise asked (%.2f K %+.2f K/K)",
+                self.mode,
+                intercept,
+                slope,
+            )
+            return 0.0, 0.0
+
+        # The overshoot's own form, none past where it is gone, from the
+        # straight line through all of it.
+        def residuals(parameters: np.ndarray) -> np.ndarray:
+            return (
+                ecodan.supply_overshoot_k(asked_k, (parameters[0], parameters[1]))
+                - over_k
+            )
+
+        fit = least_squares(
+            residuals,
+            x0=[intercept + slope * ecodan.MIN_RISE_K, -intercept / slope],
+            # Gone past the base rise, which it falls from.
+            bounds=(
+                [0.0, np.nextafter(ecodan.MIN_RISE_K, np.inf)],
+                [np.inf, ecodan.MAX_RISE_K],
+            ),
+        )
+        at_base_k, gone_k = (float(value) for value in fit.x)
+        logger.info(
+            "Heat pump COP calibration (%s): supply %.2f K over the flow "
+            "setpoint at the base rise, none from a rise of %.2f K asked "
+            "(%d readings)",
+            self.mode,
+            at_base_k,
+            gone_k,
+            rows.sum(),
+        )
+
+        return at_base_k, gone_k
 
     def _fit_part_load(
         self,
@@ -1359,7 +1458,7 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
     def _start_excess(self, df: pd.DataFrame) -> tuple[float, float]:
         """(Hz, s) of HeatPumpCOPModel.start_excess_hz/_seconds: by least
         squares over the minutes after the first planning step of each run
-        the compressor starts from off, of its speed above the median it
+        the compressor starts from off, of its speed above the lowest it
         holds from HELD_SPEED_SETTLE on (see _held_speed_line), against
         a line falling from its value as that step ends to none. Out of a
         defrost the compressor runs its own restart. (0.0, 0.0) without
@@ -1389,13 +1488,17 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             if not held.any():
                 continue
 
-            after = since >= step_s
-            stretches.append(
-                (
-                    since[after] - step_s,
-                    frequency[rows][after] - np.median(frequency[rows][held]),
+            held_hz = self._lowest_held_hz(
+                pd.Series(
+                    frequency[rows][held], index=df["time"].to_numpy()[rows][held]
                 )
             )
+
+            if np.isnan(held_hz):
+                continue
+
+            after = since >= step_s
+            stretches.append((since[after] - step_s, frequency[rows][after] - held_hz))
 
         if len(stretches) < BoilerThermalIdentifier.MIN_RAMP_RUNS:
             return 0.0, 0.0
@@ -1819,6 +1922,23 @@ class HeatPumpCOPIdentifier(SystemIdentifier[HeatPumpCOPModel]):
             ).join(
                 left="T_supply",
                 right="defrost",
+                on=("time",),
+                how="left",
+            )
+
+        # Optional: the supply's overshoot over it (see _supply_overshoot).
+        # A setpoint, reported on change, so the previous reading is the
+        # current one.
+        if config.heat_pump.flow_setpoint is not None:
+            builder = builder.timeseries(
+                "flow_setpoint",
+                config.heat_pump.flow_setpoint,
+                interval="1m",
+                aggregation="last",
+                fill="previous",
+            ).join(
+                left="T_supply",
+                right="flow_setpoint",
                 on=("time",),
                 how="left",
             )

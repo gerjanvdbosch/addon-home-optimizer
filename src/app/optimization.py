@@ -12,16 +12,24 @@ import pandas as pd
 from app.state import StateManager
 from domain.config import BoilerConfig, Config, Price, Tariff
 from domain.jobs import OptimizeConfig
-from domain.models import BoilerThermalModel, FloorCircuitModel
+from domain.models import BoilerThermalModel, FloorCircuitModel, HeatPumpCOPModel
 from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.physics import (
     CP_WATER_J_PER_KG_K,
     RHO_WATER_KG_PER_L,
     indoor_dew_point_c,
     mains_water_temperature_c,
+    zone_observations,
 )
 from domain.sensors import SensorReference
-from domain.state import BaseloadHabit, SeriesPoint, State, TapHabit, ZoneHabit
+from domain.state import (
+    BaseloadHabit,
+    Plan,
+    SeriesPoint,
+    State,
+    TapHabit,
+    ZoneHabit,
+)
 from domain.time import local_day_start, to_local_time
 from features import ecodan
 from features.baseload import BaseloadForecaster
@@ -76,6 +84,9 @@ class Optimization:
     # Today's and tomorrow's cost, heat pump, baseload and grid, measured up to now
     # and planned on (see publish_day): kind, then today or tomorrow.
     DAY_ENTITY = "sensor.home_optimizer_{}_{}"
+    # Whether the plan in force was solved now, and when it was (see
+    # publish_status).
+    STATUS_ENTITY = "sensor.home_optimizer_status"
 
     def __init__(
         self,
@@ -501,33 +512,65 @@ class Optimization:
         # 0.672) - likely HiGHS reusing the warm start's instance, which
         # proved plans optimal that were not (see MPCOptimizer.solve), rather
         # than the time limit.
+        # A plan that cannot be solved - infeasible, or none found within the
+        # time limit - leaves the previous one in force from this quarter hour
+        # on, so its starts and stops still come; without one (or past its
+        # end) the hot water alone, as the zone must not take that plan down
+        # with it. Published as the status either way (see publish_status).
+        status, plan_time, reason = "ok", now, None
+
         try:
             result = optimizer.solve(planned)
-        except RuntimeError as error:
-            if zone is None:
+
+            # Held to its least, a steered run that still leaves the comfort
+            # band - started late, by hand or a forecast too warm - may heat
+            # harder: only then, and the bias follows that plan (user, 12 Nov
+            # 2026). The band's slack measures only what more heat could
+            # change.
+            if (
+                zone is not None
+                and planned.zone_auto_adaptive
+                and result.zone_below_band_k > ZONE_BOUND_MARGIN_K
+            ):
+                logger.warning(
+                    "Zone %.2f K below its band at the least heat: planned again "
+                    "above it",
+                    result.zone_below_band_k,
+                )
+                planned = dataclasses.replace(planned, zone_above_least=True)
+                result = optimizer.solve(planned)
+        except Exception as error:
+            reason = self.failure_reason(error)
+            previous = self.previous_plan(state.plan, forecast_times)
+
+            if previous is not None:
+                logger.warning(
+                    "Plan failed (%s): the plan of %s followed",
+                    reason,
+                    previous[0].isoformat(),
+                    exc_info=not isinstance(error, RuntimeError),
+                )
+                status, (plan_time, result) = "previous_plan", previous
+            elif zone is not None:
+                logger.warning("Plan with the zone failed, hot water alone: %s", error)
+                status = "dhw_only"
+                zone, optimizer, planned = None, dhw_only, data
+
+                try:
+                    result = optimizer.solve(planned)
+                except Exception:
+                    self.publish_status("no_plan", None, reason)
+                    raise
+            else:
+                self.publish_status("no_plan", None, reason)
                 raise
 
-            # The zone is not acted on, so it must not take the hot water plan
-            # down with it: without it, that is the plan as it always was.
-            logger.warning("Plan with the zone failed, hot water alone: %s", error)
-            zone, optimizer, planned = None, dhw_only, data
-            result = optimizer.solve(planned)
-
-        # Held to its least, a steered run that still leaves the comfort band
-        # - started late, by hand or a forecast too warm - may heat harder:
-        # only then, and the bias follows that plan (user, 12 Nov 2026). The
-        # band's slack measures only what more heat could change.
-        if (
-            zone is not None
-            and planned.zone_auto_adaptive
-            and result.zone_below_band_k > ZONE_BOUND_MARGIN_K
-        ):
-            logger.warning(
-                "Zone %.2f K below its band at the least heat: planned again above it",
-                result.zone_below_band_k,
+        # Only a whole plan: one of the hot water alone would, followed, leave
+        # the zone without its runs where an older whole one still has them.
+        if status == "ok":
+            self.state_manager.update_plan(
+                Plan(made=now, times=forecast_times, result=result)
             )
-            planned = dataclasses.replace(planned, zone_above_least=True)
-            result = optimizer.solve(planned)
 
         # A stop of the run under way holds until the compressor no longer
         # serves the zone or a plan takes the run up again (see
@@ -634,10 +677,101 @@ class Optimization:
             heat_pump_changes[0],
             now,
             optimizer.floor_circuit_model,
+            optimizer.space_cop_model,
         )
-        # Last, so it reads after what was published.
+        self.publish_status(status, plan_time, reason)
+        # Last, so it reads after what was published: the day's sensors, then
+        # its tables (see log_day_costs).
         self.log_day_costs(
             config, state, planned, result, optimizer, forecast_times, now
+        )
+
+    # A plan's per-step fields that past its end hold nothing - off, no heat,
+    # no power; the rest (temperatures, the supply, the flow) hold their last.
+    NOTHING_PLANNED_FIELDS = frozenset(
+        {
+            "schedule",
+            "space_schedule",
+            "heat_w",
+            "space_heat_w",
+            "space_least_heat_w",
+            "electrical_power_w",
+            "space_electrical_w",
+            "electricity_step_kwh",
+            "grid_step_kwh",
+        }
+    )
+
+    @classmethod
+    def previous_plan(
+        cls, plan: Plan | None, times: list[datetime]
+    ) -> tuple[datetime, MPCResult] | None:
+        """When the last plan solved was made, and it over `times` (see
+        shifted_result); None without one, or one that ended before them."""
+
+        if plan is None or times[0] not in plan.times:
+            return None
+
+        return plan.made, cls.shifted_result(
+            plan.result, plan.times.index(times[0]), len(times)
+        )
+
+    @classmethod
+    def shifted_result(cls, result: MPCResult, start: int, steps: int) -> MPCResult:
+        """The plan from its step `start` on, over `steps` steps: past its
+        own end nothing planned (NOTHING_PLANNED_FIELDS), the rest held at
+        its last."""
+
+        planned_steps = len(result.schedule)
+        changes = {}
+
+        for field in dataclasses.fields(result):
+            values = getattr(result, field.name)
+
+            if not isinstance(values, tuple) or not values:
+                continue
+
+            # Per step, or per step and the end (a state after the last step).
+            extra = len(values) - planned_steps
+
+            if extra not in (0, 1):
+                continue
+
+            kept = values[start : start + steps + extra]
+            fill = 0 if field.name in cls.NOTHING_PLANNED_FIELDS else values[-1]
+            changes[field.name] = kept + (fill,) * (steps + extra - len(kept))
+
+        return dataclasses.replace(result, **changes)
+
+    @staticmethod
+    def failure_reason(error: Exception) -> str:
+        """Why a plan failed, in a few words: the solver's termination
+        condition (e.g. 'infeasible'), or the error."""
+
+        text = str(error)
+
+        if "Termination condition:" in text:
+            return text.rsplit(".", 1)[-1].strip()
+
+        return f"{type(error).__name__}: {text}"[:80]
+
+    def publish_status(
+        self, status: str, plan_time: datetime | None, reason: str | None
+    ) -> None:
+        """Whether the plan in force was solved now ('ok'), is a previous one
+        followed ('previous_plan'), the hot water's alone ('dhw_only'),
+        or there is none ('no_plan'); when the plan in force was made and
+        why the last solve failed. An automation warns on the plan's age: a
+        job that never gets this far leaves it to grow too."""
+
+        self.home_assistant.set_state(
+            self.STATUS_ENTITY,
+            status,
+            {
+                "friendly_name": "Home Optimizer status",
+                "plan_time": plan_time.isoformat() if plan_time else None,
+                "reason": reason,
+            },
         )
 
     def _run_minutes(
@@ -1218,7 +1352,8 @@ class Optimization:
         house's, its baseload, and the grid meter's balance (kWh), as four
         sensors, measured up to now and planned on, each with those two parts
         as attributes: the cost with what makes it up (see costed), the heat
-        pump with its modes, the grid with its import and export. Through the
+        pump with its modes, the grid with its import, export and the solar
+        behind it. Through the
         day their history shows how the plan's day turned out."""
 
         # The meter's net import, negative on a day that exports more; what it
@@ -1257,7 +1392,7 @@ class Optimization:
                 "kWh",
                 "energy",
                 "kwh",
-                {f"{c}_kwh": total(c) for c in ("import", "export")},
+                {f"{c}_kwh": total(c) for c in ("import", "export", "solar")},
             ),
         )
 
@@ -1896,19 +2031,14 @@ class Optimization:
         # Every loop, at the flow its runs ran at, without a run in the frame.
         loops = identifier.last_run_loops(zone)
         floor_open = ((loops[0], loops[1]),) * len(times) if loops else ()
-        floor_flow = (loops[2],) * len(times) if loops else ()
+        loop_flows = ((loops[0] + loops[1], loops[2]),) if loops else ()
         rest_minimum_c = config.building.rest_temperature
+        rest_rooms: tuple[tuple[float, float], ...] = ()
 
         # Set to the rest's minimum while a heating run is served (see
         # publish_zone), each room's own thermostat opens its loops while the
-        # room is below it and closes them once it gets there: per step, the
-        # plan takes the rooms open that are below it then - the room now,
-        # risen as the previous plan had the rest rise since, in its runs at
-        # the room's own rate (see _planned_rest_rise_k). Held at the room now,
-        # rooms 0.01-0.4 K below it stayed open all run though they closed
-        # within the hour, and tomorrow's rooms - cooled overnight below it -
-        # closed because they are above it now (9 Nov 2026: 12.6 kWh planned
-        # for tomorrow's floor against 17.9 with its upstairs loops open).
+        # room is below it and closes them once it gets there (see
+        # MPCInput.zone_rest_rooms).
         if rest_minimum_c is not None and not cooling:
             rooms = config.building.rooms
             total_m2 = sum(room.area_m2 for room in rooms)
@@ -1918,7 +2048,8 @@ class Optimization:
                 if habit is not None and len(habit.run_rise) == len(rooms)
                 else [1.0] * len(rooms)
             )
-            rest = np.zeros(len(times))
+            rest_row = zone_observations(identifier.model)[1]
+            rest_now_c = float(rest_row @ planned[state_names].iloc[0].to_numpy())
 
             for room, ratio in zip(rooms, run_rise, strict=True):
                 if room.temperature == config.building.thermostat.temperature:
@@ -1926,34 +2057,32 @@ class Optimization:
 
                 reading = self._last_reading(room.temperature, now)
 
-                if reading is not None:
-                    read_at, room_c = reading
-                    rise_k = self._planned_rest_rise_k(
-                        state.schedule.building.rest_temperatures,
-                        state.schedule.building.on,
-                        times,
-                        read_at,
-                        timedelta(hours=mpc_config.step_hours),
-                        ratio,
-                    )
-                    rest += (room_c + rise_k < rest_minimum_c) * (
-                        room.area_m2 / total_m2
-                    )
+                # A room whose thermostat stopped reporting counts closed, as
+                # no heat it takes is known.
+                if reading is None:
+                    continue
 
-            living = identifier.model.living_area_fraction
+                read_at, room_c = reading
+                # Risen since its reading - up to a report interval old (see
+                # _last_reading) - as the filter has the rest's rise, at the
+                # room's own rate: that lag matters while a run warms it.
+                before = zone[state_names].loc[:read_at].dropna()
+                since_k = (
+                    ratio * (rest_now_c - float(rest_row @ before.iloc[-1].to_numpy()))
+                    if not before.empty
+                    else 0.0
+                )
+                rest_rooms += (
+                    (room.area_m2 / total_m2, rest_minimum_c - room_c - since_k),
+                )
 
             # At the flow the runs had through as much open loop area, between
             # two such between them; the last run's without any.
-            def flow_lpm(share: float) -> float | None:
-                if habit is not None and habit.loop_open:
-                    return float(
-                        np.interp(living + share, habit.loop_open, habit.loop_flow_lpm)
-                    )
+            if habit is not None and habit.loop_open:
+                loop_flows = tuple(
+                    zip(habit.loop_open, habit.loop_flow_lpm, strict=True)
+                )
 
-                return loops[2] if loops else None
-
-            floor_open = tuple((living, float(share)) for share in rest)
-            floor_flow = tuple(flow_lpm(float(share)) for share in rest)
         inputs = dict(
             zone_state=tuple(float(c) for c in planned[state_names].iloc[0]),
             zone_target_temperature=target_c,
@@ -1975,7 +2104,8 @@ class Optimization:
                 )
             ),
             zone_floor_open=floor_open,
-            zone_floor_flow_lpm=floor_flow,
+            zone_rest_rooms=rest_rooms,
+            zone_loop_flows=loop_flows,
             zone_auto_adaptive=config.heat_pump.auto_adaptive,
             zone_cooling=cooling,
             zone_mass_minimum_c=tuple(
@@ -2008,41 +2138,6 @@ class Optimization:
                 space_cop_model=space_cop.model,
             ),
         )
-
-    @staticmethod
-    def _planned_rest_rise_k(
-        planned: list[SeriesPoint],
-        on: list[SeriesPoint],
-        times: list[datetime],
-        since: datetime,
-        step: timedelta,
-        run_rise: float = 1.0,
-    ) -> np.ndarray:
-        """How far a rest room rises from its reading at since to each of
-        times (K) as the previous plan had the rest's thermostats rise
-        (planned), the
-        steps that plan heated the zone in (on) run_rise times as fast (see
-        BuildingThermalIdentifier.room_run_rise): what a replan, made every
-        few minutes, takes the room to do meanwhile. Held beyond that plan's
-        end; zero throughout where it was made over a step before this one's
-        start - from another state, or none at all."""
-
-        if not planned or planned[0].time < times[0] - step:
-            return np.zeros(len(times))
-
-        seconds = np.array([point.time.timestamp() for point in planned])
-        values = np.array([point.value for point in planned])
-        # np.interp holds the last value beyond the end.
-        level = np.interp([time.timestamp() for time in times], seconds, values)
-        increments = np.diff(
-            level, prepend=np.interp(since.timestamp(), seconds, values)
-        )
-        # Each increment over the step it ends: the first from since.
-        heated = {point.time for point in on if point.value}
-        spans = [times[0]] + times[:-1]
-        rate = np.array([run_rise if time in heated else 1.0 for time in spans])
-
-        return np.cumsum(rate * increments)
 
     def _dew_point_forecast(
         self, state: State, times: list[datetime], mpc_config: MPCConfig
@@ -2350,6 +2445,7 @@ class Optimization:
         least_heat_w: float = 0.0,
         min_supply_c: float = 0.0,
         max_heat_w: float = math.inf,
+        overshoot: tuple[float, float] = ecodan.NO_OVERSHOOT,
     ) -> tuple[float, str]:
         """The bias to publish now, and why (for the log): for a heating run
         under way or handed over (step k its first), the bias at which the
@@ -2412,8 +2508,8 @@ class Optimization:
         flow_lpm = (
             measured.flow[-1].value
             if settled and measured.flow and measured.flow[-1].value > 0
-            else data.zone_floor_flow_lpm[k]
-            if data.zone_floor_flow_lpm
+            else result.zone_floor_flow_lpm[k]
+            if result.zone_floor_flow_lpm
             else None
         )
         outdoor_c = self._latest(outdoor, now)
@@ -2466,6 +2562,7 @@ class Optimization:
                 maximum_c=data.zone_maximum_temperature[k],
                 least_heat_w=least_heat_w,
                 round_up=round_up,
+                overshoot=overshoot,
             )
 
         previous = state.schedule.building.sun_heat_w
@@ -2526,7 +2623,8 @@ class Optimization:
         # (see ecodan.setpoint_bias_k).
         if bias == ecodan.least_bias_k(room_c, setpoint_c):
             given_w = max(
-                ecodan.MIN_RISE_K * ecodan.water_w_per_k(flow_lpm), least_heat_w
+                ecodan.rise_heat_w(ecodan.MIN_RISE_K, flow_lpm, overshoot),
+                least_heat_w,
             )
             asked = f"minimum (~{kw(given_w)})"
         else:
@@ -2544,6 +2642,7 @@ class Optimization:
         heat_pump_state: list[SeriesPoint],
         now: datetime,
         floor_circuit: FloorCircuitModel | None = None,
+        space_cop: HeatPumpCOPModel | None = None,
     ) -> None:
         """Writes the plan's floor decision to Home Assistant, as publish_dhw
         does the hot water's: on/off for the quarter hour running now, the
@@ -2701,6 +2800,9 @@ class Optimization:
                         if floor_circuit is not None
                         else (0.0, 0.0, math.inf)
                     ),
+                    space_cop.supply_overshoot
+                    if space_cop is not None
+                    else ecodan.NO_OVERSHOOT,
                 )
 
             if serving and result.space_supply_c:
@@ -2804,16 +2906,26 @@ class Optimization:
     def _last_reading(
         self, reference: SensorReference, now: datetime
     ) -> tuple[datetime, float] | None:
-        """A room thermometer's last reading in the hour before now and when
-        it was taken, None without: the rooms' thermostats report every 30
-        minutes, so a reading may be half an hour old - some 0.07 K of a
-        run's rise."""
+        """A room thermometer's last reading and when it last held, None
+        without one in the day before now (a thermostat that stopped
+        reporting).
+
+        A thermostat reports on a fixed interval, but a reading is recorded
+        only when it changes: up to two hours apart for a steady room (real
+        data, 15-16 Nov 2026), which in the hour before now alone came and
+        went between replans, and the plan with its loops. The most common
+        gap between its records is that interval (30 minutes for each of the
+        rooms' Danfoss thermostats, over a day and a week alike; the shorter
+        ones are reports between, a setpoint changed), so an unchanged reading
+        still held at its last report on that grid - some 0.07 K of a run's
+        rise before now at most. A single record in a day is a room that
+        held it all day."""
 
         frame = self.loader.load(
             DatasetBuilder()
             .timeseries("value", reference, aggregation="last", interval="1m")
             .build(),
-            now - timedelta(hours=1),
+            now - timedelta(days=1),
             now,
         )
 
@@ -2827,9 +2939,17 @@ class Optimization:
         if readings.empty:
             return None
 
-        last = readings.iloc[-1]
+        times = pd.to_datetime(readings["time"])
+        recorded_at = times.iloc[-1].to_pydatetime()
+        value = float(readings["value"].iloc[-1])
 
-        return pd.Timestamp(last["time"]).to_pydatetime(), float(last["value"])
+        if len(times) < 2:
+            return now, value
+
+        interval = times.diff().dropna().dt.round("1min").mode().iloc[0]
+        reports = (now - recorded_at) // interval.to_pytimedelta()
+
+        return recorded_at + reports * interval.to_pytimedelta(), value
 
     def _latest(self, reference: SensorReference, now: datetime) -> float | None:
         """A sensor's last reading in the quarter hour before now, None without."""

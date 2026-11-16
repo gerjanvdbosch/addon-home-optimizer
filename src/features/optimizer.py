@@ -3482,21 +3482,11 @@ class MPCOptimizer:
         observation = zone_observation(building)
         num_states = a.shape[0]
         # The loops the plan's runs go through each step (see
-        # MPCInput.zone_floor_open): where the floor's heat lands - the part of
-        # it moved under the living room per W, Q_floor_moved - and how much of
-        # the circuit takes it.
+        # MPCInput.zone_floor_open, zone_rest_rooms; set below the rollouts).
         area_share = building.living_area_fraction
         floor_open = data.zone_floor_open or (
             ((area_share, 1.0 - area_share),) * num_steps
         )
-        living_fraction = [
-            float(floor_living_fraction(living, rest, area_share))
-            for living, rest in floor_open
-        ]
-        moved_per_w = [
-            float(floor_heat_moved_w(1.0, fraction, area_share))
-            for fraction in living_fraction
-        ]
         initial = np.array([float(t) for t in data.zone_state])
 
         if len(initial) != num_states:
@@ -3718,7 +3708,7 @@ class MPCOptimizer:
         # weight_temperature_slack, an unavoidable shortfall of a few
         # hundredths of a degree had the solver proving plans to a millionth
         # of one: over a minute for a plan it had found in seconds.
-        def states_with(heat_w: float) -> list[np.ndarray]:
+        def states_with(heat_w: float, moved_per_w: list[float]) -> list[np.ndarray]:
             state = initial
             states = [state]
 
@@ -3742,10 +3732,50 @@ class MPCOptimizer:
 
             return states
 
+        # Left alone, no floor heat lands anywhere, whichever loops are open.
+        unheated = states_with(0.0, [0.0] * num_steps)
+
+        # Each rest room's own thermostat holds its loops open while the room
+        # is below its setpoint: the plan takes it open in the steps it would
+        # still be there left alone, its reading now carried along the rest's
+        # drift. Its rise from the plan's own heat is not foreseen - a replan
+        # sees it closed once its reading gets there. Taken from the previous
+        # plan's heat, a plan that heated upstairs had the next close its
+        # loops, which left upstairs unheated and had the one after open them
+        # again: every replan flipped tomorrow's run (real data, 15 Nov 2026).
+        # Decided with the plan's own runs - a set of loops per step chosen
+        # with the run - the program grew too hard to solve on a cold morning
+        # (16 Nov 2026: 2.89 EUR after 11 minutes, 2.14 within reach); taken
+        # left alone, the plans cost 3 ct more priced as that program prices
+        # them, in 2 s against 9-60 (15 Nov 2026).
+        if data.zone_rest_rooms and not cooling:
+            rest_row = zone_observations(building)[1]
+            floor_open = [
+                (
+                    living,
+                    sum(
+                        share
+                        for share, headroom_k in data.zone_rest_rooms
+                        if float(rest_row @ (state - initial)) < headroom_k
+                    ),
+                )
+                for (living, _), state in zip(floor_open, unheated, strict=True)
+            ]
+
+        # Where the floor's heat lands - the part of it moved under the living
+        # room per W, Q_floor_moved - and how much of the circuit takes it.
+        living_fraction = [
+            float(floor_living_fraction(living, rest, area_share))
+            for living, rest in floor_open
+        ]
+        moved_per_w = [
+            float(floor_heat_moved_w(1.0, fraction, area_share))
+            for fraction in living_fraction
+        ]
+
         # Every state lies between these two for any plan: the zone's response
         # is monotone in the heat, which runs from 0 to flat out either way.
-        flat_out = states_with(sign * max_heat_w)
-        unheated = states_with(0.0)
+        flat_out = states_with(sign * max_heat_w, moved_per_w)
         warmest = [np.maximum(a, b) for a, b in zip(flat_out, unheated, strict=True)]
         coolest = [np.minimum(a, b) for a, b in zip(flat_out, unheated, strict=True)]
         reachable_c = [float(observation @ state) for state in warmest]
@@ -3976,7 +4006,19 @@ class MPCOptimizer:
         # sink's range, which the unheated and flat-out rollouts bound - the
         # slabs' mean being monotone in the heat like each slab.
         model.space_sink_on = pyo.Var(model.K)
-        flow_lpm = data.zone_floor_flow_lpm or (None,) * num_steps
+        # The pump's flow through each step's open loops (see
+        # MPCInput.zone_loop_flows).
+        flow_lpm = [
+            (
+                float(
+                    np.interp(living + rest, *zip(*data.zone_loop_flows, strict=True))
+                )
+                if data.zone_loop_flows
+                else None
+            )
+            for living, rest in floor_open
+        ]
+        model.zone_floor_flow_lpm = flow_lpm
         conductance = [
             float(floor_circuit_conductance_w_per_k(operating, living + rest, flow))
             for (living, rest), flow in zip(floor_open, flow_lpm, strict=True)
@@ -4345,6 +4387,12 @@ class MPCOptimizer:
             # ran a day's solve into its time limit (real data, 12 Nov 2026).
             # Not in the fallback (MPCInput.zone_above_least).
             if steered:
+                overshoot = (
+                    self.space_cop_model.supply_overshoot
+                    if self.space_cop_model is not None
+                    else ecodan.NO_OVERSHOOT
+                )
+
                 for k in range(num_steps):
                     # The bias asks for more than the least only past the
                     # controller's least rise with the room at or below its
@@ -4355,9 +4403,9 @@ class MPCOptimizer:
                         bought = bought_w(k)
                         flow = flow_lpm[k] or operating.flow_lpm
 
-                        if bought > ecodan.min_rise_k(
-                            zone_outdoor_c[k]
-                        ) * ecodan.water_w_per_k(flow):
+                        if bought > ecodan.rise_heat_w(
+                            ecodan.min_rise_k(zone_outdoor_c[k]), flow, overshoot
+                        ):
                             sun_heat_w[k] = bought
 
                     on = model.space_on[k]
@@ -4563,6 +4611,7 @@ class MPCOptimizer:
         zone_temperatures: tuple[float, ...] = ()
         zone_rest_temperatures: tuple[float, ...] = ()
         zone_mass_temperatures: tuple[float, ...] = ()
+        zone_floor_flow_lpm: tuple[float | None, ...] = ()
         space_supply_c: tuple[float, ...] = ()
         space_least_heat_w: tuple[float, ...] = ()
         space_electrical_w: tuple[float, ...] = ()
@@ -4575,8 +4624,7 @@ class MPCOptimizer:
             zone_temperatures = tuple(
                 float(pyo.value(model.zone_measured(k))) for k in range(num_steps)
             )
-            # What the rest's thermostats read, which the next plan takes their
-            # loops from (see MPCInput.zone_floor_open).
+            # What the rest's thermostats read.
             rest_row = zone_observations(self.building_model)[1]
             zone_rest_temperatures = tuple(
                 float(
@@ -4591,6 +4639,7 @@ class MPCOptimizer:
                 float(pyo.value(model.zone_state[k, ZONE_SLAB_STATES[0]]))
                 for k in range(num_steps)
             )
+            zone_floor_flow_lpm = tuple(getattr(model, "zone_floor_flow_lpm", ()))
             # The electricity that heat costs, as the objective prices it:
             # the heat moved, either way, over the step's COP.
             space_electrical_w = tuple(
@@ -4653,6 +4702,7 @@ class MPCOptimizer:
             zone_temperatures=zone_temperatures,
             zone_rest_temperatures=zone_rest_temperatures,
             zone_mass_temperatures=zone_mass_temperatures,
+            zone_floor_flow_lpm=zone_floor_flow_lpm,
             space_supply_c=space_supply_c,
             space_least_heat_w=space_least_heat_w,
             space_electrical_w=space_electrical_w,

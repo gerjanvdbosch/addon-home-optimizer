@@ -64,9 +64,23 @@ blueprint:
       selector:
         number:
           min: 30
-          max: 365
+          max: 1825
           step: 1
           unit_of_measurement: days
+          mode: box
+    stale_minutes:
+      name: Plan age warning (minutes)
+      description: >-
+        Warns when the plan in force is older than this, or the optimizer's
+        status (sensor.home_optimizer_status) has not been ok for this long:
+        the plans keep failing and the last one is followed or held.
+      default: 60
+      selector:
+        number:
+          min: 15
+          max: 720
+          step: 15
+          unit_of_measurement: min
           mode: box
     notify_devices:
       name: Notify devices (optional)
@@ -86,12 +100,17 @@ blueprint:
       selector:
         boolean:
 
+# For the plan watchdog's template trigger, which sees no variables.
+trigger_variables:
+  stale_minutes: !input stale_minutes
+
 variables:
   living: !input living_climate
   rest: !input rest_climates
   bias_number: !input bias_number
   calibrate_days: !input calibrate_days
   notify_devices: !input notify_devices
+  stale_minutes: !input stale_minutes
   dry_run: !input dry_run
   dhw_switch: !input dhw_switch
   dhw_setpoint: !input dhw_setpoint_entity
@@ -159,6 +178,19 @@ triggers:
     to: "on"
     for: { minutes: 15 }
     id: dhw_watchdog
+  # Watchdog: the plans keep failing. On the plan's age too, so a job that
+  # fails before it publishes any status is seen as well.
+  - trigger: state
+    entity_id: sensor.home_optimizer_status
+    not_to: ok
+    for: { minutes: !input stale_minutes }
+    id: plan_watchdog
+  - trigger: template
+    value_template: >-
+      {% set made = state_attr('sensor.home_optimizer_status', 'plan_time') %}
+      {{ made is not none
+         and now() - as_datetime(made) > timedelta(minutes=stale_minutes | int) }}
+    id: plan_watchdog
 
 conditions:
   - condition: state
@@ -229,10 +261,18 @@ actions:
                  or (not dry_run and trigger.id == 'dhw_end'
                      and is_state(dhw_switch, 'off')) }}
         sequence:
+          # Handed over to the floor, the zone's start told here too: one
+          # message, not two minutes apart (see Zone start).
           - variables:
               message: >-
                 Optimizer DHW end, tank
-                {{ states('sensor.home_optimizer_dhw_soc') }} %
+                {{ states('sensor.home_optimizer_dhw_soc') }} %{{
+                  ', zone on, living room '
+                  ~ states('sensor.home_optimizer_zone_setpoint') ~ ' °C'
+                  ~ (', rest ' ~ states('sensor.home_optimizer_zone_rest_setpoint') ~ ' °C'
+                     if has_value('sensor.home_optimizer_zone_rest_setpoint') else '')
+                  if is_state('binary_sensor.home_optimizer_zone_status', 'on')
+                     and has_value('sensor.home_optimizer_zone_setpoint') }}
           - *notify
           - *control
           - action: switch.turn_on
@@ -254,7 +294,16 @@ actions:
                 {{ states('sensor.home_optimizer_zone_setpoint') }} °C{{
                   ', rest ' ~ states('sensor.home_optimizer_zone_rest_setpoint') ~ ' °C'
                   if has_value('sensor.home_optimizer_zone_rest_setpoint') }}
-          - *notify
+              # Handed over from hot water the zone goes on in the tank's last
+              # quarter hour: told with the tank's end instead (see DHW end).
+              dhw_running: >-
+                {{ (dry_run and is_state('binary_sensor.home_optimizer_dhw_status', 'on'))
+                   or (not dry_run and is_state(dhw_switch, 'off')) }}
+          - if:
+              - condition: template
+                value_template: "{{ not dhw_running }}"
+            then:
+              - *notify
           - *control
           # The thermostat calls for heat only above the room: left at a lower
           # setpoint the run never starts (6 Nov 2026: 15 degC, 40 min late).
@@ -440,6 +489,29 @@ actions:
                 Optimizer warning: zone run planned for 15 minutes but the heat
                 pump is off (thermostat {{ state_attr(living, 'temperature') }} °C,
                 room {{ state_attr(living, 'current_temperature') }} °C)
+          - *notify
+      - alias: Plan watchdog
+        conditions:
+          - condition: trigger
+            id: plan_watchdog
+          # Still so as the trigger fires: not ok, or the plan in force too
+          # old (a status left at ok by a job that no longer gets that far).
+          - condition: template
+            value_template: >-
+              {% set made = state_attr('sensor.home_optimizer_status', 'plan_time') %}
+              {{ not is_state('sensor.home_optimizer_status', 'ok')
+                 or (made is not none
+                     and now() - as_datetime(made)
+                         > timedelta(minutes=stale_minutes | int)) }}
+        sequence:
+          - variables:
+              made: "{{ state_attr('sensor.home_optimizer_status', 'plan_time') }}"
+              message: >-
+                Optimizer warning: {{ states('sensor.home_optimizer_status') }}
+                for over {{ stale_minutes | int }} min
+                ({{ state_attr('sensor.home_optimizer_status', 'reason') or 'no reason' }}),
+                plan in force from
+                {{ as_timestamp(made) | timestamp_custom('%H:%M') if made else 'none' }}
           - *notify
       - alias: DHW watchdog
         conditions:

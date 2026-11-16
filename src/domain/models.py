@@ -615,11 +615,11 @@ class HeatPumpCOPModel:
     # moves a fixed volume per turn, of a vapour denser in warmer air. Empty
     # until calibrated, and for the other modes.
     speed_heat_w: tuple[float, ...] = ()
-    # The speed (Hz) heating runs hold once past their start, at the outdoor
-    # temperatures they were seen at (degC, rising): the outdoor unit turns
-    # down less in colder air (real data, Oct-Nov 2026: 26 Hz above ~8 degC,
-    # 32-40 Hz at 4-6 degC with the supply already past its setpoint, so
-    # 3.5-4.1 kW of heat where the floor's runs' least was 3.0 kW).
+    # The lowest speed (Hz) heating runs hold once past their start - where
+    # the controller asks for its least - at the outdoor temperatures they
+    # were seen at (degC, rising): the outdoor unit turns down less in colder
+    # air (real data, Aug-Nov 2026, at the least ask: 26-28 Hz above ~7.5
+    # degC, 32 Hz below 6.5 degC).
     # Interpolated between the temperatures seen, held beyond them. Empty
     # until calibrated: the floor's own least (FloorCircuitModel.min_heat_w).
     held_speed_outdoor_c: tuple[float, ...] = ()
@@ -634,6 +634,25 @@ class HeatPumpCOPModel:
     # within minutes (31 runs). 0.0 until calibrated, and for the other modes.
     start_excess_hz: float = 0.0
     start_excess_seconds: float = 0.0
+    # How far (K) the supply a heating run holds sits above the flow setpoint
+    # the controller asks at its base rise over the return, falling linearly
+    # to none at a rise of supply_overshoot_gone_rise_k (K) asked: the
+    # controller turns the compressor down in steps and holds the supply in a
+    # band at and above its setpoint, which a small rise asked overruns most
+    # (real data, 20 Oct-16 Nov 2026: 0.47 K at a rise of 2.5 K asked, 0.35 at
+    # 3, 0.09 at 3.5, none from 4). The heat the floor takes is the water's
+    # flow times the rise asked plus this (see features.ecodan.rise_heat_w).
+    # 0.0 until calibrated, without the flow setpoint, and for the other
+    # modes: the supply at the setpoint.
+    supply_overshoot_k: float = 0.0
+    supply_overshoot_gone_rise_k: float = 0.0
+
+    @property
+    def supply_overshoot(self) -> tuple[float, float]:
+        """(supply_overshoot_k, supply_overshoot_gone_rise_k), as
+        features.ecodan takes them."""
+
+        return self.supply_overshoot_k, self.supply_overshoot_gone_rise_k
 
     @staticmethod
     def heat_at_speed_w(speed_heat_w: tuple[float, ...], speed_hz, T_outdoor):

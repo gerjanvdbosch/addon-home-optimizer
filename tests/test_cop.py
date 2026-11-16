@@ -882,7 +882,9 @@ def test_heat_and_power_follow_the_speed_a_run_holds_at_its_outdoor_temperature(
 
 def test_heating_fit_learns_the_speed_runs_hold_past_their_start_by_outdoor(tmp_path):
     """The outdoor unit turns down less in colder air: runs come down from a
-    start's speed and hold 26 Hz above 10 degC, 1.5 Hz more per K below. The
+    start's speed and, asked for the least, hold 26 Hz above 10 degC, 1.5 Hz
+    more per K below. Most of a run asks for more, and the speed follows: the
+    least is what the run holds when asked for the least, not its median. The
     heat per speed is one line in speed and outdoor temperature, so the least
     heat is higher in the cold than the floor's runs' least alone tells."""
 
@@ -892,14 +894,16 @@ def test_heating_fit_learns_the_speed_runs_hold_past_their_start_by_outdoor(tmp_
 
     rng = np.random.default_rng(5)
     line = (600.0, 75.0, -5.0, 2.0)
-    runs, minutes = 24, 60
+    runs, minutes = 24, 95
     outdoor_per_run = rng.uniform(0.0, 14.0, size=runs)
     T_outdoor = np.repeat(outdoor_per_run, minutes)
-    # Runs at one outdoor temperature hold scattered speeds (what was asked).
-    scatter_hz = np.repeat(rng.normal(0.0, 2.0, size=runs), minutes)
-    held_hz = 26.0 + 1.5 * np.maximum(10.0 - T_outdoor, 0.0) + scatter_hz
-    # 20 minutes coming down from the start's speed, then settled.
-    speed_hz = np.where(np.tile(np.arange(minutes), runs) < 20, 45.0, held_hz)
+    least_hz = 26.0 + 1.5 * np.maximum(10.0 - T_outdoor, 0.0)
+    # Runs at one outdoor temperature asked for scattered heat above the least.
+    asked_hz = least_hz + np.repeat(rng.uniform(0.0, 10.0, size=runs), minutes)
+    # 20 minutes coming down from the start's speed, 55 at what was asked,
+    # the last 20 at the least.
+    minute = np.tile(np.arange(minutes), runs)
+    speed_hz = np.where(minute < 20, 45.0, np.where(minute < 75, asked_hz, least_hz))
     q_th_w = HeatPumpCOPModel.heat_at_speed_w(line, speed_hz, T_outdoor)
     T_supply = 26.0
     water_w_per_k = (RHO_WATER_KG_PER_L / 60.0) * CP_WATER_J_PER_KG_K * FLOW_LPM
@@ -933,8 +937,8 @@ def test_heating_fit_learns_the_speed_runs_hold_past_their_start_by_outdoor(tmp_
             np.interp(outdoor_c, model.held_speed_outdoor_c, model.held_speed_hz)
         )
 
-    assert held(2.0) == pytest.approx(38.0, abs=2.0)
-    assert held(12.0) == pytest.approx(26.0, abs=1.0)
+    assert held(2.0) == pytest.approx(38.0, abs=1.0)
+    assert held(12.0) == pytest.approx(26.0, abs=0.5)
     # Through the scatter, not stepping with it: a forecast a little colder
     # asks no jump in speed.
     assert np.all(
@@ -1006,3 +1010,40 @@ def test_a_heating_run_from_off_starts_faster_and_falls_to_its_held_speed():
     )
     assert model.start_excess_heat_w(5.0, -900.0, 0.0) == 0.0
     assert model.start_excess_heat_w(5.0, 3600.0, 4500.0) == 0.0
+
+
+def test_heating_fit_reads_the_supplys_overshoot_over_the_flow_setpoint():
+    """The supply sits above the flow setpoint, most at a small rise asked:
+    0.6 K at the base rise, none from 4 K. Read off the settled readings that
+    ask more than the base rise; without the setpoint, none."""
+
+    rng = np.random.default_rng(3)
+    runs, minutes = 12, 120
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    asked_k = np.repeat(rng.uniform(2.0, 5.0, size=runs), minutes)
+    T_return = 22.0
+    flow_setpoint_c = T_return + asked_k
+    overshoot_k = 0.6 * np.clip((4.0 - asked_k) / 2.0, 0.0, None)
+    df = pd.DataFrame(
+        {
+            "time": pd.to_datetime(
+                [
+                    start + timedelta(hours=3 * run, minutes=minute)
+                    for run in range(runs)
+                    for minute in range(minutes)
+                ],
+                utc=True,
+            ),
+            "T_return": T_return,
+            "T_supply": flow_setpoint_c + overshoot_k,
+            "flow_setpoint": flow_setpoint_c,
+            "compressor_frequency": 30.0,
+        }
+    )
+    identifier = HeatPumpCOPIdentifier(key="heating")
+
+    at_base_k, gone_k = identifier._supply_overshoot(df)
+
+    assert at_base_k == pytest.approx(0.6, abs=0.02)
+    assert gone_k == pytest.approx(4.0, abs=0.05)
+    assert identifier._supply_overshoot(df.drop(columns="flow_setpoint")) == (0.0, 0.0)
