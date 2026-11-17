@@ -8,7 +8,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 
 from app.settings import configure_logger, create_repositories, load_settings
 from app.worker import Worker
@@ -127,8 +127,13 @@ async def status(request: Request):
 
 
 @app.get("/api/state")
-async def state(request: Request):
-    return request.app.state.repositories.state.load()
+async def state(request: Request) -> Response:
+    """The plan marks quarters without a value with NaN (space_supply_c while
+    the zone is off), which strict JSON lacks: pydantic writes it as null."""
+    return Response(
+        request.app.state.repositories.state.load().model_dump_json(),
+        media_type="application/json",
+    )
 
 
 @app.get("/api/config")

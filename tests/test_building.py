@@ -22,6 +22,7 @@ from domain.physics import (
     floor_heat_w,
     floor_living_fraction,
     floor_loops_conductance_w_per_k,
+    ground_floor_conductance_w_per_k,
     horizon_visible_fraction,
     internal_gain_w,
     night_share,
@@ -1401,7 +1402,7 @@ def test_a_rooms_sun_warms_that_room_before_the_rest():
     runs ahead."""
 
     a_d, b_d = discretize_zoh(*zone_state_space(TRUE_MODEL), 3600.0)
-    sun_in_living = np.array([20.0, 0.0, 2000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    sun_in_living = np.array([20.0, 0.0, 2000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
     state = a_d @ np.full(4, 20.0) + b_d @ sun_in_living
 
@@ -1519,6 +1520,24 @@ def test_the_upper_slab_warms_the_living_room_through_its_ceiling():
     }
 
 
+def test_the_living_rooms_slab_loses_heat_to_the_ground_below_it():
+    """A house at one temperature over colder ground loses UA x dT through
+    the living room's floor alone; Rc 3.7 over 42 m2 is 10.4 W/K, and no
+    floor on the ground none."""
+
+    ua = ground_floor_conductance_w_per_k(42.0, 3.7)
+    model = replace(TRUE_MODEL, ua_ground_w_per_k=ua)
+    a, b = zone_state_space(model)
+    ground = np.zeros(b.shape[1])
+    ground[0], ground[9] = 20.0, 10.0
+    flows = zone_heat_capacities(model) * (a @ np.full(4, 20.0) + b @ ground)
+
+    assert ua == pytest.approx(42.0 / 4.04)
+    assert ground_floor_conductance_w_per_k(42.0, None) == 0.0
+    assert flows.sum() == pytest.approx(-ua * 10.0)
+    assert flows[2] == pytest.approx(-ua * 10.0)
+
+
 def test_the_floors_heat_lands_only_under_the_loops_that_are_open():
     """With the rest's loops closed the floor's heat all enters the living
     room's screed, the zone storing the same heat; with every loop open
@@ -1540,7 +1559,7 @@ def test_the_floors_heat_lands_only_under_the_loops_that_are_open():
     living = floor_living_fraction(share, 0.0, share)
     moved = floor_heat_moved_w(1000.0, living, share)
     heated = capacity * (
-        b @ np.array([0.0, 0.0, 0.0, 0.0, 1000.0, moved, 0.0, 0.0, 0.0])
+        b @ np.array([0.0, 0.0, 0.0, 0.0, 1000.0, moved, 0.0, 0.0, 0.0, 0.0])
     )
 
     assert heated.sum() == pytest.approx(1000.0)
@@ -1649,7 +1668,8 @@ def test_a_screed_holds_part_of_the_slabs_heat_at_the_floors_surface():
     uniform = np.full(6, 20.0)
 
     stored = capacity @ (
-        a @ uniform + b @ np.array([20.0, 0.0, 0.0, 0.0, 1000.0, 0.0, 0.0, 0.0, 0.0])
+        a @ uniform
+        + b @ np.array([20.0, 0.0, 0.0, 0.0, 1000.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     )
     assert stored == pytest.approx(1000.0)
     assert np.nonzero(b[:, 4])[0].tolist() == [4, 5]
@@ -1673,7 +1693,7 @@ def test_the_occupants_warm_the_living_rooms_air_first():
         * (TRUE_MODEL.living_area_fraction)
     )
     model = replace(TRUE_MODEL, ua_living_air_w_per_k=600.0, c_living_air_j_per_k=air_c)
-    people = np.array([20.0, 0.0, 0.0, 0.0, 0.0, 0.0, 150.0, 0.0, 0.0])
+    people = np.array([20.0, 0.0, 0.0, 0.0, 0.0, 0.0, 150.0, 0.0, 0.0, 0.0])
 
     a, b = zone_state_space(model)
     plain_a, plain_b = zone_state_space(TRUE_MODEL)
@@ -1727,7 +1747,7 @@ def test_a_screed_in_halves_holds_the_same_heat_and_shows_it_later():
             3.0e6 * shares,
         ]
     )
-    heat = np.array([20.0, 0.0, 0.0, 0.0, 1000.0, 0.0, 0.0, 0.0, 0.0])
+    heat = np.array([20.0, 0.0, 0.0, 0.0, 1000.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
     assert a.shape == (8, 8)
     assert np.nonzero(b[:, 4])[0].tolist() == [6, 7]
@@ -1885,7 +1905,7 @@ def test_a_constant_schedule_filters_as_the_constant_system():
     a, b = zone_state_space(TRUE_MODEL)
     n = 50
     inputs = np.column_stack(
-        [rng.uniform(0, 15, n), rng.uniform(0, 500, n)] + [np.zeros(n)] * 7
+        [rng.uniform(0, 15, n), rng.uniform(0, 500, n)] + [np.zeros(n)] * 8
     )
     measured = 20.0 + rng.normal(0, 0.1, (n, 2))
     dt = np.full(n, DT_SECONDS)
@@ -2464,7 +2484,14 @@ def test_the_water_reads_the_screed_once_a_run_settled():
             "Q_floor_w": [0.0, 4500.0, 4000.0, 3500.0, 3000.0, -1500.0],
             # Only the living room's loops open in the fifth quarter hour.
             "floor_open_living": [np.nan, share, share, share, share, share],
-            "floor_open_rest": [np.nan, 1 - share, 1 - share, 1 - share, 0.0, 1 - share],
+            "floor_open_rest": [
+                np.nan,
+                1 - share,
+                1 - share,
+                1 - share,
+                0.0,
+                1 - share,
+            ],
             "floor_flow_lpm": [np.nan, 18.0, 18.0, 18.0, 16.0, 18.0],
             "flow_lpm": [0.0, 18.0, 18.0, 18.0, 16.0, 18.0],
         }

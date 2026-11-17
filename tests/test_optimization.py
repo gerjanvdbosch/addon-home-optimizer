@@ -1779,13 +1779,16 @@ def test_the_status_says_which_plan_is_in_force_and_why_the_last_failed():
         "ValueError: no forecast"
     )
 
-    optimization.publish_status("previous_plan", START, "infeasible")
+    optimization.publish_status("previous_plan", START, "infeasible", HeatPumpStates())
     state, attributes = home_assistant.states[Optimization.STATUS_ENTITY]
 
     assert state == "previous_plan"
     assert attributes["plan_time"] == START.isoformat()
     assert attributes["reason"] == "infeasible"
+    # For the blueprint, which follows the config's heat pump state labels.
+    assert attributes["heat_pump_states"]["dhw"] == "SWW"
+    assert attributes["heat_pump_states"]["off"] == "Uit"
 
-    optimization.publish_status("ok", START, None)
+    optimization.publish_status("OK", START, None, HeatPumpStates())
 
     assert home_assistant.states[Optimization.STATUS_ENTITY][1]["reason"] is None

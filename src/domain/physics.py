@@ -48,6 +48,10 @@ CP_AIR_J_PER_KG_K = 1005.0
 # than silently dropped.
 Q_PERSON_SENSIBLE_W = 75.0
 
+# The surface resistance on either side of a floor with the heat flowing down
+# (m2K/W, NEN-EN-ISO 6946): above it in the room, below it in the crawl space.
+FLOOR_SURFACE_RESISTANCE_M2K_PER_W = 0.17
+
 # Share of the sun through open glazing that the floor absorbs (the PVC on the
 # screed); the rest is taken up by the furnishings and walls' light surfaces,
 # which pass it to the air within minutes. An assumption, not a fit: freed, the
@@ -355,7 +359,7 @@ def zone_state_space(
     air, where it has a node of its own (see
     BuildingThermalModel.ua_living_air_w_per_k), last;
     u = [T_outdoor, Q_internal, Q_living, Q_rest, Q_floor, Q_floor_moved,
-    Q_living_air, Q_sun_living, Q_sun_rest].
+    Q_living_air, Q_sun_living, Q_sun_rest, T_ground].
 
     Q_internal and Q_floor are the dwelling's, divided by floor area; Q_living
     and Q_rest land in that room alone: the sun its glazing lets through behind
@@ -373,9 +377,12 @@ def zone_state_space(
     out of the rest's: where rooms have closed their loops, the water heats
     only the floors still open (see floor_heat_moved_w) - zero with every loop
     open. The rest's slab exchanges with the living room below it too,
-    through its ceiling. Q_living_air is the heat of the occupants awake in
-    the living room: it warms the air around them first, the thermostat's,
-    which passes it on to the room - or without an air node the room itself.
+    through its ceiling; the living room's slab with the ground below it,
+    through the ground floor's insulation (see
+    BuildingThermalModel.ua_ground_w_per_k). Q_living_air is the heat of the
+    occupants awake in the living room: it warms the air around them first,
+    the thermostat's, which passes it on to the room - or without an air node
+    the room itself.
     With that node the living room's floor surface exchanges with it too, by
     FLOOR_CONVECTIVE_SHARE of its conductance, and with the room by the rest.
 
@@ -402,7 +409,7 @@ def zone_state_space(
     size = zone_size(model)
 
     a = np.zeros((size, size))
-    b = np.zeros((size, 9))
+    b = np.zeros((size, 10))
 
     for room, other in ((0, 1), (1, 0)):
         slab = room + 2
@@ -435,6 +442,10 @@ def zone_state_space(
             a[pipes, slab] = ua_down[room] / c_pipes
             a[slab, pipes] = ua_down[room] / c_slab
             a[slab, slab] = -ua_down[room] / c_slab
+
+    ground = model.ua_ground_w_per_k
+    a[2, 2] -= ground / c[2]
+    b[2, 9] = ground / c[2]
 
     ceiling = model.ua_ceiling_w_per_k
     a[0, 0] -= ceiling / c[0]
@@ -893,6 +904,26 @@ def indoor_dew_point_c(
         e = e + weight * (outdoor[..., k] + model.moisture_surplus_pa - e)
 
     return dew_point_c(np.stack(pressures, axis=-1))
+
+
+def ground_floor_conductance_w_per_k(area_m2: float, rc: float | None) -> float:
+    """From a ground floor's slab to the ground below it (W/K): its area over
+    the floor's thermal resistance and both surface resistances. Zero without
+    a floor on the ground."""
+
+    if rc is None:
+        return 0.0
+
+    return area_m2 / (rc + 2.0 * FLOOR_SURFACE_RESISTANCE_M2K_PER_W)
+
+
+def ground_temperature_c(day_of_year):
+    """The ground's temperature under the house (deg C): the year's air
+    temperature cycle damped and delayed by the ground, as the mains water
+    takes it on (see mains_water_temperature_c). Assumed for the crawl space
+    under the floor, which is not measured."""
+
+    return np.vectorize(mains_water_temperature_c, otypes=[float])(day_of_year)
 
 
 def mains_water_temperature_c(day_of_year: int) -> float:

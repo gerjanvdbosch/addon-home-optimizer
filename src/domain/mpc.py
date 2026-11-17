@@ -191,6 +191,10 @@ class MPCInput:
     # surfaces (see physics.zone_state_space).
     zone_living_sun_w: tuple[float, ...] = ()
     zone_rest_sun_w: tuple[float, ...] = ()
+    # The ground's temperature under the house per step (deg C, see
+    # physics.ground_temperature_c), where the living room's floor lies on it
+    # (BuildingThermalModel.ua_ground_w_per_k).
+    zone_ground_c: tuple[float, ...] = ()
     # The envelope's conductance per step (W/K): windows open more on warmer
     # days (see physics.envelope_conductance_w_per_k). Empty is the building
     # model's own, every step.
@@ -243,10 +247,12 @@ class MPCInput:
     # BuildingConfig.insulated_pipes). Empty leaves the supply to the floor
     # and the compressor.
     zone_supply_minimum_c: tuple[float, ...] = ()
-    # While cooling, the local calendar day each step lies in (any number that
-    # differs between days), and whether the tank was heated earlier today: a
-    # day's cooling comes before its hot water (see
-    # MPCOptimizer._add_space_heating). Empty orders nothing.
+    # The local calendar day each step lies in (any number that differs
+    # between days), and whether the tank was heated earlier today: while
+    # cooling, a day's cooling comes before its hot water (see
+    # MPCOptimizer._add_space_heating), empty ordering nothing; while heating,
+    # the days the zone's hand-over to the tank is searched in (see
+    # MPCOptimizer._solve_with_zone).
     zone_local_day: tuple[int, ...] = ()
     dhw_earlier_today: bool = False
     # How long the compressor run under way has lasted (hours); 0 without one,

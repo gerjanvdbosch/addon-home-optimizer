@@ -320,6 +320,11 @@ class BuildingThermalModel:
     # concrete floor that is the living room's ceiling. Zero is no floor of
     # the rest's above the living room - and a model saved before it.
     ua_ceiling_w_per_k: float = 0.0
+    # From the living room's slab down through the insulated ground floor to
+    # the ground below it (W/K): configured (see BuildingConfig.ground_floor_rc),
+    # not fitted - free, folds fitted 0-6 +- 6 W/K (Oct-Nov 2026). Zero is no
+    # floor on the ground - and a model saved before it.
+    ua_ground_w_per_k: float = 0.0
     # Share of the occupants' heat that is in the rest of the house while they
     # sleep: the bedrooms are there. By day it lands by floor area. None is by
     # floor area at night too - a model saved before it.

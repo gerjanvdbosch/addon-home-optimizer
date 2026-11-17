@@ -1054,15 +1054,24 @@ class MPCOptimizer:
         # in scattered quarters, the one before the hand-over often not among
         # them - and free after it that day; cooling shares no run with the
         # tank (see plan_tank).
+        # A block the previous plan starts now is not under way until the heat
+        # pump has begun it: held off by hand, every replan planned it for the
+        # quarter under way and none moved it, for an hour (17 Nov 2026).
         tank_on = data.previous_tank_on[: tank.num_steps]
         day = data.zone_local_day
         start = next(
-            (k for k in range(1, len(tank_on)) if tank_on[k] and not tank_on[k - 1]),
+            (
+                k
+                for k in range(len(tank_on))
+                if tank_on[k] and not (tank_on[k - 1] if k else data.boiler_on_current)
+            ),
             None,
         )
         tomorrow = next((k for k in range(1, len(day)) if day[k] != day[k - 1]), 0)
+        # Before now there is no hand-over: such a block is tried later.
+        shift = HANDOVER_SHIFTS_STEPS[tomorrow % len(HANDOVER_SHIFTS_STEPS)]
         end = (
-            start + HANDOVER_SHIFTS_STEPS[tomorrow % len(HANDOVER_SHIFTS_STEPS)]
+            (start + shift if start + shift > 0 else start - shift)
             if start is not None
             and not data.zone_cooling
             and tank.step_start_h[start] < HANDOVER_LEAD_HOURS
@@ -3425,6 +3434,14 @@ class MPCOptimizer:
         living_air_gain_w = data.zone_living_air_gain_w or none_w
         living_sun_w = data.zone_living_sun_w or none_w
         rest_sun_w = data.zone_rest_sun_w or none_w
+        # Only read where the living room's floor lies on the ground.
+        ground_c = data.zone_ground_c or none_w
+
+        if building.ua_ground_w_per_k and not data.zone_ground_c:
+            raise ValueError(
+                "The living room's floor lies on the ground: the plan needs the "
+                "ground's temperature (MPCInput.zone_ground_c)."
+            )
 
         # The same compressor serves both, so its output is the tank's nominal
         # heat - but the zone no more than its runs have moved (see
@@ -3692,6 +3709,7 @@ class MPCOptimizer:
                         float(living_air_gain_w[k]),
                         float(living_sun_w[k]),
                         float(rest_sun_w[k]),
+                        float(ground_c[k]),
                     ]
                 )
                 state = a_d @ state + b_d @ inputs

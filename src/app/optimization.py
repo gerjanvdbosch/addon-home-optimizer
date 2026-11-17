@@ -10,13 +10,14 @@ import numpy as np
 import pandas as pd
 
 from app.state import StateManager
-from domain.config import BoilerConfig, Config, Price, Tariff
+from domain.config import BoilerConfig, Config, HeatPumpStates, Price, Tariff
 from domain.jobs import OptimizeConfig
 from domain.models import BoilerThermalModel, FloorCircuitModel, HeatPumpCOPModel
 from domain.mpc import MPCConfig, MPCInput, MPCResult
 from domain.physics import (
     CP_WATER_J_PER_KG_K,
     RHO_WATER_KG_PER_L,
+    ground_temperature_c,
     indoor_dew_point_c,
     mains_water_temperature_c,
     zone_observations,
@@ -517,7 +518,7 @@ class Optimization:
         # on, so its starts and stops still come; without one (or past its
         # end) the hot water alone, as the zone must not take that plan down
         # with it. Published as the status either way (see publish_status).
-        status, plan_time, reason = "ok", now, None
+        status, plan_time, reason = "OK", now, None
 
         try:
             result = optimizer.solve(planned)
@@ -559,15 +560,17 @@ class Optimization:
                 try:
                     result = optimizer.solve(planned)
                 except Exception:
-                    self.publish_status("no_plan", None, reason)
+                    self.publish_status(
+                        "no_plan", None, reason, config.heat_pump.states
+                    )
                     raise
             else:
-                self.publish_status("no_plan", None, reason)
+                self.publish_status("no_plan", None, reason, config.heat_pump.states)
                 raise
 
         # Only a whole plan: one of the hot water alone would, followed, leave
         # the zone without its runs where an older whole one still has them.
-        if status == "ok":
+        if status == "OK":
             self.state_manager.update_plan(
                 Plan(made=now, times=forecast_times, result=result)
             )
@@ -679,7 +682,7 @@ class Optimization:
             optimizer.floor_circuit_model,
             optimizer.space_cop_model,
         )
-        self.publish_status(status, plan_time, reason)
+        self.publish_status(status, plan_time, reason, config.heat_pump.states)
         # Last, so it reads after what was published: the day's sensors, then
         # its tables (see log_day_costs).
         self.log_day_costs(
@@ -756,13 +759,20 @@ class Optimization:
         return f"{type(error).__name__}: {text}"[:80]
 
     def publish_status(
-        self, status: str, plan_time: datetime | None, reason: str | None
+        self,
+        status: str,
+        plan_time: datetime | None,
+        reason: str | None,
+        heat_pump_states: HeatPumpStates,
     ) -> None:
-        """Whether the plan in force was solved now ('ok'), is a previous one
+        """Whether the plan in force was solved now ('OK'), is a previous one
         followed ('previous_plan'), the hot water's alone ('dhw_only'),
         or there is none ('no_plan'); when the plan in force was made and
         why the last solve failed. An automation warns on the plan's age: a
-        job that never gets this far leaves it to grow too."""
+        job that never gets this far leaves it to grow too.
+
+        With it the heat pump state's label per mode, so the blueprint
+        follows the config rather than its own copy."""
 
         self.home_assistant.set_state(
             self.STATUS_ENTITY,
@@ -771,6 +781,7 @@ class Optimization:
                 "friendly_name": "Home Optimizer status",
                 "plan_time": plan_time.isoformat() if plan_time else None,
                 "reason": reason,
+                "heat_pump_states": heat_pump_states.model_dump(),
             },
         )
 
@@ -2097,6 +2108,11 @@ class Optimization:
             zone_living_air_gain_w=gain("living_air_gain_w"),
             zone_living_sun_w=tuple(planned["living_sun_w"].fillna(0.0)),
             zone_rest_sun_w=tuple(planned["rest_sun_w"].fillna(0.0)),
+            zone_ground_c=tuple(
+                ground_temperature_c(
+                    [to_local_time(t).timetuple().tm_yday for t in times]
+                ).tolist()
+            ),
             # Beyond the forecast the envelope a day earlier, else the nearest.
             zone_envelope_w_per_k=tuple(
                 self.state_manager.extend_forecast(
@@ -2117,8 +2133,11 @@ class Optimization:
         )
 
         # The measurements start at local midnight, so any hot water among
-        # them was today's.
-        if cooling and config.building.dhw_after_cooling:
+        # them was today's. Heating too: the zone's hand-over search reads
+        # its days and alternates on where tomorrow begins - without them it
+        # only ever tried earlier (real data, 17 Nov 2026: hot water kept at
+        # 11:30 at 4 degC, at 13:45 1.4 ct cheaper).
+        if not cooling or config.building.dhw_after_cooling:
             inputs["zone_local_day"] = tuple(
                 to_local_time(t).toordinal() for t in times
             )

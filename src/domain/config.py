@@ -396,6 +396,11 @@ class BuildingConfig(BaseModel):
     # chance of condensation. On, a day the tank has been heated is not cooled
     # again until local midnight (see MPCOptimizer._add_space_heating).
     dhw_after_cooling: bool = Field(default=True)
+    # The thermal resistance of the thermostat's room's floor, from its slab
+    # to the crawl space or ground below it (m2K/W): the floor's insulation.
+    # The default is the Dutch building code's minimum for a new house (2015
+    # on). None is no floor on the ground under that room (an upper flat).
+    ground_floor_rc: float | None = Field(default=3.7, gt=0.0)
 
     def comfort(self, cooling: bool) -> tuple[list[tuple[time, float]], ...] | None:
         """A mode's comfort as three schedules: the wanted temperature and the

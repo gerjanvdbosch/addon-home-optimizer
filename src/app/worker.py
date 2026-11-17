@@ -1,10 +1,11 @@
 import logging
+import signal
 import sys
 from datetime import UTC, datetime
 from multiprocessing import get_context
 from multiprocessing.context import SpawnProcess
 from queue import Queue
-from threading import Thread
+from threading import Lock, Thread
 
 from domain.jobs import Job, JobType, WorkerState
 
@@ -28,6 +29,10 @@ class Worker:
         self.thread: Thread | None = None
         self.process: SpawnProcess | None = None
         self.jobs: dict[str, dict] = {}
+        # Guards stopping against a job being started at the same moment, so
+        # stop() never misses the process it has to end.
+        self.lock = Lock()
+        self.stopping = False
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -57,10 +62,21 @@ class Worker:
         if not self.thread:
             return
 
+        with self.lock:
+            self.stopping = True
+            process = self.process
+
         self.queue.put(None)
 
-        if self.process and self.process.is_alive():
-            self.process.terminate()
+        if process and process.is_alive():
+            process.terminate()
+            # The job handles the SIGTERM between Python steps, so a HiGHS
+            # solve finishes first; kill it within the supervisor's 10 s stop
+            # timeout instead.
+            process.join(timeout=5)
+
+            if process.is_alive():
+                process.kill()
 
         self.thread.join(timeout=10)
 
@@ -71,22 +87,28 @@ class Worker:
             job = self.queue.get()
 
             if job is None:
-                logging.info("Worker stopped")
                 break
 
-            self.jobs[job.id]["state"] = WorkerState.RUNNING
-
-            logging.info(
-                "Job started: id=%s type=%s",
-                job.id[:6],
-                job.type.value,
-            )
-
             try:
-                self.process = get_context("spawn").Process(
-                    target=run_job, args=(job,), daemon=True
-                )
-                self.process.start()
+                with self.lock:
+                    # Jobs still queued when the add-on stops are dropped: a
+                    # started one would only be terminated again.
+                    if self.stopping:
+                        break
+
+                    self.jobs[job.id]["state"] = WorkerState.RUNNING
+
+                    logging.info(
+                        "Job started: id=%s type=%s",
+                        job.id[:6],
+                        job.type.value,
+                    )
+
+                    self.process = get_context("spawn").Process(
+                        target=run_job, args=(job,), daemon=True
+                    )
+                    self.process.start()
+
                 self.process.join()
 
                 if self.process.exitcode == 0:
@@ -113,8 +135,16 @@ class Worker:
             finally:
                 del self.jobs[job.id]
 
+        logging.info("Worker stopped")
+
 
 def run_job(job: Job):
+    # Stopping the add-on terminates a running job. Leave through SystemExit,
+    # not by dying on the signal, so multiprocessing's exit handlers unlink the
+    # job's named semaphores (pyomo creates a Lock at import); otherwise the
+    # resource tracker reports them as leaked at shutdown.
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
+
     # Imported here, in the job's process, so the web process never loads the
     # modelling libraries.
     from app.bootstrap import create_container

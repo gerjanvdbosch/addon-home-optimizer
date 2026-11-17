@@ -47,6 +47,8 @@ from domain.physics import (
     floor_heat_w,
     floor_living_fraction,
     floor_loops_conductance_w_per_k,
+    ground_floor_conductance_w_per_k,
+    ground_temperature_c,
     horizon_visible_fraction,
     internal_gain_w,
     night_share,
@@ -352,12 +354,17 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
     # The room node per m2 of floor: at least its air (rho*V*cp, from the
     # configured volume); at most air, furnishings (some 10 kg/m2 of wood, 25
-    # kJ/m2K) and internal walls - about a square metre of 10 cm calcium silicate
-    # brick per square metre of floor, 160 kJ/m2K - with room to spare. The
-    # walls belong here, not with the slab: they follow the room air closely
+    # kJ/m2K) and the walls on the room side of the insulation. In a terraced
+    # house those are mostly the party walls: two of some 50 m2, each with
+    # 10-20 cm of calcium silicate (1.6 MJ/m3K) on this side, ~24 MJ/K, and the
+    # facades' inner leaves, ~7 MJ/K - some 350-480 kJ/m2K over 84 m2 of floor.
+    # The walls belong here, not with the slab: they follow the room air closely
     # (a three-node fit coupled them to it at its 2000 W/K ceiling), while the
-    # slab exchanges with the room through its surface only.
-    MAX_AIR_CAPACITY_J_PER_M2_K = 250.0e3
+    # slab exchanges with the room through its surface only. At 250 kJ/m2K (one
+    # square metre of 10 cm wall per m2 of floor) every fit sat on the bound;
+    # freed, folds fitted to 6 Oct - 10 Nov 2026 took 254-339, held out
+    # living/rest 0.0793/0.0817 -> 0.0783/0.0801 K (18 Nov 2026).
+    MAX_AIR_CAPACITY_J_PER_M2_K = 500.0e3
     INITIAL_AIR_CAPACITY_J_PER_M2_K = 100.0e3
 
     # The floor slab per m2: at least 4 cm of screed (2000 kg/m3, 850 J/kgK);
@@ -646,6 +653,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
         # off the floor's runs by calibrate (see _fit_screed) and held through
         # its last fit.
         self.screed: tuple[float, float] = (0.0, 0.0)
+        # The living room's slab to the ground (see
+        # BuildingConfig.ground_floor_rc), set by dataset(); none until then.
+        self.ua_ground_w_per_k = 0.0
         # Whether the data shows a horizon east and west of the facade's
         # normal (see _horizon_scan), read off it during each fit; a horizon
         # left open until then.
@@ -955,6 +965,7 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             c_living_air_j_per_k=self.living_air_capacity_j_per_k,
             horizon_east_deg=float(x[24]),
             horizon_west_deg=float(x[25]),
+            ua_ground_w_per_k=self.ua_ground_w_per_k,
         )
 
     def load(self, path) -> None:
@@ -1463,8 +1474,8 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
 
     def _inputs(self, model, df: pd.DataFrame) -> np.ndarray:
         """u = [T_outdoor, Q_internal, Q_living, Q_rest, Q_floor,
-        Q_floor_moved, Q_living_air, Q_sun_living, Q_sun_rest] per sample (see
-        physics.zone_state_space).
+        Q_floor_moved, Q_living_air, Q_sun_living, Q_sun_rest, T_ground] per
+        sample (see physics.zone_state_space).
 
         Rebuilt per fit iteration because three of the six depend on
         identified parameters (the effective apertures, the in-zone baseload
@@ -1567,6 +1578,9 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
                 df["Q_floor_moved_w"].to_numpy(dtype=float),
                 q_living_air,
                 *q_open,
+                ground_temperature_c(
+                    pd.DatetimeIndex(df["time"]).tz_convert(LOCAL_TIMEZONE).day_of_year
+                ),
             ]
         )
 
@@ -3619,6 +3633,10 @@ class BuildingThermalIdentifier(SystemIdentifier[BuildingThermalModel]):
             )
 
         self.thermostat_room_index = matching[0]
+        self.ua_ground_w_per_k = ground_floor_conductance_w_per_k(
+            self.room_areas_m2[self.thermostat_room_index],
+            config.building.ground_floor_rc,
+        )
         self.room_temperature_columns = [
             f"room_temperature_{i}" for i in range(len(self.room_areas_m2))
         ]

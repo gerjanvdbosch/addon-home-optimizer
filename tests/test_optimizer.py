@@ -1148,6 +1148,46 @@ def test_a_replan_tries_handing_the_zone_over_to_the_tank_earlier_or_later(
     assert start + shift in first_steps
 
 
+@pytest.mark.parametrize(("tomorrow", "begun"), [(20, False), (21, False), (21, True)])
+def test_a_block_planned_for_now_moves_until_the_heat_pump_begins_it(
+    monkeypatch, tomorrow, begun
+):
+    """The previous plan's block at the quarter under way is not under way
+    until the tank's run is, and is tried later either quarter hour - there
+    is no earlier: held off by hand, every replan planned hot water for now
+    and none tried handing the floor run over later (real data, 17 Nov
+    2026)."""
+
+    num_steps = len(SOLAR_FORECAST_W)
+    target = [10.0] * num_steps
+    target[num_steps - 6 : num_steps - 2] = [45.0] * 4
+    zone_ends = []
+    plan_tank = optimizer_module.plan_tank
+
+    def recording(tank, zone_on=(), *args):
+        zone_ends.extend(
+            k for k in range(1, len(zone_on)) if zone_on[k - 1] and not zone_on[k]
+        )
+        return plan_tank(tank, zone_on, *args)
+
+    monkeypatch.setattr(optimizer_module, "plan_tank", recording)
+    MPCOptimizer(
+        THERMAL_MODEL, MPCConfig(), cop_model=COP_MODEL, building_model=BUILDING_MODEL
+    ).solve(
+        _zone_input(
+            target_temperature_top=tuple(target),
+            boiler_on_current=begun,
+            space_on_current=not begun,
+            space_elapsed_hours=0.0 if begun else 2.0,
+            previous_space_on=(0,) * num_steps,
+            previous_tank_on=tuple(int(k < 5) for k in range(num_steps)),
+            zone_local_day=tuple(int(k >= tomorrow) for k in range(num_steps)),
+        )
+    )
+
+    assert (2 in zone_ends) == (not begun)
+
+
 @pytest.mark.parametrize(("pause", "holds"), [(1, False), (2, True)])
 def test_the_compressor_never_pauses_for_a_single_quarter(pause, holds):
     """A pause shorter than MPCConfig.heat_pump_min_off_steps is a start for
@@ -1400,7 +1440,7 @@ def test_a_zone_run_handed_over_by_the_tank_takes_the_loops_heat():
     for k in range(len(result.schedule) - 1):
         floor_w = result.space_heat_w[k] + handover_j / 900.0 * (k in handed)
         state = a_d @ state + b_d @ np.array(
-            [data.ambient_temperature, 0.0, 0.0, 0.0, floor_w, 0.0, 0.0, 0.0, 0.0]
+            [data.ambient_temperature, 0.0, 0.0, 0.0, floor_w, 0.0, 0.0, 0.0, 0.0, 0.0]
         )
 
         assert float(zone_observation(BUILDING_MODEL) @ state) == pytest.approx(
@@ -1891,7 +1931,7 @@ def test_a_plan_through_the_living_rooms_loops_alone_heats_its_floor():
     for k in range(len(heat) - 1):
         moved = (1.0 - share) * heat[k] if closed[k] else 0.0
         state = a_d @ state + b_d @ np.array(
-            [5.0, 150.0, 0.0, 0.0, heat[k], moved, 0.0, 0.0, 0.0]
+            [5.0, 150.0, 0.0, 0.0, heat[k], moved, 0.0, 0.0, 0.0, 0.0]
         )
         assert living_floor[k + 1] == pytest.approx(state[2], abs=1e-4)
 
@@ -1908,7 +1948,7 @@ def test_a_rest_rooms_loops_open_where_left_alone_it_would_be_below_its_setpoint
 
     for _ in range(47):
         unheated.append(
-            a_d @ unheated[-1] + b_d @ np.array([5.0, 150.0, 0, 0, 0, 0, 0, 0, 0])
+            a_d @ unheated[-1] + b_d @ np.array([5.0, 150.0, 0, 0, 0, 0, 0, 0, 0, 0])
         )
 
     rest_row = zone_observations(TWO_NODE)[1]
@@ -3115,7 +3155,7 @@ def test_a_cooling_run_takes_its_ramp_from_the_floor_in_the_step_it_starts():
 
     def zone_after(floor_w: float) -> float:
         state = a_d @ np.array(data.zone_state) + b_d @ np.array(
-            [30.0, 150.0, 0.0, 0.0, floor_w, 0.0, 0.0, 0.0, 0.0]
+            [30.0, 150.0, 0.0, 0.0, floor_w, 0.0, 0.0, 0.0, 0.0, 0.0]
         )
 
         return float(zone_observation(TWO_NODE) @ state)

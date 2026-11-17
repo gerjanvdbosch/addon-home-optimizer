@@ -4,6 +4,23 @@ blueprint:
   domain: automation
   source_url: https://github.com/gerjanvdbosch/addon-home-optimizer/blob/main/blueprints/home_optimizer.yaml
   input:
+    dry_run:
+      name: Dry run
+      description: >-
+        Only notifies what the plan would do: switches and thermostats are
+        left alone, and the watchdogs are off. The bias is still set.
+      default: false
+      selector:
+        boolean:
+    notify_devices:
+      name: Notify devices (optional)
+      description: >-
+        Phones (Companion app) that get runs and warnings. None sends nothing.
+      default: [ ]
+      selector:
+        device:
+          integration: mobile_app
+          multiple: true
     optimizer:
       name: Optimizer enabled
       selector:
@@ -72,7 +89,7 @@ blueprint:
       name: Plan age warning (minutes)
       description: >-
         Warns when the plan in force is older than this, or the optimizer's
-        status (sensor.home_optimizer_status) has not been ok for this long:
+        status (sensor.home_optimizer_status) has not been OK for this long:
         the plans keep failing and the last one is followed or held.
       default: 60
       selector:
@@ -82,27 +99,11 @@ blueprint:
           step: 15
           unit_of_measurement: min
           mode: box
-    notify_devices:
-      name: Notify devices (optional)
-      description: >-
-        Phones (Companion app) that get runs and warnings. None sends nothing.
-      default: [ ]
-      selector:
-        device:
-          integration: mobile_app
-          multiple: true
-    dry_run:
-      name: Dry run
-      description: >-
-        Only notifies what the plan would do: switches and thermostats are
-        left alone, and the watchdogs are off. The bias is still set.
-      default: false
-      selector:
-        boolean:
 
-# For the plan watchdog's template trigger, which sees no variables.
+# For the template triggers, which see no variables.
 trigger_variables:
   stale_minutes: !input stale_minutes
+  heat_pump: !input heat_pump_state
 
 variables:
   living: !input living_climate
@@ -114,7 +115,10 @@ variables:
   dry_run: !input dry_run
   dhw_switch: !input dhw_switch
   dhw_setpoint: !input dhw_setpoint_entity
-  heat_pump: !input heat_pump_state
+  # The heat pump state's label per mode, from the add-on's config
+  # (heat_pump.states); none before its first plan.
+  heat_pump_states: >-
+    {{ state_attr('sensor.home_optimizer_status', 'heat_pump_states') or {} }}
 
 triggers:
   - trigger: state
@@ -124,12 +128,14 @@ triggers:
     id: dhw_start
   # The heat pump out of DHW for 10 minutes, so a started run is never cut off:
   # a defrost keeps the state on DHW, the 10 minutes ride out a flicker, and a
-  # sensor gone unavailable is no end. "SWW" is the add-on's heat_pump mode
-  # dhw default.
-  - trigger: state
-    entity_id: !input heat_pump_state
-    from: SWW
-    not_to: [ SWW, unknown, unavailable ]
+  # sensor gone unavailable is no end. The DHW label is the add-on's
+  # heat_pump.states dhw, so a template: a state trigger's from is fixed.
+  - trigger: template
+    value_template: >-
+      {% set dhw = (state_attr('sensor.home_optimizer_status', 'heat_pump_states')
+                    or {}).get('dhw') %}
+      {{ dhw is not none
+         and states(heat_pump) not in [dhw, 'unknown', 'unavailable'] }}
     for: { minutes: 10 }
     id: dhw_end
   # Dry run: the heat pump does its own hot water, so the plan's end is told.
@@ -167,7 +173,7 @@ triggers:
     at: !input calibrate_time
     id: calibrate
   # Watchdog: a run planned for a quarter of an hour that the heat pump is not
-  # doing. "Uit" and "SWW" are the add-on's heat_pump.states defaults.
+  # doing.
   - trigger: state
     entity_id: binary_sensor.home_optimizer_zone_status
     to: "on"
@@ -182,7 +188,7 @@ triggers:
   # fails before it publishes any status is seen as well.
   - trigger: state
     entity_id: sensor.home_optimizer_status
-    not_to: ok
+    not_to: OK
     for: { minutes: !input stale_minutes }
     id: plan_watchdog
   - trigger: template
@@ -480,9 +486,10 @@ actions:
           - condition: state
             entity_id: binary_sensor.home_optimizer_zone_status
             state: "on"
-          - condition: state
-            entity_id: !input heat_pump_state
-            state: Uit
+          - condition: template
+            value_template: >-
+              {{ heat_pump_states.off is defined
+                 and is_state(heat_pump, heat_pump_states.off) }}
         sequence:
           - variables:
               message: >-
@@ -494,12 +501,12 @@ actions:
         conditions:
           - condition: trigger
             id: plan_watchdog
-          # Still so as the trigger fires: not ok, or the plan in force too
-          # old (a status left at ok by a job that no longer gets that far).
+          # Still so as the trigger fires: not OK, or the plan in force too
+          # old (a status left at OK by a job that no longer gets that far).
           - condition: template
             value_template: >-
               {% set made = state_attr('sensor.home_optimizer_status', 'plan_time') %}
-              {{ not is_state('sensor.home_optimizer_status', 'ok')
+              {{ not is_state('sensor.home_optimizer_status', 'OK')
                  or (made is not none
                      and now() - as_datetime(made)
                          > timedelta(minutes=stale_minutes | int)) }}
@@ -522,7 +529,9 @@ actions:
             entity_id: binary_sensor.home_optimizer_dhw_status
             state: "on"
           - condition: template
-            value_template: "{{ has_value(heat_pump) and states(heat_pump) != 'SWW' }}"
+            value_template: >-
+              {{ heat_pump_states.dhw is defined and has_value(heat_pump)
+                 and states(heat_pump) != heat_pump_states.dhw }}
         sequence:
           - variables:
               message: >-
