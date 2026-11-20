@@ -171,7 +171,8 @@ class MPCInput:
     zone_target_temperature: tuple[float, ...] = ()
     # The hard edges of the comfort band per step (deg C). The maximum is also
     # how warm buffering heat may make the zone, the minimum how cold
-    # buffering cold may. Empty bounds nothing.
+    # buffering cold may - while heating not hard: past it costs comfort (see
+    # weight_comfort_eur_per_k2h). Empty bounds nothing.
     zone_minimum_temperature: tuple[float, ...] = ()
     zone_maximum_temperature: tuple[float, ...] = ()
     # Heat entering the zone that no decision can change (W): appliances,

@@ -1,4 +1,5 @@
 import dataclasses
+import time
 from dataclasses import replace
 
 import highspy
@@ -32,6 +33,7 @@ from domain.physics import (
 from features import optimizer as optimizer_module
 from features.optimizer import (
     MIP_ABSOLUTE_GAP_EUR,
+    PLAN_HOLD_EUR,
     W_PER_KW,
     MPCOptimizer,
     TankPlan,
@@ -605,6 +607,10 @@ def test_the_plan_is_solved_apart_from_its_warm_start(monkeypatch):
         return run(highs)
 
     monkeypatch.setattr(highspy.Highs, "run", recorded)
+    # The plan's search after the program runs instances of its own.
+    monkeypatch.setattr(
+        MPCOptimizer, "_search", lambda self, *args: (None, float("inf"), False)
+    )
 
     target = [10.0] * len(SOLAR_FORECAST_W)
     target[18] = 45.0
@@ -1188,6 +1194,31 @@ def test_a_block_planned_for_now_moves_until_the_heat_pump_begins_it(
     assert (2 in zone_ends) == (not begun)
 
 
+def test_the_plans_search_is_never_dearer_than_the_programs_plan():
+    """The search after the program starts from the program's own plan and
+    keeps a move only where it makes the plan cheaper, priced by the same
+    program with the plan's on/off steps held - to the program's own cost
+    where nothing moved."""
+
+    target = [10.0] * len(SOLAR_FORECAST_W)
+    target[18] = 45.0
+    data = _zone_input(target_temperature_top=tuple(target))
+    optimizer = MPCOptimizer(
+        THERMAL_MODEL, MPCConfig(), cop_model=COP_MODEL, building_model=BUILDING_MODEL
+    )
+    tank = optimizer._tank_setting(data)
+    result, chosen = optimizer._solve_with_zone(data, tank, time.monotonic() + 60)
+    planned = (
+        tuple(int(on) for on in result.space_schedule),
+        tuple(on for on, _ in chosen),
+        tuple(on for _, on in chosen),
+    )
+    plan, cost, held = optimizer._search(data, tank, time.monotonic() + 5, planned)
+
+    assert plan is not None
+    assert cost <= result.objective_value + (PLAN_HOLD_EUR if held else 1e-6)
+
+
 @pytest.mark.parametrize(("pause", "holds"), [(1, False), (2, True)])
 def test_the_compressor_never_pauses_for_a_single_quarter(pause, holds):
     """A pause shorter than MPCConfig.heat_pump_min_off_steps is a start for
@@ -1683,9 +1714,10 @@ def test_without_an_identified_ramp_every_step_is_a_full_one():
     )
 
 
-def test_a_higher_ceiling_buffers_the_sun_in_the_floor_and_the_ceiling_holds():
+def test_a_higher_ceiling_buffers_the_sun_in_the_floor_and_the_ceiling_bends():
     """Room above the target is what a floor buffer is charged into: with it the
-    plan moves heat into the sunny hours, and never past the ceiling."""
+    plan moves heat into the sunny hours. Past the heating ceiling the room
+    costs comfort, squared, so the plan goes a few tenths beyond it at most."""
 
     steps = 96
     hour = (np.arange(steps) * 0.25 + 6.0) % 24.0
@@ -1723,11 +1755,11 @@ def test_a_higher_ceiling_buffers_the_sun_in_the_floor_and_the_ceiling_holds():
         result = optimizer.solve(
             replace(data, zone_maximum_temperature=(ceiling_c,) * steps)
         )
-        assert max(result.zone_temperatures) <= ceiling_c + 1e-6
+        assert max(result.zone_temperatures) <= ceiling_c + 0.3
 
         return float(np.asarray(result.space_heat_w)[sunny].sum())
 
-    assert sunny_heat(22.0) > 1.5 * sunny_heat(20.3)
+    assert sunny_heat(22.0) > 1.3 * sunny_heat(20.3)
 
 
 def _cold_day(steps: int = 96, **overrides):
@@ -2483,14 +2515,17 @@ def _mild_day(below_k: float, sun_w: float = 0.0, weight: float = 0.5):
 def test_a_band_lets_the_morning_dip_that_the_sun_brings_back():
     """Held to its target, the zone is heated in the morning; with a band
     below it the plan lets the morning dip go where the sun brings the zone
-    back - never past the band's edge."""
+    back - never past the band's edge - and heats far less then: what it
+    still heats is kept through the sunny hours for the evening, the
+    ceiling it passes priced as comfort."""
 
     hour, target, exact = _mild_day(0.0, sun_w=2000.0)
     _, _, banded = _mild_day(1.0, sun_w=2000.0)
     morning = hour < 10.0
+    exact_morning_w = np.asarray(exact.space_heat_w)[morning].sum()
 
-    assert np.asarray(exact.space_heat_w)[morning].sum() > 0.0
-    assert np.asarray(banded.space_heat_w)[morning].sum() == pytest.approx(0.0)
+    assert exact_morning_w > 0.0
+    assert np.asarray(banded.space_heat_w)[morning].sum() < 0.5 * exact_morning_w
     assert sum(banded.space_heat_w) < sum(exact.space_heat_w)
     assert (np.asarray(banded.zone_temperatures) >= target - 1.0 - 1e-6).all()
 

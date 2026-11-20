@@ -172,6 +172,22 @@ HANDOVER_SHIFTS_STEPS = (-2, 2)
 # Up to how far ahead the next tank block's hand-over is moved (h): each try
 # costs a solve 2-10 s, and a block further ahead has replans enough to come.
 HANDOVER_LEAD_HOURS = 6.0
+# The share of the solve's time the plan's search keeps after the program
+# (see MPCOptimizer.solve): the previous plan, an hour on, missed its targets
+# by a tenth of a kelvin as the house drifted from its forecast - priced at
+# the slack's weight, 94 EUR - until a move or two put it right, and a
+# program that had taken all the time left it unrepaired (real data, 16 Nov
+# 2026: 22 ct dearer). A share, not seconds: a slower host prices fewer plans
+# in them, and solves the program slower alike.
+SEARCH_RESERVE_SHARE = 1 / 6
+# How much dearer the previous plan may be than the best found and still
+# stay (EUR; see MPCOptimizer._search): plans this close are a tie within the
+# model's own uncertainty - the outdoor forecast alone moves a run's cost by
+# some 0.7 ct per kelvin per kWh - and switching between them each quarter
+# hour only moves the hot water back and forth (replay, 18 Nov 2026: hot
+# water at 11:30 planned at 08:00-10:00, at 15:45 at 11:00, today's plans
+# within 0.5 ct). The same rule as a run's stop (see Optimization.zone_stopped).
+PLAN_HOLD_EUR = 0.005
 
 W_PER_KW = 1000.0
 J_PER_KWH = 3.6e6
@@ -957,7 +973,10 @@ class MPCOptimizer:
         # One time limit for the whole solve, the second round below included:
         # the jobs queue one after another, every five minutes.
         deadline = time.monotonic() + self.config.solve_time_limit_s
-        result, chosen = self._solve_with_zone(data, tank, deadline)
+        program_deadline = (
+            deadline - SEARCH_RESERVE_SHARE * self.config.solve_time_limit_s
+        )
+        result, chosen = self._solve_with_zone(data, tank, program_deadline)
 
         # The tank's plans were built around the zone's runs as estimated
         # beforehand, and the zone the program settles on may hand the
@@ -976,12 +995,37 @@ class MPCOptimizer:
             and _runs(plan_tank(tank, settled, data.zone_cooling, data.zone_local_day))
             != chosen
         ):
-            again, _ = self._solve_with_zone(
-                replace(data, previous_space_on=settled), tank, deadline
+            again, settled_chosen = self._solve_with_zone(
+                replace(data, previous_space_on=settled), tank, program_deadline
             )
 
             if again.objective_value < result.objective_value:
-                return again
+                result, chosen = again, settled_chosen
+
+        # Then the plan as runs (see _search), from the program's plan and the
+        # previous one, in the time the program left: it finds plans the
+        # program's tank plans do not hold - hot water before the floor, 1.3
+        # ct cheaper; one 7.8 ct cheaper than the program's optimum (real
+        # data, 17 and 18 Nov 2026) - and the previous plan, held to, is
+        # never dearer than what a program stopped at its limit found, nor
+        # one following another's start the previous plan gave it. Before
+        # the program, the search took the time it needed: four plans 16-32
+        # ct dearer over nine days (18 Nov 2026).
+        searched, cost, held = self._search(
+            data,
+            tank,
+            deadline,
+            (
+                tuple(int(on) for on in result.space_schedule),
+                tuple(on for on, _ in chosen),
+                tuple(on for _, on in chosen),
+            ),
+        )
+
+        if searched is not None and (
+            held or cost < result.objective_value - MIP_ABSOLUTE_GAP_EUR
+        ):
+            return self._held_result(data, tank, searched) or result
 
         return result
 
@@ -1167,6 +1211,426 @@ class MPCOptimizer:
         )
 
         return self._extract_result(model, data, results.termination_condition), chosen
+
+    def _search(
+        self, data: MPCInput, tank: TankSetting, deadline: float, planned: tuple
+    ) -> tuple[tuple | None, float, bool]:
+        """The plan as runs: the zone's runs and the tank's blocks searched
+        for directly, each plan priced exactly - its on/off steps held, the
+        program's other variables, starts and hand-overs among them, then
+        follow, and the program left to price the rest, the same physics and
+        costs to the cent (real data: an optimal plan priced alike to 1e-9 EUR,
+        in 0.15 s, a run moved a quarter in 0.01-0.3 s). Each move kept that
+        makes the plan cheaper:
+
+        - each zone run's start and end moved a quarter or two, a run
+          dropped, a pause between two filled; each tank block a quarter
+          earlier, later, longer or shorter;
+        - each of today's tank blocks tried every half hour of the day,
+          nearest first, the zone off there and through its old place or
+          not, up to it or on from it or not - the tank first, last or in
+          the middle of a floor run.
+
+        A block is one block wherever it goes, and a plan that breaks one of
+        the program's rules - a minimum runtime or pause, a run under way -
+        has no price. Starting plans: `planned` - the program's own - the
+        previous plan and a few the tank's dynamic program makes, all priced
+        whatever the time; searched from the cheapest and from the previous
+        plan, the time shared. The plan found as (zone, heat pump, booster)
+        on/off per step, its cost - no dearer than `planned` - and whether it
+        is the previous plan held, within PLAN_HOLD_EUR of the best."""
+
+        model = self._build_model(data, tank)
+        solver = self._solver()
+        solver.set_instance(model)
+        num_steps = tank.num_steps
+        columns = solver._pyomo_var_to_solver_var_map
+        sources = (model.space_on, model.boiler_on, model.booster_on)
+        free = [
+            (source, k, columns[id(variable[k])])
+            for source, variable in enumerate(sources)
+            for k in range(num_steps)
+            if not variable[k].fixed and id(variable[k]) in columns
+        ]
+        index = np.array([column for _, _, column in free], dtype=np.int32)
+        highs = highspy.Highs()
+        highs.setOptionValue("output_flag", False)
+        relaxation = solver._solver_model.getLp()
+        relaxation.integrality_ = []
+        highs.passModel(relaxation)
+
+        for option, value in solver.highs_options.items():
+            highs.setOptionValue(option, value)
+
+        prices: dict[tuple, float] = {}
+
+        def held_to(plan) -> float:
+            """The program with the plan's on/off steps held, solved: its
+            exact cost, inf where it breaks a rule."""
+
+            values = np.array([float(plan[source][k]) for source, k, _ in free])
+            highs.changeColsBounds(len(index), index, values, values)
+            # Each from scratch, presolved: with every on/off held much of the
+            # program presolves away, faster than the simplex from the plan
+            # before (real data, 120 plans: 161 against 201 ms each, the same
+            # costs to 6e-9 EUR).
+            highs.clearSolver()
+            highs.setOptionValue("solver", "simplex")
+            highs.run()
+
+            if highs.getModelStatus() != highspy.HighsModelStatus.kOptimal:
+                return math.inf
+
+            return highs.getInfo().objective_function_value
+
+        def price(plan) -> float:
+            if plan not in prices:
+                # The compressor serves one demand at a time.
+                prices[plan] = (
+                    math.inf
+                    if any(z and (h or b) for z, h, b in zip(*plan, strict=True))
+                    else held_to(plan)
+                )
+
+            return prices[plan]
+
+        held = self._zone_held(data, tank)
+        day = data.zone_local_day or (0,) * num_steps
+
+        def around(zone) -> tuple:
+            zone = tuple(
+                max(on, hold)
+                for on, hold in zip(
+                    (list(zone) + [0] * num_steps)[:num_steps], held, strict=True
+                )
+            )
+            pattern = _runs(
+                plan_tank(tank, zone, data.zone_cooling, data.zone_local_day)
+            )
+            return (
+                zone,
+                tuple(on for on, _ in pattern),
+                tuple(on for _, on in pattern),
+            )
+
+        def runs(on) -> list[tuple[int, int]]:
+            found, k = [], 0
+
+            while k < len(on):
+                if on[k]:
+                    end = k
+
+                    while end < len(on) and on[end]:
+                        end += 1
+
+                    found.append((k, end))
+                    k = end
+                else:
+                    k += 1
+
+            return found
+
+        def padded(on) -> tuple[int, ...]:
+            return tuple((list(on) + [0] * num_steps)[:num_steps])
+
+        min_off = self.config.heat_pump_min_off_steps
+
+        def repaired(plan) -> tuple:
+            """The plan with the steps a floor run under way holds (see
+            _zone_held) on, and a pause shorter than the compressor's least
+            filled with the zone: a plan made before the run, or a move, may
+            leave either - and no move of one quarter then reaches a plan that
+            holds."""
+
+            zone, heat_pump, booster = plan
+            zone = [max(on, hold) for on, hold in zip(zone, held, strict=True)]
+            busy = [
+                z or h or b for z, h, b in zip(zone, heat_pump, booster, strict=True)
+            ]
+            found = runs(busy)
+
+            for (_, end), (start, _) in zip(found, found[1:], strict=False):
+                if start - end < min_off:
+                    zone[end:start] = [1] * (start - end)
+
+            return (tuple(zone), heat_pump, booster)
+
+        on = self._relaxed_zone(model, solver)
+        previous = repaired(
+            (
+                padded(data.previous_space_on),
+                padded(data.previous_tank_on),
+                (0,) * num_steps,
+            )
+        )
+        cheapest = min(
+            [repaired(planned), previous]
+            + [
+                repaired(around(zone))
+                for zone in (
+                    data.previous_space_on,
+                    (),
+                    *(tuple(int(x >= share) for x in on) for share in (0.75, 0.25)),
+                )
+            ],
+            key=price,
+        )
+
+        if price(cheapest) == math.inf:
+            return None, math.inf, False
+
+        def placed(plan, start, end, at) -> tuple:
+            """The plan with its tank block start:end moved to begin at `at`,
+            the zone off there."""
+
+            zone, heat_pump, booster = (list(source) for source in plan)
+            length = end - start
+            blocks = (heat_pump[start:end], booster[start:end])
+            heat_pump[start:end] = booster[start:end] = [0] * length
+            heat_pump[at : at + length], booster[at : at + length] = blocks
+            zone[at : at + length] = [0] * length
+
+            return (tuple(zone), tuple(heat_pump), tuple(booster))
+
+        def relocated(plan):
+            zone = plan[0]
+            tank_on = [h or b for h, b in zip(plan[1], plan[2], strict=True)]
+
+            # Today's blocks: tomorrow's has replans enough to come. On the
+            # half hour; reshaped moves a block a quarter.
+            for start, end in runs(tank_on):
+                if (start == 0 and data.boiler_on_current) or day[start] != day[0]:
+                    continue
+
+                length = end - start
+
+                # Nearest first: the search has seconds where the program
+                # left few.
+                for at in sorted(
+                    range(start % 2 or 2, num_steps - length + 1, 2),
+                    key=lambda at: abs(at - start),
+                ):
+                    if at == start or day[at] != day[start]:
+                        continue
+
+                    if any(held[at : at + length]):
+                        continue
+
+                    # The floor through the block's old place, or not; and up
+                    # to the block's new place or on from it - a hand-over -
+                    # or not.
+                    # The floor through the block's old place first, and on
+                    # from the block's new place - the tank first - then up to
+                    # it, then neither.
+                    for refill in (1, 0):
+                        if refill and not (
+                            (start > 0 and zone[start - 1])
+                            or (end < num_steps and zone[end])
+                        ):
+                            continue
+
+                        moved = placed(plan, start, end, at)
+
+                        if not any(moved[1][start:end] + moved[2][start:end]):
+                            moved = (
+                                moved[0][:start] + (refill,) * length + moved[0][end:],
+                                *moved[1:],
+                            )
+
+                        busy = [h or b for h, b in zip(moved[1], moved[2], strict=True)]
+                        after = at + length
+                        following = next(
+                            (
+                                k
+                                for k in range(after, num_steps)
+                                if moved[0][k] or busy[k]
+                            ),
+                            None,
+                        )
+                        last = next(
+                            (
+                                k
+                                for k in range(at - 1, -1, -1)
+                                if moved[0][k] or busy[k]
+                            ),
+                            None,
+                        )
+
+                        if (
+                            following is not None
+                            and moved[0][following]
+                            and following > after
+                        ):
+                            yield (
+                                moved[0][:after]
+                                + (1,) * (following - after)
+                                + moved[0][following:],
+                                *moved[1:],
+                            )
+
+                        if last is not None and moved[0][last] and last + 1 < at:
+                            yield (
+                                moved[0][: last + 1]
+                                + (1,) * (at - last - 1)
+                                + moved[0][at:],
+                                *moved[1:],
+                            )
+
+                        yield moved
+
+        def reshaped(plan):
+            zone, heat_pump, booster = plan
+            busy = [h or b for h, b in zip(heat_pump, booster, strict=True)]
+            found = runs(zone)
+
+            for start, end in runs(busy):
+                if day[start] != day[0]:
+                    continue
+
+                if not (start == 0 and data.boiler_on_current):
+                    for at in (start - 1, start + 1):
+                        if 0 < at <= num_steps - (end - start) and not any(
+                            held[at : at + end - start]
+                        ):
+                            yield placed(plan, start, end, at)
+
+                for last, value in ((end - 1, 0), (end, 1)):
+                    if 0 < last < num_steps and not (value and zone[last]):
+                        longer = list(heat_pump)
+                        longer[last] = value
+                        yield (zone, tuple(longer), booster)
+
+            for i, (start, end) in enumerate(found):
+                if day[start] != day[0]:
+                    continue
+
+                for steps in (1, 2):
+                    for first, last, value in (
+                        (start - steps, start, 1),
+                        (start, start + steps, 0),
+                        (end - steps, end, 0),
+                        (end, end + steps, 1),
+                    ):
+                        if first < 0 or last > num_steps:
+                            continue
+
+                        if value and any(busy[first:last]):
+                            continue
+
+                        moved = list(zone)
+                        moved[first:last] = [value] * (last - first)
+                        yield (tuple(moved), heat_pump, booster)
+
+                moved = list(zone)
+                moved[start:end] = [0] * (end - start)
+                yield (tuple(moved), heat_pump, booster)
+
+                if i + 1 < len(found):
+                    gap = range(end, found[i + 1][0])
+
+                    if not any(busy[k] for k in gap):
+                        moved = list(zone)
+                        moved[end : found[i + 1][0]] = [1] * len(gap)
+                        yield (tuple(moved), heat_pump, booster)
+
+        # Today's runs and blocks only: tomorrow's are planned again by the
+        # replans to come, and the search spent most of its moves on them
+        # (real data, 18 Nov 2026: tomorrow's block moved a quarter at a time,
+        # eleven times).
+        spent = {moves.__name__: 0.0 for moves in (reshaped, relocated)}
+
+        def descended(plan, until: float, order) -> tuple:
+            """The plan improved a move at a time until no move helps or
+            `until`: from each better plan the moves start over, in `order`,
+            the nearest first."""
+
+            improved = True
+
+            while improved and time.monotonic() < until:
+                improved = False
+
+                for moves in order:
+                    began = time.monotonic()
+
+                    for move in moves(plan):
+                        if time.monotonic() >= until:
+                            break
+
+                        candidate = repaired(move)
+
+                        if price(candidate) < price(plan) - 1e-9:
+                            plan, improved = candidate, True
+                            break
+
+                    spent[moves.__name__] += time.monotonic() - began
+
+                    if improved:
+                        break
+
+            return plan
+
+        # From the cheapest start and from the previous plan, the time shared:
+        # an hour on, the previous plan can miss a target by a tenth of a
+        # kelvin and cost more than the program's own until a move puts it
+        # right - and then cost far less (real data, 14 Nov 2026: 1.97 EUR
+        # from the program stopped at its limit, its own start not searched
+        # from, 21 ct dearer than the plan before).
+        best = cheapest
+        starts = list(dict.fromkeys((cheapest, previous)))
+
+        for i, start in enumerate(starts):
+            until = time.monotonic() + (deadline - time.monotonic()) / (len(starts) - i)
+            # The previous plan wants repair first; a plan already sound, the
+            # tank moved first - the move that takes a slow host longest to
+            # reach otherwise, behind the small ones.
+            order = (
+                (reshaped, relocated) if start == previous else (relocated, reshaped)
+            )
+            best = min(best, descended(start, until, order), key=price)
+
+        logger.info(
+            "Plan searched: %.4f EUR, %d plans priced, %s",
+            price(best),
+            len(prices),
+            {name: round(seconds, 1) for name, seconds in spent.items()},
+        )
+
+        held = bool(data.previous_space_on or data.previous_tank_on) and (
+            price(previous) <= price(best) + PLAN_HOLD_EUR
+        )
+
+        return (previous, price(previous), True) if held else (best, price(best), False)
+
+    def _held_result(
+        self, data: MPCInput, tank: TankSetting, plan: tuple
+    ) -> MPCResult | None:
+        """The plan `_search` found - (zone, heat pump, booster) on/off per
+        step - with the program's other variables solved for; None should
+        that fail."""
+
+        model = self._build_model(data, tank)
+
+        for source, variable in enumerate(
+            (model.space_on, model.boiler_on, model.booster_on)
+        ):
+            for k in model.K:
+                if not variable[k].fixed:
+                    variable[k].fix(plan[source][k])
+
+        # Every decision held, this takes the time of one relaxation, not the
+        # time the search left: held to that, a busy host fell back to the
+        # program's plan, 18 ct dearer (replay, 17 Nov 2026).
+        solver = self._solver()
+        solver.config.time_limit = self.config.solve_time_limit_s
+        results = solver.solve(model)
+
+        if results.termination_condition != TerminationCondition.optimal:
+            logger.warning("The searched plan did not solve: the program's kept")
+            return None
+
+        results.solution_loader.load_vars()
+
+        return self._extract_result(model, data, results.termination_condition)
 
     @staticmethod
     def _relaxed_zone(model: pyo.ConcreteModel, solver: Highs) -> list[float]:
@@ -1362,13 +1826,16 @@ class MPCOptimizer:
         tank's target band or the zone's comfort band: the slacks priced at
         weight_temperature_slack, which measure only what a plan can still
         change. Such a start is a previous plan the house no longer follows -
-        a run started by hand, a restart, a defrost - and far from optimal."""
+        a run started by hand, a restart, a defrost - and far from optimal.
+        The heating zone's ceiling is priced as comfort, no promise."""
+
+        cooling = model.space_sign < 0
 
         return any(
             pyo.value(model.slack[k])
             - pyo.value(model.slack_in[k])
             + pyo.value(model.zone_slack[k])
-            + pyo.value(model.zone_excess[k])
+            + (pyo.value(model.zone_excess[k]) if cooling else 0.0)
             > ZONE_BOUND_MARGIN_K
             for k in model.K
         )
@@ -3500,6 +3967,7 @@ class MPCOptimizer:
         model.zone_excess = pyo.Var(model.K, domain=pyo.NonNegativeReals)
         model.zone_discomfort_k = pyo.Var(model.K, domain=pyo.NonNegativeReals)
         model.zone_discomfort_k2 = pyo.Var(model.K, domain=pyo.NonNegativeReals)
+        model.zone_excess_k2 = pyo.Var(model.K, domain=pyo.NonNegativeReals)
 
         model.zone_constraints = pyo.ConstraintList()
 
@@ -3885,7 +4353,16 @@ class MPCOptimizer:
             # The band's edges, soft only so that a plan must still exist where
             # sun alone pushes the zone past the ceiling, or a cold night below
             # the floor: only what the plan can change is its to answer for,
-            # priced as dearly as the tank's target.
+            # priced as dearly as the tank's target - but for the heating
+            # zone's ceiling, which only its own heat can pass: a room a little
+            # warmer is discomfort, not a broken promise, so priced as comfort
+            # is (see _build_objective), squared from the edge. At the hard
+            # price, hot water on the noon sun could not hand over to a floor
+            # run in a sunlit room 0.36 K above its 20 degC ceiling; it waited
+            # for the room to cool, off the sun (real data, 20 Nov 2026: 11 ct
+            # dearer over two days, for a room 0.2 K warmer an hour).
+            excess_span_k = 0.0
+
             for j in ends:
                 if minimum_c is not None:
                     model.zone_constraints.add(
@@ -3894,9 +4371,21 @@ class MPCOptimizer:
                     )
 
                 if maximum_c is not None:
+                    edge_c = max(float(maximum_c[k]), unheated_c[j])
                     model.zone_constraints.add(
-                        measured(j) - model.zone_excess[k]
-                        <= max(float(maximum_c[k]), unheated_c[j])
+                        measured(j) - model.zone_excess[k] <= edge_c
+                    )
+                    excess_span_k = max(excess_span_k, reachable_c[j] - edge_c)
+
+            if not cooling:
+                for point_k in np.arange(
+                    COMFORT_TANGENT_SPACING_K,
+                    excess_span_k + COMFORT_TANGENT_SPACING_K,
+                    COMFORT_TANGENT_SPACING_K,
+                ):
+                    model.zone_constraints.add(
+                        model.zone_excess_k2[k]
+                        >= 2.0 * point_k * model.zone_excess[k] - point_k**2
                     )
 
         # A zone that leaves its comfort band by step k when left alone needs
@@ -4533,15 +5022,20 @@ class MPCOptimizer:
 
             # The zone's band is a promise the plan made, not worth trading
             # for a few cents of electricity. Within it, comfort is traded, as
-            # for the tank's target.
+            # for the tank's target - and so is the heating zone's ceiling
+            # (see _add_space_heating).
             if hasattr(model, "zone_slack"):
+                heating = model.space_sign > 0
                 objective += self.config.weight_temperature_slack * (
-                    model.zone_slack[k] + model.zone_excess[k]
+                    model.zone_slack[k] + (0.0 if heating else model.zone_excess[k])
                 )
                 objective += (
                     self.config.weight_comfort_eur_per_k2h
                     * dt_hours[k]
-                    * model.zone_discomfort_k2[k]
+                    * (
+                        model.zone_discomfort_k2[k]
+                        + (model.zone_excess_k2[k] if heating else 0.0)
+                    )
                 )
 
         # The heat left in the zone at the plan's end, at what heat costs the

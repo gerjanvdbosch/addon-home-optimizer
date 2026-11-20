@@ -293,9 +293,11 @@ class Thermostat(BaseModel):
 # The zone's comfort over the day: from each time of day, the temperature
 # wanted (deg C) and how far the zone may go below and above it (K). Away from
 # the wanted temperature towards discomfort costs the plan
-# MPCConfig.weight_comfort_eur_per_k2h; the band's edges are hard. The other
-# side is free up to its edge: warmer while heating is heat buffered in the
-# floor, cooler while cooling cold buffered - both already paid for in energy.
+# MPCConfig.weight_comfort_eur_per_k2h; the band's edges are hard, but for the
+# heating ceiling. The other side is free up to its edge: warmer while heating
+# is heat buffered in the floor, cooler while cooling cold buffered - both
+# already paid for in energy. Heated past the ceiling costs comfort again, at
+# the same weight, squared from the edge.
 # The titles head the columns of the config page's schedule table.
 ComfortSchedule = list[
     tuple[
